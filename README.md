@@ -1,6 +1,6 @@
 <table>
   <tr>
-    <td align="center" bgcolor="#ff6363"><strong>⚠️ BETA — OpenLeash is still in beta. Some features may be missing, and the app may be unstable.</strong></td>
+    <td align="center" bgcolor="#ff6363"><strong>⚠️ BETA —————— OpenLeash is still in beta. Some features may be missing, and the app may be unstable.</strong></td>
   </tr>
 </table>
 
