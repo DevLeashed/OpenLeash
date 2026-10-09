@@ -21,7 +21,7 @@
 
 ## What is OpenLeash?
 
-OpenLeash is a desktop app that connects a language model to a project on your machine. Through OpenLeash's tools, the model can read files, make edits, run shell commands, search the web, and delegate to sub-agents. Output streams live, and anything that is not read-only asks for approval first.
+OpenLeash is a desktop app that connects a language model to a project on your machine. Through OpenLeash's tools, the model can read files, make edits, run shell commands, search the web, and delegate to subagents. Output streams live, and anything that is not read-only asks for approval first.
 
 The core is written in Rust (Tauri 2) and the interface in React 19. You bring your own API key; supported providers are listed under [Highlights](#highlights).
 
@@ -29,11 +29,11 @@ The agent executes model-authored commands, so the permission layer is security-
 
 ## Highlights
 
-- **Tools.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, sub-agents and more. Each tool's description states when to use it and when not to.
+- **Tools.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, subagents and more. Each tool's description states when to use it and when not to.
 - **Edits.** Exact-string, unique-match edits. They fail if the agent has not read the file or if the file changed since.
 - **Permission gates.** Read-only commands run without asking. Everything else asks. Allow rules never match chained commands (`&&`, `;`, `|`, `$(...)`, backticks, redirects). Plan mode blocks edits until you approve.
 - **Parallel tasks.** Each task runs in its own **git worktree**, so concurrent agents do not collide. Review and commit per branch.
-- **Sub-agents.** Large searches run in a fresh, read-only context to keep the main one clean.
+- **Subagents.** Large searches run in a fresh, read-only context to keep the main one clean.
 - **Providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Gemini, OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, LM Studio, vLLM and custom endpoints.
 - **Controls.** A live todo list, mid-turn steering, `Esc` to pause or kill the whole process tree, and a budget cap.
 - **Goal mode.** `/goal <what done looks like>` keeps the agent working until it shows the goal is met.
