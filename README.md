@@ -1,6 +1,6 @@
 <table>
   <tr>
-    <td align="center" bgcolor="#ff6363"><strong>⚠️ BETA —————— OpenLeash is still in beta. Some features may be missing, and the app may be unstable.</strong></td>
+    <td align="center" bgcolor="#ff6363"><strong>⚠️ BETA — OpenLeash is still in beta. Some features may be missing, and the app may be unstable.</strong></td>
   </tr>
 </table>
 
@@ -12,7 +12,7 @@
 
 **A desktop harness for coding agents.**
 
-Runs language models on your machine with file, shell and web tools, parallel tasks, and permission gates.
+It's good trust me bro
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
@@ -23,7 +23,7 @@ Runs language models on your machine with file, shell and web tools, parallel ta
 
 ## What is OpenLeash?
 
-OpenLeash is a desktop app that runs a language model against a project on your machine. The model can read files, make edits, run shell commands, search the web, and delegate to sub-agents. Output streams live, and anything that is not read-only asks for approval first.
+OpenLeash is a desktop app that connects a language model to a project on your machine. Through OpenLeash's tools, the model can read files, make edits, run shell commands, search the web, and delegate to sub-agents. Output streams live, and anything that is not read-only asks for approval first.
 
 The core is written in Rust (Tauri 2) and the interface in React 19. You bring your own API key; supported providers are listed under [Highlights](#highlights).
 
@@ -89,7 +89,7 @@ Type `/` in the composer for slash commands (`/goal`, `/plan`, `/compact`, `/mod
 
 ## Security
 
-OpenLeash runs a model on your machine with the tools to read and write files and execute shell commands. **Nothing sandboxes it.** Before pointing it at a repository you do not trust, note that:
+OpenLeash gives a model the tools to read and write files and execute shell commands on your machine. **Nothing sandboxes it.** Before pointing it at a repository you do not trust, note that:
 
 - reads are not sandboxed, so the agent can read anything your account can;
 - a repo's `AGENTS.md` / `CLAUDE.md` is injected into the agent's prompt, so open untrusted repos in plan mode;
