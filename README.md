@@ -10,9 +10,9 @@
 
 # OpenLeash
 
-**A desktop harness for coding agents, with a permission layer you can trust.**
+**A desktop harness for coding agents.**
 
-Run language models against your real machine, with real tools, parallel tasks and a leash on what they can do.
+Runs language models on your machine with file, shell and web tools, parallel tasks, and permission gates.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
@@ -23,23 +23,23 @@ Run language models against your real machine, with real tools, parallel tasks a
 
 ## What is OpenLeash?
 
-OpenLeash is a desktop app that lets a language model work on your code the way a developer would: it reads files, makes edits, runs shell commands, searches the web, and delegates to sub-agents. You watch it happen live and you stay in control.
+OpenLeash is a desktop app that runs a language model against a project on your machine. The model can read files, make edits, run shell commands, search the web, and delegate to sub-agents. Output streams live, and anything that is not read-only asks for approval first.
 
-The core is written in Rust (Tauri 2) and the interface in React 19. Bring your own API key for Anthropic, OpenAI, Gemini, OpenRouter, Ollama, and much more.
+The core is written in Rust (Tauri 2) and the interface in React 19. You bring your own API key; supported providers are listed under [Highlights](#highlights).
 
-Because the agent executes model-authored commands, **the permission layer is a security feature, not a convenience**. It is the most heavily tested part of the codebase. See the [security model](docs/security-model.md) for exactly what it does and does not protect against.
+The agent executes model-authored commands, so the permission layer is security-critical. It is the most heavily tested part of the codebase. See the [security model](docs/security-model.md) for what it does and does not protect against.
 
 ## Highlights
 
-- **Small, sharp toolset.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, sub-agents and more. Each tool says when to use it and when not to.
-- **Safe edits.** Exact-string, unique-match edits. They fail if the agent never read the file or if it changed since.
-- **Permission gates.** Read-only commands run freely. Everything else asks. Allow rules never match chained commands (`&&`, `;`, `|`, `$(...)`, backticks, redirects). Plan mode blocks edits until you approve.
-- **Parallel work.** Run many tasks at once, each in its own **git worktree**, so agents never collide. Review and commit per branch.
+- **Tools.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, sub-agents and more. Each tool's description states when to use it and when not to.
+- **Edits.** Exact-string, unique-match edits. They fail if the agent has not read the file or if the file changed since.
+- **Permission gates.** Read-only commands run without asking. Everything else asks. Allow rules never match chained commands (`&&`, `;`, `|`, `$(...)`, backticks, redirects). Plan mode blocks edits until you approve.
+- **Parallel tasks.** Each task runs in its own **git worktree**, so concurrent agents do not collide. Review and commit per branch.
 - **Sub-agents.** Large searches run in a fresh, read-only context to keep the main one clean.
-- **Many providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Gemini, OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, LM Studio, vLLM and custom endpoints.
-- **Stay in the loop.** A live todo list, steering mid-turn, `Esc` to pause or kill the whole process tree, and a budget cap.
-- **Goal mode.** `/goal <what done looks like>` keeps the agent going until it proves it is finished.
-- **Extensible.** Skills (`SKILL.md`), MCP servers (stdio and HTTP), hooks, and project memory via `OPENLEASH.md` / `AGENTS.md` / `CLAUDE.md`.
+- **Providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Gemini, OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, LM Studio, vLLM and custom endpoints.
+- **Controls.** A live todo list, mid-turn steering, `Esc` to pause or kill the whole process tree, and a budget cap.
+- **Goal mode.** `/goal <what done looks like>` keeps the agent working until it shows the goal is met.
+- **Extensions.** Skills (`SKILL.md`), MCP servers (stdio and HTTP), hooks, and project memory via `OPENLEASH.md` / `AGENTS.md` / `CLAUDE.md`.
 - **Review view.** Per-file revert and commit, with or without git.
 - **No telemetry.** Requests go only to the providers and services you use.
 
@@ -74,7 +74,7 @@ You can also set a key through the environment (`ANTHROPIC_API_KEY`, `OPENAI_API
 
 To make a production build, run `npm run tauri build`.
 
-## Quick tour
+## Shortcuts
 
 | Key | Action |
 |---|---|
