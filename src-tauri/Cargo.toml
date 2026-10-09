@@ -1,0 +1,83 @@
+[package]
+name = "openleash"
+version = "0.1.0"
+description = "OpenLeash - desktop agent harness"
+authors = ["The OpenLeash Authors"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/DevLeashed/OpenLeash"
+homepage = "https://github.com/DevLeashed/OpenLeash"
+documentation = "https://github.com/DevLeashed/OpenLeash#readme"
+keywords = ["ai", "agent", "llm", "tauri", "desktop"]
+categories = ["development-tools"]
+exclude = ["dist", "compiled", "published", "node_modules"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "openleash_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tauri-plugin-dialog = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+tokio-util = "0.7"
+regex = "1"
+# Hook trust is recorded against a hash of the hook body (`checks::hook_hash`),
+# so it has to be a real hash rather than a hand-rolled checksum: what it defends
+# against is a repository that ships a hook body chosen to collide with the one
+# the user approved. Already in the tree via tauri-utils, so this adds no new
+# download and no second copy of the crate.
+sha2 = "0.10"
+ignore = "0.4"
+globset = "0.4"
+similar = "2"
+# Startup: the task files are parsed on a pool (see `store::load_tasks`). A
+# blocking pool with std threads would work, but rayon gives the work-stealing
+# scheduler that keeps 190 unevenly-sized files from leaving cores idle.
+rayon = "1"
+dirs = "6"
+base64 = "0.22"
+urlencoding = "2"
+png = "0.17"
+xcap = "0.9"
+enigo = "0.5"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+tauri-plugin-notification = "2"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "tokio-rustls", "rustls-tls-webpki-roots"] }
+tauri-plugin-single-instance = "2"
+
+
+# These APIs are used only by the Windows guard and COM integration. Keeping
+# them unconditional pulls windows-future into Linux/macOS builds, where its
+# Windows-only COM implementation cannot compile. xcap/enigo already gate their
+# own Windows dependencies; no dependency patch or lockfile update is needed.
+[target.'cfg(windows)'.dependencies]
+# Match Tauri/tao's 0.61 import library for the global Esc hook.
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Foundation", "Win32_System_Registry", "Win32_Security"] }
+# COM macros in win/mod.rs expand to absolute ::windows_core:: paths.
+windows-core = "0.61"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

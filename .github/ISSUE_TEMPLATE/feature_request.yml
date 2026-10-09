@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest something OpenLeash should be able to do
+title: ""
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What are you trying to do that you can't? Describe the situation rather
+        than the solution — the solution is usually one of several ways to
+        address it, and the maintainer may have a reason to prefer a different one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Including workarounds you currently rely on.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the app is this about?
+      multiple: true
+      options:
+        - Agent / tools
+        - Permissions / security model
+        - Permissions UI
+        - Sessions and chats
+        - Review and git
+        - Providers and models
+        - Plugins / MCP / skills
+        - UI and keyboard
+        - Settings
+        - Build, packaging or releases
+        - Not sure
+    validations:
+      required: false

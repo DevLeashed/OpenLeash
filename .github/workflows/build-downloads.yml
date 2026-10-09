@@ -1,0 +1,178 @@
+# On-demand, unsigned downloads only: no tags, releases, or signing secrets.
+name: Build downloads
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - label: windows-x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          # VS 2022 on this image includes VC.Tools.ARM64 and ARM64 SDK libs.
+          # Cross-compiling keeps NSIS and its plugins on a supported x64 host.
+          - label: windows-arm64
+            os: windows-2022
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+          # Keep genuine build failures visible, without cancelling other targets.
+          - label: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+          # Native ARM libraries; intentionally no ARM AppImage tooling assumption.
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: 'true'
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+      BUILD_TARGET: ${{ matrix.target }}
+      BUILD_LABEL: ${{ matrix.label }}
+      BUILD_BUNDLES: ${{ matrix.bundles }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates file pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libxdo-dev libdbus-1-dev \
+            libxkbcommon-dev libpipewire-0.3-dev libspa-0.2-dev \
+            clang libclang-dev libgbm-dev libxcb1-dev libxcb-randr0-dev libxrandr-dev \
+            libxi-dev libxtst-dev patchelf libfuse2
+
+      - name: Verify PipeWire and SPA header versions
+        if: runner.os == 'Linux'
+        run: |
+          pkg-config --atleast-version=1.0.0 libpipewire-0.3 || {
+            echo "libpipewire-0.3 headers 1.0.0 or newer are required by the locked PipeWire bindings" >&2
+            exit 1
+          }
+          pkg-config --atleast-version=0.2 libspa-0.2 || {
+            echo "libspa-0.2 headers implementing the SPA 0.2 API are required by the locked libspa bindings" >&2
+            exit 1
+          }
+          printf 'PipeWire %s; SPA API %s\n' \
+            "$(pkg-config --modversion libpipewire-0.3)" \
+            "$(pkg-config --modversion libspa-0.2)"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check app version metadata
+        run: npm run version:check
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          key: downloads-${{ matrix.target }}
+
+      - name: Build unsigned installers and application
+        # The first -- is npm's separator; the second forwards --locked to Cargo.
+        # Tauri also runs beforeBuildCommand (TypeScript + production Vite build).
+        run: npm run tauri -- build --ci --no-sign --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" -- --locked
+
+      - name: Stage downloads and SHA-256 checksums
+        # Archive the macOS app before upload: artifact ZIPs discard Unix modes.
+        shell: python
+        run: |
+          import hashlib
+          import os
+          from pathlib import Path
+          import shutil
+          import tarfile
+
+          label = os.environ["BUILD_LABEL"]
+          release = Path("src-tauri/target") / os.environ["BUILD_TARGET"] / "release"
+          bundle = release / "bundle"
+          stage = Path("downloads")
+          stage.mkdir(exist_ok=False)
+
+          def required(pattern):
+              matches = sorted(bundle.glob(pattern))
+              if not matches:
+                  raise RuntimeError(f"Missing required download: {bundle / pattern}")
+              return matches
+
+          def copy_files(pattern):
+              for source in required(pattern):
+                  if not source.is_file() or source.stat().st_size == 0:
+                      raise RuntimeError(f"Invalid download: {source}")
+                  destination = stage / source.name
+                  if destination.exists():
+                      raise RuntimeError(f"Duplicate download name: {destination}")
+                  shutil.copy2(source, destination)
+
+          if label.startswith("windows-"):
+              executable = release / "openleash.exe"
+              if not executable.is_file() or executable.stat().st_size == 0:
+                  raise RuntimeError(f"Missing portable executable: {executable}")
+              shutil.copy2(executable, stage / f"openleash-{label}-portable.exe")
+              copy_files("nsis/*.exe")
+          elif label.startswith("macos-"):
+              for app in required("macos/*.app"):
+                  if not app.is_dir() or not (app / "Contents/MacOS/openleash").is_file():
+                      raise RuntimeError(f"Invalid app bundle: {app}")
+                  with tarfile.open(stage / f"{app.stem}-{label}.app.tar.gz", "w:gz") as archive:
+                      archive.add(app, arcname=app.name)
+              copy_files("dmg/*.dmg")
+          else:
+              copy_files("deb/*.deb")
+              if label == "linux-x64":
+                  copy_files("appimage/*.AppImage")
+
+          lines = []
+          for download in sorted(stage.iterdir()):
+              with download.open("rb") as stream:
+                  hasher = hashlib.sha256()
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+                  digest = hasher.hexdigest()
+              lines.append(f"{digest}  {download.name}\n")
+          (stage / "SHA256SUMS.txt").write_text("".join(lines), encoding="utf-8")
+
+      # Each matrix leg uploads independently; a failed target publishes nothing.
+      - name: Upload downloads
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openleash-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: downloads/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

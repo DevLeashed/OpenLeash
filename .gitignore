@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Python bytecode from one-off helper scripts
+__pycache__/
+*.pyc
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Built binaries and installers
+compiled/
+published/
+
+# Coverage / instrumentation output
+*.profraw
+coverage/
+lcov.info
+lcov-report/
+.nyc_output/
+*.lcov
+.grcov
+
+# Local scratch
+.tmp-*
+.qcheck/
+.scratch/
+.research/
+.openleash/

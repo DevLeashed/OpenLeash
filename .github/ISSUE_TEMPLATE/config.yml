@@ -1,0 +1,17 @@
+# First-time issues: search first, never paste secrets, and say what you
+# expected. Full guidance lives in CONTRIBUTING.md.
+#
+# Platform note: the Rust crate does not currently compile on Linux (see the note
+# in src-tauri/Cargo.toml) and CI runs the Rust tests on Windows, so a Linux
+# contributor can work on the frontend but cannot run `cargo test`.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/DevLeashed/OpenLeash/security/advisories/new
+    about: Report privately via GitHub's private vulnerability reporting. Please do not open a public issue for a security bug, and never paste a live API key or your settings.json.
+  - name: Question or discussion
+    url: https://github.com/DevLeashed/OpenLeash/discussions
+    about: Ask how to use OpenLeash, or propose an idea that is not yet a concrete change. "It didn't work" is hard to act on — include what you expected to happen.
+  - name: Contributing guide
+    url: https://github.com/DevLeashed/OpenLeash/blob/main/CONTRIBUTING.md
+    about: How to build, test, and what a change to the permission layer needs to include.
