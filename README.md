@@ -14,7 +14,6 @@
 
 Run language models against your real machine, with real tools, parallel tasks and a leash on what they can do.
 
-[![CI](https://github.com/DevLeashed/OpenLeash/actions/workflows/ci.yml/badge.svg)](https://github.com/DevLeashed/OpenLeash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/core-Rust-DEA584?logo=rust&logoColor=white)
