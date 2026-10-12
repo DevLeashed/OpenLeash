@@ -1,13 +1,9 @@
-# On-demand downloads; optional updater signing. Never creates tags or releases.
+# On-demand downloads with updater signing (requires Tauri signing secrets). Never creates tags or releases.
 name: Build downloads
 
 on:
   workflow_dispatch:
     inputs:
-      build_updater:
-        description: Build signed updater extras (requires Tauri signing secrets)
-        type: boolean
-        default: true
       release_tag:
         description: Release tag for updater URLs (blank = package version, no v)
         type: string
@@ -58,7 +54,7 @@ jobs:
       BUILD_TARGET: ${{ matrix.target }}
       BUILD_LABEL: ${{ matrix.label }}
       BUILD_BUNDLES: ${{ matrix.bundles }}
-      BUILD_UPDATER: ${{ inputs.build_updater }}
+      BUILD_UPDATER: 'true'
       RELEASE_TAG: ${{ inputs.release_tag }}
 
     steps:
@@ -118,7 +114,7 @@ jobs:
         run: python -B -c 'import json, os, sys; sys.path.insert(0, "scripts"); from updater_assets import release_identity; release_identity(json.load(open("package.json"))["version"], os.environ["RELEASE_TAG"])'
 
       - name: Build unsigned downloads
-        if: ${{ !inputs.build_updater || matrix.label == 'linux-arm64' }}
+        if: ${{ matrix.label == 'linux-arm64' }}
         # The first -- is npm's separator; the second forwards --locked to Cargo.
         # Tauri also runs beforeBuildCommand (TypeScript + production Vite build).
         run: |
@@ -129,7 +125,7 @@ jobs:
           fi
 
       - name: Build updater-signed downloads
-        if: inputs.build_updater && matrix.label != 'linux-arm64'
+        if: matrix.label != 'linux-arm64'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -137,7 +133,7 @@ jobs:
         # Updater signing is distinct from Authenticode / Apple notarization.
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo 'Set TAURI_SIGNING_PRIVATE_KEY in repository Actions secrets before opting in.' >&2
+            echo 'Set TAURI_SIGNING_PRIVATE_KEY in repository Actions secrets before running this workflow.' >&2
             exit 1
           fi
           bundles="$BUILD_BUNDLES"
@@ -205,7 +201,6 @@ jobs:
 
   updater-manifest:
     name: Assemble updater manifest (no publishing)
-    if: inputs.build_updater
     needs: build
     runs-on: ubuntu-24.04
     permissions:

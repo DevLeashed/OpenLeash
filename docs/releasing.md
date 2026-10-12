@@ -113,7 +113,7 @@ them. Do not use this channel for confidential or private distribution.
    never attach it to a release or paste it into logs. The public key in
    `plugins.updater.pubkey` must match. Losing/rotating the key prevents existing
    installations accepting updates signed only by the new key.
-2. Bump the app version and run **Build downloads** with **build_updater** checked.
+2. Bump the app version and run **Build downloads**.
    Leave **release_tag** blank for the exact package version (e.g. `0.1.0`, not
    `v0.1.0`), matching existing releases. If using a `v` tag, explicitly enter
    `v<version>`. Different versions, whitespace and path/URL injection are rejected.
@@ -134,8 +134,8 @@ them. Do not use this channel for confidential or private distribution.
    `https://github.com/DevLeashed/OpenLeash/releases/download/<tag>/<asset>`;
    publish only after every referenced asset is attached. Do not reuse versions.
 
-With **build_updater** unchecked (default), the six unsigned downloads still
-build without signing secrets. Signed mode merges
+**Build downloads** always builds updater-signed artifacts, so the signing secrets
+are required. The build merges
 `src-tauri/tauri.updater.conf.json` (`createUpdaterArtifacts: true`) and omits
 `--no-sign`: Tauri's CLI skips updater signatures as well as OS signing when that
 flag is set. A Tauri updater key does **not** provide an Authenticode certificate,

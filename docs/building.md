@@ -36,8 +36,8 @@ distributions; test downloads on the systems you intend to support.
 to the repository's default branch:
 
 1. Open GitHub → **Actions** → **Build downloads** → **Run workflow**.
-2. Select the branch; leave **build_updater** unchecked for unsigned downloads,
-   or enable it after configuring the signing secrets described in [Releases](releasing.md).
+2. Select the branch. Updater signing is always on, so configure the signing
+   secrets described in [Releases](releasing.md) first.
    The optional **release_tag** defaults to the package version without a `v` prefix.
 3. Open the completed run and download the single-file ZIPs under **Artifacts**.
 
