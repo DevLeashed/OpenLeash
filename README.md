@@ -45,7 +45,7 @@ The full list is in [docs/features.md](docs/features.md).
 
 ## Roadmap
 
-- Remote connectivity
+- Remote connectivity targeted for 0.1.2
 
 ## Getting started
 
