@@ -757,8 +757,23 @@ pub async fn send_images(
 }
 
 pub fn spawn_run(h: Arc<Harness>, task_id: String) {
+    let rt = h.runtime(&task_id);
+    let startup = rt.startup_cancel.lock().unwrap();
+    if rt.startup_pending.load(Ordering::SeqCst)
+        && startup
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    {
+        return;
+    }
+    if rt.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let cancel = CancellationToken::new();
+    *rt.cancel.lock().unwrap() = Some(cancel.clone());
+    drop(startup);
     tauri::async_runtime::spawn(async move {
-        run_main(h, task_id).await;
+        run_main_reserved(h, task_id, cancel).await;
     });
 }
 
@@ -767,9 +782,17 @@ pub fn spawn_run(h: Arc<Harness>, task_id: String) {
 /// it runs on a blocking thread that can't await the async half.
 pub fn stop_tokens(h: &Harness, task_id: &str) {
     let rt = h.runtime(task_id);
+    // Startup setup is separate from the agent loop; Stop has to cancel it too.
+    let startup = rt.startup_cancel.lock().unwrap();
+    if rt.startup_pending.load(Ordering::SeqCst) {
+        if let Some(cancel) = startup.as_ref() {
+            cancel.cancel();
+        }
+    }
     if let Some(c) = rt.cancel.lock().unwrap().as_ref() {
         c.cancel();
     }
+    drop(startup);
     {
         let mut bg = rt.bg_cancel.lock().unwrap();
         bg.cancel();
@@ -1832,13 +1855,33 @@ pub async fn resume(
     }
 }
 
-async fn run_main(h: Arc<Harness>, task_id: String) {
-    let rt = h.runtime(&task_id);
+fn install_run_token(rt: &Runtime) -> Option<CancellationToken> {
+    let startup = rt.startup_cancel.lock().unwrap();
+    let stopped_during_startup = rt.startup_pending.load(Ordering::SeqCst)
+        && startup
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+    if stopped_during_startup {
+        return None;
+    }
     if rt.running.swap(true, Ordering::SeqCst) {
-        return;
+        return None;
     }
     let cancel = CancellationToken::new();
     *rt.cancel.lock().unwrap() = Some(cancel.clone());
+    Some(cancel)
+}
+
+async fn run_main(h: Arc<Harness>, task_id: String) {
+    let rt = h.runtime(&task_id);
+    let Some(cancel) = install_run_token(&rt) else {
+        return;
+    };
+    run_main_reserved(h, task_id, cancel).await;
+}
+
+async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: CancellationToken) {
+    let rt = h.runtime(&task_id);
     h.update_task(&task_id, |t| {
         t.status = "running".into();
         t.waiting_kind = None;
@@ -1944,10 +1987,23 @@ async fn run_main(h: Arc<Harness>, task_id: String) {
     // to the page it was on, and a headless Chrome left running holds a profile
     // dir and a chunk of memory for nothing.
     super::browser::close_task(&task_id);
-    (h.bus)(
-        "ol://attention",
-        json!({"task_id": task_id, "kind": if parked { "waiting" } else { status }}),
-    );
+    // Only an ordinary finish can hand over to a queued follow-up. A parked run
+    // is waiting, and a stopped run leaves its queue alone (both below), so they
+    // take nothing here.
+    let drained = if parked || status == "stopped" {
+        Vec::new()
+    } else {
+        drain_queue(&rt).await
+    };
+    // "Done" means nothing more is coming. A queued follow-up restarts the run
+    // straight below, so announcing a finish here rang for a chat still working.
+    // A failure is announced regardless: the run did fail, whatever runs next.
+    if drained.is_empty() || status == "failed" {
+        (h.bus)(
+            "ol://attention",
+            json!({"task_id": task_id, "kind": if parked { "waiting" } else { status }}),
+        );
+    }
 
     // A parked run is *waiting*, not finished, so it gets neither the queued
     // turn nor a keepalive: the watcher owns what happens next, and a keepalive
@@ -1966,7 +2022,6 @@ async fn run_main(h: Arc<Harness>, task_id: String) {
     // An ordinary finish: the queue may hold a follow-up turn, which restarts
     // the run below and serves its own idle. Only if there is none is this the
     // end of the run, and so the moment the cache-keepalive loop becomes useful.
-    let drained = drain_queue(&rt).await;
     if drained.is_empty() {
         if status == "done" {
             start_keepalive(h.clone(), task_id);
@@ -2295,11 +2350,12 @@ async fn frozen_prefix(
         return Ok((sys, mcp, plugins));
     }
     let agent_id = format!("ol-{task_id}");
-    let (skills, inject_global_claude, extra, plugins) = {
+    let (skills, inject_global_claude, disabled_docs, extra, plugins) = {
         let s = h.settings.read().await;
         let out = (
             store::all_skills(&s, &project),
             s.inject_global_claude,
+            prompt::disabled_docs(&s.project_docs, &project),
             feature_sections(&s),
             s.plugins.clone(),
         );
@@ -2316,6 +2372,7 @@ async fn frozen_prefix(
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
             agent_id: &agent_id,
             inject_global_claude,
+            disabled_docs: &disabled_docs,
         },
         None,
         &skills,
@@ -2365,11 +2422,12 @@ async fn prefix_for(
     if !t.system.is_empty() {
         return (t.system.clone(), t.mcp_tools.clone(), t.plugins.clone());
     }
-    let (skills, inject_global_claude, extra, plugins) = {
+    let (skills, inject_global_claude, disabled_docs, extra, plugins) = {
         let s = h.settings.read().await;
         let out = (
             store::all_skills(&s, &t.project),
             s.inject_global_claude,
+            prompt::disabled_docs(&s.project_docs, &t.project),
             feature_sections(&s),
             s.plugins.clone(),
         );
@@ -2386,6 +2444,7 @@ async fn prefix_for(
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
             agent_id: &format!("ol-{}", t.id),
             inject_global_claude,
+            disabled_docs: &disabled_docs,
         },
         None,
         &skills,
@@ -3110,9 +3169,13 @@ impl Agent {
                     let tg = t.lock().await;
                     let plugins = prefix_plugins(h, &tg).await;
                     drop(tg);
-                    let (skills, inject_global_claude) = {
+                    let (skills, inject_global_claude, disabled_docs) = {
                         let st = h.settings.read().await;
-                        let out = (store::all_skills(&st, &project), st.inject_global_claude);
+                        let out = (
+                            store::all_skills(&st, &project),
+                            st.inject_global_claude,
+                            prompt::disabled_docs(&st.project_docs, &project),
+                        );
                         drop(st);
                         out
                     };
@@ -3126,6 +3189,7 @@ impl Agent {
                             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                             agent_id: &agent_id,
                             inject_global_claude,
+                            disabled_docs: &disabled_docs,
                         },
                         Some(&s.def),
                         &skills,
@@ -3848,9 +3912,13 @@ impl Agent {
         let tg = t.lock().await;
         let plugins = prefix_plugins(&self.h, &tg).await;
         drop(tg);
-        let (skills, inject_global_claude) = {
+        let (skills, inject_global_claude, disabled_docs) = {
             let st = self.h.settings.read().await;
-            let out = (store::all_skills(&st, &project), st.inject_global_claude);
+            let out = (
+                store::all_skills(&st, &project),
+                st.inject_global_claude,
+                prompt::disabled_docs(&st.project_docs, &project),
+            );
             drop(st);
             out
         };
@@ -3864,6 +3932,7 @@ impl Agent {
                 date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 agent_id: &format!("ol-{}/{}", self.task_id, s.id),
                 inject_global_claude,
+                disabled_docs: &disabled_docs,
             },
             Some(&s.def),
             &skills,
@@ -3983,7 +4052,7 @@ impl Agent {
             .collect();
         Ok(format!(
             "{}\n\nSchemas for these deferred tools:\n{}",
-            toolindex::search_result(&catalog, query, limit),
+            toolindex::search_result(catalog, query, limit),
             schemas.join("\n\n")
         ))
     }
@@ -7351,6 +7420,11 @@ fn approve_auto_edits(task: &mut Task) {
 
 #[cfg(test)]
 mod tests {
+    // The `test_home` guard must span the whole test to serialize
+    // `OPENLEASH_HOME` across tokio tests, so it is deliberately held across
+    // `.await` points. See AGENTS.md: do not drop the lock to quiet the lint.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
 
     #[test]

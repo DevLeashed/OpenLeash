@@ -364,6 +364,31 @@ pub struct AllowRule {
     pub project: String,
 }
 
+/// A per-project opt-out of some of the project's own instruction files.
+///
+/// The whole reason it exists: a repository can carry a `CLAUDE.md` (or
+/// `AGENTS.md`, …) that a particular project should not have injected into every
+/// agent's prompt — the common case being a `CLAUDE.md` inherited from a
+/// different tool. The user picks which files, per project, and the loader skips
+/// them exactly as if they were absent.
+///
+/// Kept separate from folder trust on purpose. Trust is a security decision
+/// about whether *anything* from the folder may be loaded, fails closed, and is
+/// remembered per folder (and parent). This is a convenience selection that
+/// fails *open* — no rule means every file is loaded — so recording one must
+/// never be mistaken for, or weaken, a trust decision. An untrusted folder
+/// injects nothing regardless of what is listed here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectDocRule {
+    /// The project folder, stored normalized like a trust decision's path so a
+    /// path picked one way and compared another still matches.
+    pub path: String,
+    /// File names from `prompt::MEMORY_FILES` the user switched off. Project
+    /// files only; the user's own `~/.` globals are not governed by this.
+    pub disabled: Vec<String>,
+}
+
 /// `Debug` is hand-written: `env` is exactly where people put `GITHUB_TOKEN`
 /// and friends, so a derived Debug would print it. Keys are kept (they are
 /// diagnostic) — only the values are masked.
@@ -753,6 +778,12 @@ pub struct Settings {
     /// Also inject the user's global `~/.claude/CLAUDE.md` into every agent. Off by default.
     #[serde(default)]
     pub inject_global_claude: bool,
+    /// Per-project opt-out of individual project instruction files. Empty = every
+    /// project loads everything it has; an entry names a folder and the files the
+    /// user switched off for it. Fails open and is only a selection, never a
+    /// trust decision — see [`ProjectDocRule`].
+    #[serde(default)]
+    pub project_docs: Vec<ProjectDocRule>,
     /// Let the agent keep this chat's name up to date as the work moves on
     /// (the `set_title` tool). It rides along on turns the agent is already
     /// making, so it costs nothing extra, and an unnamed chat in the sidebar
@@ -890,6 +921,7 @@ impl Default for Settings {
             trusted_hooks: vec![],
             hooks_trust_migrated: false,
             inject_global_claude: false,
+            project_docs: vec![],
             agent_titles: true,
             automatic_chat_reorder: true,
             memory: false,
@@ -1481,9 +1513,9 @@ fn parse_agent_groups(front: &str) -> Vec<ToolGroup> {
                 }
             }
             pending = Some((rest.trim().to_string(), vec![]));
-        } else if pending.is_some() {
+        } else if let Some((_, cont)) = pending.as_mut() {
             // An indented `key: value` under the last `- ` item.
-            pending.as_mut().unwrap().1.push(t.to_string());
+            cont.push(t.to_string());
         }
     }
     if let Some((item, cont)) = pending.take() {
@@ -3252,6 +3284,7 @@ mod memory_tests {
                 date: "2026-09-28".into(),
                 agent_id: "ol-m1",
                 inject_global_claude: false,
+                disabled_docs: &[],
             },
             None,
             &[],

@@ -266,6 +266,9 @@ fn on() -> bool {
     true
 }
 
+// The positional arguments are one model's fields in table order; this is a
+// built-in catalog literal, not a call-site-facing API, so the arity is kept.
+#[allow(clippy::too_many_arguments)]
 fn m(
     p: &str,
     id: &str,
@@ -1594,7 +1597,7 @@ async fn for_each_sse(
     mut f: impl FnMut(&str, &str) -> Result<(), Fail>,
 ) -> Result<(), Fail> {
     let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
+    let mut framing = SseFraming::default();
     loop {
         let chunk = tokio::select! {
             c = stream.next() => c,
@@ -1604,17 +1607,40 @@ async fn for_each_sse(
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|e| Transient(format!("stream error: {e}")))?;
-        buf.extend_from_slice(&chunk);
-        while let Some(pos) = find_event_end(&buf) {
-            let raw: Vec<u8> = buf.drain(..pos).collect();
-            // The event is complete and self-delimiting, so every codepoint in
-            // it is whole. Anything still invalid here is the provider's doing,
-            // not our framing.
-            let event = String::from_utf8_lossy(&raw);
+        framing.push(&chunk, &mut f)?;
+    }
+    Ok(())
+}
+
+/// Incremental byte framing shared by the network reader and its tests.
+/// `search` only revisits an unfinished delimiter, not the growing event body.
+/// Completed events borrow the buffer; its remainder moves once per chunk,
+/// never once per event in a batch.
+#[derive(Default)]
+struct SseFraming {
+    buf: Vec<u8>,
+    search: usize,
+    #[cfg(test)]
+    scanned: usize,
+    #[cfg(test)]
+    moved: usize,
+}
+
+impl SseFraming {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        f: &mut impl FnMut(&str, &str) -> Result<(), Fail>,
+    ) -> Result<(), Fail> {
+        self.buf.extend_from_slice(chunk);
+        let mut consumed = 0;
+        while let Some(end) = self.next_end() {
+            // Decode only a complete event, so split UTF-8 codepoints survive.
+            let event = String::from_utf8_lossy(&self.buf[consumed..end]);
             let name = event
                 .lines()
                 .find_map(|l| l.strip_prefix("event:"))
-                .map(|s| s.trim().to_string())
+                .map(str::trim)
                 .unwrap_or_default();
             let data: Vec<&str> = event
                 .lines()
@@ -1622,36 +1648,58 @@ async fn for_each_sse(
                 .map(|l| l.trim_start())
                 .collect();
             if !data.is_empty() {
-                f(&name, &data.join("\n"))?;
+                f(name, &data.join("\n"))?;
+            }
+            consumed = end;
+        }
+        if consumed != 0 {
+            let remaining = self.buf.len() - consumed;
+            self.buf.copy_within(consumed.., 0);
+            self.buf.truncate(remaining);
+            self.search -= consumed;
+            #[cfg(test)]
+            {
+                self.moved += remaining;
             }
         }
-        if buf.len() > SSE_BUF_MAX {
+        // As before, the ceiling applies only to the unparsed tail, after all
+        // complete events in this chunk have been delivered.
+        if self.buf.len() > SSE_BUF_MAX {
             return Err(Transient(format!(
                 "stream sent {} bytes with no event boundary",
-                buf.len()
+                self.buf.len()
             )));
         }
+        Ok(())
     }
-    Ok(())
-}
 
-/// Byte index just past the next `\n\n` (or `\r\n\r\n`), CRLF folded first by
-/// the caller. Returns `None` when no complete event is buffered yet.
-fn find_event_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\n' {
-            if buf[i + 1] == b'\n' {
-                return Some(i + 2);
+    fn next_end(&mut self) -> Option<usize> {
+        while self.search + 1 < self.buf.len() {
+            #[cfg(test)]
+            {
+                self.scanned += 1;
             }
-            // `\n\r\n` and `\r\n\n` also read as a blank line.
-            if buf[i + 1] == b'\r' && i + 2 < buf.len() && buf[i + 2] == b'\n' {
-                return Some(i + 3);
+            let i = self.search;
+            if self.buf[i] == b'\n' {
+                if self.buf[i + 1] == b'\n' {
+                    self.search = i + 2;
+                    return Some(self.search);
+                }
+                // Mixed LF/CRLF blank lines retain the original semantics.
+                if self.buf[i + 1] == b'\r' {
+                    if i + 2 == self.buf.len() {
+                        break; // Recheck this LF when the next byte arrives.
+                    }
+                    if self.buf[i + 2] == b'\n' {
+                        self.search = i + 3;
+                        return Some(self.search);
+                    }
+                }
             }
+            self.search += 1;
         }
-        i += 1;
+        None
     }
-    None
 }
 
 /// Dispatch one attempt to the right backend.
@@ -1714,6 +1762,19 @@ fn anthropic_messages(msgs: &[Message], model: &str) -> Vec<Value> {
         .collect()
 }
 
+fn unique_tool_names(tools: &[Value]) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .iter()
+        .filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| seen.insert(name.to_string()))
+        })
+        .cloned()
+        .collect()
+}
+
 async fn anthropic(
     http: &reqwest::Client,
     settings: &Settings,
@@ -1744,11 +1805,9 @@ async fn anthropic(
     let mi = model_info(&t.model_id);
     let level = pick_level(&mi.reasoning_levels, req.effort);
 
-    let tools: Vec<Value> = req
-        .tools
-        .iter()
-        .map(|t| {
-            let mut t = t.clone();
+    let tools: Vec<Value> = unique_tool_names(&req.tools)
+        .into_iter()
+        .map(|mut t| {
             t["eager_input_streaming"] = json!(true);
             t
         })
@@ -1952,9 +2011,9 @@ async fn anthropic(
         Ok(())
     })
     .await?;
-    if !done && stop.is_empty() {
+    if !done {
         return Err(Transient(
-            "the stream ended before the response finished".into(),
+            "the provider stream ended before message_stop".into(),
         ));
     }
 
@@ -2260,8 +2319,6 @@ async fn codex(
     })
 }
 
-// ───────────────────────── OpenAI-compatible ─────────────────────────
-
 fn to_openai_messages(system: &str, msgs: &[Message]) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for m in msgs {
@@ -2430,6 +2487,20 @@ fn opencode_tool_aliases(tools: &mut Vec<Value>, req: &ChatRequest) {
     }
 }
 
+/// A provider may close its stream without a completion marker. Treat that as
+/// retryable rather than returning partial text as a completed assistant turn.
+fn require_stream_finish(finish: &str) -> Result<(), Fail> {
+    match finish {
+        "" => Err(Transient(
+            "the provider stream ended before sending a finish reason".into(),
+        )),
+        "error" => Err(Transient(
+            "the provider reported an error mid-stream".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 async fn openai_compat(
     http: &reqwest::Client,
     settings: &Settings,
@@ -2478,8 +2549,14 @@ async fn openai_compat(
     }
     if let Some(l) = pick_level(&mi.reasoning_levels, req.effort) {
         match mi.reasoning_param.as_str() {
-            "reasoning_effort" => body["reasoning_effort"] = json!(l),
+            "reasoning.max_tokens" => {
+                body["reasoning"] = json!({"max_tokens": budget_tokens(&l)});
+            }
             "reasoning.effort" => body["reasoning"] = json!({"effort": l}),
+            "reasoning_effort" if prov == "openrouter" => {
+                body["reasoning"] = json!({"effort": l});
+            }
+            "reasoning_effort" => body["reasoning_effort"] = json!(l),
             "thinking" => {
                 let off = matches!(
                     l.to_lowercase().as_str(),
@@ -2608,11 +2685,7 @@ async fn openai_compat(
     if !any {
         return Err(Transient("the provider returned an empty stream".into()));
     }
-    if finish == "error" {
-        return Err(Transient(
-            "the provider reported an error mid-stream".into(),
-        ));
-    }
+    require_stream_finish(&finish)?;
 
     let mut content = vec![];
     if !text.is_empty() {
@@ -2669,6 +2742,24 @@ pub fn budget_tokens(level: &str) -> u64 {
         })
 }
 
+fn remote_model(m: &Value, provider: &str) -> Option<Value> {
+    Some(json!({
+        "id": m["id"].as_str().or(m["name"].as_str()).filter(|s| !s.is_empty())?,
+        "name": m["display_name"].as_str().or(m["name"].as_str()).unwrap_or(""),
+        "context": m["context_length"].as_u64().or(m["max_input_tokens"].as_u64()).or(m.pointer("/top_provider/context_length").and_then(|x| x.as_u64())),
+        "output": m["max_tokens"].as_u64().or(m.pointer("/top_provider/max_completion_tokens").and_then(|x| x.as_u64())),
+        "input_price": m.pointer("/pricing/prompt").and_then(|x| x.as_str()).and_then(|x| x.parse::<f64>().ok()).map(|x| x * 1e6),
+        "output_price": m.pointer("/pricing/completion").and_then(|x| x.as_str()).and_then(|x| x.parse::<f64>().ok()).map(|x| x * 1e6),
+        "modalities": m.pointer("/architecture/input_modalities").cloned(),
+        "reasoning_levels": m.get("reasoning_levels").or_else(|| m.get("supported_reasoning_levels")),
+        "reasoning_param": m.get("reasoning_param").or_else(|| m.get("reasoning_parameter")),
+        "reasoning": m.get("reasoning"),
+        "reasoning_effort": m.get("reasoning_effort"),
+        "provider": provider,
+        "supported_parameters": m.get("supported_parameters"),
+    }))
+}
+
 /// List model ids a provider serves (`GET /models`), for the add-model picker.
 pub async fn list_remote_models(
     http: &reqwest::Client,
@@ -2715,24 +2806,7 @@ pub async fn list_remote_models(
         .or_else(|| v["models"].as_array())
         .cloned()
         .unwrap_or_default();
-    Ok(arr
-        .into_iter()
-        .map(|m| {
-            json!({
-                "id": m["id"].as_str().or(m["name"].as_str()).unwrap_or(""),
-                "name": m["display_name"].as_str().or(m["name"].as_str()).unwrap_or(""),
-                "context": m["context_length"].as_u64().or(m["max_input_tokens"].as_u64()).or(m.pointer("/top_provider/context_length").and_then(|x| x.as_u64())),
-                "output": m["max_tokens"].as_u64().or(m.pointer("/top_provider/max_completion_tokens").and_then(|x| x.as_u64())),
-                "input_price": m.pointer("/pricing/prompt").and_then(|x| x.as_str()).and_then(|x| x.parse::<f64>().ok()).map(|x| x * 1e6),
-                "output_price": m.pointer("/pricing/completion").and_then(|x| x.as_str()).and_then(|x| x.parse::<f64>().ok()).map(|x| x * 1e6),
-                "modalities": m.pointer("/architecture/input_modalities").cloned(),
-                "reasoning_levels": m.get("reasoning_levels").or_else(|| m.get("supported_reasoning_levels")),
-                "reasoning_param": m.get("reasoning_param").or_else(|| m.get("reasoning_parameter")),
-                "supported_parameters": m.get("supported_parameters"),
-            })
-        })
-        .filter(|m| m["id"].as_str().is_some_and(|s| !s.is_empty()))
-        .collect())
+    Ok(arr.iter().filter_map(|m| remote_model(m, prov)).collect())
 }
 
 #[cfg(test)]
@@ -2992,6 +3066,192 @@ mod account_terms_tests {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn anthropic_stream_requires_message_stop_even_with_a_stop_reason() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n";
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let mut settings = Settings::default();
+        settings
+            .custom_providers
+            .push(super::super::store::CustomProvider {
+                id: "mock-anthropic".into(),
+                kind: "anthropic".into(),
+                base_url: format!("http://{address}"),
+                name: "Mock Anthropic".into(),
+                insist: false,
+            });
+        let target = Target {
+            model_id: "mock-anthropic/test".into(),
+            prov: "mock-anthropic".into(),
+            model: "test".into(),
+            account: None,
+            api_key: Some("test-key".into()),
+        };
+        let req = ChatRequest {
+            system: "system".into(),
+            messages: vec![Message::user_text("hello")],
+            tools: vec![],
+            effort: 2,
+            max_tokens: 100,
+            cache_key: "test".into(),
+        };
+        let client = reqwest::Client::new();
+        let cancel = CancellationToken::new();
+        let mut headers = None;
+        let mut events = vec![];
+        let mut on = |event| events.push(event);
+        let result = anthropic(
+            &client,
+            &settings,
+            &target,
+            &req,
+            &mut on,
+            &cancel,
+            &mut headers,
+        )
+        .await;
+        assert!(matches!(result, Err(Fail::Transient(_))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Text(text) if text == "partial")));
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_streams_retry_clean_eof_after_partial_output() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let mut settings = Settings::default();
+        settings.providers.insert(
+            "mock".into(),
+            super::super::store::ProviderCfg {
+                base_url: format!("http://{address}/v1"),
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let target = Target {
+            model_id: "mock/test".into(),
+            prov: "mock".into(),
+            model: "test".into(),
+            account: None,
+            api_key: Some("test-key".into()),
+        };
+        let req = ChatRequest {
+            system: "system".into(),
+            messages: vec![Message::user_text("hello")],
+            tools: vec![],
+            effort: 2,
+            max_tokens: 100,
+            cache_key: "test".into(),
+        };
+        let client = reqwest::Client::new();
+        let cancel = CancellationToken::new();
+        let mut headers = None;
+        let mut events = vec![];
+        let mut on = |event| events.push(event);
+        let result = openai_compat(
+            &client,
+            &settings,
+            &target,
+            &req,
+            &mut on,
+            &cancel,
+            &mut headers,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Fail::Transient(_))),
+            "partial close must enter router retry"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Text(text) if text == "partial")));
+    }
+
+    #[test]
+    fn provider_streams_require_a_terminal_finish_reason() {
+        assert!(matches!(require_stream_finish(""), Err(Fail::Transient(_))));
+        assert!(matches!(
+            require_stream_finish("error"),
+            Err(Fail::Transient(_))
+        ));
+        for finish in ["stop", "length", "tool_calls"] {
+            assert!(require_stream_finish(finish).is_ok());
+        }
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_is_carried_through_remote_model_list() {
+        let source = json!({
+            "id": "openai/gpt-5",
+            "name": "OpenAI: GPT-5",
+            "context_length": 400_000,
+            "top_provider": {"max_completion_tokens": 128_000},
+            "architecture": {"input_modalities": ["text", "image"]},
+            "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+            "supported_parameters": ["reasoning"],
+            "reasoning": {"mandatory": true, "supports_max_tokens": false, "supported_efforts": ["high", "medium", "low", "none"]},
+            "reasoning_effort": ["low", "medium", "high"],
+        });
+        let model = remote_model(&source, "openrouter").unwrap();
+        assert_eq!(
+            model["reasoning"]["supported_efforts"],
+            json!(["high", "medium", "low", "none"])
+        );
+        assert_eq!(model["reasoning"]["mandatory"], true);
+        assert_eq!(model["reasoning_effort"], json!(["low", "medium", "high"]));
+        assert_eq!(model["supported_parameters"], json!(["reasoning"]));
+        assert_eq!(model["context"], 400_000);
+    }
+
+    #[test]
+    fn anthropic_tools_have_unique_names() {
+        let tools = vec![
+            json!({"name":"search","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}),
+            json!({"name":"mcp__server__lookup","input_schema":{"type":"object"}}),
+            json!({"name":"search","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}),
+        ];
+        let unique = unique_tool_names(&tools);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(
+            unique[0], tools[0],
+            "the first schema retains dispatch semantics"
+        );
+        assert_eq!(unique[1], tools[1]);
+        assert_eq!(unique_tool_names(&[]), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn remote_model_needs_a_selectable_id() {
+        assert!(remote_model(&json!({"name": ""}), "openrouter").is_none());
+    }
+
     #[test]
     fn key_hint_never_panics_on_a_key_that_ends_mid_codepoint() {
         // 9 ASCII bytes, but a trailing 3-byte CJK char: `key.len() - 4` lands
@@ -3008,51 +3268,128 @@ mod tests {
     }
 
     #[test]
-    fn sse_framing_survives_a_codepoint_split_across_chunks() {
-        // The bug this guards: decoding per chunk turned a multi-byte char that
-        // straddled a TCP boundary into U+FFFD, corrupting model output forever.
-        let src = "data: {\"t\":\"中文 ok\"}\n\ndata: second\n\n";
+    fn sse_framing_survives_every_chunk_split() {
+        // Includes split UTF-8, every supported blank-line form, multiline data,
+        // ignored comments/no-data events, whitespace, and an unfinished tail.
+        let src = ": ping\n\nevent:  delta \ndata: {\"t\":\"中文 😀 ok\"}\ndata:   second\n\n\
+                   event: crlf\r\ndata: three\r\n\r\n\
+                   data: four\n\r\ndata: five\r\n\n\
+                   event: ignored\n\ndata:\n\ndata: trailing 中";
         let bytes = src.as_bytes();
-        for split in 1..bytes.len() {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut got: Vec<String> = Vec::new();
+        let expected = vec![
+            (
+                "delta".to_string(),
+                "{\"t\":\"中文 😀 ok\"}\nsecond".to_string(),
+            ),
+            ("crlf".to_string(), "three".to_string()),
+            (String::new(), "four".to_string()),
+            (String::new(), "five".to_string()),
+            (String::new(), String::new()),
+        ];
+        for split in 0..=bytes.len() {
+            let mut framing = SseFraming::default();
+            let mut got = Vec::new();
             for part in [&bytes[..split], &bytes[split..]] {
-                buf.extend_from_slice(part);
-                while let Some(pos) = find_event_end(&buf) {
-                    let raw: Vec<u8> = buf.drain(..pos).collect();
-                    let event = String::from_utf8_lossy(&raw);
-                    let data: Vec<&str> = event
-                        .lines()
-                        .filter_map(|l| l.strip_prefix("data:"))
-                        .map(|l| l.trim_start())
-                        .collect();
-                    if !data.is_empty() {
-                        got.push(data.join("\n"));
-                    }
-                }
+                framing
+                    .push(part, &mut |name, data| {
+                        got.push((name.to_string(), data.to_string()));
+                        Ok(())
+                    })
+                    .unwrap();
             }
-            assert_eq!(
-                got,
-                vec!["{\"t\":\"中文 ok\"}", "second"],
-                "split at byte {split} lost data"
-            );
+            assert_eq!(got, expected, "split at byte {split}");
+            assert_eq!(framing.buf, "data: trailing 中".as_bytes());
         }
+        let mut framing = SseFraming::default();
+        let mut got = Vec::new();
+        for part in bytes.chunks(1) {
+            framing
+                .push(part, &mut |name, data| {
+                    got.push((name.to_string(), data.to_string()));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(got, expected);
     }
 
     #[test]
-    fn sse_framing_handles_crlf_and_a_trailing_partial_event() {
-        assert_eq!(find_event_end(b"a\r\n\r\nb"), Some(5));
-        assert_eq!(find_event_end(b"a\n\nb"), Some(3));
-        assert_eq!(
-            find_event_end(b"a\nb"),
-            None,
-            "no blank line yet, keep buffering"
-        );
-        assert_eq!(
-            find_event_end(b"trailing"),
-            None,
-            "an unterminated tail is not an event"
-        );
+    fn sse_framing_fragmented_large_event_scans_linear_work() {
+        let payload = "x".repeat(128 * 1024);
+        let src = format!("data: {payload}\n\r\n");
+        let mut framing = SseFraming::default();
+        let mut events = 0;
+        for byte in src.as_bytes().chunks(1) {
+            framing
+                .push(byte, &mut |name, data| {
+                    assert_eq!(name, "");
+                    assert_eq!(data, payload);
+                    events += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(events, 1);
+        assert!(framing.buf.is_empty());
+        // One extra scan is needed for the split LF/CR/LF delimiter.
+        assert!(framing.scanned <= src.len() + 1);
+        assert_eq!(framing.moved, 0);
+    }
+
+    #[test]
+    fn sse_framing_large_batch_moves_only_the_partial_tail() {
+        let mut src = "data: 中文\r\n\r\n".repeat(20_000);
+        src.push_str("data: partial\n\r");
+        let mut framing = SseFraming::default();
+        let mut events = 0;
+        framing
+            .push(src.as_bytes(), &mut |_, data| {
+                assert_eq!(data, "中文");
+                events += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(events, 20_000);
+        assert_eq!(framing.buf, b"data: partial\n\r");
+        assert_eq!(framing.moved, framing.buf.len());
+        assert!(framing.scanned <= src.len());
+        framing
+            .push(b"\n", &mut |_, data| {
+                assert_eq!(data, "partial");
+                events += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(events, 20_001);
+        assert!(framing.buf.is_empty());
+    }
+
+    #[test]
+    fn sse_framing_preserves_tail_limit_and_callback_errors() {
+        let mut framing = SseFraming::default();
+        let oversized = vec![b'x'; SSE_BUF_MAX + 1];
+        assert!(matches!(
+            framing.push(&oversized, &mut |_, _| panic!("incomplete event")),
+            Err(Fail::Transient(_))
+        ));
+        // A complete event larger than the tail ceiling is still delivered.
+        let mut framing = SseFraming::default();
+        let mut src = b"data: ".to_vec();
+        src.extend_from_slice(&oversized);
+        src.extend_from_slice(b"\n\n");
+        framing
+            .push(&src, &mut |_, data| {
+                assert_eq!(data.len(), oversized.len());
+                Ok(())
+            })
+            .unwrap();
+        let mut calls = 0;
+        let result = framing.push(b"data: first\n\ndata: second\n\n", &mut |_, _| {
+            calls += 1;
+            Err(Fail::Cancel)
+        });
+        assert!(matches!(result, Err(Fail::Cancel)));
+        assert_eq!(calls, 1);
     }
 
     #[test]

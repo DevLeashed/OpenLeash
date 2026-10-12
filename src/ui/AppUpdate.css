@@ -1,0 +1,5 @@
+.app-update-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-shrink: 0; font-size: 12px; }
+.app-update-banner > [role="status"] { flex: 1; min-width: 200px; }
+.app-update-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.app-update-about { display: flex; flex-direction: column; gap: 10px; align-items: stretch; }
+.app-update-error { color: var(--red, #ff8a8a); overflow-wrap: anywhere; }

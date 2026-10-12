@@ -37,7 +37,7 @@ export function pendingOf(items: Item[] | undefined): Item[] {
 export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
   // Memoised so the array is the same one every render: it is the dependency of
   // the memo below, and a fresh `[]` each render would recompute on every keystroke.
-  const qs: Q[] = useMemo(() => it.data?.questions ?? [], [it.id, it.data?.questions]);
+  const qs: Q[] = useMemo(() => it.data?.questions ?? [], [it.data?.questions]);
   const [ans, setAns] = useState<Ans[]>(() => qs.map(initial));
   // Open by default. The card is a thing to deal with whenever, not a thing you
   // have to open first, and the notification that came with it pointed here.

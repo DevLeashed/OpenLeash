@@ -54,7 +54,52 @@ beforeEach(() => {
   (Element.prototype as unknown as { getAnimations?: unknown }).getAnimations ??= () => [];
 });
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  // The opt-in is read once at boot; a test that turns it on must not leak it
+  // into the tests that assert the default hidden behaviour.
+  set({ claudeAllowed: false });
+});
+
+// The opt-in is a file named `ALLOW_CLAUDE` beside the executable, decided by
+// the backend at boot (`claude_allowed` in src-tauri/src/lib.rs) and carried in
+// `Boot.claude_allowed`. A file — not a setting — so an unmarked install stays
+// closed even when somebody else's settings are restored into it.
+describe("opting into the Claude subscription", () => {
+  const claudeSub = subscription("claude", "Claude (subscription)");
+
+  it("keeps Claude off screen while the install has not opted in", () => {
+    set({ claudeAllowed: false });
+    expect(shownProviders([claudeSub, subscription("codex", "ChatGPT (Codex)")]).map((p) => p.id)).toEqual(["codex"]);
+    expect(shownAccounts([acct("a1", "claude"), acct("a2", "codex")]).map((a) => a.id)).toEqual(["a2"]);
+  });
+
+  it("offers the Claude provider and its accounts once ALLOW_CLAUDE is present", () => {
+    set({ claudeAllowed: true });
+    expect(shownProviders([claudeSub, subscription("codex", "ChatGPT (Codex)")]).map((p) => p.id)).toEqual(["claude", "codex"]);
+    expect(shownAccounts([acct("a1", "claude"), acct("a2", "codex")]).map((a) => a.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("puts the Claude connect flow back on the accounts screen", () => {
+    set({
+      claudeAllowed: true,
+      providers: [claudeSub],
+      accounts: [acct("a1", "claude")],
+      settingsTab: "accounts",
+    });
+    render(<AccountsTab />);
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Claude (subscription)");
+    expect(text).toContain("1 of 1 available");
+    expect(button$("Add")).toBeDefined();
+  });
+});
+
+/** First button whose label includes `text`, the way the other screen tests look. */
+function button$(text: string) {
+  return [...document.querySelectorAll("button")].find((b) => b.textContent?.includes(text));
+}
 
 describe("the accounts screen", () => {
   it("does not mention Claude at all, even when Claude accounts were imported earlier", () => {

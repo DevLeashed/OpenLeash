@@ -12,7 +12,7 @@ export interface Opt { label: string; description?: string; recommended?: boolea
 export interface Q {
   question: string; header?: string; type: QType; description?: string; options?: Opt[];
   allow_other?: boolean; // legacy: a choice question always offers a free-text box now
-  required?: boolean; placeholder?: string; default?: any; min?: number; max?: number;
+  required?: boolean; placeholder?: string; default?: unknown; min?: number; max?: number;
   note?: boolean; note_placeholder?: string;
 }
 /** An optional free-text remark that rides along with one question's answer. */
@@ -32,7 +32,7 @@ export const clean = (l: string) => l.replace(/\s*\n?\(recommended\)/i, "");
 export const isRec = (o: Opt) => o.recommended || /\(recommended\)/i.test(o.label);
 const blankNote = (): AnsNote => ({ on: false, text: "" });
 /** Keep only notes that are whole option indexes, up to `max`. */
-const optNotesOf = (raw: any, max: number): OptNotes => {
+const optNotesOf = (raw: unknown, max: number): OptNotes => {
   if (!raw || typeof raw !== "object") return {};
   const out: OptNotes = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
@@ -87,7 +87,7 @@ export function valid(q: Q, a: Ans): string | null {
   }
 }
 
-export function value(q: Q, a: Ans): any {
+export function value(q: Q, a: Ans): unknown {
   if (a.skipped) return null;
   const opts = q.options ?? [];
   // Every index in `sel` names one of `opts` — `initial` and `restore` filter to
@@ -123,7 +123,7 @@ const optNote = (a: Ans, i: number) => a.optNotes?.[i]?.trim() || undefined;
 const choice = (label: string, note?: string) => (note ? { label, note } : label);
 
 /** The answer, plus a note about it when the question asked for one. */
-export function entry(q: Q, a: Ans): { value: any; note?: string } {
+export function entry(q: Q, a: Ans): { value: unknown; note?: string } {
   const v = value(q, a);
   const n = a.note.on ? a.note.text.trim() : "";
   return n ? { value: v, note: n } : { value: v };
@@ -176,20 +176,24 @@ export function restore(raw: string, qs: Q[]): Draft | null {
   }
 }
 
-export const showAnswer = (v: any): string => {
+export const showAnswer = (v: unknown): string => {
   if (typeof v === "boolean") return v ? "Yes" : "No";
-  const one = (x: any) => (x && typeof x === "object" && !Array.isArray(x) && "label" in x
-    ? String(x.label) + (x.note ? ` — “${x.note}”` : "")
-    : String(x));
+  const one = (x: unknown): string => {
+    if (x && typeof x === "object" && !Array.isArray(x) && "label" in x) {
+      const { label, note } = x as { label?: unknown; note?: unknown };
+      return String(label) + (note ? ` — “${String(note)}”` : "");
+    }
+    return String(x);
+  };
   return v === null || v === undefined || v === "" ? "skipped"
     : Array.isArray(v) ? (v.length ? v.map(one).join(", ") : "none")
     : one(v);
 };
 
 /** Answers are positional with a parallel `notes` array, so old sessions still read. */
-export function readAnswer(it: Item, i: number): { value: any; note?: string } {
+export function readAnswer(it: Item, i: number): { value: unknown; note?: string } {
   const a = it.data?.answers?.[i] ?? null;
-  return { value: a && typeof a === "object" && !Array.isArray(a) && "value" in a ? a.value : a, note: it.data?.notes?.[i] || undefined };
+  return { value: a && typeof a === "object" && !Array.isArray(a) && "value" in a ? (a as { value?: unknown }).value : a, note: it.data?.notes?.[i] || undefined };
 }
 
 const NOTE_HINT = "Add a note";
@@ -257,7 +261,7 @@ function Resolved({ it }: { it: Item }) {
   const [open, setOpen] = useState(false);
   const one = qs.length === 1;
   const first = readAnswer(it, 0);
-  const notes: string[] = (it.data?.notes ?? []).map((n: any) => (typeof n === "string" ? n : ""));
+  const notes: string[] = (it.data?.notes ?? []).map((n) => (typeof n === "string" ? n : ""));
   if (it.data?.dismissed) {
     const why = typeof it.data.note === "string" ? it.data.note : "";
     return (
@@ -304,7 +308,10 @@ function Resolved({ it }: { it: Item }) {
 }
 
 export function Question({ it, task }: { it: Item; task: TaskSummary }) {
-  const qs: Q[] = it.data?.questions ?? [];
+  // Memoised so the array is stable across renders: it is a dependency of the
+  // `answered` memo below, and a fresh `[]` each render would recompute that on
+  // every keystroke.
+  const qs: Q[] = useMemo(() => it.data?.questions ?? [], [it.data]);
   const [page, setPage] = useState(0);
   const [ans, setAns] = useState<Ans[]>(() => qs.map(initial));
   const [err, setErr] = useState<string | null>(null);
@@ -320,7 +327,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   const saved = useRef<string | null>(null);
   // `ans` is built from `qs` (`qs.map(initial)`, and `restore` maps over the
   // same list), so the two are the same length and read positionally.
-  const answered = useMemo(() => ans.map((a, i) => !valid(qs[i]!, a) && (a.skipped || value(qs[i]!, a) !== null)), [ans]);
+  const answered = useMemo(() => ans.map((a, i) => !valid(qs[i]!, a) && (a.skipped || value(qs[i]!, a) !== null)), [ans, qs]);
   const done = !!(it.data?.answers || it.data?.dismissed);
 
   // An item already on disk wins over the local state: re-answering replaces

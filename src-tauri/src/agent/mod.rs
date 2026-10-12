@@ -33,6 +33,8 @@ mod reviewer_checkpoint;
 #[cfg(test)]
 mod reviewer_commit;
 #[cfg(test)]
+mod reviewer_docs;
+#[cfg(test)]
 mod reviewer_edits;
 #[cfg(test)]
 mod reviewer_hooks;
@@ -66,6 +68,8 @@ mod reviewer_startup;
 mod reviewer_streams;
 #[cfg(test)]
 mod reviewer_task_creation;
+#[cfg(test)]
+mod reviewer_task_persistence;
 #[cfg(test)]
 mod reviewer_toolsearch;
 #[cfg(test)]
@@ -754,6 +758,14 @@ pub struct Runtime {
     /// this merge cleanly with every other agent adding `Task` fields.
     pub loaded_tools: Mutex<HashMap<String, Vec<String>>>,
     pub repeats: Mutex<HashMap<String, u32>>,
+    /// Startup/setup work for a newly-created chat, independent of background agent jobs.
+    pub startup_cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// Prevents follow-up sends from starting a turn before workspace setup and
+    /// the initial prompt dispatch complete.
+    pub startup_pending: std::sync::atomic::AtomicBool,
+    pub startup_ready: tokio::sync::Notify,
+    /// Synchronous deletion waits for startup cleanup before inspecting worktree state.
+    pub startup_done: std::sync::Condvar,
     pub running: std::sync::atomic::AtomicBool,
     /// Parent token for background sub-agents (outlives a single main run; Esc replaces it).
     pub bg_cancel: std::sync::Mutex<CancellationToken>,
@@ -1514,6 +1526,22 @@ impl Harness {
         );
     }
 
+    /// One timeline item from a transient state that has finished (e.g. a
+    /// startup/loading notice). Removes and publishes only when it still exists.
+    pub async fn remove_item(&self, task_id: &str, item_id: &str) {
+        let mut removed = false;
+        if let Ok(t) = self.task(task_id).await {
+            let mut t = t.lock().await;
+            let before = t.items.len();
+            t.items.retain(|item| item.id != item_id);
+            removed = t.items.len() != before;
+        }
+        if removed {
+            self.emit(task_id, "itemgone", json!({"id": item_id}));
+            self.save_task(task_id).await;
+        }
+    }
+
     /// Timeline item in a sub-agent's own transcript.
     pub async fn upsert_sub_item(&self, task_id: &str, sub: &str, item: Item) {
         if let Ok(t) = self.task(task_id).await {
@@ -1728,15 +1756,30 @@ impl Harness {
         let rt = self.runtime(task_id);
         let _save = rt.task_save.lock().await;
         if let Ok(t) = self.task(task_id).await {
-            let mut t = t.lock().await;
-            // Trimming images here rather than only in the debounced writer: a
-            // caller of this path is about to read the file back or the run is
-            // over, so this is the last chance to keep a multi-megabyte payload
-            // of screenshots out of what lands on disk.
-            runner::prune_task_images(&mut t);
-            store::save_task(&t);
+            Self::write_task_json(t).await;
         }
         self.dirty.lock().unwrap().remove(task_id);
+    }
+
+    /// Both save paths hold `task_save` until this finishes, so an older
+    /// snapshot cannot land after a newer one. Only pruning and serialization
+    /// need the task lock; the atomic write (including fsync) must not hold it
+    /// or run on an async worker.
+    async fn write_task_json(t: TaskRef) {
+        tokio::task::spawn_blocking(move || {
+            let (id, json) = {
+                let mut g = t.blocking_lock();
+                // Prune before serializing so reopened chats do not bring old
+                // screenshot payloads back into memory.
+                runner::prune_task_images(&mut g);
+                (g.id.clone(), serde_json::to_string(&*g))
+            };
+            if let Ok(json) = json {
+                store::save_json(&id, &json);
+            }
+        })
+        .await
+        .ok();
     }
 
     /// Persist settings, without making the caller wait for the disk.
@@ -1834,23 +1877,7 @@ impl Harness {
                         // history. This is the one save path that did not go
                         // through the accessor by accident, so it is worth saying.
                         let Ok(t) = h.task(&id).await else { continue };
-                        // Serialize and write on a blocking thread, so neither
-                        // the CPU nor the disk is on the async runtime, and the
-                        // lock is only held to produce the JSON.
-                        let json = tokio::task::spawn_blocking(move || {
-                            let mut g = t.blocking_lock();
-                            // The sweep is part of the write, not a separate pass:
-                            // it only has to keep up with the timeline, and doing
-                            // it here means the bytes written are already the
-                            // trimmed ones, so a chat reopened tomorrow cannot
-                            // parse a gigabyte of screenshots back in.
-                            runner::prune_task_images(&mut g);
-                            serde_json::to_string(&*g)
-                        })
-                        .await;
-                        if let Ok(Ok(j)) = json {
-                            store::save_json(&id, &j);
-                        }
+                        Self::write_task_json(t).await;
                     }
                 }
             }

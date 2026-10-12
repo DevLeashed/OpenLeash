@@ -59,7 +59,7 @@ const frozen = (extra: Partial<TaskSummary> = {}) =>
 const dotColor = () => document.querySelector<HTMLElement>(".srow .dot")?.style.background ?? "";
 
 beforeEach(() => {
-  (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+  (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -139,14 +139,16 @@ describe("a frozen chat stops animating", () => {
 });
 
 describe("pausing a chat yourself does not mark it unread", () => {
+  /** The `listen` mock, plus the handler registry this suite adds. */
+  const listenMock = listen as unknown as ReturnType<typeof vi.fn> & { handlers?: Record<string, (event: { payload: unknown }) => void> };
   /** Drive a real `ol://attention` event, the way the backend sends one. */
   const bootWith = async (t: TaskSummary) => {
-    (listen as unknown as ReturnType<typeof vi.fn>).mockClear();
-    (listen as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (name: string, cb: any) => {
-      (listen as any).handlers = { ...((listen as any).handlers ?? {}), [name]: cb };
-      return () => { delete (listen as any).handlers[name]; };
+    listenMock.mockClear();
+    listenMock.mockImplementation(async (name: string, cb: (event: { payload: unknown }) => void) => {
+      listenMock.handlers = { ...(listenMock.handlers ?? {}), [name]: cb };
+      return () => { delete listenMock.handlers![name]; };
     });
-    (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string, args: any) => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string, args: { patch?: Record<string, unknown> } = {}) => {
       if (cmd === "app_boot") return { settings: {}, tasks: [t], project: "" };
       if (cmd === "settings_update") return { ...args.patch };
       return null;
@@ -154,7 +156,7 @@ describe("pausing a chat yourself does not mark it unread", () => {
     await boot();
   };
   const attention = (payload: Record<string, unknown>) =>
-    (listen as any).handlers["ol://attention"]({ payload: { task_id: "t1", ...payload } });
+    listenMock.handlers!["ol://attention"]!({ payload: { task_id: "t1", ...payload } });
 
   beforeEach(() => { set({ view: "home", task: null, unread: {}, notices: [] }); });
   afterEach(() => disposeBoot());

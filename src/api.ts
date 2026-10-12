@@ -48,11 +48,53 @@ export interface TaskSummary {
   touched_at: string;
 }
 
+/** One entry of a `computer` tool call's `actions` list. */
+export interface ToolAction {
+  [key: string]: unknown;
+  type?: string; text?: string; keys?: string[]; x?: number; y?: number;
+}
+
+/** A tool call's parsed arguments. Free-form across every tool (path, pattern,
+ *  ids, actions…), so only the fields the transcript reads in a typed position
+ *  are named; the index signature keeps the rest reachable as `unknown` for
+ *  narrowing. */
+export interface ToolInput {
+  [key: string]: unknown;
+  path?: string; pattern?: string; glob?: string; to?: string; message?: string;
+  ids?: string[]; mode?: string; edits?: unknown[]; command?: string; id?: string;
+  url?: string; query?: string; queries?: string[]; urls?: string[]; action?: string;
+  name?: string; kind?: string; summary?: string; file?: string; monitor?: number | string;
+  selector?: string; text?: string; js?: string; number?: number; title?: string;
+  repo?: string; actions?: ToolAction[]; run_in_background?: boolean; content?: string;
+}
+
+/** The free-form per-item payload the backend puts on `Item.data`. Different
+ *  item kinds fill different fields — an approval card, a question form, a tool
+ *  result — so the index signature stays `unknown` and a caller narrows what it
+ *  reads. The named fields are the ones read in a typed position (rendered as
+ *  text, compared to a literal, indexed). */
+export interface ItemData {
+  [key: string]: unknown;
+  name?: string; input?: ToolInput; output?: string; status?: string; meta?: string;
+  diff?: { k: "a" | "d" | "c" | "h"; t: string }[];
+  images?: string[]; images_dropped?: number; exec?: boolean; bg_id?: string;
+  resolved?: string; kind?: string; detail?: string; title?: string; feedback?: string;
+  rec_wt?: boolean | null; suggest_wt?: boolean; reason?: string; git?: boolean; rec_why?: string;
+  sub?: string; repeat?: boolean; rule?: string;
+  sub_id?: string; role?: string; background?: boolean; secs?: number;
+  level?: string; summary?: string; quiet?: boolean; model?: string; via?: string;
+  from?: string; question?: string; answer?: string; working?: boolean;
+  path?: string; branch?: string; goal?: boolean; global?: boolean; replied?: string[];
+  queued?: boolean; brief?: boolean; dismissed?: boolean; note?: string; sum?: string;
+  intro?: string; label?: string; artifact_card?: Record<string, unknown>; preview_draft?: string;
+  questions?: import("./ui/Question").Q[]; notes?: string[]; answers?: unknown[];
+}
+
 export interface Item {
   id: string;
   kind: "user" | "text" | "thinking" | "tool" | "approval" | "question" | "asklater" | "sub" | "notice" | "user_notice" | "artifact";
   text: string;
-  data: any;
+  data: ItemData;
   ts: string;
 }
 
@@ -135,6 +177,8 @@ export interface Settings {
   budget: number; spend: Record<string, number>; tokens_month: number;
   /** Folder trust decisions. No entry for a folder = untrusted until decided. */
   trust?: TrustDecision[];
+  /** Per-project opt-out of individual project instruction files. */
+  project_docs?: ProjectDocRule[];
   /** How an agent-made commit is attributed in git log. */
   git_attribution?: Attribution;
   /** Run the repository's own git hooks when the agent commits. Off by default. */
@@ -192,8 +236,12 @@ export type TrustKind = "folder" | "parent";
 export type TrustState = "trusted" | "untrusted";
 export interface TrustDecision { path: string; kind: TrustKind; decision: TrustState; decided_at: string }
 export interface TrustMatched { kind: TrustKind; path: string; decision: TrustState }
+/** Per-project opt-out of individual project instruction files (`MEMORY_FILES`).
+ *  No rule for a folder = every file it has is loaded. This is a selection, not
+ *  a trust decision: it never weakens folder trust. */
+export interface ProjectDocRule { path: string; disabled: string[] }
 /** One file that would be injected into the system prompt. */
-export interface ManifestFile { name: string; path: string; bytes: number; chars: number; truncated: boolean; pointer_only: boolean; global: boolean; preview: string }
+export interface ManifestFile { name: string; path: string; bytes: number; chars: number; truncated: boolean; pointer_only: boolean; disabled: boolean; global: boolean; preview: string }
 export interface ManifestSkill { name: string; description: string; path: string; files: number }
 export interface ManifestAgent { id: string; name: string; description: string; tools: string; path: string }
 export interface ManifestHook { event: string; matcher: string; command: string; source: string }
@@ -214,7 +262,7 @@ export interface PluginsStatus {
   browser: { ok: boolean; error?: string; browser?: string };
 }
 
-export interface Boot { settings: Settings; providers: ProviderView[]; provider_presets: ProviderPreset[]; models: ModelInfo[]; tasks: TaskSummary[]; accounts: AccountView[]; agents: AgentDef[]; skills: SkillDef[]; shell: string; data_dir: string; month_spend: number; user_notices?: Record<string, Item[]> }
+export interface Boot { settings: Settings; providers: ProviderView[]; provider_presets: ProviderPreset[]; models: ModelInfo[]; tasks: TaskSummary[]; accounts: AccountView[]; agents: AgentDef[]; skills: SkillDef[]; shell: string; data_dir: string; month_spend: number; user_notices?: Record<string, Item[]>; /** Whether a file named `ALLOW_CLAUDE` sits beside the executable, opting this install into the Claude subscription integration. Absent from an older backend, which reads as "not opted in". */ claude_allowed?: boolean }
 
 /** What the monthly cap is actually counting: the per-day spend ledger the
  *  backend keeps, plus the running token total. Survives a stats reset, so it
@@ -269,7 +317,18 @@ export type TaskPatch = Partial<Pick<TaskSummary, "model" | "effort" | "perm" | 
  *  app can learn a real path: the browser `File` object deliberately has none. */
 export interface FileRef { path: string; name: string; size: number; isDir: boolean; image: boolean }
 
+export interface AppUpdateStatus {
+  status: "idle" | "checking" | "available" | "downloading" | "ready" | "error" | "current";
+  version: string | null;
+  error: string | null;
+  can_install: boolean;
+}
+
 export const api = {
+  appUpdateStatus: () => invoke<AppUpdateStatus>("app_update_status"),
+  appUpdateCheck: () => invoke<AppUpdateStatus>("app_update_check"),
+  appUpdateDownload: () => invoke<AppUpdateStatus>("app_update_download"),
+  appUpdateInstall: () => invoke<void>("app_update_install"),
   boot: () => invoke<Boot>("app_boot"),
   tasks: () => invoke<TaskSummary[]>("tasks_list"),
   task: (id: string) => invoke<{ summary: TaskSummary; items: Item[]; sub_items: Record<string, Item[]>; bg: Bg[] }>("task_get", { id }),
@@ -415,7 +474,7 @@ export const api = {
   githubLoginWait: (deviceCode: string, interval: number, expiresIn: number) => invoke<string>("github_login_wait", { deviceCode, interval, expiresIn }),
   githubLoginCancel: () => invoke<void>("github_login_cancel"),
   githubToken: (token: string) => invoke<void>("plugin_github_token", { token }),
-  project: (path: string) => invoke<{ exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; trusted: boolean; decided: boolean }>("project_info", { path }),
+  project: (path: string) => invoke<{ path: string; exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; docs: string[]; disabled_docs: string[]; trusted: boolean; decided: boolean }>("project_info", { path }),
   /** What a folder would inject, trusted or not — the trust dialog's evidence
    *  and the manifest panel's data. */
   trustManifest: (path: string) => invoke<TrustManifest>("trust_manifest", { path }),
@@ -430,6 +489,10 @@ export const api = {
    *  argument — the plugin's own toast path has nowhere to put one, which is why
    *  its toasts could be delivered but never clicked. */
   toast: (taskId: string, title: string, body: string) => invoke<void>("toast_show", { taskId, title, body }),
+  /** The chat a toast click asked for before the window was listening, or null.
+   *  Call once the `ol://toast-click` listener is attached: the call is what
+   *  tells the backend clicks may be emitted from now on. */
+  takeToastClick: () => invoke<string | null>("take_toast_click"),
 };
 
 export const EFFORTS = ["Max", "Extra High", "High", "Medium", "Low"];

@@ -24,7 +24,7 @@ import { api } from "../api";
 import { describe as notifyText, surfaces } from "../notify";
 import { noticeMeta } from "./Notices";
 import { AskNonBlocking, pendingOf } from "./AskNonBlocking";
-import type { Item, TaskSummary } from "../api";
+import type { Item, ItemData, TaskSummary } from "../api";
 
 const task = { id: "t1" } as unknown as TaskSummary;
 
@@ -308,8 +308,8 @@ describe("which questions the card list shows", () => {
   it("shows only the ones still unanswered, in the order they were asked", () => {
     const items = [
       card({ id: "a1" }),
-      card({ id: "a2", data: { questions: [{ question: "b" }], answers: ["x"] } } as any),
-      card({ id: "a3", data: { questions: [{ question: "c" }], dismissed: true } } as any),
+      card({ id: "a2", data: { questions: [{ question: "b" }], answers: ["x"] } as unknown as ItemData }),
+      card({ id: "a3", data: { questions: [{ question: "c" }], dismissed: true } as unknown as ItemData }),
       { id: "a4", kind: "question", text: "", ts: "", data: { questions: [] } } as Item,
     ] as Item[];
     expect(pendingOf(items).map((i) => i.id)).toEqual(["a1"]);

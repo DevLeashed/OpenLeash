@@ -48,12 +48,17 @@ const chat = (): TaskSummary => ({
  * how many live handlers an event has. The mock in the other suites keeps one
  * handler per name, which hides exactly the stacking this file is about.
  */
-const liveHandlers = (name: string) => (listen as any).live[name] ?? [];
+/** One `listen` callback, as the mock stores it. */
+type Handler = (event: { payload: unknown }) => void;
+/** The `listen` mock, plus the per-name handler registry this suite adds. */
+const listenMock = listen as unknown as ReturnType<typeof vi.fn> & { live?: Record<string, Handler[]> };
+
+const liveHandlers = (name: string) => listenMock.live?.[name] ?? [];
 
 const mockListen = () => {
-  (listen as any).live = {};
-  (listen as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (name: string, cb: any) => {
-    const all: any[] = ((listen as any).live[name] ??= []);
+  listenMock.live = {};
+  listenMock.mockImplementation(async (name: string, cb: Handler) => {
+    const all = (listenMock.live![name] ??= []);
     all.push(cb);
     return () => {
       const i = all.indexOf(cb);
@@ -74,7 +79,7 @@ const replyItem = (text: string): Item => ({ id: "a", kind: "text", text, ts: "2
 
 beforeEach(() => {
   mockListen();
-  (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+  (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
   set({
     view: "session", task: "t1", items: {}, subItems: {}, tasks: { t1: chat() },
     settings: {} as unknown as Settings,

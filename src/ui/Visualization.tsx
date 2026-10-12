@@ -4,13 +4,14 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { copyText, mdComponents, remarkOl } from "./mdx";
-import { Button, useEscapeClose } from "./primitives";
+import { Button, Thumb, useEscapeClose } from "./primitives";
+import { ImageExplanation } from "./ImageExplanation";
 import { listenForVisualizationDraft, type VisualizationFeedbackDraft } from "./visualizationFeedback";
 
 export const MAX_VIZ_BYTES = 240 * 1024; // leave space for the document wrapper
 export const MAX_VIZ_COUNT = 8;
 const toolbarButtonStyle = { height: 27, padding: "0 9px", borderRadius: 7, fontSize: 11.5, gap: 6 } as const;
-export type VizPart = { kind: "markdown"; source: string } | { kind: "visualization"; source: string } | { kind: "placeholder"; source: string; message?: string };
+export type VizPart = { kind: "markdown"; source: string } | { kind: "visualization" | "diagram" | "image"; source: string } | { kind: "placeholder"; source: string; message?: string };
 /** Parse fences before rendering: Markdown accepts unclosed fences while streaming.
  * Only exact, top-level opt-in fences qualify; all other Markdown stays inert. */
 export function visualizationParts(text: string): VizPart[] {
@@ -22,7 +23,7 @@ export function visualizationParts(text: string): VizPart[] {
     const closing = new RegExp(`^ {0,3}${marker[0]}{${marker.length},}\\s*$`);
     while (end < lines.length && !closing.test(lines[end] ?? "")) end++;
     const source = lines.slice(i + 1, end).join("\n");
-    if (opening[3] !== "openleash-viz") plain.push(...lines.slice(i, Math.min(end + 1, lines.length)));
+    if (opening[3] !== "openleash-viz" && opening[3] !== "openleash-svg" && opening[3] !== "openleash-image") plain.push(...lines.slice(i, Math.min(end + 1, lines.length)));
     else {
       if (plain.length) out.push({ kind: "markdown", source: plain.join("\n") });
       plain = [];
@@ -30,7 +31,7 @@ export function visualizationParts(text: string): VizPart[] {
       else if (!source.trim()) out.push({ kind: "placeholder", source, message: "This interactive visualization is empty." });
       else if (count >= MAX_VIZ_COUNT) out.push({ kind: "placeholder", source, message: `Only ${MAX_VIZ_COUNT} visualizations per reply can run.` });
       else if (new TextEncoder().encode(source).length > MAX_VIZ_BYTES) out.push({ kind: "placeholder", source, message: "This interactive visualization is too large to run." });
-      else { out.push({ kind: "visualization", source }); count++; }
+      else { out.push({ kind: opening[3] === "openleash-svg" ? "diagram" : opening[3] === "openleash-image" ? "image" : "visualization", source }); count++; }
     }
     i = end;
   }
@@ -65,6 +66,8 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
   const frame = useRef<HTMLIFrameElement>(null);
   const viewer = useRef<HTMLDivElement>(null);
   const returnFocus = useRef<HTMLButtonElement | null>(null);
+  const [height, setHeight] = useState(420);
+  const [width, setWidth] = useState("100%");
   const [expanded, setExpanded] = useState(false);
   const collapse = useCallback(() => setExpanded(false), []);
   useEscapeClose(expanded, collapse);
@@ -77,7 +80,7 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Tab" || !viewer.current) return;
-      const stops = [...viewer.current.querySelectorAll<HTMLElement>("button:not([disabled]), iframe")];
+      const stops = [...viewer.current.querySelectorAll<HTMLElement>("button:not([disabled]), select, iframe")];
       const first = stops[0], last = stops[stops.length - 1];
       if (event.shiftKey ? document.activeElement === first : document.activeElement === last) {
         event.preventDefault(); (event.shiftKey ? last : first)?.focus();
@@ -132,20 +135,50 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
       <strong title={title} style={{ flex: 1, minWidth: 160, fontSize: 13 }}>{title}</strong>
       {(id || expanded) && <Button variant="ghost" style={toolbarButtonStyle} aria-expanded={expanded} aria-haspopup="dialog" onClick={(event) => { returnFocus.current = event.currentTarget; setExpanded(value => !value); }}>{expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}{expanded ? "Collapse preview" : "Expand preview"}</Button>}
       {!busy && !id && !error && <Button variant="primary" style={toolbarButtonStyle} onClick={() => void publish()}><RefreshCw size={13} />{autoStart ? "Restart preview" : "Preview"}</Button>}
+      <label style={{ fontSize: 12 }}>Height <select aria-label="Preview height" value={height} onChange={e => setHeight(Number(e.target.value))}><option value={280}>Compact</option><option value={420}>Standard</option><option value={720}>Tall</option></select></label>
+      <label style={{ fontSize: 12 }}>Width <select aria-label="Preview width" value={width} onChange={e => setWidth(e.target.value)}><option value="100%">Responsive</option><option value="375px">Phone</option><option value="768px">Tablet</option></select></label>
       <Button variant="ghost" style={toolbarButtonStyle} aria-expanded={showSource} onClick={() => setShowSource(!showSource)}><Code2 size={13} />{showSource ? "Hide source" : "Source"}</Button>
       <Button variant="ghost" style={toolbarButtonStyle} onClick={() => copyText(source, "Visualization source copied")}><Copy size={13} />Copy source</Button>
       {(busy || id) && <Button variant="ghost" style={{ ...toolbarButtonStyle, color: "var(--red)" }} onClick={stop}><Square size={12} />Stop</Button>}
     </div>
     {busy && <p role="status" aria-live="polite" style={{ padding: "0 10px", color: "var(--mut)" }}>Starting interactive preview…</p>}
     {error && <p role="alert" style={{ padding: 10 }}>{error} <Button variant="ghost" style={toolbarButtonStyle} onClick={() => autoStart ? setAttempt(value => value + 1) : void publish()}><RefreshCw size={13} />Retry preview</Button></p>}
-    {id && <iframe ref={frame} key={id} title={`${title} preview`} sandbox="allow-scripts" referrerPolicy="no-referrer" src={convertFileSrc(id, "openleash-viz")} style={{ display: "block", width: "100%", height: expanded ? "100%" : 420, flex: expanded ? 1 : undefined, minHeight: expanded ? 0 : undefined, border: 0, background: "var(--bg)" }} />}
+    {id && <iframe ref={frame} key={id} title={`${title} preview`} sandbox="allow-scripts" referrerPolicy="no-referrer" src={convertFileSrc(id, "openleash-viz")} style={{ display: "block", width, maxWidth: "100%", height: expanded ? "100%" : height, flex: expanded ? 1 : undefined, minHeight: expanded ? 0 : undefined, border: 0, background: "var(--bg)" }} />}
     {showSource && <pre style={{ padding: 12, maxHeight: expanded ? "30vh" : 320, flexShrink: 0, overflow: "auto", whiteSpace: "pre-wrap" }}><code>{source}</code></pre>}
     </div>
   </section>;
 }
+export function diagramTitle(source: string): string {
+  // Parse detached XML only; never insert supplied nodes into the application.
+  if (typeof DOMParser === "undefined") return "Agent-generated diagram";
+  const doc = new DOMParser().parseFromString(source, "image/svg+xml");
+  if (doc.querySelector("parsererror")) return "Agent-generated diagram";
+  return doc.querySelector("title")?.textContent?.trim().slice(0, 160) || "Agent-generated diagram";
+}
+
+/** Image-context SVG disables scripts, foreign DOM access and external resources. */
+function InlineDiagram({ source }: { source: string }) {
+  const title = diagramTitle(source);
+  const [failed, setFailed] = useState(false);
+  const [showSource, setShowSource] = useState(false);
+  return <section aria-label={title} style={{ border: "1px solid var(--line)", borderRadius: 10, margin: "12px 0", padding: 12 }}>
+    <div role="toolbar" aria-label="Diagram controls" style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+      <strong style={{ flex: 1 }}>{title}</strong>
+      <Button variant="ghost" aria-expanded={showSource} onClick={() => setShowSource(value => !value)}>{showSource ? "Hide source" : "Source"}</Button>
+      <Button variant="ghost" onClick={() => copyText(source, "Diagram source copied")}>Copy source</Button>
+    </div>
+    {failed ? <p role="status">This diagram could not be displayed. Source is still available.</p> : <Thumb src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`} alt={title} onError={() => setFailed(true)} style={{ display: "block", width: "100%", maxHeight: 560, objectFit: "contain" }} />}
+    {showSource && <pre style={{ maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap" }}><code>{source}</code></pre>}
+  </section>;
+}
+
 export function AssistantMarkdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const mapped = visualizationParts(text).map((part, i) => part.kind === "visualization"
     ? <Visualization key={`${i}:${part.source}`} source={part.source} autoStart />
+    : part.kind === "image"
+      ? <ImageExplanation key={`${i}:${part.source}`} source={part.source} />
+    : part.kind === "diagram"
+      ? <InlineDiagram key={`${i}:${part.source}`} source={part.source} />
     : part.kind === "placeholder"
       ? <VisualizationPlaceholder key={i} source={part.source} message={part.message ?? (streaming ? "Working on the interactive preview…" : "This interactive visualization is incomplete.")} />
       : <ReactMarkdown key={i} remarkPlugins={[remarkGfm, remarkOl]} components={mdComponents}>{part.source}</ReactMarkdown>);

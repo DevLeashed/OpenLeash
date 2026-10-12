@@ -6,7 +6,7 @@
 // skills in the system prompt; the agent reads the full `SKILL.md` when the
 // job matches the description.
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, SkillDef } from "../api";
 import { flash, set, useStore } from "../store";
 import { Button, IconButton, Modal, Pressable, Switch } from "./primitives";
@@ -14,8 +14,12 @@ import { I } from "./icons";
 
 function Preview({ name, onClose }: { name: string; onClose: () => void }) {
   const [data, setData] = useState<{ skill: SkillDef; content: string; files: string[] } | null>(null);
+  // The newest onClose, so the fetch effect still fires only on `name` changes
+  // yet calls the current handler on failure.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
-    api.skillRead(name).then(setData).catch((e) => { flash(String(e)); onClose(); });
+    api.skillRead(name).then(setData).catch((e) => { flash(String(e)); onCloseRef.current(); });
   }, [name]);
   return (
     <Modal onClose={onClose} style={{ width: "min(640px, 100%)" }}>

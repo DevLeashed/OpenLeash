@@ -36,14 +36,19 @@ distributions; test downloads on the systems you intend to support.
 to the repository's default branch:
 
 1. Open GitHub → **Actions** → **Build downloads** → **Run workflow**.
-2. Select the branch and start the run.
-3. Open the completed run and download the per-platform ZIPs under **Artifacts**.
+2. Select the branch; leave **build_updater** unchecked for unsigned downloads,
+   or enable it after configuring the signing secrets described in [Releases](releasing.md).
+   The optional **release_tag** defaults to the package version without a `v` prefix.
+3. Open the completed run and download the single-file ZIPs under **Artifacts**.
 
 It builds macOS ARM64, Windows AMD64/ARM64, and Linux AMD64/ARM64. AMD64 means
 x86-64 on both Intel and AMD CPUs. Linux AMD64 includes an AppImage and Debian
 package; Linux ARM64 uses a Debian package. See [Releases](releasing.md) for
 artifact contents, signing limitations and retention. This workflow neither
-creates nor publishes a GitHub Release and needs no signing secrets. The Linux
+creates nor publishes a GitHub Release. Default unsigned runs need no secrets;
+opt-in updater-signed runs require Tauri signing secrets and additionally produce
+single-file installer/archive/signature artifacts and an assembled `latest.json`.
+Upload their extracted contents to a release manually. The Linux
 build uses Ubuntu 24.04 for the PipeWire 1.0 and SPA 0.2 headers required by the
 Rust bindings; older Linux distributions may not run the resulting packages.
 
@@ -76,6 +81,7 @@ Windows-only, one only runs inside a container, one only on Apple Silicon.
 
 | Script | What it does | Runs on |
 |---|---|---|
+| `scripts/assemble-updater.py` | Validates extracted updater artifacts/fragments and creates a static `latest.json`; no signing, network requests or publishing. CI runs this automatically for signed download builds. | Python 3, any platform |
 | `build.bat` | **Fast dev build, not a release build.** `--debug` (skips release LTO and `codegen-units=1`), `--no-bundle` (no installer), `--config tauri.fast.conf.json` (skips the `tsc` typecheck). Copies the portable exe to `compiled/`. | Windows |
 | `run.bat` | `npm run tauri dev`. | Windows |
 | `refresh_icon.bat` | `npm run tauri icon src-tauri/icons/icon.png` — regenerates every platform icon set from the source PNG. | Windows |

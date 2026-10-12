@@ -15,15 +15,18 @@ export function AgentNotice({ it, taskId, chatTitle }: { it: Item; taskId: strin
   const Icon = warning ? CircleAlert : Info;
   const dismiss = async () => {
     if (dismissing) return;
+    // Hide at once: the backend save queues behind the chat's other writes, so
+    // waiting for its item event made the click feel dead. A failed save brings the card back.
     setDismissing(true);
     try {
       await api.dismissAgentNotice(taskId, it.id);
-      // The backend publishes the updated item; only that persisted state removes the card.
+      // The backend publishes the updated item, which removes it from the store for good.
     } catch (e) {
       setDismissing(false);
       flash(`Couldn't dismiss notice · ${String(e)}`);
     }
   };
+  if (dismissing) return null;
   return (
     <section className={"agent-notice" + (warning ? " warning" : "")} role="status" aria-label={warning ? "Agent warning" : "Agent notice"}>
       <div className="agent-notice-head">

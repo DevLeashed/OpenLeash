@@ -200,10 +200,12 @@ fn trust_survives_an_unchanged_command_across_a_reload() {
     checks::approve(&h, &mut approved);
 
     // Through the settings file and back, the way the app actually does it.
-    let mut s = Settings::default();
-    s.hooks = vec![h.clone()];
-    s.trusted_hooks = approved.clone();
-    s.hooks_trust_migrated = true;
+    let s = Settings {
+        hooks: vec![h.clone()],
+        trusted_hooks: approved.clone(),
+        hooks_trust_migrated: true,
+        ..Default::default()
+    };
     let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
     let mut back = round;
     checks::migrate_hooks(&mut back);
@@ -322,11 +324,13 @@ fn an_untrusted_project_hook_does_not_run() {
 /// would leave every hook in the app untrusted and silently dead.
 #[test]
 fn an_unrelated_settings_write_does_not_disarm_the_hooks() {
-    let mut s = Settings::default();
-    s.hooks = vec![
-        user_hook("post_tool", "cargo fmt"),
-        user_hook("stop", "npm test"),
-    ];
+    let mut s = Settings {
+        hooks: vec![
+            user_hook("post_tool", "cargo fmt"),
+            user_hook("stop", "npm test"),
+        ],
+        ..Default::default()
+    };
     checks::migrate_hooks(&mut s);
     assert!(s.hooks.iter().all(|h| h.trusted));
     let ids: Vec<String> = s.hooks.iter().map(|h| h.id.clone()).collect();
@@ -973,7 +977,7 @@ fn an_oversized_hook_output_is_spilled_with_a_head_and_tail_preview() {
     assert_eq!(checks::cap_injected("small"), "small");
 
     let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_file(&spill);
+    let _ = std::fs::remove_file(spill);
 }
 
 /// The cap is applied by the engine, not just available as a helper: a hook that

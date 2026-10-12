@@ -239,6 +239,9 @@ pub struct ManifestFile {
     pub truncated: bool,
     /// A `CLAUDE.md` that only points at `AGENTS.md`; it is skipped anyway.
     pub pointer_only: bool,
+    /// Switched off for this project in the doc selection, so it is listed here
+    /// for the user to see and toggle but does not reach the prompt.
+    pub disabled: bool,
     /// True for the user's own `~/.…` files, which are loaded even when the
     /// project folder is untrusted.
     pub global: bool,
@@ -324,9 +327,11 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Anything project-local at all, globals excluded.
+    /// Anything project-local at all, globals excluded. A file the user switched
+    /// off for this project does not count: it will not be injected, so a folder
+    /// whose only instruction file is disabled is not "injecting" anything.
     pub fn has_project_items(&self) -> bool {
-        self.instructions.iter().any(|f| !f.global)
+        self.instructions.iter().any(|f| !f.global && !f.disabled)
             || !self.skills.is_empty()
             || !self.agents.is_empty()
             || !self.hooks.is_empty()
@@ -338,7 +343,14 @@ impl Manifest {
 const PREVIEW_CHARS: usize = 700;
 const MANIFEST_CAP: usize = 200;
 
-fn push_file(out: &mut Vec<ManifestFile>, path: &Path, name: &str, global: bool, raw: &str) {
+fn push_file(
+    out: &mut Vec<ManifestFile>,
+    path: &Path,
+    name: &str,
+    global: bool,
+    disabled: bool,
+    raw: &str,
+) {
     let chars = raw.chars().count();
     let preview: String = raw.chars().take(PREVIEW_CHARS).collect();
     out.push(ManifestFile {
@@ -350,6 +362,7 @@ fn push_file(out: &mut Vec<ManifestFile>, path: &Path, name: &str, global: bool,
         chars,
         truncated: chars > 40_000,
         pointer_only: name == "CLAUDE.md" && prompt::is_agents_pointer_only(raw),
+        disabled,
         global,
         preview,
     });
@@ -506,6 +519,7 @@ fn scan_overrides(root: &str, m: &mut Manifest) {
 /// `inject_global_claude` toggle; everything else is read from disk.
 pub fn manifest(s: &store::Settings, root: &str) -> Manifest {
     let matched = resolve(&s.trust, root).cloned();
+    let disabled_docs = prompt::disabled_docs(&s.project_docs, root);
     let trusted = matched
         .as_ref()
         .is_some_and(|d| d.decision == TrustState::Trusted);
@@ -525,7 +539,8 @@ pub fn manifest(s: &store::Settings, root: &str) -> Manifest {
     for f in MEMORY_FILES {
         let p = Path::new(root).join(f);
         if let Ok(text) = std::fs::read_to_string(&p) {
-            push_file(&mut m.instructions, &p, f, false, &text);
+            let disabled = disabled_docs.iter().any(|d| d == f);
+            push_file(&mut m.instructions, &p, f, false, disabled, &text);
         }
     }
     if let Some(home) = dirs::home_dir() {
@@ -536,6 +551,7 @@ pub fn manifest(s: &store::Settings, root: &str) -> Manifest {
                 &g,
                 "~/.openleash/OPENLEASH.md (user-global)",
                 true,
+                false,
                 &text,
             );
         }
@@ -548,6 +564,7 @@ pub fn manifest(s: &store::Settings, root: &str) -> Manifest {
                         &c,
                         "~/.claude/CLAUDE.md (user-global)",
                         true,
+                        false,
                         &text,
                     );
                 }

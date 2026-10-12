@@ -3,10 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (cmd: string, args: any) => (cmd === "settings_update" ? { ...args.patch } : null)) }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (cmd: string, args: { patch?: Record<string, unknown> }) => (cmd === "settings_update" ? { ...args.patch } : null)) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
-import type { AccountView, Item, Settings, TaskSummary } from "./api";
+import type { AccountView, Item, ProviderView, Settings, SubInfo, TaskSummary } from "./api";
+import type { Note } from "./store";
 import { until, countOptionalAgents, defaultX, emptyXLayer, xDepth, xOn, X_DEFAULT_RUNNING, X_DEFAULT_TOTAL, X_MAX_LAYERS, fmtK } from "./api";
 import { netWindows } from "./ui/Accounts";
 import { bufferDelta, clickedChat, DEFAULT_ZOOM, evictTranscripts, flushDeltas, forgetTask, get, inFrontNow, modelInfo, set, stepZoom, subscribe, zoom } from "./store";
@@ -159,7 +160,7 @@ describe("interface zoom", () => {
   it("reports the 110% default when settings haven't loaded yet", () => {
     // Overlays position themselves in unzoomed pixels; before boot they have no
     // setting to read, so they fall back to the default rather than to 100%.
-    set({ settings: null as any });
+    set({ settings: null });
     expect(DEFAULT_ZOOM).toBe(110);
     expect(zoom()).toBe(1.1);
     set({ settings: { ui_zoom: 80 } as unknown as Settings });
@@ -170,19 +171,19 @@ describe("interface zoom", () => {
 import { isConnected } from "./store";
 describe("subscription providers", () => {
   it("count as connected as soon as an account exists, without a reload", () => {
-    const codex = { id: "codex", connected: false, account: {} } as any;
+    const codex = { id: "codex", connected: false, account: {} } as unknown as ProviderView;
     set({ accounts: [] });
     expect(isConnected(codex)).toBe(false);
     set({ accounts: [acct("a", [10])] });
     expect(isConnected(codex)).toBe(true);
-    expect(isConnected({ id: "claude", connected: false, account: {} } as any)).toBe(false);
-    expect(isConnected({ id: "codex", connected: false, account: null } as any)).toBe(false);
+    expect(isConnected({ id: "claude", connected: false, account: {} } as unknown as ProviderView)).toBe(false);
+    expect(isConnected({ id: "codex", connected: false, account: null } as unknown as ProviderView)).toBe(false);
   });
 });
 
 import { chatInProject, chatProjectIsCurrent, compareChats, orderBetween, ProjectCtxMenu, projectMenuEntries, sortKey, withoutProject } from "./ui/Chrome";
 describe("drag to reorder", () => {
-  const t = (id: string, order: number, updated = "2026-09-01T00:00:00Z", touched = updated) => ({ id, order, updated_at: updated, touched_at: touched }) as any;
+  const t = (id: string, order: number, updated = "2026-09-01T00:00:00Z", touched = updated) => ({ id, order, updated_at: updated, touched_at: touched }) as unknown as TaskSummary;
   it("drops between neighbours, at the top, or at the bottom", () => {
     expect(orderBetween(t("a", 3000), t("b", 1000), false)).toBe(2000);
     expect(orderBetween(undefined, t("b", 1000), false)).toBeGreaterThan(1000);
@@ -199,14 +200,14 @@ describe("drag to reorder", () => {
 describe("chat list order", () => {
   // A chat whose agent is churning has a newer `updated_at` than one the user
   // just came back to; it must not overtake it.
-  const t = (id: string, updated: string, touched: string) => ({ id, order: 0, updated_at: updated, touched_at: touched }) as any;
+  const t = (id: string, updated: string, touched: string) => ({ id, order: 0, updated_at: updated, touched_at: touched }) as unknown as TaskSummary;
   it("follows the user's own activity, not the agent's", () => {
     const busy = t("busy", "2026-09-02T00:00:00Z", "2026-01-01T00:00:00Z");
     const mine = t("mine", "2026-01-01T00:00:00Z", "2026-09-01T00:00:00Z");
     expect([busy, mine].sort((a, b) => sortKey(b) - sortKey(a)).map((x) => x.id)).toEqual(["mine", "busy"]);
   });
   it("falls back to updated_at for a chat saved before the field existed", () => {
-    const old = { id: "old", order: 0, updated_at: "2026-01-01T00:00:00Z" } as any;
+    const old = { id: "old", order: 0, updated_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
     expect(sortKey(old)).toBe(Date.parse("2026-01-01T00:00:00Z"));
   });
   // The other half of the drag contract, and the half that was broken: a manual
@@ -217,15 +218,15 @@ describe("chat list order", () => {
   it("sorts a released chat by recency again, not by where it was dragged", () => {
     const other = t("other", "2026-09-01T00:00:00Z", "2026-06-01T00:00:00Z");
     // Dragged to the very top of the list, long ago.
-    const dragged = { id: "dragged", order: 1e15, updated_at: "2026-01-01T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as any;
+    const dragged = { id: "dragged", order: 1e15, updated_at: "2026-01-01T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
     expect([other, dragged].sort((a, b) => sortKey(b, false) - sortKey(a, false)).map((x) => x.id)).toEqual(["dragged", "other"]);
     // The touch clears `order`; the chat you just acted in leads on recency.
     const released = { ...dragged, order: 0, touched_at: "2026-12-01T00:00:00Z" };
     expect([other, released].sort((a, b) => sortKey(b) - sortKey(a)).map((x) => x.id)).toEqual(["dragged", "other"]);
   });
   it("keeps manually dragged chats in place even when they finish", () => {
-    const old = { id: "old", order: 1e15, status: "done", updated_at: "2026-09-03T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as any;
-    const finished = { id: "finished", order: -1e15, status: "done", updated_at: "2026-09-04T00:00:00Z", touched_at: "2026-01-02T00:00:00Z" } as any;
+    const old = { id: "old", order: 1e15, status: "done", updated_at: "2026-09-03T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
+    const finished = { id: "finished", order: -1e15, status: "done", updated_at: "2026-09-04T00:00:00Z", touched_at: "2026-01-02T00:00:00Z" } as unknown as TaskSummary;
     expect([old, finished].sort(compareChats).map((chat) => chat.id)).toEqual(["old", "finished"]);
     expect([old, finished].sort((a, b) => compareChats(a, b, false, false)).map((chat) => chat.id)).toEqual(["old", "finished"]);
   });
@@ -238,42 +239,42 @@ describe("chat list order", () => {
       { ...base, id: "question", status: "waiting", waiting_kind: "question" },
       { ...base, id: "approval", status: "waiting", waiting_kind: "approval" },
       { ...base, id: "wake", status: "waiting", waiting_kind: "wake" },
-    ] as any[];
+    ] as unknown as TaskSummary[];
     expect(chats.sort(compareChats).map((chat) => chat.id)).toEqual([
       "question", "approval", "paused", "running", "done", "wake",
     ]);
   });
   it("honors a manual drag position while automatic reorder is enabled", () => {
-    const dragged = { id: "dragged", order: 1e15, status: "done", updated_at: "2026-01-01T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as any;
-    const recent = { id: "recent", order: 0, status: "done", updated_at: "2026-09-01T00:00:00Z", touched_at: "2026-06-01T00:00:00Z" } as any;
+    const dragged = { id: "dragged", order: 1e15, status: "done", updated_at: "2026-01-01T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
+    const recent = { id: "recent", order: 0, status: "done", updated_at: "2026-09-01T00:00:00Z", touched_at: "2026-06-01T00:00:00Z" } as unknown as TaskSummary;
     expect([recent, dragged].sort((a, b) => sortKey(b) - sortKey(a)).map((chat) => chat.id)).toEqual(["dragged", "recent"]);
   });
   it("uses manual position when automatic reorder is disabled", () => {
-    const dragged = { id: "dragged", order: 1e15, status: "done", updated_at: "2026-01-01T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as any;
-    const other = { id: "other", order: 0, status: "done", updated_at: "2026-09-01T00:00:00Z", touched_at: "2026-06-01T00:00:00Z" } as any;
+    const dragged = { id: "dragged", order: 1e15, status: "done", updated_at: "2026-01-01T00:00:00Z", touched_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
+    const other = { id: "other", order: 0, status: "done", updated_at: "2026-09-01T00:00:00Z", touched_at: "2026-06-01T00:00:00Z" } as unknown as TaskSummary;
     expect([other, dragged].sort((a, b) => sortKey(b, false) - sortKey(a, false)).map((chat) => chat.id)).toEqual(["dragged", "other"]);
   });
   it("keeps the newest running chats ahead of completed backlog", () => {
     const base = { order: 0, updated_at: "2026-09-01T00:00:00Z", touched_at: "2026-09-01T00:00:00Z" };
-    const completed = Array.from({ length: 80 }, (_, i) => ({ ...base, id: `done-${i}`, status: "done" })) as any[];
-    const newest = { ...base, id: "newest", status: "running", touched_at: "2026-09-02T00:00:00Z" } as any;
+    const completed = Array.from({ length: 80 }, (_, i) => ({ ...base, id: `done-${i}`, status: "done" })) as unknown as TaskSummary[];
+    const newest = { ...base, id: "newest", status: "running", touched_at: "2026-09-02T00:00:00Z" } as unknown as TaskSummary;
     const rest = [...completed, newest].sort(compareChats).slice(0, 80);
     expect(rest.map((chat) => chat.id)).toContain("newest");
   });
   it("keeps a freshly stopped chat in its recency position among finished chats", () => {
-    const stopped = { id: "stopped", status: "stopped", order: 0, touched_at: "2026-09-02T00:00:00Z", updated_at: "2026-09-02T00:00:00Z" } as any;
-    const done = { id: "done", status: "done", order: 0, touched_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" } as any;
+    const stopped = { id: "stopped", status: "stopped", order: 0, touched_at: "2026-09-02T00:00:00Z", updated_at: "2026-09-02T00:00:00Z" } as unknown as TaskSummary;
+    const done = { id: "done", status: "done", order: 0, touched_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" } as unknown as TaskSummary;
     expect([done, stopped].sort(compareChats).map((chat) => chat.id)).toEqual(["stopped", "done"]);
   });
   it("sorts by recency inside each priority group", () => {
-    const older = { id: "older", status: "done", order: 0, touched_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" } as any;
+    const older = { id: "older", status: "done", order: 0, touched_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
     const newer = { ...older, id: "newer", touched_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" };
     expect([older, newer].sort(compareChats).map((chat) => chat.id)).toEqual(["newer", "older"]);
   });
 });
 
 describe("sidebar project filter", () => {
-  const chat = (id: string, project: string) => ({ id, project }) as any;
+  const chat = (id: string, project: string) => ({ id, project }) as unknown as TaskSummary;
   const here = "D:/work/openleash", there = "D:/work/other";
   it("shows the current project's chats, and the open one, and every chat without a project", () => {
     expect(chatInProject(chat("a", here), here, false, null)).toBe(true);
@@ -445,10 +446,10 @@ describe("ultrathread X visibility", () => {
 
 import { swarmCounts, swarmGlow, swarmState } from "./ui/session/Swarm";
 describe("ultrathread badge", () => {
-  const s = (status: string) => ({ status }) as any;
-  const t = (o: any) => ({ status: "idle", paused: null, subs: [], ...o }) as any;
+  const s = (status: string) => ({ status }) as unknown as SubInfo;
+  const t = (o: Partial<Pick<TaskSummary, "status" | "paused" | "subs">>): Pick<TaskSummary, "status" | "paused" | "subs"> => ({ status: "idle", paused: null, subs: [], ...o });
   it("counts each agent state so the badge can show progress", () => {
-    expect(swarmCounts([s("running"), s("running"), s("done"), s("failed"), s("stopped")] as any))
+    expect(swarmCounts([s("running"), s("running"), s("done"), s("failed"), s("stopped")] as SubInfo[]))
       .toEqual({ running: 2, done: 1, failed: 1, stopped: 1 });
   });
   it("only glows while the swarm is actually working", () => {
@@ -460,7 +461,7 @@ describe("ultrathread badge", () => {
     expect(swarmGlow(swarmState(t({})))).toBe(false);
     // Everyone finished, cleanly or not.
     expect(swarmGlow(swarmState(t({ status: "done", subs: [s("done"), s("done"), s("done")] })))).toBe(false);
-    expect(swarmCounts([s("done"), s("failed")] as any).failed).toBe(1);
+    expect(swarmCounts([s("done"), s("failed")] as SubInfo[]).failed).toBe(1);
     expect(total).toBe(3);
   });
   it("reports the state that says how the swarm ended", () => {
@@ -468,7 +469,7 @@ describe("ultrathread badge", () => {
     // A failure anywhere outranks a clean finish.
     expect(swarmState(t({ status: "done", subs: [s("done"), s("failed")] }))).toBe("failed");
     // Paused and waiting beat whatever the agents were doing.
-    expect(swarmState(t({ status: "running", paused: { reason: "manual" }, subs: [s("running")] }))).toBe("paused");
+    expect(swarmState(t({ status: "running", paused: { reason: "manual", kind: "manual", since: "" }, subs: [s("running")] }))).toBe("paused");
     expect(swarmState(t({ status: "waiting", subs: [s("running")] }))).toBe("waiting");
     // A stopped chat that ran agents reads as stopped, not done.
     expect(swarmState(t({ status: "stopped", subs: [s("stopped")] }))).toBe("stopped");
@@ -479,7 +480,7 @@ import { FeedRows, UserMsg } from "./ui/Session";
 import { InlineArtifactCard } from "./ui/InlineArtifactCard";
 describe("transcript feed", () => {
   const task = { id: "t1", model: "m", cwd: "D:/p", subs: [] } as unknown as TaskSummary;
-  it("folds finished subagents behind Done and keeps background commands in action groups", () => {
+  it("merges finished subagents into the action group instead of their own Done line", () => {
     const task = { id: "t1", model: "m", cwd: "D:/p", subs: [] } as unknown as TaskSummary;
     const sub = (id: string, status: string) => ({ id, kind: "sub", text: `swept ${id}`, data: { status, name: "explore", sub_id: id } }) as unknown as Item;
     const bg = (id: string, running: boolean) => ({ id: `bg_${id}`, cmd: "npm run dev", started: "2026-01-01T00:00:00Z", last_line: "ready", running, exit: running ? null : "exit 0" });
@@ -491,10 +492,11 @@ describe("transcript feed", () => {
       items: [sub("s1", "done"), job("a", "ok"), job("b", "ok"), sub("s2", "running")],
       task, showThinking: false, bgs,
     }));
-    // The subagent keeps its Done fold; commands share the ordinary action line.
-    expect(html).toContain("Done");
-    expect(html).toContain("1 sub-agent");
-    expect(html).toContain("Ran a command, started a command");
+    // One chain: the finished subagent and both commands share it, and the settled
+    // subagent reads as a count on the same line rather than a separate Done fold.
+    expect(html).not.toContain("Done");
+    expect(html).toContain("Ran a command, started a command, 1 sub-agent finished");
+    expect((html.match(/class="toolgroup"/g) ?? [])).toHaveLength(1);
     // Nothing hides behind the header that isn't the point of it, and the work
     // that is still in flight stays visible rather than being folded away.
     expect(html).not.toContain("swept s1");
@@ -593,8 +595,26 @@ describe("transcript feed", () => {
     // The app never passes `bgs` — it comes from the store. A subagent settles on
     // its own status, so this must fold with nothing but the item in hand.
     const html = renderToStaticMarkup(createElement(FeedRows, { items: [sub], task, showThinking: false }));
-    expect(html).toContain("Done");
-    expect(html).toContain("1 sub-agent");
+    expect(html).not.toContain("Done");
+    expect(html).toContain("1 sub-agent finished");
+  });
+
+  it("counts a failed subagent as a failure on the chain, and a live one is not folded", () => {
+    const task = { id: "t1", model: "m", cwd: "D:/p", subs: [] } as unknown as TaskSummary;
+    const sub = (id: string, status: string) => ({ id, kind: "sub", text: `swept ${id}`, data: { status, name: "explore", sub_id: id } }) as unknown as Item;
+    const read = (id: string) => ({ id, kind: "tool", text: "", data: { name: "read_file", status: "ok", input: { path: `${id}.ts` } } }) as unknown as Item;
+    // A sub-agent that ended badly is the receipt this line most needs to keep:
+    // previously it was a separate Done line that said "did not finish", and
+    // merging it into the chain must not drop that.
+    const bad = renderToStaticMarkup(createElement(FeedRows, { items: [read("a"), sub("s1", "failed")], task, showThinking: false }));
+    expect(bad).not.toContain("Done");
+    expect(bad).toContain("Read a");
+    expect(bad).toContain("1 sub-agent finished");
+    expect(bad).toContain("1 failed");
+    // A still-running sub-agent keeps its own pill row rather than folding away.
+    const live = renderToStaticMarkup(createElement(FeedRows, { items: [read("a"), sub("s2", "running")], task, showThinking: false }));
+    expect(live).toContain("Read a");
+    expect(live).toContain("swept s2");
   });
 
   it("doesn't guess that an unknown background command is finished", () => {
@@ -953,10 +973,10 @@ import { deleteArchivedTasks } from "./ui/Chrome";
 describe("delete all archived chats", () => {
   // `flash` sets its timer through `window`, so the store needs one here.
   beforeEach(() => {
-    (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+    (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
     set({ settings: {} as unknown as Settings, view: "home", task: null });
   });
-  const t = (id: string, archived: boolean) => ({ id, archived }) as any;
+  const t = (id: string, archived: boolean) => ({ id, archived }) as unknown as TaskSummary;
   const reply = () => (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => null);
 
   it("drops archived chats and the open view, keeps the active ones", async () => {
@@ -983,8 +1003,8 @@ import { readdirSync, readFileSync } from "node:fs";
 describe("streamed deltas", () => {
   // Chunks are buffered and applied in one pass: a long chat used to copy and
   // re-render its whole transcript for every chunk of every token.
-  const item = (id: string, text: string) => ({ id, text, kind: "text" }) as any;
-  beforeEach(() => { flushDeltas(); set({ items: { t1: [item("a", "one"), item("b", "two")] } as any }); });
+  const item = (id: string, text: string) => ({ id, text, kind: "text" }) as unknown as Item;
+  beforeEach(() => { flushDeltas(); set({ items: { t1: [item("a", "one"), item("b", "two")] } }); });
 
   it("folds a burst of chunks into one update, in order", () => {
     let updates = 0;
@@ -1106,7 +1126,7 @@ describe("spend ledger the budget cap reads", () => {
   });
 });
 
-import { describe as notifyText, surfaces, toastBody, type Needs } from "./notify";
+import { createToastLedger, describe as notifyText, surfaces, toastBody, type Needs } from "./notify";
 import { NoticeCard, noticeMeta } from "./ui/Notices";
 describe("desktop notifications", () => {
   it("opens the chat the toast was raised for, and only ever one of ours", () => {
@@ -1260,6 +1280,50 @@ describe("where attention surfaces", () => {
     // the gap before boot answers.
     expect(surfaces(q, "X", "", false, false)).toContain("desktop");
   });
+
+  // A chat that keeps asking while you are away (every approval, every notice,
+  // every "done" of a queued run) used to ring once per event. One toast per chat
+  // and kind is enough: the first is still waiting for you.
+  it("raises one toast per chat and kind until you come back to look", () => {
+    const ledger = createToastLedger();
+    expect(ledger.admit("aaaaaaaaaaaa", "approval")).toBe(true);
+    expect(ledger.admit("aaaaaaaaaaaa", "approval")).toBe(false);
+    expect(ledger.admit("aaaaaaaaaaaa", "approval")).toBe(false);
+    // A different kind for the same chat is new news, and another chat is its own.
+    expect(ledger.admit("aaaaaaaaaaaa", "done")).toBe(true);
+    expect(ledger.admit("bbbbbbbbbbbb", "approval")).toBe(true);
+  });
+
+  it("clears one chat's toasts when you open it, and leaves the others", () => {
+    const ledger = createToastLedger();
+    ledger.admit("aaaaaaaaaaaa", "approval");
+    ledger.admit("aaaaaaaaaaaa", "done");
+    ledger.admit("bbbbbbbbbbbb", "done");
+    ledger.forgetChat("aaaaaaaaaaaa");
+    expect(ledger.admit("aaaaaaaaaaaa", "approval")).toBe(true);
+    expect(ledger.admit("aaaaaaaaaaaa", "done")).toBe(true);
+    expect(ledger.admit("bbbbbbbbbbbb", "done")).toBe(false);
+  });
+
+  it("clears everything when the window comes back to the front", () => {
+    const ledger = createToastLedger();
+    ledger.admit("aaaaaaaaaaaa", "question");
+    ledger.admit("bbbbbbbbbbbb", "notice");
+    ledger.forgetAll();
+    expect(ledger.admit("aaaaaaaaaaaa", "question")).toBe(true);
+    expect(ledger.admit("bbbbbbbbbbbb", "notice")).toBe(true);
+  });
+
+  it("does not confuse a chat id with the kind next to it", () => {
+    // The key joins chat and kind with a colon. Chat ids are hex, so no id can
+    // contain one, but forgetting a chat must still match the whole id, not a prefix.
+    const ledger = createToastLedger();
+    ledger.admit("aaaaaaaaaaaa", "done");
+    ledger.admit("aaaaaaaaaaaab", "done");
+    ledger.forgetChat("aaaaaaaaaaaa");
+    expect(ledger.admit("aaaaaaaaaaaa", "done")).toBe(true);
+    expect(ledger.admit("aaaaaaaaaaaab", "done")).toBe(false);
+  });
 });
 
 describe("ultrathread X ladder", () => {
@@ -1327,7 +1391,7 @@ import { archivePicked } from "./ui/Chrome";
 describe("archiving a selection of chats", () => {
   beforeEach(() => {
     // `flash` sets its timer through `window`, so the store needs one here.
-    (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+    (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
     set({ settings: {} as unknown as Settings, view: "home", task: null, selecting: true, picked: {} });
     (invoke as unknown as ReturnType<typeof vi.fn>).mockClear();
   });
@@ -1477,7 +1541,7 @@ describe("archiving the chats that have gone idle", () => {
 
 describe("archiving idle chats: what it sends", () => {
   beforeEach(() => {
-    (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+    (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
     set({ settings: {} as unknown as Settings, view: "home", task: null, selecting: false, picked: {} });
     (invoke as unknown as ReturnType<typeof vi.fn>).mockClear();
   });
@@ -1770,7 +1834,7 @@ describe("paused chats view", () => {
   // `useStore` reads straight from the module store, and the view reaches for
   // `flash`'s timer on a failed resume, so give it the window it expects.
   beforeEach(() => {
-    (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+    (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
     // A row draws its model's colour, and `modelColor` resolves that through the
     // provider list — so these cases have to carry one. An earlier case's
     // `set({ providers: undefined })` would otherwise leave the render throwing
@@ -1860,7 +1924,7 @@ describe("memory and chat-naming settings", () => {
   });
 
   it("saves the toggles through the settings command, not local state", async () => {
-    (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string, args: any) => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string, args: { patch?: Record<string, unknown> }) => {
       if (cmd === "settings_update") return { ...args.patch };
       return null;
     });
@@ -1870,7 +1934,7 @@ describe("memory and chat-naming settings", () => {
     expect(got).toMatchObject({ memory: true, agent_titles: false });
     const call = (invoke as unknown as ReturnType<typeof vi.fn>).mock.calls.find((c) => c[0] === "settings_update");
     expect(call).toBeTruthy();
-    expect((call as any)[1].patch).toMatchObject({ memory: true, agent_titles: false });
+    expect(call![1].patch).toMatchObject({ memory: true, agent_titles: false });
   });
 });
 
@@ -1878,7 +1942,7 @@ describe("transcripts held in memory", () => {
   const item = (id: string): Item => ({ id, kind: "text", text: "x", data: {}, ts: "now" } as unknown as Item);
 
   beforeEach(() => {
-    set({ task: null, view: "home", hist: [], fwd: [], items: {}, subItems: {}, bg: {}, notes: {} } as any);
+    set({ task: null, view: "home", hist: [], fwd: [], items: {}, subItems: {}, bg: {}, notes: {} });
   });
 
   it("drops the transcripts of chats you are not looking at", () => {
@@ -1886,7 +1950,7 @@ describe("transcripts held in memory", () => {
     // chat that ever produced an event stayed in the store for the life of the
     // process -- including chats running in the background that were never
     // opened. Switching to one chat has to release the others.
-    set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, subItems: { a: { s1: [item("4")] }, b: { s2: [item("5")] } }, bg: { a: [], b: [] } } as any);
+    set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, subItems: { a: { s1: [item("4")] }, b: { s2: [item("5")] } }, bg: { a: [], b: [] } });
     const patch = evictTranscripts(get(), "b");
     expect(Object.keys(patch.items ?? {})).toEqual(["b"]);
     // A's sub-agent transcript goes with the chat it belonged to: a swarm whose
@@ -1901,14 +1965,14 @@ describe("transcripts held in memory", () => {
     // a fresh object here would re-render the whole transcript for no reason.
     // Only the open chat is pinned, so `items` must hold `b` alone by the time
     // this runs -- which is the state `openTask` leaves it in.
-    set({ items: { b: [item("2")] }, subItems: { b: {} }, bg: { b: [] } } as any);
+    set({ items: { b: [item("2")] }, subItems: { b: {} }, bg: { b: [] } });
     expect(evictTranscripts(get(), "b")).toEqual({});
   });
 
   it("keeps the chat being opened", () => {
     // The chat just loaded is never a candidate for eviction, even though it
     // was not in the store before this call.
-    set({ items: { a: [item("1")] } } as any);
+    set({ items: { a: [item("1")] } });
     const patch = evictTranscripts(get(), "b");
     expect(Object.keys(patch.items ?? {})).toEqual([]);
     expect(evictTranscripts(get(), "a")).toEqual({});
@@ -1917,21 +1981,21 @@ describe("transcripts held in memory", () => {
   it("keeps a chat Back can still land on", () => {
     // `back()` deliberately does not refetch -- it trusts the transcript is
     // already loaded. Evicting a chat on the nav stack would show it empty.
-    set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, hist: [{ view: "chat", task: "c" }] } as any);
+    set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, hist: [{ view: "chat", task: "c" }] } as unknown as Partial<Parameters<typeof set>[0]>);
     expect(Object.keys(evictTranscripts(get(), "a").items ?? {})).toEqual(["a", "c"]);
   });
 
   it("leaves Home alone as a nav entry", () => {
     // A nav entry with no chat is the Home screen. `null` must not become a key
     // that shadows a real id.
-    set({ items: { a: [item("1")] }, hist: [{ view: "home", task: null }] } as any);
+    set({ items: { a: [item("1")] }, hist: [{ view: "home", task: null }] });
     expect(evictTranscripts(get(), "a")).toEqual({});
   });
 
   it("forgets a deleted chat's notes too", () => {
     // The one map `forgetTask` never dropped: a deleted chat's annotations
     // stayed reachable from nowhere for the rest of the session.
-    set({ notes: { gone: [{ chat: "gone", quote: "a".repeat(6000) } as any], kept: [] }, tasks: {} } as any);
+    set({ notes: { gone: [{ chat: "gone", quote: "a".repeat(6000) } as unknown as Note], kept: [] }, tasks: {} });
     const patch = forgetTask(get(), "gone");
     expect(Object.keys(patch.notes ?? {})).toEqual(["kept"]);
   });

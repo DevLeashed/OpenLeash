@@ -21,6 +21,7 @@ fn env() -> Env<'static> {
         date: "2026-01-01".into(),
         agent_id: "ol-test",
         inject_global_claude: false,
+        disabled_docs: &[],
     }
 }
 
@@ -61,6 +62,29 @@ fn main_prompt_explains_inline_visualization_behavior_and_safety() {
         !sys.contains("explicitly clicks Preview"),
         "main prompt still tells the agent to make users click Preview"
     );
+}
+
+#[test]
+fn handoffs_preserve_verification_receipts_and_unresolved_failures() {
+    let handoff = prompt::compact_prompt();
+    for rule in [
+        "Verification receipts",
+        "exact commands",
+        "filters/scope",
+        "exit codes",
+        "evidence paths",
+        "owner-accepted",
+        "unresolved failure",
+        "isolated rerun",
+        "unverified",
+        "IDs",
+        "authorization",
+    ] {
+        assert!(handoff.contains(rule), "missing handoff rule: {rule}");
+    }
+    let sys = prompt::system(&env(), None, &[]);
+    assert!(sys.contains("compare completion claims against observed tool results"));
+    assert!(sys.contains("label partial results explicitly"));
 }
 
 #[test]

@@ -15,8 +15,8 @@ const chat = { id: "t1", title: "chat one", status: "waiting", waiting_kind: "qu
 afterEach(() => { disposeBoot(); vi.restoreAllMocks(); });
 
 it("keeps an unanswered blocking chat marked until the backend ends the wait", async () => {
-  const handlers: Record<string, (event: { payload: any }) => void> = {};
-  (listen as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (name: string, cb: (event: { payload: any }) => void) => {
+  const handlers: Record<string, (event: { payload: unknown }) => void> = {};
+  (listen as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (name: string, cb: (event: { payload: unknown }) => void) => {
     handlers[name] = cb;
     return () => { delete handlers[name]; };
   });

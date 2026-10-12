@@ -65,7 +65,10 @@ export function NeedsYou() {
 
   useEffect(() => {
     if (!open) return;
-    const run = ++generation.current;
+    // Copied to a local: the cleanup must compare the *live* ref value, not the
+    // one captured when the effect ran.
+    const gen = generation;
+    const run = ++gen.current;
     const current = Object.values(get().tasks).filter(needsYou);
     setPreviews((old) => {
       const keep = new Set(current.map((task) => task.id));
@@ -78,15 +81,15 @@ export function NeedsYou() {
       // opened this inbox, not for every chat at app startup.
       setPreviews((old) => ({ ...old, [task.id]: { text: "Loading pending decision…", loaded: false } }));
       void api.task(task.id).then(({ items }) => {
-        if (generation.current !== run) return;
+        if (gen.current !== run) return;
         const result = previewFrom(items, kind) ?? { text: "Pending card will be visible in the chat", loaded: true };
         setPreviews((old) => ({ ...old, [task.id]: result }));
       }).catch(() => {
-        if (generation.current !== run) return;
+        if (gen.current !== run) return;
         setPreviews((old) => ({ ...old, [task.id]: { text: "Open the chat to inspect its pending card", loaded: true } }));
       });
     }
-    return () => { if (generation.current === run) generation.current++; };
+    return () => { if (gen.current === run) gen.current++; };
   }, [open, waitingKey]);
 
   const close = () => { generation.current++; setOpen(false); };

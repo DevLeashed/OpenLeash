@@ -1,8 +1,17 @@
-# On-demand, unsigned downloads only: no tags, releases, or signing secrets.
+# On-demand downloads; optional updater signing. Never creates tags or releases.
 name: Build downloads
 
 on:
   workflow_dispatch:
+    inputs:
+      build_updater:
+        description: Build signed updater extras (requires Tauri signing secrets)
+        type: boolean
+        default: false
+      release_tag:
+        description: Release tag for updater URLs (blank = package version, no v)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -23,13 +32,13 @@ jobs:
           - label: windows-x64
             os: windows-2022
             target: x86_64-pc-windows-msvc
-            bundles: nsis
+            bundles: none
           # VS 2022 on this image includes VC.Tools.ARM64 and ARM64 SDK libs.
-          # Cross-compiling keeps NSIS and its plugins on a supported x64 host.
+          # Cross-compile the portable executable on the x64 host.
           - label: windows-arm64
             os: windows-2022
             target: aarch64-pc-windows-msvc
-            bundles: nsis
+            bundles: none
           # Keep genuine build failures visible, without cancelling other targets.
           - label: linux-x64
             os: ubuntu-24.04
@@ -49,6 +58,8 @@ jobs:
       BUILD_TARGET: ${{ matrix.target }}
       BUILD_LABEL: ${{ matrix.label }}
       BUILD_BUNDLES: ${{ matrix.bundles }}
+      BUILD_UPDATER: ${{ inputs.build_updater }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -103,76 +114,125 @@ jobs:
           workspaces: src-tauri -> target
           key: downloads-${{ matrix.target }}
 
-      - name: Build unsigned installers and application
+      - name: Validate release identity
+        run: python -B -c 'import json, os, sys; sys.path.insert(0, "scripts"); from updater_assets import release_identity; release_identity(json.load(open("package.json"))["version"], os.environ["RELEASE_TAG"])'
+
+      - name: Build unsigned downloads
+        if: ${{ !inputs.build_updater || matrix.label == 'linux-arm64' }}
         # The first -- is npm's separator; the second forwards --locked to Cargo.
         # Tauri also runs beforeBuildCommand (TypeScript + production Vite build).
-        run: npm run tauri -- build --ci --no-sign --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" -- --locked
-
-      - name: Stage downloads and SHA-256 checksums
-        # Archive the macOS app before upload: artifact ZIPs discard Unix modes.
-        shell: python
         run: |
-          import hashlib
-          import os
-          from pathlib import Path
-          import shutil
-          import tarfile
+          if [ "$BUILD_BUNDLES" = none ]; then
+            npm run tauri -- build --ci --no-sign --target "$BUILD_TARGET" --no-bundle -- --locked
+          else
+            npm run tauri -- build --ci --no-sign --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" -- --locked
+          fi
 
-          label = os.environ["BUILD_LABEL"]
-          release = Path("src-tauri/target") / os.environ["BUILD_TARGET"] / "release"
-          bundle = release / "bundle"
-          stage = Path("downloads")
-          stage.mkdir(exist_ok=False)
+      - name: Build updater-signed downloads
+        if: inputs.build_updater && matrix.label != 'linux-arm64'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # --no-sign skips updater signatures too, so MUST NOT be used here.
+        # Updater signing is distinct from Authenticode / Apple notarization.
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo 'Set TAURI_SIGNING_PRIVATE_KEY in repository Actions secrets before opting in.' >&2
+            exit 1
+          fi
+          bundles="$BUILD_BUNDLES"
+          if [ "$bundles" = none ]; then bundles=nsis; fi
+          npm run tauri -- build --ci --target "$BUILD_TARGET" \
+            --config "$GITHUB_WORKSPACE/src-tauri/tauri.updater.conf.json" \
+            --bundles "$bundles" -- --locked
 
-          def required(pattern):
-              matches = sorted(bundle.glob(pattern))
-              if not matches:
-                  raise RuntimeError(f"Missing required download: {bundle / pattern}")
-              return matches
+      - name: Test download staging
+        run: |
+          python -B scripts/test-stage-downloads.py
+          python -B scripts/test-updater.py
 
-          def copy_files(pattern):
-              for source in required(pattern):
-                  if not source.is_file() or source.stat().st_size == 0:
-                      raise RuntimeError(f"Invalid download: {source}")
-                  destination = stage / source.name
-                  if destination.exists():
-                      raise RuntimeError(f"Duplicate download name: {destination}")
-                  shutil.copy2(source, destination)
+      - name: Stage release-named downloads
+        id: downloads
+        run: |
+          python scripts/stage-downloads.py
+          if [ "$BUILD_UPDATER" = true ]; then
+            python -B -c 'import json, os; from scripts.updater_assets import release_identity; version=json.load(open("package.json"))["version"]; tag=release_identity(version, os.environ.get("RELEASE_TAG", "")); print("Validated updater release tag:", tag)'
+          fi
 
-          if label.startswith("windows-"):
-              executable = release / "openleash.exe"
-              if not executable.is_file() or executable.stat().st_size == 0:
-                  raise RuntimeError(f"Missing portable executable: {executable}")
-              shutil.copy2(executable, stage / f"openleash-{label}-portable.exe")
-              copy_files("nsis/*.exe")
-          elif label.startswith("macos-"):
-              for app in required("macos/*.app"):
-                  if not app.is_dir() or not (app / "Contents/MacOS/openleash").is_file():
-                      raise RuntimeError(f"Invalid app bundle: {app}")
-                  with tarfile.open(stage / f"{app.stem}-{label}.app.tar.gz", "w:gz") as archive:
-                      archive.add(app, arcname=app.name)
-              copy_files("dmg/*.dmg")
-          else:
-              copy_files("deb/*.deb")
-              if label == "linux-x64":
-                  copy_files("appimage/*.AppImage")
-
-          lines = []
-          for download in sorted(stage.iterdir()):
-              with download.open("rb") as stream:
-                  hasher = hashlib.sha256()
-                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                      hasher.update(chunk)
-                  digest = hasher.hexdigest()
-              lines.append(f"{digest}  {download.name}\n")
-          (stage / "SHA256SUMS.txt").write_text("".join(lines), encoding="utf-8")
-
-      # Each matrix leg uploads independently; a failed target publishes nothing.
-      - name: Upload downloads
+      # Each artifact ZIP contains exactly one file at its root.
+      - name: Upload primary download
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: openleash-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: downloads/*
+          name: ${{ steps.downloads.outputs.file_1 }}
+          path: downloads/${{ steps.downloads.outputs.file_1 }}
           if-no-files-found: error
+          overwrite: true
           compression-level: 0
+          retention-days: 14
+
+      - name: Upload secondary download or updater installer
+        if: steps.downloads.outputs.file_2 != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.downloads.outputs.file_2 }}
+          path: downloads/${{ steps.downloads.outputs.file_2 }}
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload updater signature or fragment
+        if: steps.downloads.outputs.file_3 != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.downloads.outputs.file_3 }}
+          path: downloads/${{ steps.downloads.outputs.file_3 }}
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload updater metadata fragment
+        if: steps.downloads.outputs.file_4 != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.downloads.outputs.file_4 }}
+          path: downloads/${{ steps.downloads.outputs.file_4 }}
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
+  updater-manifest:
+    name: Assemble updater manifest (no publishing)
+    if: inputs.build_updater
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Download single-file artifacts
+        # gh extracts into separate named directories; no ZIPs are nested in latest.json.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run download "$RUN_ID" --dir extracted
+      - name: Assemble static latest.json
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          version=$(python -c 'import json; print(json.load(open("package.json"))["version"])')
+          python -B scripts/assemble-updater.py extracted --version "$version" --release-tag "$RELEASE_TAG"
+      - name: Upload single-file updater manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: latest.json
+          path: latest.json
+          if-no-files-found: error
+          overwrite: true
           retention-days: 14

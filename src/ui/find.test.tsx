@@ -3,9 +3,9 @@ import { describe, expect, it, beforeEach } from "vitest";
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { FindBar } from "./Find";
 import { set } from "../store";
-import type { Item } from "../api";
+import type { Item, ItemData } from "../api";
 
-const item = (id: string, kind: Item["kind"], text: string, data: any = {}): Item => ({ id, kind, text, data, ts: "2026-01-01T00:00:00Z" });
+const item = (id: string, kind: Item["kind"], text: string, data: ItemData = {}): Item => ({ id, kind, text, data, ts: "2026-01-01T00:00:00Z" });
 
 beforeEach(() => {
   cleanup();

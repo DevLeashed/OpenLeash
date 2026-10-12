@@ -38,6 +38,7 @@ fn env_for(project: &str) -> Env<'static> {
         date: "2026-01-01".into(),
         agent_id: "ol-test",
         inject_global_claude: false,
+        disabled_docs: &[],
     }
 }
 
@@ -279,7 +280,7 @@ fn the_user_global_file_is_loaded_even_when_untrusted() {
     let p = d.to_string_lossy().into_owned();
     let _g = no_trust();
 
-    let got = prompt::memory_for_prompt(&p, false);
+    let got = prompt::memory_for_prompt(&p, false, &[]);
     let want = prompt::global_memory(false);
     assert_eq!(
         got, want,
@@ -290,7 +291,7 @@ fn the_user_global_file_is_loaded_even_when_untrusted() {
         "the project file must not be in there: {got:?}"
     );
     // And the raw inventory still sees it, for the manifest to show.
-    assert_eq!(prompt::project_files(&p).len(), 1);
+    assert_eq!(prompt::project_files(&p, &[]).len(), 1);
     let _ = std::fs::remove_dir_all(&d);
 }
 

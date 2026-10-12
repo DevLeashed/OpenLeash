@@ -192,16 +192,16 @@ function ResumeChoice({ id }: { id: string }) {
           <MenuScrim onClick={() => setOpen(false)} />
           <div className="pop umenu" style={{ width: 280 }}>
             <div className="mhead">This chat was stopped</div>
-            <MenuRow onClick={() => go("continue")}>
-              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                <span>Continue</span>
-                <span style={{ fontSize: 11, color: "var(--mut3)" }}>Retry what got cut off and carry on (subagents too)</span>
-              </div>
-            </MenuRow>
             <MenuRow onClick={() => go("wrap")}>
               <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
                 <span>Wrap up</span>
                 <span style={{ fontSize: 11, color: "var(--mut3)" }}>Don't continue · summarise what got done and what's left</span>
+              </div>
+            </MenuRow>
+            <MenuRow onClick={() => go("continue")}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                <span>Continue</span>
+                <span style={{ fontSize: 11, color: "var(--mut3)" }}>Retry what got cut off and carry on (subagents too)</span>
               </div>
             </MenuRow>
           </div>

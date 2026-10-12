@@ -94,6 +94,19 @@ it("keeps drafts separate for each exact version and restores them on return", a
   expect((screen.getByLabelText("Annotation note") as HTMLTextAreaElement).value).toBe("Version two note");
 });
 
+it("stages an exact-revision implementation request without sending or approving it", async () => {
+  mockDraftArtifact("");
+  render(<ArtifactWorkspace taskId="task-1" taskTitle="Chat" />);
+  await screen.findByText("Second version");
+  fireEvent.click(screen.getByRole("button", { name: "Implement this revision" }));
+  const request = (screen.getByLabelText("Follow up for agent") as HTMLTextAreaElement).value;
+  expect(request).toContain("draft-art, exact revision draft-v2");
+  expect(request).toContain("existing permissions");
+  expect(invoke.mock.calls.some(([command]) => command === "artifact_feedback_submit")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Send feedback to agent" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledWith("artifact_feedback_submit", expect.objectContaining({ versionId: "draft-v2", text: request.trim() })));
+});
+
 it("prioritizes simple feedback, lets the list be hidden, and shows version metadata", async () => {
   const annotated = { ...draftArtifact, versions: draftVersions.map((v) => ({ ...v, decisions: ["Keep axes consistent"], constraints: ["No external assets"], codeRefs: [{ path: "src/chart.ts", startLine: 12, description: "Chart entry" }] })) };
   invoke.mockImplementation(async (command: string) => command === "artifact_list" ? [annotated] : structuredClone(annotated));
@@ -107,7 +120,7 @@ it("prioritizes simple feedback, lets the list be hidden, and shows version meta
   expect(screen.queryByRole("complementary", { name: "Artifact list" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Show list" }));
   expect(screen.getByRole("complementary", { name: "Artifact list" })).toBeTruthy();
-  expect(screen.getByText("Keep axes consistent")).toBeTruthy();
+  expect(screen.getAllByText("Keep axes consistent").length).toBeGreaterThan(0);
   expect(screen.getByText("No external assets")).toBeTruthy();
   expect(screen.getByText("src/chart.ts:12")).toBeTruthy();
 });

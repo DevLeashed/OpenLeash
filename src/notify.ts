@@ -99,6 +99,44 @@ export function surfaces(p: Attention, title: string, step: string, focused: boo
   return both;
 }
 
+/** OS toasts already raised and not yet looked at, by chat and kind.
+ *
+ *  A chat can ask for the same thing many times while you are away: every tool
+ *  call that needs approval, every `notify_user`, every nonblocking question. Each
+ *  one used to be its own toast, so a single run could ring a dozen times. The
+ *  first toast for a chat and kind already says "this chat needs you", and it is
+ *  still waiting in Action Center, so the repeats add nothing but noise.
+ *
+ *  Cleared when you open that chat, and when the window comes back to the front:
+ *  from then on the in-app notices are what you see, and a new event is news. */
+export type ToastLedger = {
+  /** True, and recorded, when a toast for this chat and kind is due. */
+  admit(taskId: string, needs: Needs): boolean;
+  /** You opened this chat. */
+  forgetChat(taskId: string): void;
+  /** The window came back to the front. */
+  forgetAll(): void;
+};
+
+export function createToastLedger(): ToastLedger {
+  const raised = new Set<string>();
+  const keyOf = (taskId: string, needs: Needs) => `${taskId}:${needs}`;
+  return {
+    admit(taskId, needs) {
+      const key = keyOf(taskId, needs);
+      if (raised.has(key)) return false;
+      raised.add(key);
+      return true;
+    },
+    forgetChat(taskId) {
+      for (const key of raised) if (key.startsWith(`${taskId}:`)) raised.delete(key);
+    },
+    forgetAll() {
+      raised.clear();
+    },
+  };
+}
+
 /** Pure: the OS-toast body. Exported for tests.
  *
  *  Deliberately built from counts, never from `step`. A toast is rendered by

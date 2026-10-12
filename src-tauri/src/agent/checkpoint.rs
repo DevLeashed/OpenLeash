@@ -487,8 +487,7 @@ fn read_mine(chat: &str) -> HashMap<String, AgentWrite> {
 pub fn target(chat: &str, count: usize) -> Option<String> {
     read_turns(chat)
         .into_iter()
-        .filter(|(n, _, _, _, _)| *n <= count)
-        .next_back()
+        .rfind(|(n, _, _, _, _)| *n <= count)
         .map(|(_, _, _, _, sha)| sha)
 }
 

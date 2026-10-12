@@ -1,3 +1,10 @@
+/* Collaboration remains usable when chat + workspace cannot fit side by side. */
+@media (max-width: 1200px) {
+  .session-collaboration-layout { flex-direction: column; }
+  .session-collaboration-layout .collaboration-chat { flex: 0 0 42% !important; min-width: 0 !important; min-height: 180px; }
+  .session-collaboration-layout .collaboration-workspace { min-width: 0 !important; min-height: 220px; }
+}
+
 /* Geist, self-hosted rather than `@import`ed from fonts.googleapis.com.
  *
  * A remote `@import` at the top of the stylesheet is render-blocking: the webview
@@ -1600,10 +1607,6 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .tg-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px 2px; padding-left: 12px; border-left: 1px solid var(--ov-70); }
 .tg-list .tool { animation: olRowIn .22s var(--out) both; }
 .tg-list .tool .hd { height: 28px; }
-/* finished background work. Settled, so the line says so outright rather than
-   leaving the reader to tell from the text: everything behind it is over. */
-.toolgroup.done .tg-line { color: var(--mut2); }
-.toolgroup.done .tg-text { color: var(--mut3); }
 .bgdone { display: flex; flex-direction: column; gap: 3px; }
 .bg-exit { padding: 0 10px 2px; font-size: 10.5px; color: var(--mut3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -1631,6 +1634,11 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .ubimgs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .ubimgs img { max-width: 180px; max-height: 140px; border-radius: 8px; object-fit: cover; display: block; }
 
+/* Inline reply pictures keep captions and failure states in the prose flow. */
+.reply-image { display: inline-block; max-width: 100%; margin: 10px 0; }
+.reply-image img { display: block; border-radius: 10px; }
+.reply-image-caption { display: block; margin-top: 6px; color: var(--mut); font-size: 12px; }
+.reply-image-error, .reply-image-loading { display: block; padding: 12px; color: var(--mut); border: 1px solid var(--line); border-radius: 8px; }
 /* full-size image view */
 .zoomable { cursor: zoom-in; }
 .zoomable:hover { box-shadow: 0 0 0 2px var(--accent); }

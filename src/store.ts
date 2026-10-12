@@ -1,8 +1,8 @@
 // App state: a tiny external store fed by IPC calls and live backend events.
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { describe as attentionText, notify, surfaces, type Attention, type Needs } from "./notify";import { listen } from "@tauri-apps/api/event";
+import { createToastLedger, describe as attentionText, notify, surfaces, type Attention, type Needs } from "./notify";import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { AccountView, AgentDef, api, Assist, baseName, Bg, Boot, FileRef, Item, ModelInfo, normPath, Perm, ProviderPreset, ProviderView, SavedPrompt, Settings, SkillDef, SubInfo, TaskSummary, UltraX, withRequiredAgents, xOn } from "./api";
+import { AccountView, AgentDef, AppUpdateStatus, api, Assist, baseName, Bg, Boot, FileRef, Item, ModelInfo, normPath, Perm, ProviderPreset, ProviderView, SavedPrompt, Settings, SkillDef, SubInfo, TaskSummary, UltraX, withRequiredAgents, xOn } from "./api";
 
 export type View = "home" | "session" | "diff" | "saved" | "paused" | "settings";
 export type Menu = null | "plus" | "perm" | "branch" | "folder" | "model" | "assist" | "agents" | "route";
@@ -10,6 +10,10 @@ export type Menu = null | "plus" | "perm" | "branch" | "folder" | "model" | "ass
 export interface State {
   ready: boolean;
   bootError: string | null;
+  appUpdate: AppUpdateStatus;
+  appUpdateDismissed: string | null;
+  appUpdateBusy: boolean;
+  appUpdateActionError: string | null;
   settings: Settings | null;
   providers: ProviderView[];
   providerPresets: ProviderPreset[];
@@ -17,6 +21,11 @@ export interface State {
   shell: string;
   dataDir: string;
   monthSpend: number;
+  /** Whether this install opted into the Claude subscription integration by
+   *  putting a file named `ALLOW_CLAUDE` beside the executable. Decided by the
+   *  backend at boot and never editable from the app: it gates what the UI
+   *  offers, and `add_account` refuses the import anyway. */
+  claudeAllowed: boolean;
   tasks: Record<string, TaskSummary>;
   items: Record<string, Item[]>;
   /** Session messages shown immediately while task_send is completing. */
@@ -53,7 +62,7 @@ export interface State {
   attachFiles: Record<string, (FileRef & { imageDataUrl?: string; imageIndex?: number })[]>;
   // composer options for new tasks
   home: { plan: boolean; ultra: boolean; ultra_wt: boolean; ultra_x: UltraX | null; perm: Perm; model: string; effort: number; worktree: boolean; branch: string; subagents: boolean; assist: Assist; agents: string[]; route: string };
-  projectInfo: { exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; trusted: boolean; decided: boolean } | null;
+  projectInfo: { path: string; exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; docs: string[]; disabled_docs: string[]; trusted: boolean; decided: boolean } | null;
   sidebar: boolean;
   details: boolean;
   pal: boolean;
@@ -134,7 +143,7 @@ export interface Note {
 
 
 let state: State = {
-  ready: false, bootError: null, settings: null, providers: [], providerPresets: [], models: [], shell: "", dataDir: "", monthSpend: 0,
+  ready: false, bootError: null, settings: null, providers: [], providerPresets: [], models: [], shell: "", dataDir: "", monthSpend: 0, claudeAllowed: false,
   tasks: {}, items: {}, pendingMessages: {}, bg: {}, subItems: {}, accounts: [], agents: [], skills: [], subOpen: null, pickFor: null, renaming: null,
   view: "home", hist: [], fwd: [], task: null, settingsTab: "general", modelSetupOpen: false, ultraXOpen: false,
   draft: "", sessionDrafts: {}, attach: {}, attachFiles: {},
@@ -143,6 +152,8 @@ let state: State = {
   sidebar: true, details: typeof window === "undefined" || window.innerWidth >= 1100,
   pal: false, find: false, findSeed: "", swap: false, notes: {}, menu: null, menuAnchor: null, projCtx: null, toast: null, openError: null, catalogError: null, unread: {},
   notices: [], picked: {}, selecting: false, mass: false, massAll: false, fork: null, chatStats: null,
+  appUpdate: { status: "idle", version: null, error: null, can_install: false },
+  appUpdateDismissed: null, appUpdateBusy: false, appUpdateActionError: null,
   trustPrompt: false,
 };
 
@@ -150,6 +161,7 @@ const subs = new Set<() => void>();
 export const get = () => state;
 export function set(patch: Partial<State> | ((s: State) => Partial<State>)) {
   const p = typeof patch === "function" ? patch(state) : patch;
+  if (!(Object.keys(p) as (keyof State)[]).some((key) => !Object.is(state[key], p[key]))) return;
   state = { ...state, ...p };
   // Notify now, not in a microtask. Deferring this broke every controlled text
   // field: React restores a controlled field's value at the end of the event
@@ -163,16 +175,42 @@ export function set(patch: Partial<State> | ((s: State) => Partial<State>)) {
   //
   // The bursts this used to smooth over are now batched where they are made, not
   // here: streamed deltas are folded on a frame (`bufferDelta`/`flushDeltas`),
-  // and a repeated task summary is dropped by `shallowEqualTask`. A patch that
-  // changes nothing reaches the subscribers but re-renders nothing, because every
-  // selector in the app returns a stable value and `useSyncExternalStore` bails
-  // out on an unchanged snapshot.
+  // and a repeated task summary is dropped by `shallowEqualTask`. Unchanged
+  // patches are discarded above so they don't run every mounted selector.
   subs.forEach((f) => f());
 }
+let appUpdateRevision = 0;
+export const appUpdateKey = (status: AppUpdateStatus) => `${status.status}:${status.version ?? ""}`;
+export function receiveAppUpdate(status: AppUpdateStatus) {
+  appUpdateRevision++;
+  set((s) => ({ appUpdate: status, appUpdateActionError: null,
+    appUpdateDismissed: appUpdateKey(s.appUpdate) === appUpdateKey(status) ? s.appUpdateDismissed : null }));
+}
+export function dismissAppUpdate() { set({ appUpdateDismissed: appUpdateKey(get().appUpdate) }); }
+export function appUpdateTasksActive(tasks: Record<string, TaskSummary>) {
+  return Object.values(tasks).some((t) => t.status === "running" || t.status === "waiting" || t.busy > 0);
+}
+/** Only user gestures call these commands; the backend owns periodic work. */
+export async function runAppUpdate(action: "check" | "download" | "install") {
+  if (get().appUpdateBusy) return;
+  if (action === "install" && (appUpdateTasksActive(get().tasks) || get().appUpdate.status !== "ready" || !get().appUpdate.can_install)) return;
+  set({ appUpdateBusy: true, appUpdateActionError: null });
+  const revision = appUpdateRevision;
+  try {
+    if (action === "install") await api.appUpdateInstall();
+    else {
+      const status = await (action === "check" ? api.appUpdateCheck() : api.appUpdateDownload());
+      if (revision === appUpdateRevision) receiveAppUpdate(status);
+    }
+  } catch (error) {
+    set({ appUpdateActionError: String(error) });
+  } finally { set({ appUpdateBusy: false }); }
+}
+
 export function useStore<T>(sel: (s: State) => T): T {
   // The third argument is the server snapshot: without it React refuses to render
   // store-backed components at all in `renderToStaticMarkup`, which the tests use.
-  return useSyncExternalStore((f) => (subs.add(f), () => subs.delete(f)), () => sel(state), () => sel(state));
+  return useSyncExternalStore(subscribe, () => sel(state), () => sel(state));
 }
 /** Subscribes to store notifications. Returns an unsubscribe fn. */
 export function subscribe(f: () => void) {
@@ -336,7 +374,11 @@ export async function watchWindowState() {
   }
   const refresh = async (focused: boolean) => {
     const [visible, minimized] = await Promise.all([w.isVisible().catch(() => true), w.isMinimized().catch(() => false)]);
+    const wasInFront = inFront;
     inFront = inFrontNow(focused, visible, minimized);
+    // Back in the window: the notices are in view, so the toasts raised while
+    // you were away have done their job and the next event is news again.
+    if (inFront && !wasInFront) toasts.forgetAll();
   };
   const poll = window.setInterval(() => { void w.isFocused().then((f) => refresh(f)).catch(() => {}); }, 1000);
   trackDetach(() => window.clearInterval(poll));
@@ -382,6 +424,9 @@ const raiseToast = (title: string, body: string, taskId: string) => {
   void api.toast(taskId, title, body).catch(() => { /* in-app badge still shows it */ });
 };
 
+/** Which OS toasts are still waiting to be looked at. See `ToastLedger`. */
+const toasts = createToastLedger();
+
 export function go(view: View, extra: Partial<State> = {}) {
   set((s) => ({
     view, menu: null, pal: false,
@@ -395,6 +440,7 @@ export function go(view: View, extra: Partial<State> = {}) {
   }));
   const t = extra.task ?? get().task;
   if ((view === "session" || view === "diff") && t) {
+    toasts.forgetChat(t);
     void openTask(t);
     set((s) => ({
       // A blocking request stays marked until the backend ends the wait. Other
@@ -505,6 +551,14 @@ export async function loadProject(path: string) {
   if (!path) return set({ projectInfo: null, catalogError: null });
   try {
     const info = await api.project(path);
+    // Guard against a stale answer: two project switches in flight can resolve
+    // out of order, and the settings panel turns this inventory into per-file
+    // switches whose writes go to the *current* project. Rendering one folder's
+    // files under another's name would let a toggle record a rule against the
+    // wrong path. `info.path` is what the backend actually answered about; when
+    // it is absent the answer is applied as before rather than dropped, so this
+    // can never turn a working load into a silently empty panel.
+    if (info.path && normPath(info.path) !== normPath(get().settings?.project ?? "")) return;
     set((s) => ({ projectInfo: info, home: { ...s.home, branch: info.branch } }));
 
   } catch {
@@ -630,24 +684,52 @@ export function shallowEqualTask(a: TaskSummary | undefined, b: TaskSummary): bo
     // `subs` and `todos` are rebuilt on every summary; compare the parts the UI
     // reads so an identical resend counts as unchanged.
     if (k === "subs" || k === "todos") {
-      if (!sameAgents(x as any, y as any)) return false;
+      if (!sameAgents(x, y)) return false;
     } else if (x !== y) return false;
   }
   return true;
 }
 
-const sameAgents = (a: any, b: any) => a === b || (Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x: any, i: number) => {
-  const y = b[i];
-  return x === y || (x && y && x.id === y.id && x.status === y.status && x.meta === y.meta && x.model === y.model && x.started === y.started && x.report === y.report);
-}));
+/** Field-wise comparison of the rebuilt `subs`/`todos` lists. Takes `unknown`
+ *  because it is handed a union of those two element shapes; it reads only the
+ *  shared field names, so a field the shape lacks (`Todo` has no `meta`) reads
+ *  as equal on both sides — the same thing the previous `any` version did. */
+function sameAgents(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  return a.every((x: unknown, i: number) => {
+    const y: unknown = b[i];
+    if (x === y) return true;
+    if (typeof x !== "object" || x === null || typeof y !== "object" || y === null) return false;
+    const p = x as Record<string, unknown>, q = y as Record<string, unknown>;
+    return p.id === q.id && p.status === q.status && p.meta === q.meta && p.model === q.model && p.started === q.started && p.report === q.report;
+  });
+}
 
 /** Streamed chunks waiting to be folded into their items, keyed `task\0sub\0item`. */const pendingDeltas = new Map<string, string>();
 let deltaFrame: number | null = null;
 
 /** Buffers one streamed chunk. Exported for tests: this is the coalescing. */
 export function bufferDelta(task: string, sub: string | null, item: string, text: string) {
+  if (!text) return;
   const key = `${task}\u0000${sub ?? ""}\u0000${item}`;
   pendingDeltas.set(key, (pendingDeltas.get(key) ?? "") + text);
+}
+
+/** Search from the live tail, where streamed items normally are. Stop as soon
+ * as all chunks land, avoiding a map and id lookup for every historical item.
+ * Keep the original list when a stale delta references an item that's gone. */
+function appendDeltas(list: Item[], chunks: Map<string, string>): Item[] {
+  let next = list;
+  for (let i = list.length - 1; i >= 0 && chunks.size; i--) {
+    const item = list[i]!;
+    const text = chunks.get(item.id);
+    if (text === undefined) continue;
+    if (next === list) next = list.slice();
+    next[i] = { ...item, text: item.text + text };
+    chunks.delete(item.id);
+  }
+  return next;
 }
 
 /** Applies every buffered chunk in one state update, then re-arms for the next frame. */
@@ -676,12 +758,13 @@ export function flushDeltas() {
       if (g.sub && sub !== undefined) {
         const list = s.subItems[id]?.[sub];
         if (!list) continue;
-        const next = list.map((x) => (g.chunks.has(x.id) ? { ...x, text: x.text + g.chunks.get(x.id)! } : x));
-        subItems = { ...subItems, [id]: { ...subItems[id], [sub]: next } };
+        const next = appendDeltas(list, g.chunks);
+        if (next !== list) subItems = { ...subItems, [id]: { ...subItems[id], [sub]: next } };
       } else {
         const list = s.items[id];
         if (!list) continue;
-        items = { ...items, [id]: list.map((x) => (g.chunks.has(x.id) ? { ...x, text: x.text + g.chunks.get(x.id)! } : x)) };
+        const next = appendDeltas(list, g.chunks);
+        if (next !== list) items = { ...items, [id]: next };
       }
     }
     return items === s.items && subItems === s.subItems ? {} : { items, subItems };
@@ -727,6 +810,14 @@ export function boot(): Promise<void> {
         return;
       }
       trackDetach(dispose);
+      // Subscribe before taking the snapshot; a newer event must win over a
+      // slow IPC response. Updater failure must not prevent harness startup.
+      const revision = appUpdateRevision;
+      void api.appUpdateStatus().then((status) => {
+        if (gen === attachGen && revision === appUpdateRevision) receiveAppUpdate(status);
+      }).catch((error: unknown) => {
+        if (gen === attachGen && revision === appUpdateRevision) set({ appUpdateActionError: String(error) });
+      });
     }
 
     let b: Boot;
@@ -741,23 +832,44 @@ export function boot(): Promise<void> {
     const tasks: Record<string, TaskSummary> = {};
     b.tasks.forEach((t) => (tasks[t.id] = t));
     set({
-      ready: true, settings: b.settings, providers: b.providers, providerPresets: b.provider_presets ?? [], models: b.models, shell: b.shell, dataDir: b.data_dir, monthSpend: b.month_spend, tasks, accounts: b.accounts, agents: b.agents, skills: b.skills ?? [],
+      ready: true, settings: b.settings, providers: b.providers, providerPresets: b.provider_presets ?? [], models: b.models, shell: b.shell, dataDir: b.data_dir, monthSpend: b.month_spend, claudeAllowed: b.claude_allowed ?? false, tasks, accounts: b.accounts, agents: b.agents, skills: b.skills ?? [],
       items: mergeNoticeSnapshot(get().items, b.user_notices ?? {}),
       home: { plan: false, ultra: false, ultra_wt: false, ultra_x: null, perm: b.settings.perm, model: b.settings.model, effort: b.settings.effort, worktree: b.settings.worktree, branch: "", subagents: true, assist: b.settings.assist ?? "default", agents: withRequiredAgents(b.settings.default_agents ?? ["explore", "general"]), route: "" },
     });
     set((st) => ({ home: { ...st.home, route: defaultRoute(st.home.model) } }));
+    // A toast click that landed before this window was listening — the app was
+    // closed and the click launched it. The listener is attached above, and
+    // taking the click is what lets later clicks through, so this is the moment.
+    api.takeToastClick()
+      .then((id) => {
+        const task = clickedChat(id ?? undefined);
+        if (task) go("session", { task });
+      })
+      .catch(() => { /* no pending click, or no shell to ask: nothing to open */ });
     api.draftGet("new-chat").then((d) => d && !get().draft && set({ draft: d })).catch(() => {});
     void loadProject(b.settings.project);
   })();
   return bootInflight;
 }
 
+/** The `ol://event` payloads, discriminated on `kind`, mirroring the shapes
+ *  `Harness::emit` serializes in Rust. A concrete variant per kind lets the
+ *  handler narrow `payload` instead of treating it as `any`. */
+type TaskEvent =
+  | { task_id: string; kind: "task"; payload: TaskSummary }
+  | { task_id: string; kind: "item"; payload: Item }
+  | { task_id: string; kind: "sitem"; payload: { sub_id: string; item: Item } }
+  | { task_id: string; kind: "delta"; payload: { item_id: string; text: string; sub_id: string | null } }
+  | { task_id: string; kind: "drop"; payload: { sub_id: string | null; ids: string[] } }
+  | { task_id: string; kind: "itemgone"; payload: { id: string } }
+  | { task_id: string; kind: "bg"; payload: Bg[] };
+
 /** The whole Tauri listener set, as one detachable function. */
 async function attachListeners(): Promise<() => void> {
     const detachers: Array<() => void> = [];
     const add = (u: unknown) => { if (typeof u === "function") detachers.push(u as () => void); };
 
-    add(await listen<{ task_id: string; kind: string; payload: any }>("ol://event", ({ payload: e }) => {
+    add(await listen<TaskEvent>("ol://event", ({ payload: e }) => {
     const id = e.task_id;
     if (e.kind === "task") {
       set((s) => {
@@ -831,6 +943,7 @@ async function attachListeners(): Promise<() => void> {
     // ol://event payload ever carries it: without this the pause banner on the
     // new-chat page cannot appear until some unrelated settings write happens
     // to round-trip through `settings_update`.
+    add(await listen<AppUpdateStatus>("ol://app-update", ({ payload }) => receiveAppUpdate(payload)));
     add(await listen<Settings>("ol://settings", ({ payload }) => set({ settings: payload })));
     add(await listen<AccountView[]>("ol://accounts", ({ payload }) => set({ accounts: payload })));
     add(await listen<ModelInfo[]>("ol://models", ({ payload }) => set({ models: payload })));
@@ -851,7 +964,9 @@ async function attachListeners(): Promise<() => void> {
       // pause or a stop the user made themselves is not news — they are standing
       // right there having done it.
       const said = attentionText(payload, task.title, task.step);
-      if (where.includes("desktop")) void notify(payload, task.title, task.step, task, raiseToast);
+      // One toast per chat and kind until you look at it again; the in-app
+      // notice below still records every event.
+      if (where.includes("desktop") && said && toasts.admit(payload.task_id, said.needs)) void notify(payload, task.title, task.step, task, raiseToast);
       // Durable notice cards come from saved items, never the expiring/superseding
       // toast list. Their attention event still raises a desktop notification.
       if (where.includes("inapp") && said && payload.kind !== "notice") {
@@ -981,17 +1096,24 @@ export function stepZoom(dir: 1 | -1 | 0) {
 export const isConnected = (p: ProviderView) => p.connected || (!!p.account && state.accounts.some((a) => a.kind === p.id));
 
 /**
- * Subscription logins the UI never offers or shows. The backend can still import
- * and route them; this only keeps them off screen, so no part of the app hints
+ * Subscription logins that are off unless the install opts in. The backend has
+ * the provider compiled in and can still import and route it; this only decides
+ * whether it is offered on screen.
+ *
+ * The opt-in is a file named `ALLOW_CLAUDE` next to the executable, read once
+ * into `claudeAllowed` at boot (and enforced again in `add_account`, which is
+ * the real gate — hiding a control is not). Without it, no part of the app hints
  * that connecting one was ever possible.
  *
  * Filter what is *shown*, not what is *ready*: `isConnected` and the composer's
  * "is this model usable" check still see the real providers, so a chat already
- * on one of these models keeps working.
+ * on one of these models keeps working, and accounts imported before the opt-in
+ * was removed are hidden rather than dropped.
  */
-const HIDDEN_SUBSCRIPTIONS = new Set(["claude"]);
-export const shownProviders = (list: ProviderView[]) => list.filter((p) => !(p.account && HIDDEN_SUBSCRIPTIONS.has(p.id)));
-export const shownAccounts = (list: AccountView[]) => list.filter((a) => !HIDDEN_SUBSCRIPTIONS.has(a.kind));
+const OPT_IN_SUBSCRIPTIONS = new Set(["claude"]);
+const subscriptionHidden = (kind: string) => OPT_IN_SUBSCRIPTIONS.has(kind) && !state.claudeAllowed;
+export const shownProviders = (list: ProviderView[]) => list.filter((p) => !(p.account && subscriptionHidden(p.id)));
+export const shownAccounts = (list: AccountView[]) => list.filter((a) => !subscriptionHidden(a.kind));
 
 /** Default route for a model: a route naming it as a head beats an "all models" route; else none. */
 export function defaultRoute(model: string): string {

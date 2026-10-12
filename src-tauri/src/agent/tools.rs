@@ -912,9 +912,10 @@ pub fn grep(base: &Path, input: &Value) -> Result<(String, usize), String> {
                             out.push("--".into());
                         }
                     }
-                    for j in lo.max(last_printed.map(|x| x + 1).unwrap_or(0))..=hi {
+                    let start = lo.max(last_printed.map(|x| x + 1).unwrap_or(0));
+                    for (j, l) in lines.iter().enumerate().take(hi + 1).skip(start) {
                         let sep = if j == i { ':' } else { '-' };
-                        let line: String = lines[j].chars().take(400).collect();
+                        let line: String = l.chars().take(400).collect();
                         out.push(format!("{rel}{sep}{}{sep}{line}", j + 1));
                     }
                     last_printed = Some(hi);
@@ -1021,7 +1022,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
                 // IPv4-mapped: ::ffff:127.0.0.1 reaches loopback.
-                || v6.to_ipv4_mapped().map_or(false, |v| is_private_ip(std::net::IpAddr::V4(v)))
+                || v6.to_ipv4_mapped().is_some_and(|v| is_private_ip(std::net::IpAddr::V4(v)))
         }
     }
 }
@@ -1045,6 +1046,7 @@ pub async fn web_fetch(http: &reqwest::Client, url: &str, offset: usize) -> Resu
         .send()
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
+    let page_url = resp.url().to_string();
     let status = resp.status();
     let ct = resp
         .headers()
@@ -1077,7 +1079,12 @@ pub async fn web_fetch(http: &reqwest::Client, url: &str, offset: usize) -> Resu
         String::from_utf8_lossy(&buf).into_owned()
     };
     let text = if ct.contains("html") {
-        html_to_text(&body)
+        let images = if offset == 0 {
+            discover_page_images(&body, &page_url)
+        } else {
+            String::new()
+        };
+        format!("{}{images}", html_to_text(&body))
     } else {
         body
     };
@@ -1691,6 +1698,58 @@ pub fn capture(monitor: Option<usize>) -> Result<Shot, String> {
     })
 }
 
+/// Bounded image candidates from a fetched page, not a license or availability verdict.
+fn discover_page_images(html: &str, page: &str) -> String {
+    let Ok(base) = reqwest::Url::parse(page) else {
+        return String::new();
+    };
+    let tags = regex::Regex::new(r"(?is)<img\b[^>]{0,8192}>").unwrap();
+    let attrs = regex::Regex::new(r#"(?is)\b(src|alt)\s*=\s*["']([^"']{0,2048})["']"#).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tag in tags.find_iter(html).take(100) {
+        let mut src = String::new();
+        let mut alt = String::new();
+        for attr in attrs.captures_iter(tag.as_str()) {
+            let value = attr[2].replace("&amp;", "&");
+            if attr[1].eq_ignore_ascii_case("src") {
+                src = value;
+            } else {
+                alt = html_to_text(&value);
+            }
+        }
+        if src.is_empty() {
+            continue;
+        }
+        let Ok(url) = base.join(&src) else { continue };
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || is_private_target(url.as_str())
+        {
+            continue;
+        }
+        if seen.insert(url.to_string()) {
+            out.push(format!(
+                "{} — {}",
+                url,
+                alt.chars().take(200).collect::<String>()
+            ));
+        }
+        if out.len() == 12 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nImage candidates from {page} (URLs only; availability/licensing unverified):\n{}",
+            out.join("\n")
+        )
+    }
+}
+
 fn html_to_text(html: &str) -> String {
     let strip = regex::Regex::new(
         r"(?is)<(script|style|noscript|svg|head)[^>]*>.*?</(script|style|noscript|svg|head)>",
@@ -1722,6 +1781,17 @@ fn html_to_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_images_resolve_relative_urls_and_reject_private_targets() {
+        let html = r#"<img src='/diagram.png' alt='Pipeline'><img src='https://127.0.0.1/secret'><img src='javascript:bad'><img src='/diagram.png'>"#;
+        let images = discover_page_images(html, "https://example.org/docs/page");
+        assert!(images.contains("https://example.org/diagram.png"));
+        assert!(images.contains("Pipeline"));
+        assert!(!images.contains("127.0.0.1"));
+        assert!(!images.contains("javascript:"));
+        assert_eq!(images.matches("diagram.png").count(), 1);
+    }
 
     #[test]
     fn artifact_preview_validation_bounds_title_kind_and_source() {

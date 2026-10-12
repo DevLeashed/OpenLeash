@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { RefreshCw, Send } from "lucide-react";
 import { ArtifactAnnotation, ArtifactDetail, ArtifactFeedback, ArtifactFormat, ArtifactSummary, artifactApi, parseArtifactState } from "./artifactApi";
+import { ArtifactRecord, parseCollaborationRecord } from "./ArtifactRecord";
 import { Visualization } from "./Visualization";
 import { Button, Input, TextArea } from "./primitives";
 import { mdComponents, remarkOl } from "./mdx";
@@ -34,6 +35,8 @@ export function ArtifactContentPreview({ format, content, label, onFeedbackDraft
   onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void;
   autoStart?: boolean;
 }) {
+  const record = format === "json" ? parseCollaborationRecord(content) : null;
+  if (record) return <ArtifactRecord record={record} onDraft={onFeedbackDraft} />;
   if (format === "html") return <Visualization source={content} label={label} autoStart={autoStart} onFeedbackDraft={onFeedbackDraft} />;
   if (format === "markdown") return <div className="md" style={{ ...panel, maxHeight: 420, overflow: "auto" }}><ReactMarkdown remarkPlugins={[remarkGfm, remarkOl]} components={mdComponents}>{content}</ReactMarkdown></div>;
   if (format === "svg") return <div style={{ ...panel, maxHeight: 420, overflow: "auto", textAlign: "center" }}><img alt="SVG artifact preview" src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(content)}`} style={{ maxWidth: "100%", maxHeight: 370 }} /></div>;
@@ -52,6 +55,8 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
   const [compareDetail, setCompareDetail] = useState<ArtifactDetail | null>(null);
   const [compare, setCompare] = useState(false);
   const [showList, setShowList] = useState(true);
+  const [filter, setFilter] = useState("");
+  const [selectionText, setSelectionText] = useState("");
   // Drafts belong to an exact version, not whichever preview happens to be open.
   // They remain local and never cross the explicit submission boundary.
   const [drafts, setDrafts] = useState<Record<string, ArtifactDraft>>({});
@@ -122,6 +127,7 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
     return () => { alive = false; };
   }, [compare, taskId, artifactId, compareVersion]);
 
+  useEffect(() => { setSelectionText(""); }, [artifactId, versionId]);
   const parsedState = useMemo(() => parseArtifactState(stateText), [stateText]);
   const comparedDetail = compareDetail?.summary.id === artifactId && compareDetail.selected_version.id === compareVersion ? compareDetail : null;
   const previewDraft = useCallback((draft: VisualizationFeedbackDraft) => {
@@ -137,7 +143,7 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
     setFeedbackDraft(null);
   };
   const annotations: ArtifactAnnotation[] = detail?.annotations.filter((item) => item.version_id === versionId) ?? [];
-  const feedbackHistory: ArtifactFeedback[] = detail?.feedback.filter((item) => item.version_id === versionId) ?? [];
+  const feedbackHistory: ArtifactFeedback[] = detail?.feedback ?? [];
   const diff = current && comparedDetail ? artifactDiff(comparedDetail.selected_version.content, current.content) : [];
   const execute = async (fn: () => Promise<ArtifactDetail | undefined>, success: string, id = artifactId, vid?: string, onSaved?: () => void) => {
     if (busy) return;
@@ -147,7 +153,7 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
       onSaved?.();
       if (result) {
         setDetail(result);
-        setRows((old) => old.map((row) => row.id === result.summary.id ? result.summary : row));
+        setRows((old) => old.map((row) => row.id === result.summary.id ? { ...row, ...result.summary, pendingFeedback: result.feedback.filter(f => f.status === "submitted" || f.decision === "needs_clarification").length } : row));
       } else await load(id, vid);
       if (id) setNotice(success);
     } catch (e) { setError(String(e)); }
@@ -180,7 +186,7 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
   return <section aria-label="Artifact workspace" style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
     <header style={{ flex: "none", display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, padding: "10px 12px", borderBottom: "1px solid var(--line)" }}><b style={{ flex: 1 }}>Artifacts · {taskTitle}</b><Button variant="ghost" aria-expanded={showList} onClick={() => setShowList((value) => !value)}>{showList ? "Hide list" : "Show list"}</Button><span style={note}>Saved in this project</span><Button variant="ghost" disabled={busy} onClick={() => void execute(async () => undefined, "Artifacts refreshed.")}><RefreshCw size={13} />Refresh</Button></header>
     <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: showList ? "minmax(120px,180px) minmax(0,1fr)" : "minmax(0,1fr)" }}>
-      {showList && <aside aria-label="Artifact list" style={{ overflow: "auto", padding: 8, borderRight: "1px solid var(--line)" }}><div style={note}>Project artifacts · {rows.length}</div>{rows.map((row) => <button key={row.id} type="button" aria-pressed={row.id === artifactId} disabled={busy} onClick={() => pickArtifact(row.id)} style={{ display: "block", width: "100%", textAlign: "left", border: "1px solid", borderColor: row.id === artifactId ? "var(--accent)" : "var(--line)", background: row.id === artifactId ? "var(--raise)" : "transparent", borderRadius: 7, color: "var(--fg)", padding: 8, marginTop: 6, cursor: "pointer" }}><b>{row.title}</b><div style={note}>{row.format.toUpperCase()} · {row.version_count} versions</div></button>)}{!rows.length && <p style={note}>No model-created artifacts yet. Ask the model to create one in the conversation.</p>}</aside>}
+      {showList && <aside aria-label="Artifact list" style={{ overflow: "auto", padding: 8, borderRight: "1px solid var(--line)" }}><div style={note}>Project artifacts · {rows.length}</div><Input aria-label="Filter artifacts" value={filter} onChange={e => setFilter(e.currentTarget.value)} placeholder="Find an artifact…" />{rows.filter(row => `${row.title} ${row.format} ${row.excerpt ?? ""}`.toLowerCase().includes(filter.toLowerCase())).map((row) => <button key={row.id} type="button" aria-pressed={row.id === artifactId} disabled={busy} onClick={() => pickArtifact(row.id)} style={{ display: "block", width: "100%", textAlign: "left", border: "1px solid", borderColor: row.id === artifactId ? "var(--accent)" : "var(--line)", background: row.id === artifactId ? "var(--raise)" : "transparent", borderRadius: 7, color: "var(--fg)", padding: 8, marginTop: 6, cursor: "pointer" }}><b>{row.title}</b>{row.thumbnail ? <img alt={`${row.title} thumbnail`} src={row.thumbnail} style={{ display: "block", width: "100%", height: 70, objectFit: "contain", margin: "6px 0" }} /> : <div aria-hidden="true" style={{ padding: 8, border: "1px solid var(--line)", margin: "6px 0", fontSize: 11 }}>{row.format.toUpperCase()} · {row.excerpt || "Project artifact"}</div>}<div style={note}>{row.recordStage ? `Recorded stage: ${row.recordStage} · ` : ""}{row.format.toUpperCase()} · {row.version_count} versions · {row.pendingFeedback ?? 0} unresolved requests</div><div style={note}>{row.excerpt}</div></button>)}{!rows.length && <p style={note}>No model-created artifacts yet. Ask the model to create one in the conversation.</p>}</aside>}
       <main style={{ minWidth: 0, overflow: "auto", padding: 12 }}>{busy && <div role="status" style={note}>Loading / saving…</div>}{error && <div role="alert" style={{ color: "var(--red)" }}>{error}</div>}{notice && <div role="status" style={{ color: "var(--st-done)" }}>{notice}</div>}
         {!detail && !busy && <div style={panel}>Artifacts created by the model appear here. Ask the model in the conversation to create a design, prototype, diagram, or decision record.</div>}
         {detail && <>
@@ -193,7 +199,17 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
             {detail.summary.versions.length > 1 && <Button variant={compare ? "primary" : "ghost"} style={{ height: 28, padding: "0 9px", fontSize: 11.5 }} onClick={() => setCompare(!compare)} aria-pressed={compare}>{compare ? "Hide comparison" : "Compare versions"}</Button>}
           </div>
           {compare && detail.summary.versions.length > 1 && <label style={{ ...panel, ...note, display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>Compare selected v{current?.number} with <select aria-label="Compare against version" value={compareVersion} onChange={(e) => setCompareVersion(e.currentTarget.value)}>{detail.summary.versions.filter((v) => v.id !== versionId).map((v) => <option key={v.id} value={v.id}>v{v.number}</option>)}</select></label>}
+<div aria-label="Selected artifact preview" onMouseUp={e => { const selection = window.getSelection(); if (selection?.anchorNode && e.currentTarget.contains(selection.anchorNode)) setSelectionText(selection.toString().trim().slice(0, 300)); }} onKeyUp={e => { const selection = window.getSelection(); if (selection?.anchorNode && e.currentTarget.contains(selection.anchorNode)) setSelectionText(selection.toString().trim().slice(0, 300)); }}>
           {selectedDetail && compare && comparedDetail ? <><div style={{ display: "grid", gridTemplateColumns: "repeat(2,minmax(0,1fr))", gap: 8 }}><section aria-label={`Compared version ${comparedDetail.selected_version.number}`}><b style={note}>Compared · v{comparedDetail.selected_version.number}</b><ArtifactPreview key={`${artifactId}:${compareVersion}`} detail={comparedDetail} label="Compared artifact version" /></section><section aria-label={`Selected version ${selectedDetail.selected_version.number}`}><b style={note}>Selected · v{selectedDetail.selected_version.number}</b><ArtifactPreview key={`${artifactId}:${versionId}`} detail={selectedDetail} onFeedbackDraft={previewDraft} /></section></div><div aria-label="Version content diff" style={{ ...panel, margin: "8px 0", maxHeight: 180, overflow: "auto", font: "11px var(--mono)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{diff.map((line, i) => <div key={`${i}-${line.kind}`} style={{ color: line.kind === "remove" ? "var(--diff-del)" : line.kind === "add" ? "var(--diff-add)" : "var(--mut3)" }}>{line.kind === "remove" ? "− " : line.kind === "add" ? "+ " : "  "}{line.text || " "}</div>)}</div></> : selectedDetail && <ArtifactPreview key={`${artifactId}:${versionId}`} detail={selectedDetail} onFeedbackDraft={previewDraft} />}
+          </div>
+          {current && <section aria-label="Collaboration actions" style={{ ...panel, marginBottom: 10 }}>
+            <b>Work together on v{current.number}</b><p style={note}>This is a preview, not proof of implementation. Review a request below before explicitly sending it. Normal project permissions still apply.</p>
+            <Button disabled={busy} onClick={() => setFeedbackText(`Create or revise a grounded architecture map for this project as an openleash.collaboration.v1 JSON artifact. Inspect actual code first; include component nodes, dependency reasons, relative code references and explicit limitations. Do not invent dependencies or imply unrun verification.\n\n${feedbackText}`)}>Explore project architecture</Button>
+            <Button disabled={busy} onClick={() => setFeedbackText(`Investigate the visual issue discussed here using this exact artifact revision. Use an openleash.collaboration.v1 record with an annotated image/before-after comparison when evidence exists, actual changed-file references, exact verification commands and unresolved limitations. Preserve original images and do not label a mockup as captured output.\n\n${feedbackText}`)}>Investigate visual issue</Button>
+            <Button disabled={busy} onClick={() => setFeedbackText(`Implement artifact ${artifactId}, exact revision ${current.id} (v${current.number}), in the real project. First inspect its content, constraints and code references, explain any mismatch, then make and verify the changes under existing permissions. Link changed files, verification commands/results and remaining limitations back to this revision.\n\n${feedbackText}`)}>Implement this revision</Button>
+            {selectionText && <Button variant="ghost" onClick={() => { setTarget(selectionText); setAnnotationText(`Regarding “${selectionText}”: `); setFeedbackText(`${feedbackText}${feedbackText ? "\n\n" : ""}Target in v${current.number}: “${selectionText}”\n`); setSelectionText(""); }}>Use selected text as target</Button>}
+            <p style={note}>For diagrams/prototypes, click a marked target and review its proposal in Advanced feedback. For text, select a phrase then use it as your target.</p>
+          </section>}
           {current && <>
             <section aria-label="Review and send feedback" style={{ ...panel, margin: "12px 0" }}>
               <b>What would you like to change?</b><p style={note}>Your request is tied to v{current.number}. Drafts stay private until you send them.</p>
@@ -206,7 +222,7 @@ export function ArtifactWorkspace({ taskId, taskTitle, initialSelection }: { tas
             <section aria-label="Interactive state snapshot" style={{ ...panel, marginBottom: 8 }}><b>Play state · selected v{current.number}</b><p style={note}>A preview may suggest state values, but they stay an untrusted draft until you review and explicitly send them. You can also enter values manually. Limit: 16 KB, 100 root keys, 8 levels.</p>{feedbackDraft && <div role="status" style={{ ...panel, marginBottom: 6 }}><b>Untrusted preview proposal</b><pre style={{ maxHeight: 100, overflow: "auto", whiteSpace: "pre-wrap" }}>{JSON.stringify(feedbackDraft, null, 2)}</pre><Button onClick={usePreviewDraft}>Review proposal in feedback fields</Button> <Button variant="ghost" onClick={() => setFeedbackDraft(null)}>Dismiss</Button></div>}<TextArea aria-label="Interactive state JSON" rows={4} value={stateText} onChange={(e) => setStateText(e.currentTarget.value)} spellCheck={false} style={{ width: "100%", font: "11px var(--mono)" }} />{parsedState.error && <div role="alert" style={{ color: "var(--red)" }}>{parsedState.error}</div>}{parsedState.value && <pre aria-label="State snapshot preview" style={{ ...panel, maxHeight: 130, overflow: "auto", whiteSpace: "pre-wrap" }}>{JSON.stringify(parsedState.value, null, 2)}</pre>}</section>
             </details>
             {(current.decisions.length > 0 || current.constraints.length > 0 || current.codeRefs.length > 0) && <details style={{ ...panel, marginBottom: 12 }}><summary style={{ cursor: "pointer" }}>Decisions and constraints · v{current.number}</summary>{current.decisions.length > 0 && <><b style={note}>Decisions</b><ul>{current.decisions.map((value, i) => <li key={i} style={note}>{value}</li>)}</ul></>}{current.constraints.length > 0 && <><b style={note}>Constraints</b><ul>{current.constraints.map((value, i) => <li key={i} style={note}>{value}</li>)}</ul></>}{current.codeRefs.length > 0 && <><b style={note}>Code references</b><ul>{current.codeRefs.map((ref, i) => <li key={i} style={note}><code>{ref.path}{ref.startLine ? `:${ref.startLine}` : ""}{ref.endLine ? `–${ref.endLine}` : ""}</code> — {ref.description}</li>)}</ul></>}</details>}
-            <section aria-label="Feedback history" style={{ ...panel, marginBottom: 12 }}><b>Feedback history · v{current.number}</b>{!feedbackHistory.length && <p style={note}>No feedback for this version.</p>}{feedbackHistory.map((f: ArtifactFeedback) => <div key={f.id} style={{ borderTop: "1px solid var(--line)", paddingTop: 6, marginTop: 6 }}><div style={{ ...note, color: f.status === "responded" ? "var(--st-done)" : "var(--accent)" }}>{f.status === "submitted" ? "Sent · awaiting agent" : `Agent ${f.decision?.replace(/_/g, " ") ?? "responded"}`} · {new Date(f.created_at).toLocaleString()}</div><div style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{f.text || "(state or annotation only)"}</div>{f.response && <div style={{ ...note, marginTop: 3 }}>Agent response: {f.response}</div>}</div>)}</section>
+            <section aria-label="Feedback history" style={{ ...panel, marginBottom: 12 }}><b>Feedback history · all revisions</b>{!feedbackHistory.length && <p style={note}>No feedback for this version.</p>}{feedbackHistory.map((f: ArtifactFeedback) => <div key={f.id} style={{ borderTop: "1px solid var(--line)", paddingTop: 6, marginTop: 6 }}><div style={{ ...note, color: f.status === "responded" ? "var(--st-done)" : "var(--accent)" }}>{f.status === "submitted" ? "Sent · awaiting agent" : `Agent ${f.decision?.replace(/_/g, " ") ?? "responded"}`} · v{detail.summary.versions.find(v => v.id === f.version_id)?.number ?? "?"} · {new Date(f.created_at).toLocaleString()}</div><div style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{f.text || "(state or annotation only)"}</div>{f.response && <div style={{ ...note, marginTop: 3 }}>Agent response: {f.response}</div>}</div>)}</section>
           </>}
         </>}
       </main>

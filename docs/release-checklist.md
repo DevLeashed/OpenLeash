@@ -18,8 +18,11 @@ secrets alone does not enable signing. See [signing details](releasing.md).
 - [ ] Add CI and a tag-release workflow under `.github/workflows/`. Validate version
   metadata and tags before building, choose a platform matrix, and state supported
   architectures prominently in the release notes and download page.
-- [ ] Decide whether users should rely on manual downloads for updates. There is
-no in-app updater; users need to find and download each new release themselves.
+- [ ] Configure and verify signed in-app updates for installer/AppImage builds.
+Keep the private updater key outside the repository and in Actions secrets; test
+the background download, signature rejection, and user-confirmed restart. Portable
+Windows and Debian builds announce releases for manual installation. See
+[update setup](releasing.md).
 - [ ] Review the known security limitations in [Security model](security-model.md)
 and mention the important ones in user-facing release notes. In particular, agent
 file reads are not sandboxed, local credentials are stored in plaintext, and
@@ -74,7 +77,7 @@ audits, so it is not a substitute for this list.
    even if another target fails.
 4. Download each platform ZIP from the run's **Artifacts** section before it expires
    after 14 days. Verify the asset names, sizes, file types, architecture, and
-   SHA-256 checksums; test installers on their intended platforms.
+   file integrity; test installers and signed update paths on their intended platforms.
 5. The workflow does not create or publish a GitHub Release. Follow a separate
    release process before publishing anything to users.
 
@@ -94,7 +97,8 @@ are complete:
 
 - No CI or tag-based release workflow is currently present.
 - No production signing or notarization is configured.
-- No in-app updater is configured.
+- The in-app updater still requires Actions signing secrets and a published
+  `latest.json` plus signed update assets for each supported target.
 - No published release has yet established install/upgrade behavior across the
   supported OS matrix. Linux installers target Ubuntu 24.04; older distributions
   may not be compatible.

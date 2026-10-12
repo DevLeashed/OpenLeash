@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { DENY_PREFIX, isDenyRule, PERMS, type CustomCommand } from "../api";
+import { DENY_PREFIX, isDenyRule, normPath, PERMS, type CustomCommand } from "../api";
 import { saveSettings, set, useStore } from "../store";
 import { ago } from "../api";
 import { ARCHIVE_AGES, ageLabel, archiveStale, archiveTask, DEFAULT_ARCHIVE_AGE, deleteArchivedTasks, deleteTask, exportTasks, importTasks, staleChats } from "./Chrome";
@@ -49,6 +49,61 @@ function ThemeTab() {
   );
 }
 
+/**
+ * Per-project instruction files, with a switch to stop any of them reaching the
+ * agent's prompt.
+ *
+ * The reason this exists: a repository can carry a `CLAUDE.md` (or `AGENTS.md`,
+ * …) that a particular project should not have injected into every agent. That
+ * is a selection, not a security decision, so it lives here rather than in the
+ * folder-trust dialog — trust decides whether *anything* from the folder may be
+ * loaded and fails closed; this only narrows which of the files that are already
+ * allowable actually go in, and fails open.
+ *
+ * The list is the project's own inventory from `project_info` (`docs`), not the
+ * files that survived the selection (`disabled_docs` tells the two apart), so a
+ * switched-off file stays visible and can be switched back on. Toggling writes
+ * the whole rule list in one settings patch; `changed_doc_prefixes` on the Rust
+ * side drops any frozen prompt built under the old selection.
+ */
+function ProjectDocs() {
+  const s = useStore((st) => st.settings)!;
+  const info = useStore((st) => st.projectInfo);
+  const project = s.project;
+  const docs = info?.docs ?? [];
+  const disabled = info?.disabled_docs ?? [];
+  if (!project) {
+    return <div className="settings-note">No project open. Pick a folder to choose which of its instruction files the agent reads.</div>;
+  }
+  if (!docs.length) {
+    return <div className="settings-note">This project has no instruction files of its own. OpenLeash reads <span className="mono">OPENLEASH.md</span>, <span className="mono">AGENTS.md</span>, <span className="mono">CLAUDE.md</span> or <span className="mono">.openleash/instructions.md</span> from the project root.</div>;
+  }
+  // One rule per project, replaced whole: the disabled list is small and a
+  // per-file upsert would need the same read-modify-write anyway.
+  const setDisabled = (next: string[]) => {
+    const rules = (s.project_docs ?? []).filter((r) => normPath(r.path) !== normPath(project));
+    if (next.length) rules.push({ path: project, disabled: next });
+    void saveSettings({ project_docs: rules });
+  };
+  const toggle = (name: string, on: boolean) => {
+    const set = new Set(disabled);
+    if (on) set.delete(name); else set.add(name);
+    setDisabled(docs.filter((d) => set.has(d)));
+  };
+  return <>
+    <div className="settings-note">Files this project ships that are read into every agent's system prompt. Switch one off to keep it out of the agent entirely — it is skipped by name and by content, for this project only.</div>
+    {info && !info.trusted && <div className="settings-note">This folder is <b>not trusted</b>, so none of its files reach the agent anyway. Your selection is remembered and applies if you trust it later.</div>}
+    <div className="sgroup">
+      {docs.map((name) => (
+        <div key={name} className="srowx">
+          <div style={{ flex: 1, minWidth: 0 }}><div className="mono" style={{ fontSize: 12 }}>{name}</div></div>
+          <Switch label={`Inject ${name}`} checked={!disabled.includes(name)} onChange={(checked) => toggle(name, checked)} />
+        </div>
+      ))}
+    </div>
+  </>;
+}
+
 function General() {
   const s = useStore((st) => st.settings)!;
   const dataDir = useStore((st) => st.dataDir);
@@ -92,6 +147,8 @@ function General() {
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Inject global CLAUDE.md</div><div className="desc">Also load <span className="mono">~/.claude/CLAUDE.md</span> into every agent.</div></div>
           <Switch label="Inject global CLAUDE.md" checked={s.inject_global_claude ?? false} onChange={(checked) => void saveSettings({ inject_global_claude: checked })} /></div>
       </div>
+      <div className="settings-section-label">Project docs</div>
+      <ProjectDocs />
       <div className="settings-section-label">Memory</div>
       <div className="sgroup">
         <div className="srowx" style={{ alignItems: "flex-start" }}>

@@ -183,7 +183,10 @@ function ModelPicker({ z }: { z: number }) {
   const [hi, setHi] = useState(0);
   const inp = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
-  const enabled = useMemo(() => new Set(provs.filter((p) => p.enabled && isConnected(p)).map((p) => p.id)), [provs, accounts]);
+  // `isConnected` reads the module-level accounts, so naming the local `accounts`
+  // as a dependency would be a lie; the predicate is inlined against it instead so
+  // the dependency is real and the memo recomputes when the account list changes.
+  const enabled = useMemo(() => new Set(provs.filter((p) => p.enabled && (p.connected || (!!p.account && accounts.some((a) => a.kind === p.id)))).map((p) => p.id)), [provs, accounts]);
   useEffect(() => {
     if (menu !== "model") return;
     setQ("");
@@ -222,7 +225,7 @@ function ModelPicker({ z }: { z: number }) {
     // Favorites float to the top of every other list.
     if (prov !== "fav" && prov !== "recent") l = [...l.filter((m) => favs.includes(m.id)), ...l.filter((m) => !favs.includes(m.id))];
     return l;
-  }, [q, prov, models, recent, favs, provs, routeModels, curModel]);
+  }, [q, prov, models, recent, favs, routeModels, curModel, enabled]);
   // Only the rows on screen get mounted. The box is about 8 rows tall and the search
   // box sits above it, so a cap can never hide the only match: `shown` is 0 when a
   // search is typed. Arrow keys still walk the whole `list`, so it stays reachable.
@@ -232,7 +235,11 @@ function ModelPicker({ z }: { z: number }) {
     void saveSettings({ favorite_models: on ? favs.filter((x) => x !== id) : [...favs, id] });
     flash(on ? `Removed ${modelInfo(id).name} from favorites` : `★ ${modelInfo(id).name} added to favorites`);
   };
-  useEffect(() => { const j = list.findIndex((m) => m.id === curModel); setHi(Math.max(0, j)); }, [prov, q]);
+  // The newest list, for the highlight effect: it re-runs when the rail/query
+  // changes, but must read the list as it is now, not as it was when it last ran.
+  const latestList = useRef({ list, curModel });
+  latestList.current = { list, curModel };
+  useEffect(() => { const { list, curModel } = latestList.current; const j = list.findIndex((m) => m.id === curModel); setHi(Math.max(0, j)); }, [prov, q]);
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;

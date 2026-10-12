@@ -476,7 +476,7 @@ pub async fn request(
                     };
                     watcher.abort();
                     if let (Some(a), Some(hd)) = (&t.account, &hdrs) {
-                        h.accts.from_headers(&a.kind, &a.id, hd);
+                        h.accts.update_from_headers(&a.kind, &a.id, hd);
                     }
                     let err = match res {
                         Ok(turn) => {

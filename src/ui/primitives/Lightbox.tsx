@@ -1,6 +1,6 @@
 /** Click any image to see it full size: one shared overlay for the whole app,
  *  with arrow keys / Esc to page through the set the image belongs to. */
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
 
@@ -20,13 +20,17 @@ export const cycle = (i: number, dir: number, n: number) => (i + dir + n) % n;
 
 /** An image that opens the lightbox on click (Enter/Space work too). `items` pages
  *  through a whole set — pass the same list plus this image's index to every thumb. */
-export function Thumb({ src, alt = "", items, index = 0, style }: { src: string; alt?: string; items?: LightboxItem[]; index?: number; style?: React.CSSProperties }) {
+export function Thumb({ src, alt = "", items, index = 0, style, loading, onLoad, onError }: { src: string; alt?: string; items?: LightboxItem[]; index?: number; style?: React.CSSProperties; loading?: "lazy" | "eager"; onLoad?: () => void; onError?: () => void }) {
   const open = useLightbox();
   const show = () => open(items?.length ? items : [{ src, alt }], items?.length ? index : 0);
   return (
     <img
       src={src}
       alt={alt}
+      loading={loading}
+      referrerPolicy="no-referrer"
+      onLoad={onLoad}
+      onError={onError}
       className="zoomable"
       style={style}
       role="button"
@@ -40,17 +44,26 @@ export function Thumb({ src, alt = "", items, index = 0, style }: { src: string;
 export function LightboxProvider({ children }: { children: React.ReactNode }) {
   const [items, setItems] = useState<LightboxItem[]>([]);
   const [i, setI] = useState(0);
-  const open: Open = useCallback((list, index = 0) => { setItems(list); setI(index); }, []);
+  const dialog = useRef<HTMLDivElement>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const open: Open = useCallback((list, index = 0) => { opener.current = document.activeElement as HTMLElement | null; setItems(list); setI(Math.max(0, Math.min(index, list.length - 1))); }, []);
 
   useEffect(() => {
     if (!items.length) return;
+    const returnTo = opener.current;
+    dialog.current?.querySelector<HTMLButtonElement>("button")?.focus();
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Tab") {
+        const stops = [...(dialog.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+        const first = stops[0], last = stops[stops.length - 1];
+        if (e.shiftKey ? document.activeElement === first : document.activeElement === last) { e.preventDefault(); (e.shiftKey ? last : first)?.focus(); }
+      }
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setItems([]); return; }
       if (e.key === "ArrowRight") { e.preventDefault(); e.stopPropagation(); setI((n) => cycle(n, 1, items.length)); }
       if (e.key === "ArrowLeft") { e.preventDefault(); e.stopPropagation(); setI((n) => cycle(n, -1, items.length)); }
     };
     window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    return () => { window.removeEventListener("keydown", onKey, true); returnTo?.focus(); };
   }, [items.length]);
 
   const item = items[i];
@@ -58,10 +71,10 @@ export function LightboxProvider({ children }: { children: React.ReactNode }) {
     <Ctx.Provider value={open}>
       {children}
       {!!item && createPortal(
-        <div className="lightbox" role="dialog" aria-modal="true" aria-label={item.alt || "Image"} onMouseDown={(e) => { if (e.target === e.currentTarget) setItems([]); }}>
+        <div ref={dialog} className="lightbox" role="dialog" aria-modal="true" aria-label={item.alt || "Image"} onMouseDown={(e) => { if (e.target === e.currentTarget) setItems([]); }}>
           <button type="button" className="lightbox-x" aria-label="Close" onClick={() => setItems([])}><X size={16} strokeWidth={1.8} /></button>
           {items.length > 1 && <button type="button" className="lightbox-nav prev" aria-label="Previous image" onClick={() => setI((n) => cycle(n, -1, items.length))}><ChevronLeft size={20} strokeWidth={1.8} /></button>}
-          <img className="lightbox-img" src={item.src} alt={item.alt || ""} draggable={false} />
+          <img className="lightbox-img" src={item.src} alt={item.alt || ""} referrerPolicy="no-referrer" draggable={false} />
           {items.length > 1 && <button type="button" className="lightbox-nav next" aria-label="Next image" onClick={() => setI((n) => cycle(n, 1, items.length))}><ChevronRight size={20} strokeWidth={1.8} /></button>}
           {items.length > 1 && <div className="lightbox-foot"><span className="lightbox-n">{i + 1} / {items.length}</span></div>}
         </div>,

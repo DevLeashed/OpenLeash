@@ -1,5 +1,10 @@
 //! Integration tests for routing, retries, account rotation, pausing and the
 //! subscription backends, against a scripted local HTTP server.
+//!
+//! The `test_home` / registry guards below must span whole tests to serialize
+//! `OPENLEASH_HOME`, so they are deliberately held across `.await` points. See
+//! AGENTS.md: do not drop the lock to quiet the lint.
+#![allow(clippy::await_holding_lock)]
 
 use super::providers::{ChatRequest, StreamEvent};
 use super::router::{self, RouteErr, Who};
@@ -2541,6 +2546,112 @@ async fn asking_without_waiting_still_announces_itself() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A follow-up queued with Alt-Enter restarts the run the moment the run before it
+/// ends. That first run is not finished, so it must not announce "done": one
+/// announcement for the whole chain, when nothing is left to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_follow_up_does_not_announce_the_run_it_continues() {
+    let dir = std::env::temp_dir().join(format!("openleash-queuedone-{}", std::process::id()));
+    let _home = super::store::test_home(&dir);
+    let m = Mock::start().await;
+    let (cp, key) = custom("pq", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    // Checkpoints capture the turn through git at the end of every run. That is
+    // slow enough to hide the end of the chain behind the wait below, and is not
+    // what this test is about.
+    s.checkpoints = false;
+    let mut t = task("tq", "pq/m");
+    t.status = "idle".into();
+    t.perm = "full".into();
+    let (h, events) = harness(s, vec![t]);
+
+    // A command long enough that the follow-up is sent while the run is in flight.
+    m.push(openai_call(
+        "bash",
+        json!({"command": "sleep 2", "description": "waiting"}),
+    ));
+    m.push(openai_ok("first answer"));
+    m.push(openai_ok("follow-up answer"));
+    runner::send(h.clone(), "tq".into(), "start".into())
+        .await
+        .unwrap();
+    let mut in_flight = false;
+    for _ in 0..300 {
+        if h.runtime("tq").fg.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        in_flight,
+        "the command was running when the follow-up was queued"
+    );
+    runner::send_opts(
+        h.clone(),
+        "tq".into(),
+        "then this".into(),
+        "then this".into(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // Wait for the chain to end: the follow-up is answered, nothing is running and
+    // the finish has been announced. `wait_idle` is no use here, since it returns
+    // in the gap between the two runs.
+    let finished = |events: &Events| {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(n, v)| n == "ol://attention" && v["kind"] == "done")
+    };
+    for _ in 0..1000 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let task = h.task("tq").await.unwrap();
+        let answered = serde_json::to_string(&task.lock().await.messages)
+            .unwrap()
+            .contains("follow-up answer");
+        let running = h
+            .runtime("tq")
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if answered && !running && finished(&events) {
+            break;
+        }
+    }
+    // The run clears `running` a moment before it announces itself; let anything
+    // it is still going to say land before counting.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // The queue was drained into a second run, so the follow-up was answered...
+    let task = h.task("tq").await.unwrap();
+    let task = task.lock().await;
+    let transcript = serde_json::to_string(&task.messages).unwrap();
+    assert!(
+        transcript.contains("then this"),
+        "the follow-up reached the agent"
+    );
+    assert!(
+        transcript.contains("follow-up answer"),
+        "and the run it started answered it"
+    );
+    drop(task);
+    // ...and the chat was announced finished exactly once, at the very end.
+    let done = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(n, v)| n == "ol://attention" && v["kind"] == "done")
+        .count();
+    assert_eq!(done, 1, "one finish for the whole chain, not one per turn");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A skipped `ask_nonblocking` question is a refusal to decide, and has to read as
 /// one — the same rule as the blocking form, and for the same reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2683,11 +2794,9 @@ fn parses_subscription_model_lists() {
     assert_eq!(a[1].context, 200_000);
     // The built-in catalog has no Claude guesses: subscription entries come from
     // the live account list instead of going stale between Anthropic releases.
-    assert!(
-        providers::catalog()
-            .iter()
-            .all(|m| !matches!(m.provider.as_str(), "claude" | "anthropic"))
-    );
+    assert!(providers::catalog()
+        .iter()
+        .all(|m| !matches!(m.provider.as_str(), "claude" | "anthropic")));
     providers::set_pool_models("claude", a);
     let all = providers::all_models();
     assert!(all.iter().any(|m| m.id == "claude/claude-opus-6-2"));
@@ -2873,9 +2982,8 @@ async fn opencode_go_account_reads_usage_models_and_sends_its_key() {
         r.headers.contains("x-opencode-session: ses_"),
         "session header rides every Go path, not just chat/completions"
     );
-    assert_ne!(
-        r.headers.contains("chatgpt-account-id:"),
-        true,
+    assert!(
+        !r.headers.contains("chatgpt-account-id:"),
         "a Go account must not be sent as a ChatGPT session"
     );
 

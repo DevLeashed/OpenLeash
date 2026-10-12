@@ -360,7 +360,7 @@ impl Stats {
         let c = d.chats.entry(chat.into()).or_default();
         c.total.errors += 1;
         c.total.last_used = chrono::Utc::now().to_rfc3339();
-        if c.models.get(model).is_none() {
+        if !c.models.contains_key(model) {
             // Keep the model's `last_used` in step with the chat's: the LRU trim
             // reads the chat's stamp, but a model row with an empty one is the
             // shape the per-model charts sort on, and "never used" would read
@@ -448,6 +448,11 @@ impl Stats {
 
 #[cfg(test)]
 mod tests {
+    // The `test_home` guard must span the whole test to serialize
+    // `OPENLEASH_HOME` across tokio tests, so it is deliberately held across
+    // `.await` points. See AGENTS.md: do not drop the lock to quiet the lint.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
 
     #[test]
@@ -631,7 +636,7 @@ mod tests {
         assert_eq!(c.tools["read_file"].calls, 1);
         // The two tallies sit side by side in the same view, so they must agree.
         assert_eq!(
-            c.tools.iter().map(|(_, t)| t.calls).sum::<u64>(),
+            c.tools.values().map(|t| t.calls).sum::<u64>(),
             d.tools.values().map(|t| t.calls).sum::<u64>()
         );
     }

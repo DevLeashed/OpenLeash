@@ -109,7 +109,9 @@ function ProjectPicker() {
   const pop = useRef<HTMLDivElement>(null);
   // Same zoom the other overlays read: the popover lives outside the zoomed app root.
   const z = zoom();
-  const list = projectMenuEntries(project, projects ?? []);
+  // Memoised so the effect below can name it as a dependency without recomputing
+  // on every render; `projectMenuEntries` reads only these two inputs.
+  const list = useMemo(() => projectMenuEntries(project, projects ?? []), [project, projects]);
   const [pos, setPos] = useState<{ left: number; top: number; width: number; maxHeight: number } | null>(null);
 
   // The titlebar is draggable, so the popover can't be a child of the button.
@@ -133,7 +135,7 @@ function ProjectPicker() {
     window.addEventListener("resize", remeasure);
     return () => window.removeEventListener("resize", remeasure);
   }, [openMenuState]);
-  useEffect(() => { if (openMenuState) setHi(Math.max(0, list.indexOf(project))); }, [openMenuState, project]);
+  useEffect(() => { if (openMenuState) setHi(Math.max(0, list.indexOf(project))); }, [openMenuState, project, list]);
   useEffect(() => {
     if (!openMenuState) return;
     pop.current?.querySelector(".hi")?.scrollIntoView({ block: "nearest" });
@@ -610,7 +612,11 @@ const Row = memo(function Row({ t, active, onCtx, drag }: { t: TaskSummary; acti
   // answer until the backend ends the wait.
   const needsAnswer = dot === "var(--st-wait)" && (t.waiting_kind === "question" || t.waiting_kind === "approval");
   const dotColor = unread && !needsAnswer ? "var(--st-unread)" : dot;
-  useEffect(() => { if (renaming) setTitle(t.title); }, [renaming]);
+  // The newest title, for the rename effect: it must seed the box when `renaming`
+  // turns on, but must NOT re-seed on every title change while the user types.
+  const titleRef = useRef(t.title);
+  titleRef.current = t.title;
+  useEffect(() => { if (renaming) setTitle(titleRef.current); }, [renaming]);
   const commit = () => { set({ renaming: null }); if (title.trim() && title !== t.title) void patchTask(t.id, { title }); };
   // In select mode a click picks the chat instead of opening it.
   const click = (e: React.MouseEvent) => {

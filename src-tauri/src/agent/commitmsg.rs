@@ -508,60 +508,20 @@ fn cheaper_or_weaker(candidate: &providers::ModelInfo, base: &providers::ModelIn
 
 /// Keep commit-message spend in the same monthly budget ledger as agent turns.
 /// The router already recorded the detailed sample through `Stats::record`.
-fn record_spend(
-    h: &super::Harness,
-    cost: f64,
-    tokens: u64,
-) -> impl std::future::Future<Output = ()> + '_ {
-    async move {
-        let month = {
-            let mut settings = h.settings.write().await;
-            let day = chrono::Local::now().format("%Y-%m-%d").to_string();
-            *settings.spend.entry(day).or_insert(0.0) += cost;
-            settings.tokens_month += tokens;
-            settings.month_spend()
-        };
-        h.save_settings_debounced().await;
-        let tokens = h.settings.read().await.tokens_month;
-        (h.bus)(
-            "ol://usage",
-            serde_json::json!({ "month": month, "tokens": tokens }),
-        );
-    }
-}
-
-#[cfg(test)]
-mod request_tests {
-    use super::*;
-
-    #[test]
-    fn request_has_only_the_commit_prompt_and_bounded_output() {
-        let req = request("system instructions", "diff summary", "task-123");
-
-        assert_eq!(req.system, "system instructions");
-        assert_eq!(req.messages.len(), 1);
-        assert_eq!(req.messages[0].role, "user");
-        assert_eq!(req.messages[0].content[0]["text"], "diff summary");
-        assert!(req.tools.is_empty());
-        assert_eq!(req.effort, 4);
-        assert_eq!(req.max_tokens, 512);
-        assert_eq!(req.cache_key, "ol-commitmsg-task-123");
-    }
-
-    #[test]
-    fn a_named_weak_sibling_is_preferred_to_an_equal_price_strong_model() {
-        let mut base = providers::model_info("claude/base");
-        base.provider = "test-provider".into();
-        base.input_price = 0.0;
-        base.output_price = 0.0;
-        let mut weak = providers::model_info("claude/haiku");
-        weak.provider = "test-provider".into();
-        weak.input_price = 0.0;
-        weak.output_price = 0.0;
-
-        assert!(cheaper_or_weaker(&weak, &base));
-        assert!(!cheaper_or_weaker(&base, &weak));
-    }
+async fn record_spend(h: &super::Harness, cost: f64, tokens: u64) {
+    let month = {
+        let mut settings = h.settings.write().await;
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        *settings.spend.entry(day).or_insert(0.0) += cost;
+        settings.tokens_month += tokens;
+        settings.month_spend()
+    };
+    h.save_settings_debounced().await;
+    let tokens = h.settings.read().await.tokens_month;
+    (h.bus)(
+        "ol://usage",
+        serde_json::json!({ "month": month, "tokens": tokens }),
+    );
 }
 
 /// The user turn: a bounded rendering of the change.
@@ -690,4 +650,40 @@ fn first_fence(text: &str) -> Option<String> {
         out.push(l);
     }
     found.then(|| out.join("\n"))
+}
+
+// The test module sits last so no non-test item follows it (clippy's
+// `items_after_test_module`).
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn request_has_only_the_commit_prompt_and_bounded_output() {
+        let req = request("system instructions", "diff summary", "task-123");
+
+        assert_eq!(req.system, "system instructions");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[0].content[0]["text"], "diff summary");
+        assert!(req.tools.is_empty());
+        assert_eq!(req.effort, 4);
+        assert_eq!(req.max_tokens, 512);
+        assert_eq!(req.cache_key, "ol-commitmsg-task-123");
+    }
+
+    #[test]
+    fn a_named_weak_sibling_is_preferred_to_an_equal_price_strong_model() {
+        let mut base = providers::model_info("claude/base");
+        base.provider = "test-provider".into();
+        base.input_price = 0.0;
+        base.output_price = 0.0;
+        let mut weak = providers::model_info("claude/haiku");
+        weak.provider = "test-provider".into();
+        weak.input_price = 0.0;
+        weak.output_price = 0.0;
+
+        assert!(cheaper_or_weaker(&weak, &base));
+        assert!(!cheaper_or_weaker(&base, &weak));
+    }
 }

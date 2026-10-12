@@ -437,6 +437,7 @@ pub struct TrustedHook {
 ///   * `source`/`origin` are the *key*, not the body; the origin is already in
 ///     the lookup, and the source decides whether a hook is project-scoped at
 ///     all, so folding it in would only add churn.
+///
 /// `updated_input` *is* in, because flipping it on is an escalation: a hook that
 /// could gain the power to rewrite a tool call after approval would have been
 /// approved for something else. For project hooks, `enabled` and the current
@@ -807,6 +808,10 @@ pub struct PreTool {
 /// (JSON), `OL_OUTPUT`, `OL_CWD`, `OL_PROJECT`, `OL_TASK`, plus whatever the
 /// event's own wrapper adds (`OL_PROMPT`, `OL_REPORT`, `OL_ROOT`, …).
 #[cfg(test)]
+// The arity mirrors the hook env contract (event, tool, input, output, cwd,
+// task, cancel); collapsing it into a struct would obscure the call sites for
+// no real gain, so the count is deliberate.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_hooks(
     hooks: &[Hook],
     event: &str,
@@ -1076,6 +1081,9 @@ pub async fn pre_tool(
 }
 
 /// After a tool ran. The output is appended to the tool result by the caller.
+// Same env-contract arity as `run_hooks`; the parameters are the hook's
+// documented inputs, so the count is deliberate rather than a missing struct.
+#[allow(clippy::too_many_arguments)]
 pub async fn post_tool(
     hooks: &[Hook],
     tool: &str,
@@ -1217,9 +1225,16 @@ pub async fn setup_worktree(
     task: &str,
     cancel: &CancellationToken,
 ) -> WorktreeSetup {
-    let (copied, copy_error) = match super::git::populate_worktree(project, worktree) {
-        Ok(copied) => (copied, None),
-        Err(error) => (0, Some(error)),
+    let project_for_copy = project.to_string();
+    let worktree_for_copy = worktree.to_string();
+    let copy = tokio::task::spawn_blocking(move || {
+        super::git::populate_worktree(&project_for_copy, &worktree_for_copy)
+    })
+    .await;
+    let (copied, copy_error) = match copy {
+        Ok(Ok(copied)) => (copied, None),
+        Ok(Err(error)) => (0, Some(error)),
+        Err(error) => (0, Some(format!("worktree copy task failed: {error}"))),
     };
     let extra = [
         ("OL_WORKTREE", worktree.to_string()),

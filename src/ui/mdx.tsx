@@ -6,7 +6,8 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { invoke } from "@tauri-apps/api/core";
 import { flash, get } from "../store";
-import { Thumb } from "./primitives";
+import { ReplyImage } from "./ReplyImage";
+import { ReplyTable } from "./ReplyTable";
 import { grammarsReady, highlight, onReady } from "./highlight";
 
 // ───────────── remark plugin: annotate the tree before it becomes HTML ─────────────
@@ -47,6 +48,26 @@ function table(t: Node) {
   }
   // Done + Open (or Done + Total) columns: add a progress column.
   const head = (header.children ?? []).map((h) => text(h).trim().toLowerCase());
+  // Evidence stages are independent counts, not interchangeable definitions of done.
+  const stages = ["implemented", "tested", "verified", "accepted"].filter(stage => head.includes(stage));
+  const totalIndex = head.findIndex(h => h === "total");
+  if (stages.length && totalIndex >= 0 && numeric[totalIndex]) {
+    for (const stage of stages) {
+      const index = head.indexOf(stage);
+      if (!numeric[index]) continue;
+      rows.forEach((r, i) => {
+        const bar: Node = { type: "tableCell", children: i === 0 ? [{ type: "text", value: `${stage[0]!.toUpperCase()}${stage.slice(1)} / total` }] : [] };
+        if (i > 0) {
+          const value = num(text(cell(r, index) ?? { type: "x" }));
+          const denominator = num(text(cell(r, totalIndex) ?? { type: "x" }));
+          prop(bar, "dataBar", denominator > 0 && value >= 0 && value <= denominator ? value / denominator : -1);
+        }
+        r.children = [...(r.children ?? []), bar];
+        if (i === 0) t.align = [...(t.align ?? []), null];
+      });
+    }
+    return;
+  }
   const done = head.findIndex((h) => /^(done|completed?|passed|closed)$/.test(h));
   const open = head.findIndex((h) => /^(open|remaining|todo|left|failed|pending)$/.test(h));
   const total = head.findIndex((h) => /^total$/.test(h));
@@ -82,10 +103,11 @@ export function copyText(t: string, what = "Copied") {
 }
 
 /** Plain text of a rendered code block (for its copy button). */
-function codeOf(node: any): string {
+function codeOf(node: unknown): string {
   if (typeof node === "string") return node;
   if (Array.isArray(node)) return node.map(codeOf).join("");
-  return node?.props?.children != null ? codeOf(node.props.children) : "";
+  const el = node as { props?: { children?: unknown } } | null | undefined;
+  return el?.props?.children != null ? codeOf(el.props.children) : "";
 }
 
 function openPath(path: string) {
@@ -108,7 +130,7 @@ export function fenceLang(className: string | undefined): string {
 /** A fenced code block, syntax-highlighted when the label names a grammar.
  *  Falls back to the uncoloured text rather than dropping the block, so an
  *  unknown language (or one we chose not to ship) still reads correctly. */
-function CodeBlock({ lang, code }: { lang: string; code: string }) {
+const CodeBlock = memo(function CodeBlock({ lang, code }: { lang: string; code: string }) {
   // The grammars are a lazy chunk, so the first render of a code block is plain
   // text and the colour arrives a tick later. Subscribing through
   // `useSyncExternalStore` makes that a local re-render of this one block
@@ -128,7 +150,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   // the .codewrap frame and the copy button, so wrapping here too produced a
   // nested .codewrap with a duplicate Copy button on every fenced block.
   return nodes ? <code className={lang ? `language-${lang}` : undefined}>{renderNodes(nodes)}</code> : <code>{text}</code>;
-}
+});
 
 /** Turn a hast fragment into React nodes. The tree comes from highlight.js, so
  *  every node is one of three shapes: element, text, or root. */
@@ -143,7 +165,8 @@ function renderNodes(nodes: import("hast").RootContent[]): React.ReactNode {
 }
 
 export const mdComponents: Components = {
-  img: ({ src, alt }) => <Thumb src={typeof src === "string" ? src : ""} alt={alt ?? ""} />,
+  table: ({ children }) => <ReplyTable>{children}</ReplyTable>,
+  img: ({ src, alt, title }) => <ReplyImage key={src} src={typeof src === "string" ? src : ""} alt={alt ?? ""} title={title} />,
   code: ({ node, className, children, ...rest }) => {
     const inline = (node?.properties as Record<string, unknown> | undefined)?.dataInline != null;
     const s = String(children ?? "");

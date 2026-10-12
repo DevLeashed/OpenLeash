@@ -10,6 +10,10 @@ export interface ArtifactSummary {
   id: string; title: string; format: ArtifactFormat; latest_version_id: string;
   created_at: string; updated_at: string; version_count: number; versions: ArtifactVersionRef[];
   currentVersionId?: string;
+  pendingFeedback?: number;
+  thumbnail?: string;
+  recordStage?: string;
+  excerpt?: string;
 }
 export interface ArtifactVersion extends ArtifactVersionRef {
   content: string; decisions: string[]; constraints: string[]; codeRefs: ArtifactCodeRef[];
@@ -40,6 +44,17 @@ const summaryFrom = (w: WireSummary, versions: WireVersion[]): ArtifactSummary =
   id: w.id, title: w.title, format: w.kind, latest_version_id: w.currentVersionId, created_at: w.createdAt, updated_at: w.updatedAt,
   version_count: versions.length, versions: versions.map((v, i) => ({ id: v.id, parent_id: v.parentId, number: i + 1, created_at: v.createdAt })),
 });
+function overviewFrom(w: WireArtifact): ArtifactSummary {
+  const current = w.versions.find(v => v.id === w.currentVersionId);
+  let recordStage: string | undefined;
+  let image: string | undefined;
+  if (w.kind === "json" && current) {
+    try { const record = JSON.parse(current.content); if (record.schema === "openleash.collaboration.v1") { recordStage = ["concept", "prototype", "implemented", "verified"].includes(record.stage) ? record.stage : undefined; if (typeof record.image === "string") image = JSON.parse(record.image).src; } } catch { /* Generic JSON still has a text overview. */ }
+  }
+  return { ...summaryFrom(w, w.versions), pendingFeedback: (w.feedback ?? []).filter(f => f.status === "submitted" || f.decision === "needs_clarification").length,
+    excerpt: (current?.decisions?.[0] ?? "Saved project artifact").slice(0, 180), recordStage,
+    thumbnail: w.kind === "svg" && current ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(current.content)}` : typeof image === "string" && /^data:image\/(png|jpeg|webp);base64,/i.test(image) && image.length <= 200000 ? image : undefined };
+}
 function versionFrom(w: WireVersion, all: WireVersion[]): ArtifactVersion {
   const refs = summaryFrom({ id: "", title: "", kind: "html", currentVersionId: "", createdAt: "", updatedAt: "" }, all).versions;
   return { id: w.id, parent_id: w.parentId, number: refs.find((v) => v.id === w.id)?.number ?? 0, created_at: w.createdAt,
@@ -65,7 +80,7 @@ export const artifactApi = {
   list: async (taskId: string): Promise<ArtifactSummary[]> => {
     const rows = await invoke<WireSummary[]>("artifact_list", { taskId });
     // list rows intentionally omit versions; load manifests so selection/history are accurate.
-    return Promise.all(rows.map(async (row) => { const full = await invoke<WireArtifact>("artifact_get", { taskId, artifactId: row.id }); return summaryFrom(row, full.versions); }));
+    return Promise.all(rows.map(async (row) => { const full = await invoke<WireArtifact>("artifact_get", { taskId, artifactId: row.id }); return overviewFrom(full); }));
   },
   get: async (taskId: string, artifactId: string, versionId?: string) => detailFrom(await invoke<WireArtifact>("artifact_get", { taskId, artifactId }), versionId),
   create: async (taskId: string, input: ArtifactCreateInput): Promise<ArtifactSummary> => {

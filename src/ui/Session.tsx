@@ -5,12 +5,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { copyText, mdComponents, MdInline, remarkOl } from "./mdx";
+import { CommandReceipt } from "./CommandReceipt";
+import { RecoverySummary } from "./RecoverySummary";
 import { AssistantMarkdown } from "./Visualization";
 import { ArtifactWorkspace } from "./ArtifactWorkspace";
 import { InlineArtifactCard, hasArtifactCardSlot, type ArtifactWorkspaceSelection } from "./InlineArtifactCard";
 import { BrowserPanel } from "./BrowserPanel";
 import { FindBar } from "./Find";
-import { api, ago, effortLabel, fmt$, Bg, FileRef, Item, SubInfo, TaskSummary, xDepth, xOn } from "../api";
+import { api, ago, effortLabel, fmt$, Bg, FileRef, Item, ItemData, ToolAction, ToolInput, SubInfo, TaskSummary, xDepth, xOn } from "../api";
 import { flash, get, go, chatModel, modelColor, modelInfo, openTask, set, subModel, useStore, useThrottled, zoom } from "../store";
 import { Composer, humanBytes, MAX_FILES, MAX_IMAGE, PendingStar } from "./Composer";
 import { openSwap } from "./ModelSwap";
@@ -48,11 +50,13 @@ const MD_THROTTLE_MS = 120;
 
 const Md = memo(function Md({ text, interactive = false, streaming = false }: { text: string; interactive?: boolean; streaming?: boolean }) {
   const shown = useThrottled(text, MD_THROTTLE_MS);
-  return (
+  // Raw deltas still render Md. Reuse the subtree until the throttled text (or
+  // rendering mode) changes so those renders do not re-run the markdown parser.
+  return useMemo(() => (
     <div className="md">
       {interactive ? <AssistantMarkdown text={shown} streaming={streaming} /> : <ReactMarkdown remarkPlugins={MD_PLUGINS} components={MD_COMPONENTS}>{shown}</ReactMarkdown>}
     </div>
-  );
+  ), [shown, interactive, streaming]);
 });
 
 /** An agent reply with a hover copy button (copies the markdown source); right-click shows which model wrote it. */
@@ -99,9 +103,9 @@ function rel(p: string, cwd: string) {
   return a.toLowerCase().startsWith(b.toLowerCase() + "/") ? a.slice(b.length + 1) : a;
 }
 
-function toolView(d: any, cwd: string) {
+function toolView(d: ItemData, cwd: string) {
   const name: string = d.name ?? "";
-  const inp = d.input ?? {};
+  const inp: ToolInput = d.input ?? {};
   switch (name) {
     case "read_file": return { icon: li(FileText), color: G, verb: "Read", target: inp.path ? rel(inp.path, cwd) : "" };
     case "glob": return { icon: li(Search), color: G, verb: "Find", target: inp.pattern ?? "" };
@@ -143,8 +147,8 @@ function toolView(d: any, cwd: string) {
       return { icon: li(GitBranch), color: G, verb: "GitHub", target: [a, ref, inp.repo ? `· ${inp.repo}` : ""].filter(Boolean).join(" ") };
     }
     case "computer": {
-      const acts: any[] = Array.isArray(inp.actions) ? inp.actions : [];
-      const one = (a: any) => a.type === "type" ? `type “${String(a.text ?? "").slice(0, 30)}”` : a.type === "keypress" ? (a.keys ?? []).join("+") : a.x != null ? `${String(a.type).replace(/_/g, " ")} ${a.x},${a.y}` : String(a.type ?? "");
+      const acts: ToolAction[] = Array.isArray(inp.actions) ? inp.actions : [];
+      const one = (a: ToolAction) => a.type === "type" ? `type “${String(a.text ?? "").slice(0, 30)}”` : a.type === "keypress" ? (a.keys ?? []).join("+") : a.x != null ? `${String(a.type).replace(/_/g, " ")} ${a.x},${a.y}` : String(a.type ?? "");
       return { icon: li(Monitor), color: G, verb: "Computer", target: acts.map(one).join(" → ") };
     }
     default:
@@ -156,7 +160,7 @@ function toolView(d: any, cwd: string) {
 /** The page a `browser` call ended on, from the result line, or the one it was
  *  pointed at. Only real web urls: a `file://` is a path on this machine and
  *  belongs in a file manager, not a browser tab. */
-function browserPage(d: any): string | null {
+function browserPage(d: ItemData): string | null {
   const landed = String(d.output ?? "").match(/Now at: (\S+)/)?.[1] ?? "";
   const asked = d.input?.action === "navigate" ? String(d.input?.url ?? "") : "";
   for (const u of [landed, asked]) {
@@ -174,7 +178,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
   const d = it.data ?? {};
   const v = toolView(d, cwd);
   const hasDiff = Array.isArray(d.diff) && d.diff.length > 0;
-  const images: string[] = Array.isArray(d.images) ? d.images.filter((x: any) => typeof x === "string") : [];
+  const images: string[] = Array.isArray(d.images) ? d.images.filter((x) => typeof x === "string") : [];
   const imgs = images.map((src, i) => ({ src, alt: `${v.verb} image ${i + 1}` }));
   // The backend stops keeping the blobs on older rows to bound what a long
   // computer-use session holds (see `prune_item_images`), and leaves the count
@@ -217,6 +221,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
         <span className="meta" style={{ color: status === "error" || status === "denied" ? "#ff8a8a" : undefined }}>{diffCounts ? <><span style={{ color: "var(--diff-add)" }}>+{diffCounts[1]}</span> <span style={{ color: "var(--diff-del)" }}>−{diffCounts[2]}</span></> : meta}</span>
         <span style={{ transform: `rotate(${open ? 180 : 0}deg)`, transition: "transform .22s cubic-bezier(.32,.72,0,1)", display: "flex" }}>{I.chev("var(--dim)")}</span>
       </Pressable>
+      <CommandReceipt data={d} cwd={cwd} />
       <div className="fold" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
         <div>
           {open && (
@@ -236,7 +241,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
               )}
               {images.map((src, i) => <Thumb key={i} src={src} items={imgs} index={i} alt={`${v.verb} image ${i + 1}`} style={{ maxWidth: "100%", maxHeight: 260, borderRadius: 8, margin: "4px 0", border: "1px solid rgba(255,255,255,0.1)", objectFit: "contain" }} />)}
               {hasDiff
-                ? d.diff.map((l: any, i: number) => <div key={i} className={"dline " + l.k}><span className="dsign">{l.k === "a" ? "+" : l.k === "d" ? "−" : ""}</span><span className="dtext" style={{ color: l.k === "a" ? "var(--diff-add)" : l.k === "d" ? "var(--diff-del)" : undefined }}>{l.t || " "}</span></div>)
+                ? d.diff?.map((l, i) => <div key={i} className={"dline " + l.k}><span className="dsign">{l.k === "a" ? "+" : l.k === "d" ? "−" : ""}</span><span className="dtext" style={{ color: l.k === "a" ? "var(--diff-add)" : l.k === "d" ? "var(--diff-del)" : undefined }}>{l.t || " "}</span></div>)
                 : String(d.output ?? "").split("\n").slice(0, 400).map((t: string, i: number) => <div key={i} style={{ color: status === "error" ? "var(--red2)" : undefined }}>{t || " "}</div>)}
             </div>
           )}
@@ -283,7 +288,7 @@ function Approval({ it, task }: { it: Item; task: TaskSummary }) {
             {d.rec_why && <span> · {d.rec_why}</span>}
           </div>
         )}
-        <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: 9, padding: "8px 12px", maxHeight: 320, overflow: "auto" }}><Md text={d.detail} /></div>
+        <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: 9, padding: "8px 12px", maxHeight: 320, overflow: "auto" }}><Md text={d.detail ?? ""} /></div>
         {showFb && <Input autoFocus value={fb} onChange={(e) => setFb(e.currentTarget.value)} placeholder="Anything the agent should know instead?" onKeyDown={(e) => { if (e.key === "Enter") respond("deny"); }} />}
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           <Button variant={wtFirst ? undefined : "primary"} style={wtFirst ? undefined : { background: "var(--ultra)" }} title="Everyone works in the shared checkout" onClick={() => respond("once")}>Ultrathread{rec === false && tag}{!wtFirst && <Kbd>Enter</Kbd>}</Button>
@@ -301,7 +306,7 @@ function Approval({ it, task }: { it: Item; task: TaskSummary }) {
         {d.sub && <span className="branchtag">{d.sub} subagent</span>}
         <span style={{ fontWeight: 400, color: "var(--mut2)" }}>{d.reason}</span>
       </div>
-      {plan ? <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: 9, padding: "8px 12px", maxHeight: 420, overflow: "auto" }}><Md text={d.detail} /></div>
+      {plan ? <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: 9, padding: "8px 12px", maxHeight: 420, overflow: "auto" }}><Md text={d.detail ?? ""} /></div>
         : d.kind === "command" ? <div className="cmdbox">$ {d.detail}</div>
         : <div className="cmdbox">{d.title}{d.kind === "mcp" ? "\n" + d.detail : ""}</div>}
       {showFb && (
@@ -348,8 +353,8 @@ function Sub({ it, task, held }: { it: Item; task: TaskSummary; held: boolean })
   // the chat's — an empty `sub.model` is not "no model", it is "follows the chat".
   const m = info ? subModel(task, info) : chatModel(task);
   return (
-    <Pressable className={"subpill" + (live ? " live" : "")} onClick={() => set({ subOpen: d.sub_id, details: true })}>
-      <StatusIcon status={held && running ? "paused" : d.status} color={modelColor(m)} />
+    <Pressable className={"subpill" + (live ? " live" : "")} onClick={() => set({ subOpen: d.sub_id ?? null, details: true })}>
+      <StatusIcon status={held && running ? "paused" : d.status ?? "running"} color={modelColor(m)} />
       <span className="mono" style={{ fontSize: 11, color: "var(--mut2)" }}>{d.name ?? d.role}</span>
       {d.background && <Tooltip content="Runs in the background; the main agent keeps working"><span className="bgtag">bg</span></Tooltip>}
       <span style={{ color: "#d4d4d8", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis" }}>{it.text}</span>
@@ -678,7 +683,7 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
   );
 }
 
-type FeedEntry = { key: string; it: Item } | { key: string; tools: Item[] } | { key: string; done: Item[] };
+type FeedEntry = { key: string; it: Item } | { key: string; tools: Item[] };
 
 /** Agent-to-agent messages, questions and route switches are background chatter: they ride along in tool groups. */
 const isChatter = (it: Item) => it.kind === "notice" && (it.data?.level === "msg" || it.data?.level === "route" || it.data?.level === "event" || it.data?.level === "ask" || it.data?.level === "subq") && !it.data?.goal;
@@ -707,8 +712,9 @@ function eventSum(it: Item): string | null {
 }
 
 /** Merge back-to-back tool calls into one group; hidden thinking doesn't break a run.
- *  Commands stay in that group when they exit, so completion doesn't split the
- *  surrounding actions or reset an open fold. Subagents keep their own Done fold. */
+ *  Commands and settled sub-agents stay in that group when they end, so completion
+ *  doesn't split the surrounding actions or reset an open fold. A sub-agent that is
+ *  still running keeps its own row: it is the one thing there still worth watching. */
 function groupFeed(items: Item[], showThinking: boolean): FeedEntry[] {
   const out: FeedEntry[] = [];
   for (const it of items) {
@@ -719,15 +725,14 @@ function groupFeed(items: Item[], showThinking: boolean): FeedEntry[] {
     // item stays in the transcript; only the grouping looks past it.
     if ((it.kind === "text" || it.kind === "thinking") && !it.text.trim()) continue;
     const prev = out[out.length - 1];
-    // Before the tool check: a finished subagent is its own row, not a tool call.
-    if (it.kind === "sub" && isSettledBg(it, null)) {
-      if (prev && "done" in prev) prev.done.push(it);
-      else out.push({ key: it.id, done: [it] });
-    } else if (hasArtifactCardSlot(it)) {
+    // A finished sub-agent rides along like a call: its row folds into the chain
+    // and still opens its own transcript, so the receipt cannot break the run.
+    const settledSub = it.kind === "sub" && isSettledBg(it, null);
+    if (hasArtifactCardSlot(it)) {
       // Artifact tools have a standalone transcript row: their building state
       // and complete preview must not be hidden inside a generic tool fold.
       out.push({ key: it.id, it });
-    } else if (it.kind === "tool" || isChatter(it)) {
+    } else if (it.kind === "tool" || settledSub || isChatter(it)) {
       if (prev && "tools" in prev) prev.tools.push(it);
       else out.push({ key: it.id, tools: [it] });
     } else out.push({ key: it.id, it });
@@ -756,6 +761,7 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   let routes = 0;
   let asks = 0;
   let answered = 0;
+  let subagents = 0;
   const events: string[] = [];
   for (const t of tools) {
     if (t.kind === "notice") {
@@ -765,6 +771,13 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
       else if (t.data?.level === "ask") asks++;
       else if (t.data?.level === "subq") answered++;
       else from.push((t.text.match(/^(?:Message from )?([\w.-]+)\s*(?:→|:)/)?.[1] ?? "").trim());
+      continue;
+    }
+    // A finished sub-agent is not one of the verb groups below: it is a whole run
+    // of its own, so it reads as a count. A live one is never in here to count.
+    if (t.kind === "sub") {
+      subagents++;
+      if (endedBad(t, bgs)) failed++;
       continue;
     }
     const d = t.data ?? {};
@@ -799,6 +812,7 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   if (routes) parts.push(routes === 1 ? "switched model" : `switched model ${routes} times`);
   if (asks) parts.push(asks === 1 ? "asked the main agent" : `asked the main agent ${asks} questions`);
   if (answered) parts.push(answered === 1 ? "answered a question" : `answered ${answered} questions`);
+  if (subagents) parts.push(`${subagents} sub-agent${subagents === 1 ? "" : "s"} finished`);
   parts.push(...events);
   const text = parts.join(", ");
   return { text: text.charAt(0).toUpperCase() + text.slice(1), add, del, failed };
@@ -816,33 +830,6 @@ function endedBad(it: Item, bgs: Bg[]): boolean {
   const code = ex.match(/^exit (-?\d+)/)?.[1];
   return code != null && code !== "0";
 }
-
-/** Finished subagents retain a separate Done fold because their rows open their
- *  own transcripts. Finished commands are ordinary actions inside ToolGroup. */
-const DoneGroup = memo(function DoneGroup({ done, task, bgs }: { done: Item[]; task: TaskSummary; bgs: Bg[] }) {
-  const [open, setOpen] = useState(false);
-  // Counts, not sentences: a Done line is a receipt, and the rows behind it are
-  // the detail.
-  const nSub = done.filter((d) => d.kind === "sub").length;
-  const nJob = done.length - nSub;
-  const parts = [
-    nSub ? `${nSub} sub-agent${nSub === 1 ? "" : "s"}` : "",
-    nJob ? `${nJob} command${nJob === 1 ? "" : "s"}` : "",
-  ].filter(Boolean);
-  const bad = done.filter((d) => endedBad(d, bgs)).length;
-  return (
-    <div className="toolgroup done">
-      <Pressable className="tg-line" aria-expanded={open} onClick={() => setOpen(!open)} title={open ? undefined : "Show what finished while this was going"}>
-        <span className="tg-text">Done · {parts.join(" · ")}</span>
-        {bad > 0 && <span className="tg-failed">· {bad} did not finish</span>}
-        <span className="tg-chev" style={{ transform: `rotate(${open ? 90 : 0}deg)` }}><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M3.5 2 L6.5 5 L3.5 8" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
-      </Pressable>
-      <div className="fold" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
-        <div>{open && <div className="tg-list">{done.map((d) => <DoneRow key={d.id} it={d} task={task} bgs={bgs} />)}</div>}</div>
-      </div>
-    </div>
-  );
-});
 
 /** One finished piece of background work. A subagent keeps its pill, so the row
  *  still opens its transcript; a command gets the exit the transcript never got,
@@ -990,15 +977,19 @@ export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOp
       {rows.map((e) =>
         "tools" in e
           ? <div key={e.key} className="it" data-item={e.key}><ToolGroup tools={e.tools} task={task} held={held} bgs={jobs} /></div>
-          : "done" in e
-            ? <div key={e.key} className="it" data-item={e.key}><DoneGroup done={e.done} task={task} bgs={jobs} /></div>
-            : <Row key={e.key} it={e.it} task={task} showThinking={showThinking} held={held} streaming={e.it.id === streamingItemId} onOpenArtifact={onOpenArtifact} />)}
+          : <Row key={e.key} it={e.it} task={task} showThinking={showThinking} held={held} streaming={e.it.id === streamingItemId} onOpenArtifact={onOpenArtifact} />)}
     </>
   );
 }
 
 function Feed({ items, task, live, showThinking, onOpenArtifact }: { items: Item[]; task: TaskSummary; live: boolean; showThinking: boolean; onOpenArtifact?: (selection: ArtifactWorkspaceSelection) => void }) {
-  const latest = live ? items.filter(isVisibleFeedItem).at(-1) : undefined;
+  let latest: Item | undefined;
+  if (live) {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i]!;
+      if (isVisibleFeedItem(it)) { latest = it; break; }
+    }
+  }
   const streamingItemId = latest?.kind === "text" ? latest.id : undefined;
   const parts = useMemo(() => splitTurns(items, live), [items, live]);
   const rows: React.ReactNode[] = [];
@@ -1199,6 +1190,7 @@ function PausedBar({ task }: { task: TaskSummary }) {
     <div className="pausebar">
       <span className="pz">{I.pause(11)}</span>
       <div style={{ flex: 1, minWidth: 0 }}>
+        <RecoverySummary task={task} />
         <div style={{ fontWeight: 600, color: "#fde68a" }}>{draining ? `Pausing… waiting on ${task.busy} command${task.busy === 1 ? "" : "s"} to finish` : usage ? "Paused · out of usage" : exhausted ? "Paused · every model failed" : task.paused?.kind === "closed" ? "Paused · the app closed mid-run" : globally ? "Everything paused" : "Paused"}</div>
         <div ref={line} className={full ? "sel" : undefined} style={{ fontSize: 11.5, color: "#b8a36a", lineHeight: 1.5, ...(full ? { whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 220, overflowY: "auto" } : { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }) }} title={full ? undefined : reason}>{reason}{task.paused ? ` · ${ago(task.paused.since)} ago` : ""}. Agents are frozen mid-step; nothing was sent to them.</div>
         {long && (
@@ -1633,10 +1625,12 @@ export function Session() {
   const [workspaceSelection, setWorkspaceSelection] = useState<ArtifactWorkspaceSelection | null>(null);
   const bg = useStore((s) => (s.task ? s.bg[s.task] : undefined) ?? NO_BG);
   const [stats, setStats] = useState<{ add: number; del: number; n: number } | null>(null);
+  const taskId = task?.id;
+  const taskStatus = task?.status;
   useEffect(() => {
-    if (!task || task.status === "running") return;
-    api.review(task.id).then((r) => setStats({ n: r.files.length, add: r.files.reduce((a, f) => a + f.add, 0), del: r.files.reduce((a, f) => a + f.del, 0) })).catch(() => setStats(null));
-  }, [task?.id, task?.status]);
+    if (!taskId || taskStatus === "running") return;
+    api.review(taskId).then((r) => setStats({ n: r.files.length, add: r.files.reduce((a, f) => a + f.add, 0), del: r.files.reduce((a, f) => a + f.del, 0) })).catch(() => setStats(null));
+  }, [taskId, taskStatus]);
   if (!task) return <div className="empty">Task not found</div>;
   const paused = isPaused(task, pausedAll);
   // The agent colour follows `chatModel`, not `task.model`, so the header agrees
@@ -1696,16 +1690,16 @@ export function Session() {
           {busy > 0 && <span style={{ minWidth: 16, height: 16, padding: "0 4px", borderRadius: 8, display: "grid", placeItems: "center", background: "rgba(167,139,250,0.14)", color: "var(--violet)", fontSize: 10, fontWeight: 600 }}>{busy}</span>}
         </Button></Tooltip>
       </div>
-      <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+      <div className={workspaceOpen ? "session-collaboration-layout" : undefined} style={{ flex: 1, minHeight: 0, display: "flex" }}>
         {/* `data-task` is how the selection layer knows which chat a selection
             came from: the note it opens has to go to this chat's composer, and
             the pane is what identifies it. */}
-        <div className="session-pane" data-task={task.id} style={{ flex: 1, minWidth: 380, position: "relative", display: workspaceOpen ? "none" : undefined }}>
+        <div className={workspaceOpen ? "session-pane collaboration-chat" : "session-pane"} data-task={task.id} style={{ flex: workspaceOpen ? "0 0 38%" : 1, minWidth: 300, position: "relative" }}>
           <Timeline task={task} onOpenArtifact={(selection) => { setWorkspaceSelection(selection); setWorkspaceOpen(true); }} />
           {find && <FindBar onClose={() => set({ find: false })} />}
           <CFloat task={task} />
         </div>
-        {workspaceOpen && <div className="session-pane" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}><div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div><ArtifactWorkspace key={`${task.id}:${workspaceSelection?.artifactId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} /></div>}
+        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}><div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div><ArtifactWorkspace key={`${task.id}:${workspaceSelection?.artifactId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} /></div>}
         <Details task={task} />
       </div>
       {browserEnabled && browserTask === task.id && <BrowserPanel key={task.id} taskId={task.id} onClose={() => setBrowserTask(null)} />}

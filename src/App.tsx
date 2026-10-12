@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import "./App.css";
 import { api } from "./api";
 import { boot, DEFAULT_ZOOM, disposeBoot, flash, get, go, set, stepZoom, useStore, zoom } from "./store";
+import { AppUpdateBanner } from "./ui/AppUpdate";
 import { Sidebar, Titlebar } from "./ui/Chrome";
 import { togglePlan } from "./ui/Composer";
 import { Home, pickFolder } from "./ui/Home";
@@ -95,6 +96,7 @@ export default function App() {
     <LightboxProvider>
     <div className="app" style={{ zoom: z, width: `${100 / z}vw`, height: `${100 / z}vh` }}>
       <Titlebar />
+      <AppUpdateBanner />
       <div className="body">
         <Sidebar />
         <main className="main">

@@ -22,6 +22,21 @@ describe("provider icons", () => {
     expect(render("anthropic")).toContain("<svg");
   });
 
+  it("draws the bundled OpenCode mark for Go and Zen provider metadata", () => {
+    set({ providers: ["opencode-go", "opencode"].map((id) => ({
+      id, name: id, icon: "opencode", mono: "", color: "", base_url: "",
+      env: "", chip: "", kind: "openai", custom: false, insist: false,
+      connected: false, has_key: false, key_hint: "", key_hints: [], key_pool: false,
+      base_url_override: "", enabled: true, local: false, account: null,
+    })) });
+    for (const provider of ["opencode-go", "opencode"]) {
+      const html = render(provider);
+      expect(html).toContain("provider-icon");
+      expect(html).toContain("<title>opencode</title>");
+      expect(html).not.toContain("lucide-server");
+    }
+  });
+
   it("falls back to the generic server glyph for an unknown name", () => {
     const html = render("some-provider-nobody-shipped");
     expect(html).toContain("<svg");

@@ -13,6 +13,7 @@ const PARAMS: { id: string; label: string; hint: string }[] = [
   { id: "none", label: "Not supported", hint: "Model has no reasoning control (or always reasons)" },
   { id: "reasoning_effort", label: "reasoning_effort", hint: "OpenAI, Gemini, xAI, gpt-oss, most OpenAI-compatible APIs" },
   { id: "reasoning.effort", label: "reasoning: { effort }", hint: "OpenRouter unified reasoning" },
+  { id: "reasoning.max_tokens", label: "reasoning: { max_tokens }", hint: "OpenRouter reasoning token budget" },
   { id: "thinking", label: "thinking: { type }", hint: "Z.ai GLM, DeepSeek-style on/off. Levels like off / on" },
   { id: "thinking_budget", label: "thinking.budget_tokens", hint: "Token budgets. Levels are numbers, e.g. 4000, 16000" },
   { id: "anthropic_effort", label: "Anthropic effort", hint: "Adaptive thinking + output_config.effort (Claude 4.6+)" },
@@ -27,7 +28,9 @@ export function guess(id: string, kind: string): Guess {
   const s = id.toLowerCase();
   const LMH = ["low", "medium", "high"];
   const rules: [RegExp, Guess][] = [
-    [/claude.*haiku/, { context: 200_000, output: 64_000, reasoning_levels: kind === "anthropic" ? ["0", "4000", "8000", "16000", "32000"] : [], reasoning_param: kind === "anthropic" ? "thinking_budget" : "none", input_types: ["text", "image", "pdf"] }],
+    // Haiku 5.x uses adaptive effort; Haiku 4.x uses budget-token thinking.
+    [/claude.*haiku[-.]5[-.]/, { context: 1_000_000, output: 128_000, reasoning_levels: kind === "anthropic" ? ["low", "medium", "high", "xhigh", "max"] : [], reasoning_param: kind === "anthropic" ? "anthropic_effort" : "none", input_types: ["text", "image", "pdf"] }],
+    [/claude.*haiku/, { context: 200_000, output: 64_000, reasoning_levels: kind === "anthropic" ? ["1024", "4000", "8000", "16000", "32000"] : [], reasoning_param: kind === "anthropic" ? "thinking_budget" : "none", input_types: ["text", "image", "pdf"] }],
     [/claude/, { context: 1_000_000, output: 128_000, reasoning_levels: kind === "anthropic" ? ["low", "medium", "high", "xhigh", "max"] : [], reasoning_param: kind === "anthropic" ? "anthropic_effort" : "none", input_types: ["text", "image", "pdf"] }],
     [/gpt-oss/, { context: 128_000, output: 32_000, reasoning_levels: LMH, reasoning_param: "reasoning_effort" }],
     [/gpt-[56]|(^|\/)o[134](-|$)/, { context: 400_000, output: 128_000, reasoning_levels: ["minimal", ...LMH], reasoning_param: "reasoning_effort", input_types: ["text", "image"] }],
@@ -52,12 +55,38 @@ export function guess(id: string, kind: string): Guess {
   return { reasoning_levels: [], reasoning_param: "none", input_types: ["text"], ...hit };
 }
 
-export function remoteReasoning(m: Record<string, unknown>): { levels: string[]; param: string } {
-  const caps = Array.isArray(m.supported_parameters) ? m.supported_parameters : [];
-  const explicitLevels = m.reasoning_levels ?? m.supported_reasoning_levels;
-  const levels = Array.isArray(explicitLevels) ? explicitLevels.map((level: unknown) => typeof level === "string" ? level : level && typeof level === "object" && "effort" in level ? String(level.effort) : "").filter(Boolean) : [];
-  const declared = m.reasoning_param ?? m.reasoning_parameter;
-  const param = typeof declared === "string" && ["reasoning_effort", "reasoning.effort", "thinking", "thinking_budget", "anthropic_effort"].includes(declared) ? declared :
+export function remoteReasoning(m: RemoteModel | Record<string, unknown>, provider = ""): { levels: string[]; param: string } {
+  const metadata = m as Record<string, unknown>;
+  const caps: unknown[] = Array.isArray(metadata.supported_parameters) ? metadata.supported_parameters : [];
+  const reasoning = metadata.reasoning && typeof metadata.reasoning === "object" ? metadata.reasoning as Record<string, unknown> : {};
+  const openRouterDeclared = Array.isArray(metadata.reasoning_effort) ? metadata.reasoning_effort as unknown[] : null;
+  const isOpenRouter = provider === "openrouter" || metadata.provider === "openrouter";
+  const explicitLevels = metadata.reasoning_levels ?? metadata.supported_reasoning_levels;
+  const openRouterLevels = reasoning.supported_efforts;
+  const supportsBudget = reasoning.supports_max_tokens === true;
+  const hasOpenRouterLevels = Object.prototype.hasOwnProperty.call(reasoning, "supported_efforts");
+  const allOpenRouterLevels = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+  const rawLevels: unknown[] = Array.isArray(explicitLevels) ? explicitLevels : Array.isArray(openRouterLevels) ? openRouterLevels :
+    supportsBudget ? ["1024", "4000", "8000", "16000", "32000"] :
+    isOpenRouter && hasOpenRouterLevels && openRouterLevels === null ? allOpenRouterLevels : openRouterDeclared ?? [];
+  const levels = rawLevels.map((level: unknown) => typeof level === "string" ? level : level && typeof level === "object" && "effort" in level ? String(level.effort) : "").filter(Boolean);
+  // OpenRouter documents `supported_efforts` highest-first, while the slider
+  // spreads levels low→high. `none` is the lowest control; mandatory models
+  // cannot accept disabling reasoning.
+  if (!Array.isArray(explicitLevels) && Array.isArray(openRouterLevels)) {
+    const descending = [...levels].filter((level) => level.toLowerCase() !== "none").reverse();
+    if (levels.some((level) => level.toLowerCase() === "none") && reasoning.mandatory !== true) descending.unshift("none");
+    levels.splice(0, levels.length, ...descending);
+  }
+  const declared = metadata.reasoning_param ?? metadata.reasoning_parameter;
+  if (reasoning.mandatory === true) {
+    for (let i = levels.length - 1; i >= 0; i--) if (levels[i]?.toLowerCase() === "none") levels.splice(i, 1);
+  }
+  const param = typeof declared === "string" && ["reasoning_effort", "reasoning.effort", "reasoning.max_tokens", "thinking", "thinking_budget", "anthropic_effort"].includes(declared) ? declared :
+    supportsBudget ? "reasoning.max_tokens" :
+    Array.isArray(openRouterLevels) ? "reasoning.effort" :
+    openRouterDeclared ? "reasoning_effort" :
+    isOpenRouter && caps.includes("reasoning") ? "reasoning.effort" :
     caps.includes("reasoning_effort") ? "reasoning_effort" :
     caps.includes("reasoning") ? "reasoning.effort" : "";
   return { levels, param };
@@ -117,7 +146,7 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
   const applySmart = (id: string) => {
     const g = guess(id, prov.kind);
     const r = remote?.find((x) => x.id === id);
-    const reasoning = r ? remoteReasoning(r as unknown as Record<string, unknown>) : { levels: [], param: "" };
+    const reasoning = r ? remoteReasoning(r as unknown as Record<string, unknown>, prov.id) : { levels: [], param: "" };
     up({
       id, ...g,
       name: r?.name || m.name,

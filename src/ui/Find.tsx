@@ -48,8 +48,12 @@ export function FindBar({ onClose }: { onClose: () => void }) {
 
   useEffect(() => { inp.current?.focus(); inp.current?.select(); }, []);
   useEffect(() => { setCursor(0); }, [q, task]);
+  // The newest hits, for the jump effect: it must fire when the query or chat
+  // changes, but not re-run every time the hit list is rebuilt.
+  const hitsRef = useRef(hits);
+  hitsRef.current = hits;
   // Jump to the first hit as soon as there is one, so typing lands you on it.
-  useEffect(() => { if (hits.length) reveal(hits[0]!.id); }, [q, task]);
+  useEffect(() => { const h = hitsRef.current; if (h.length) reveal(h[0]!.id); }, [q, task]);
 
   const step = useCallback((dir: 1 | -1) => {
     if (!hits.length) return;

@@ -4,6 +4,7 @@ import claude from "@lobehub/icons-static-svg/icons/claude.svg?raw";
 import gemini from "@lobehub/icons-static-svg/icons/gemini.svg?raw";
 import ollama from "@lobehub/icons-static-svg/icons/ollama.svg?raw";
 import openai from "@lobehub/icons-static-svg/icons/openai.svg?raw";
+import opencode from "@lobehub/icons-static-svg/icons/opencode.svg?raw";
 import openrouter from "@lobehub/icons-static-svg/icons/openrouter.svg?raw";
 import zai from "@lobehub/icons-static-svg/icons/zai.svg?raw";
 import deepseek from "@lobehub/icons-static-svg/icons/deepseek.svg?raw";
@@ -29,6 +30,7 @@ const ICON_ASSETS = new Map<string, string>(
     gemini,
     ollama,
     openai,
+    opencode,
     openrouter,
     zai,
     deepseek,

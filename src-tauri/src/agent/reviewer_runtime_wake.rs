@@ -14,6 +14,11 @@
 //! `agents` dimension is called is a naming rule, and the interesting case — a
 //! system one-shot has to stop reading as "main" — is the one the per-agent split
 //! depends on.
+//!
+//! The `test_home` / registry guards must span whole tests to serialize
+//! `OPENLEASH_HOME`, so they are deliberately held across `.await` points. See
+//! AGENTS.md: do not drop the lock to quiet the lint.
+#![allow(clippy::await_holding_lock)]
 
 use super::router::agent_kind_for_test;
 use super::runner::{

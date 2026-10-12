@@ -56,6 +56,7 @@ fn env() -> prompt::Env<'static> {
         date: "2026-01-01".into(),
         agent_id: "ol-test",
         inject_global_claude: false,
+        disabled_docs: &[],
     }
 }
 

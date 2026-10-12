@@ -38,7 +38,11 @@ export function Dropdown({ value, options, onChange, placeholder = "Select…", 
     const width = Math.min(Math.max(r.width / z, 240), vw - 20);
     setPos({ left: Math.max(10, Math.min(r.left / z, vw - width - 10)), top: up ? r.top / z - 6 : r.bottom / z + 6, width, up, max: Math.max(96, Math.min(320, up ? r.top / z - 20 : below)) });
   }, [open]);
-  useEffect(() => { if (open) { setQ(""); setHi(Math.max(0, options.findIndex((o) => o.value === value))); } }, [open]);
+  // The newest options/value, for the reset effect: it must clear and re-highlight
+  // when the menu opens, but not take a dependency on either.
+  const latest = useRef({ options, value });
+  latest.current = { options, value };
+  useEffect(() => { if (open) { setQ(""); setHi(Math.max(0, latest.current.options.findIndex((o) => o.value === latest.current.value))); } }, [open]);
   // The list starts with scrolling off for a frame: enabling overflow at first paint flashes a scrollbar gutter.
   const [scrolled, setScrolled] = useState(false);
   useEffect(() => {

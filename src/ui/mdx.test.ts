@@ -4,26 +4,44 @@ import remarkParse from "remark-parse";
 import remarkGfm from "remark-gfm";
 import { PATH, remarkOl } from "./mdx";
 
-const run = (md: string) => {
+/** Minimal structural view of the mdast tree these tests walk: the plugin
+ *  writes `data.hProperties` onto nodes, which the plain `mdast` types do not
+ *  describe. */
+type MdNode = {
+  children: MdNode[];
+  data: { hProperties: { className?: string[]; dataBar?: number; dataChips?: string } };
+};
+
+const run = (md: string): MdNode => {
   const p = unified().use(remarkParse).use(remarkGfm);
   const tree = p.parse(md);
   (remarkOl() as (t: unknown) => void)(tree);
-  return tree as any;
+  return tree as unknown as MdNode;
 };
 
 describe("remarkOl", () => {
   it("marks numeric columns and adds a progress column for Done/Open", () => {
-    const t = run("| Bucket | Files | Done | Open |\n|---|---|---|---|\n| Active | 73 | 1,968 | 983 |\n| Limbo | 1 | 0 | 0 |").children[0];
-    const [head, active, limbo] = t.children;
+    const t = run("| Bucket | Files | Done | Open |\n|---|---|---|---|\n| Active | 73 | 1,968 | 983 |\n| Limbo | 1 | 0 | 0 |").children[0]!;
+    const [head, active, limbo] = t.children as [MdNode, MdNode, MdNode];
     expect(head.children.length).toBe(5);
-    expect(head.children[0].data?.hProperties?.className).toBeUndefined();
-    expect(head.children[2].data.hProperties.className).toEqual(["num"]);
-    expect(active.children[4].data.hProperties.dataBar).toBeCloseTo(1968 / 2951);
-    expect(limbo.children[4].data.hProperties.dataBar).toBe(-1);
+    expect(head.children[0]!.data?.hProperties?.className).toBeUndefined();
+    expect(head.children[2]!.data.hProperties.className).toEqual(["num"]);
+    expect(active.children[4]!.data.hProperties.dataBar).toBeCloseTo(1968 / 2951);
+    expect(limbo.children[4]!.data.hProperties.dataBar).toBe(-1);
+  });
+  it("keeps implemented, tested and accepted evidence counts separate", () => {
+    const t = run("| Area | Total | Implemented | Tested | Accepted |\n|---|---|---|---|---|\n| UI | 10 | 8 | 5 | 2 |\n| Invalid | 0 | 1 | 0 | -1 |").children[0]!;
+    expect(t.children[0]!.children.length).toBe(8);
+    expect(t.children[1]!.children.slice(5).map(c => c.data.hProperties.dataBar)).toEqual([0.8, 0.5, 0.2]);
+    expect(t.children[2]!.children.slice(5).map(c => c.data.hProperties.dataBar)).toEqual([-1, -1, -1]);
+  });
+  it("does not manufacture evidence percentages without a total", () => {
+    const t = run("| Area | Verified | Accepted |\n|---|---|---|\n| UI | 5 | 2 |").children[0]!;
+    expect(t.children[0]!.children.length).toBe(3);
   });
   it("flags chip-heavy paragraphs only", () => {
-    expect(run("`a` `b` `c` `d` `e` `f`").children[0].data.hProperties.dataChips).toBe("1");
-    expect(run("`a` and `b`").children[0].data).toBeUndefined();
+    expect(run("`a` `b` `c` `d` `e` `f`").children[0]!.data.hProperties.dataChips).toBe("1");
+    expect(run("`a` and `b`").children[0]!.data).toBeUndefined();
   });
   it("recognises file paths, not arbitrary code", () => {
     for (const p of ["src/ui/mdx.tsx", "TODO/*.md", "lib.rs:42", "C:\\x\\y.ts", "src-tauri/src"]) expect(PATH.test(p), p).toBe(true);

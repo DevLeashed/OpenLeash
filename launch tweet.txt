@@ -1,0 +1,15 @@
+We are launching OpenLeash, a new coding harness.
+
+Some of the features it has are:
+
+- Send a task and let it run—or stay closely involved when you want. The extra collaboration tools are optional; ordinary chat stays the main workflow.
+- Save a task for later, not just its prompt. Save the model, effort level, project folder, plan mode, and worktree settings alongside it, then load everything back when you’re ready.
+- Pause without pulling the plug. Press Esc to let the current command finish and freeze the turn without losing progress. Press it again to hard-stop the agent and its process tree, including background commands.
+- Resume everything, even after a restart. Paused agents and their subagents can pick back up with one button, even after restarting OpenLeash or your PC. No need to relaunch each agent or explain the task again.
+- Questions that don’t stop the work. Agents can ask for an optional preference while continuing the task. Your answer reaches them on their next model call.
+- A “Needs you” inbox gathers chats blocked on your answer or approval. Jump straight to the right card; nothing gets approved or answered for you.
+- Interactive previews inside the chat. Agents can generate working charts, calculators, diagrams, and demos, not just static images or code blocks. Prototype controls can suggest state or targets; review the proposal and choose whether to share it.
+- A shared project workspace for artifacts. Save designs, prototypes and decisions under `.openleash`; annotate a specific version, compare revisions, and explicitly send feedback when you want the agent to iterate.
+- Fork a conversation two ways. Start a new chat with the full transcript or a compacted summary of its context, leaving the original untouched.
+
+And of course, a lot of basic harness features y'all are familiar with. Except for remote control support, that might come later.

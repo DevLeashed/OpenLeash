@@ -346,7 +346,7 @@ export function AccountsTab() {
       <div className="settings-head">
         <div className="settings-head-main settings-title">Accounts</div>
         <Button onClick={() => revealed ? setRevealed(false) : setRevealWarning(true)}>{revealed ? I.eyeOff(13) : I.eye(13)}{revealed ? "Hide" : "Reveal"}</Button>
-        <Button disabled={busy} onClick={refresh}>{busy ? <Loader size={13} /> : <RefreshCw size={13} />}Refresh usage + models</Button>
+        <Button disabled={busy} onClick={refresh}>{busy ? <Loader size={13} /> : <RefreshCw size={13} />}Refresh</Button>
       </div>
       {shownProviders(providers).filter((p) => p.account).map((p) => {
         const list = accts.filter((a) => a.kind === p.id).sort((a, b) => b.priority - a.priority);

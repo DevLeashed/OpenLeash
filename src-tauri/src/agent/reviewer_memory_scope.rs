@@ -19,7 +19,7 @@ fn temp_project(tag: &str) -> std::path::PathBuf {
 #[test]
 fn a_project_with_no_instructions_file_gets_none() {
     let d = temp_project("bare");
-    assert!(project_memory(&d.to_string_lossy(), false).is_empty());
+    assert!(project_memory(&d.to_string_lossy(), false, &[]).is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -27,7 +27,7 @@ fn a_project_with_no_instructions_file_gets_none() {
 fn instructions_come_from_the_project_root_of_the_task() {
     let d = temp_project("mine");
     std::fs::write(d.join("AGENTS.md"), "PROJECT-SPECIFIC RULE").unwrap();
-    let mem = project_memory(&d.to_string_lossy(), false);
+    let mem = project_memory(&d.to_string_lossy(), false, &[]);
     assert_eq!(mem.len(), 1, "exactly the one file: {mem:?}");
     assert_eq!(mem[0].0, "AGENTS.md");
     assert!(mem[0].1.contains("PROJECT-SPECIFIC RULE"));
@@ -41,9 +41,9 @@ fn a_sibling_project_is_not_read() {
     let other = temp_project("without");
     std::fs::write(mine.join("AGENTS.md"), "MINE ONLY").unwrap();
 
-    assert_eq!(project_memory(&mine.to_string_lossy(), false).len(), 1);
+    assert_eq!(project_memory(&mine.to_string_lossy(), false, &[]).len(), 1);
     assert!(
-        project_memory(&other.to_string_lossy(), false).is_empty(),
+        project_memory(&other.to_string_lossy(), false, &[]).is_empty(),
         "another project's instructions must not bleed in"
     );
     let _ = std::fs::remove_dir_all(&mine);
@@ -60,7 +60,7 @@ fn an_instructions_file_deeper_in_the_tree_is_not_walked_up_to() {
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(outer.join("AGENTS.md"), "PARENT RULE").unwrap();
 
-    let mem = project_memory(&inner.to_string_lossy(), false);
+    let mem = project_memory(&inner.to_string_lossy(), false, &[]);
     assert!(
         mem.is_empty(),
         "no upward search from the project root: {mem:?}"

@@ -4,6 +4,7 @@
 
 mod agent;
 mod artifacts;
+mod updates;
 mod visualization;
 mod win;
 
@@ -15,7 +16,7 @@ use agent::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Manager, State};
@@ -65,6 +66,9 @@ struct Boot {
     shell: String,
     data_dir: String,
     month_spend: f64,
+    /// Whether this install may offer the Claude subscription integration at
+    /// all. See `claude_allowed`.
+    claude_allowed: bool,
 }
 
 /// Settings as the UI sees them: API keys and tokens never leave the backend.
@@ -416,6 +420,58 @@ fn files_attach(paths: Vec<String>) -> Result<Vec<FileRef>, String> {
     Ok(out)
 }
 
+/// Name of the opt-in file that switches the Claude subscription integration on.
+/// It sits next to the running executable, so the decision belongs to one install
+/// rather than to the user's settings (which travel with `OPENLEASH_HOME`) or to
+/// the source tree.
+const ALLOW_CLAUDE: &str = "ALLOW_CLAUDE";
+
+/// Is the Claude subscription integration enabled for this install?
+///
+/// The integration is hidden — no provider, no accounts, no model picker entry —
+/// unless a file named `ALLOW_CLAUDE` exists beside the executable. This is an
+/// opt-in, not a security boundary: the bundled provider is static, so anyone
+/// with the binary can wire it back up themselves. It only decides whether the
+/// app offers the thing at all.
+fn claude_allowed() -> bool {
+    claude_allowed_with(std::env::current_exe().ok().as_ref())
+}
+
+/// Testable core of [`claude_allowed`], taking the executable path explicitly so
+/// a test never depends on where the test binary itself happens to live.
+fn claude_allowed_with(exe: Option<&PathBuf>) -> bool {
+    let Some(dir) = exe.and_then(|p| p.parent()) else {
+        // No executable path (unusual, and true of some test runners): stay
+        // closed rather than guess at a directory the user never marked.
+        return false;
+    };
+    claude_allowed_in(dir)
+}
+
+/// Whether `dir` carries the opt-in marker. Only the file's existence matters:
+/// its contents are never read, so whatever the user drops there works, even if
+/// a text editor left it with a BOM or a newline.
+fn claude_allowed_in(dir: &Path) -> bool {
+    dir.join(ALLOW_CLAUDE).is_file()
+}
+
+/// The refusal shared by every path that can add an account, so none of them can
+/// drift from the rule. The UI never offers the integration without the opt-in,
+/// but hiding a control is not enforcement: a second frontend, a replayed IPC
+/// call or a UI regression would still reach the commands that call this.
+fn account_import_allowed(kind: &str, allow_claude: bool) -> Result<(), String> {
+    if kind == "claude" && !allow_claude {
+        return Err(CLAUDE_DISABLED.into());
+    }
+    Ok(())
+}
+
+/// What the connect path says when the integration is switched off. Deliberately
+/// names the file, because the only person who can see this is the user with an
+/// install they can still mark.
+const CLAUDE_DISABLED: &str =
+    "Claude subscriptions are not enabled for this install. Create a file named ALLOW_CLAUDE next to the OpenLeash executable and restart.";
+
 #[tauri::command]
 async fn app_boot(h: H<'_>) -> Result<Boot, String> {
     let s = h.settings.read().await.clone();
@@ -432,6 +488,7 @@ async fn app_boot(h: H<'_>) -> Result<Boot, String> {
         user_notices: h.user_notices().await,
         shell: agent::shell::shell().name.into(),
         data_dir: store::data_dir().to_string_lossy().into(),
+        claude_allowed: claude_allowed(),
     })
 }
 
@@ -633,6 +690,288 @@ struct NewTask {
     ultra_x: Option<store::UltraX>,
 }
 
+/// Startup guard held from task creation through first-message dispatch. Stop/delete
+/// cancel its token; Drop releases sends waiting for bootstrap and deletion waiting
+/// for final workspace metadata.
+struct StartupGuard {
+    runtime: Arc<agent::Runtime>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl StartupGuard {
+    fn new(runtime: Arc<agent::Runtime>) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        *runtime.startup_cancel.lock().unwrap() = Some(cancel.clone());
+        Self { runtime, cancel }
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let mut startup = self.runtime.startup_cancel.lock().unwrap();
+        startup.take();
+        self.runtime.startup_done.notify_all();
+        drop(startup);
+        if self.runtime.startup_pending.swap(false, Ordering::SeqCst) {
+            self.runtime.startup_ready.notify_waiters();
+        }
+    }
+}
+
+async fn wait_for_task_startup(h: &Harness, task_id: &str) {
+    let rt = h.runtime(task_id);
+    loop {
+        let ready = rt.startup_ready.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        if !rt.startup_pending.load(Ordering::SeqCst) {
+            return;
+        }
+        ready.await;
+    }
+}
+
+/// Prepare the project's workspace after the chat exists, so slow git/worktree
+/// operations do not hold the task-create IPC call open. The first prompt is
+/// still gated on completion, so agents never run before setup hooks finish.
+async fn prepare_task_workspace(
+    h: &Arc<Harness>,
+    task_id: &str,
+    project: &str,
+    requested_branch: &str,
+    want_worktree: bool,
+    prompt: &str,
+) {
+    let project_owned = project.to_string();
+    let requested_branch = requested_branch.to_string();
+    let prompt = prompt.to_string();
+    let runtime = h.runtime(task_id);
+    let startup_cancel = runtime
+        .startup_cancel
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    let cancel_for_blocking = startup_cancel.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        if cancel_for_blocking.is_cancelled() {
+            return Err("startup cancelled".to_string());
+        }
+        let repo = git::metadata(&project_owned);
+        let base_branch = if requested_branch.is_empty() {
+            repo.as_ref().map(|r| r.branch.clone()).unwrap_or_default()
+        } else {
+            requested_branch
+        };
+        if cancel_for_blocking.is_cancelled() {
+            return Err("startup cancelled".to_string());
+        }
+        let worktree_result = if want_worktree && repo.is_some() {
+            Some(git::create_worktree(
+                &project_owned,
+                &base_branch,
+                &git::slug(&prompt),
+            ))
+        } else {
+            None
+        };
+        // Keep a successful worktree result even if cancellation arrived while
+        // Git was creating it. The caller must persist the path before deletion
+        // decides whether the user asked to retain or remove that worktree.
+        Ok((project_owned, repo, base_branch, worktree_result))
+    })
+    .await;
+    let Ok(Ok((project, repo, base_branch, worktree_result))) = prepared else {
+        if !startup_cancel.is_cancelled() && runtime.startup_pending.load(Ordering::SeqCst) {
+            h.upsert_item(
+                task_id,
+                Item::new(
+                    "notice",
+                    "Could not inspect the project folder; using it directly.",
+                    json!({"level":"warning"}),
+                ),
+            )
+            .await;
+            h.update_task(task_id, |t| t.branch.clear()).await;
+            h.save_task_now(task_id).await;
+        }
+        return;
+    };
+    let mut cwd = project.clone();
+    let mut branch = repo.as_ref().map(|r| r.branch.clone()).unwrap_or_default();
+    let mut base_commit = repo.as_ref().and_then(|r| r.head.clone());
+    let mut is_worktree = false;
+    let mut notice = None;
+    match worktree_result {
+        Some(Ok((dir, br))) => {
+            cwd = dir.clone();
+            branch = br;
+            is_worktree = true;
+            // Persist the newly created workspace before honoring cancellation.
+            // Deletion waits for startup to finish, then applies the user's choice
+            // to this exact worktree instead of leaving an untracked checkout.
+            h.update_task(task_id, |t| {
+                t.cwd = cwd.clone();
+                t.branch = branch.clone();
+                t.base_branch = base_branch.clone();
+                t.base_commit = None;
+                t.worktree = true;
+            })
+            .await;
+            h.save_task_now(task_id).await;
+            if startup_cancel.is_cancelled() {
+                return;
+            }
+            let hooks = {
+                let s = h.settings.read().await;
+                agent::checks::hooks_for(&s, &project)
+            };
+            let setup_cancel = startup_cancel.child_token();
+            let setup =
+                agent::checks::setup_worktree(&hooks, &project, &dir, task_id, &setup_cancel).await;
+            if setup_cancel.is_cancelled() || !runtime.startup_pending.load(Ordering::SeqCst) {
+                return;
+            }
+            let failed: Vec<String> = setup
+                .hooks
+                .iter()
+                .filter(|o| !o.ok)
+                .map(|o| format!("`{}`: {}", o.command, o.output))
+                .collect();
+            let mut issues = Vec::new();
+            if let Some(error) = setup.copy_error {
+                issues.push(format!("included-file copy failed: {error}"));
+            }
+            if !failed.is_empty() {
+                issues.push(format!("setup hook failed: {}", failed.join("; ")));
+            }
+            if !issues.is_empty() {
+                notice = Some(format!(
+                    "The worktree was created, but setup did not finish cleanly: {}",
+                    issues.join("; ")
+                ));
+            } else if setup.copied > 0 {
+                notice = Some(format!(
+                    "Copied {} file{} from `.worktreeinclude` into the new worktree.",
+                    setup.copied,
+                    if setup.copied == 1 { "" } else { "s" }
+                ));
+            }
+            let dir_for_head = dir.clone();
+            base_commit = tokio::task::spawn_blocking(move || git::head(&dir_for_head))
+                .await
+                .ok()
+                .flatten();
+        }
+        Some(Err(e)) => {
+            notice = Some(format!(
+                "Couldn't create a worktree ({e}). Working directly in the project."
+            ))
+        }
+        None if want_worktree && repo.is_none() => {
+            notice =
+                Some("This folder isn't a git repository, so the task runs directly in it.".into())
+        }
+        None => {}
+    }
+    if startup_cancel.is_cancelled() || !runtime.startup_pending.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(n) = notice {
+        h.upsert_item(task_id, Item::new("notice", n, json!({"level": "info"})))
+            .await;
+    }
+    h.update_task(task_id, |t| {
+        t.cwd = cwd;
+        t.branch = branch;
+        t.base_branch = base_branch;
+        t.base_commit = base_commit;
+        t.worktree = is_worktree;
+    })
+    .await;
+    h.save_task_now(task_id).await;
+}
+
+struct NewTaskStartup {
+    task_id: String,
+    startup_item: String,
+    project: String,
+    base_branch: String,
+    worktree: bool,
+    prompt: String,
+    images: Vec<String>,
+    guard: StartupGuard,
+}
+
+/// Dispatches the first prompt after workspace preparation. Hook checks and image
+/// preparation can involve slow local work; the chat should be open and usable
+/// while those checks finish.
+fn start_new_task_prompt(h: Arc<Harness>, startup: NewTaskStartup) {
+    let NewTaskStartup {
+        task_id,
+        startup_item,
+        project,
+        base_branch,
+        worktree,
+        prompt,
+        images,
+        guard: startup,
+    } = startup;
+    tauri::async_runtime::spawn(async move {
+        prepare_task_workspace(&h, &task_id, &project, &base_branch, worktree, &prompt).await;
+        if startup.cancel.is_cancelled() || !startup.runtime.startup_pending.load(Ordering::SeqCst)
+        {
+            if startup.runtime.startup_pending.load(Ordering::SeqCst) {
+                h.patch_item(&task_id, &startup_item, |item| {
+                    item.text = format!(
+                        "Startup stopped before the first message was sent. The message is preserved below for you to retry:\n\n{prompt}"
+                    );
+                    item.data["working"] = json!(false);
+                    item.data["level"] = json!("warning");
+                })
+                .await;
+            } else {
+                drop(startup);
+                h.remove_item(&task_id, &startup_item).await;
+            }
+            return;
+        }
+        h.patch_item(&task_id, &startup_item, |item| {
+            item.text = "Starting…".into()
+        })
+        .await;
+        if startup.runtime.startup_pending.load(Ordering::SeqCst) && startup.cancel.is_cancelled() {
+            h.patch_item(&task_id, &startup_item, |item| {
+                item.text = format!(
+                    "Startup stopped before the first message was sent. The message is preserved below for you to retry:\n\n{prompt}"
+                );
+                item.data["working"] = json!(false);
+                item.data["level"] = json!("warning");
+            })
+            .await;
+            return;
+        }
+        let result = if images.is_empty() {
+            dispatch(h.clone(), task_id.clone(), prompt.clone()).await
+        } else {
+            runner::send_images(h.clone(), task_id.clone(), prompt.clone(), images, false).await
+        };
+        drop(startup);
+        h.remove_item(&task_id, &startup_item).await;
+        if let Err(error) = result {
+            h.upsert_item(
+                &task_id,
+                Item::new(
+                    "notice",
+                    format!("Couldn't send the first message: {error}\\n\\nYour message is preserved here so you can retry:\\n{prompt}"),
+                    json!({"level": "error"}),
+                ),
+            ).await;
+        }
+    });
+}
+
 #[tauri::command]
 async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
     let project = req.project.trim().to_string();
@@ -649,87 +988,13 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
         .chars()
         .take(70)
         .collect();
-    let repo = git::metadata(&project);
-    let is_git = repo.is_some();
-    let mut cwd = project.clone();
-    let mut branch = repo.as_ref().map(|m| m.branch.clone()).unwrap_or_default();
-    let mut base_commit = repo.as_ref().and_then(|m| m.head.clone());
-    let mut notice = None;
-    let base_branch = if req.base_branch.is_empty() {
-        branch.clone()
-    } else {
-        req.base_branch.clone()
-    };
-    let mut worktree = false;
-    if req.worktree && is_git {
-        match git::create_worktree(&project, &base_branch, &git::slug(&req.prompt)) {
-            Ok((dir, br)) => {
-                // A fresh worktree is a checkout of the *committed* tree, so the
-                // `.env`, `node_modules` and untracked output the user's own
-                // checkout has are all missing from it, and the agent's first
-                // command fails for a reason that has nothing to do with its
-                // task. Put back what the repository asked for (its
-                // `.worktreeinclude`) and give a `post_setup_worktree` hook the
-                // chance to do the rest — see `checks::setup_worktree`. Done
-                // here, before the task exists, so the very first tool call runs
-                // in a usable tree.
-                let hooks = {
-                    let s = h.settings.read().await;
-                    agent::checks::hooks_for(&s, &project)
-                };
-                let setup = agent::checks::setup_worktree(
-                    &hooks,
-                    &project,
-                    &dir,
-                    &id,
-                    &tokio_util::sync::CancellationToken::new(),
-                )
-                .await;
-                let failed: Vec<String> = setup
-                    .hooks
-                    .iter()
-                    .filter(|o| !o.ok)
-                    .map(|o| format!("`{}`: {}", o.command, o.output))
-                    .collect();
-                let mut setup_issues = Vec::new();
-                if let Some(error) = setup.copy_error {
-                    setup_issues.push(format!("included-file copy failed: {error}"));
-                }
-                if !failed.is_empty() {
-                    setup_issues.push(format!("setup hook failed: {}", failed.join("; ")));
-                }
-                if !setup_issues.is_empty() {
-                    // Told, not fatal: a setup failure must not cost the user
-                    // their task, but it must not leave the agent hitting the
-                    // same missing dependency with no explanation.
-                    notice = Some(format!(
-                        "The worktree was created, but setup did not finish cleanly: {}",
-                        setup_issues.join("; ")
-                    ));
-                } else if setup.copied > 0 {
-                    notice = Some(format!(
-                        "Copied {} file{} from `.worktreeinclude` into the new worktree.",
-                        setup.copied,
-                        if setup.copied == 1 { "" } else { "s" }
-                    ));
-                }
-                cwd = dir;
-                branch = br;
-                // A selected base branch may differ from the project’s current
-                // HEAD, so read the new checkout only on the worktree path.
-                base_commit = git::head(&cwd);
-                worktree = true;
-            }
-            Err(e) => {
-                notice = Some(format!(
-                    "Couldn't create a worktree ({e}). Working directly in the project."
-                ))
-            }
-        }
-    } else if req.worktree {
-        notice =
-            Some("This folder isn't a git repository, so the task runs directly in it.".into());
-    }
+    // Git metadata inspection and optional worktree creation take place after
+    // the chat is visible; the IPC create call only has to persist its shell.
+    let cwd = project.clone();
+    let branch = req.base_branch.clone();
+    let base_branch = req.base_branch.clone();
+    let base_commit = None;
+    let worktree = false;
     let now = chrono::Utc::now();
     let mut agents = req
         .agents
@@ -807,15 +1072,24 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
         // Built in memory, so its sub-agent maps are here rather than on disk.
         hydrated: true,
     };
-    if let Some(n) = notice {
-        task.items
-            .push(Item::new("notice", n, json!({"level": "info"})));
-    }
+    let startup = Item::new(
+        "notice",
+        "Preparing your first message…",
+        json!({"level": "info", "working": true, "startup": true}),
+    );
+    let startup_id = startup.id.clone();
+    let startup_runtime = h.runtime(&id);
+    startup_runtime
+        .startup_pending
+        .store(true, Ordering::SeqCst);
+    let startup_guard = StartupGuard::new(startup_runtime);
+    task.items.push(startup);
     let summary = task.summary();
     h.tasks
         .write()
         .await
         .insert(id.clone(), Arc::new(Mutex::new(task)));
+    h.save_task(&id).await;
     {
         let mut s = h.settings.write().await;
         s.model = req.model.clone();
@@ -830,26 +1104,27 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
             store::ensure_required_agents(&mut s.default_agents);
         }
         s.recent_models.retain(|m| m != &req.model);
-        s.recent_models.insert(0, req.model);
+        s.recent_models.insert(0, req.model.clone());
         s.recent_models.truncate(5);
         if !s.projects.contains(&project) {
             s.projects.insert(0, project.clone());
         }
-        s.project = project;
+        s.project = project.clone();
         store::save_settings(&s);
     }
-    if req.images.is_empty() {
-        dispatch(h.inner().clone(), id, req.prompt.trim().to_string()).await?;
-    } else {
-        runner::send_images(
-            h.inner().clone(),
-            id,
-            req.prompt.trim().to_string(),
-            req.images.clone(),
-            false,
-        )
-        .await?;
-    }
+    start_new_task_prompt(
+        h.inner().clone(),
+        NewTaskStartup {
+            task_id: id,
+            startup_item: startup_id,
+            project,
+            base_branch: req.base_branch,
+            worktree: req.worktree,
+            prompt: req.prompt.trim().to_string(),
+            images: req.images,
+            guard: startup_guard,
+        },
+    );
     Ok(summary)
 }
 
@@ -862,6 +1137,7 @@ async fn task_send(
     images: Option<Vec<String>>,
 ) -> Result<(), String> {
     let text = text.trim().to_string();
+    crate::wait_for_task_startup(h.inner(), &id).await;
     if let Some(images) = images.filter(|i| !i.is_empty()) {
         return runner::send_images(h.inner().clone(), id, text, images, later.unwrap_or(false))
             .await;
@@ -1107,6 +1383,17 @@ async fn task_update(h: H<'_>, id: String, patch: Value) -> Result<TaskSummary, 
 
 /// Apply a settings patch to one chat, with the task already locked.
 async fn apply_patch(h: &Harness, id: &str, patch: Value) -> Result<TaskSummary, String> {
+    let archive_paused = if patch["archived"].as_bool() == Some(true) {
+        let paused_all = h.settings.read().await.paused_all;
+        let task = h.task(id).await?;
+        let task = task.lock().await;
+        task.paused.is_some() || Harness::held_by_global(&task.summary(), paused_all)
+    } else {
+        false
+    };
+    if archive_paused {
+        runner::interrupt(h, id).await;
+    }
     let running = h
         .runtime(id)
         .running
@@ -1251,6 +1538,15 @@ async fn apply_patch(h: &Harness, id: &str, patch: Value) -> Result<TaskSummary,
         t.archived = v;
         if v {
             t.pinned = false;
+            if archive_paused {
+                t.paused = None;
+                t.unpaused = true;
+                t.status = "stopped".into();
+                t.waiting_kind = None;
+                if t.step.starts_with("Paused") {
+                    t.step = "Stopped".into();
+                }
+            }
         }
     }
     if let Some(v) = patch["pinned"].as_bool() {
@@ -1423,9 +1719,7 @@ async fn task_resume(
     message: Option<String>,
     mode: Option<String>,
 ) -> Result<(), String> {
-    // Resuming is the user picking this chat back up, so it comes to the top.
-    // (A global "resume all" is deliberately not this command, and must not
-    // reorder the list — every chat would jump at once.)
+    wait_for_task_startup(h.inner(), &id).await;
     h.touch(&id).await;
     let res = match mode.as_deref() {
         Some(m @ ("continue" | "wrap")) if message.is_none() => {
@@ -1679,6 +1973,7 @@ async fn tasks_message(
         if h.task(&id).await.is_err() {
             continue;
         }
+        wait_for_task_startup(h.inner(), &id).await;
         match runner::send_opts(
             h.inner().clone(),
             id.clone(),
@@ -1704,8 +1999,20 @@ async fn accounts_list(h: H<'_>) -> Result<Vec<accounts::AccountView>, String> {
 
 async fn add_account(
     h: &Arc<Harness>,
-    mut a: agent::store::Account,
+    a: agent::store::Account,
 ) -> Result<Vec<accounts::AccountView>, String> {
+    add_account_with(h, a, claude_allowed()).await
+}
+
+/// [`add_account`] with the install's opt-in passed in rather than probed, so a
+/// test can pin both sides of the refusal without depending on where the test
+/// binary happens to live.
+async fn add_account_with(
+    h: &Arc<Harness>,
+    mut a: agent::store::Account,
+    allow_claude: bool,
+) -> Result<Vec<accounts::AccountView>, String> {
+    account_import_allowed(&a.kind, allow_claude)?;
     // Setup tokens can't be refreshed, so prove they work before saving (no
     // silent duds). The same rule covers an OpenCode Go key: it is a bare
     // credential with nothing else to validate it against, and a typo would
@@ -1999,10 +2306,10 @@ fn export_json(tasks: Vec<Task>) -> Result<String, String> {
 /// restored, and a chat that is already archived isn't counted as work done.
 /// Pinning is dropped on the way through, exactly as the single-chat patch does —
 /// an archived chat is out of the sidebar, so a pin on it is a pin on nothing.
-///
-/// Nothing here stops a running agent: archiving hides the chat, it does not
-/// cancel it, and the transcript stays where it was. What does stop is the
-/// *global* model swap, which skips archived chats — so a bulk archive mid-swap
+/// Paused chats are stopped as they are archived, so they no longer remain in the
+/// paused list after being hidden. Archiving ordinary running chats only hides
+/// them; it does not cancel them, and the transcript stays where it was. What does
+/// stop is the *global* model swap, which skips archived chats — so a bulk archive mid-swap
 /// takes a chat out of a change that was already in flight.
 ///
 /// The command is a thin wrapper so the work can be tested against a plain
@@ -2051,7 +2358,7 @@ async fn export_chats(h: &Harness, ids: &[String], path: &str) -> Result<usize, 
     }
     out.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
     let n = out.len();
-    std::fs::write(&path, export_json(out)?).map_err(|e| format!("Couldn't write {path}: {e}"))?;
+    std::fs::write(path, export_json(out)?).map_err(|e| format!("Couldn't write {path}: {e}"))?;
     Ok(n)
 }
 
@@ -2275,6 +2582,22 @@ fn purge_task(h: &Harness, id: &str, remove_worktree: bool) -> Result<(), String
     // the same two things it would: the agent's cancellation token and every
     // background command. A deleted chat leaves nothing running behind it.
     runner::stop_tokens(h, id);
+    let runtime = h.runtime(id);
+    runtime.bg_cancel.lock().unwrap().cancel();
+    // Git creation runs on the blocking pool and cannot be interrupted in the
+    // middle of its operation. Wait for startup to persist its final workspace
+    // before honoring the caller's preserve/remove choice.
+    let mut startup = runtime.startup_cancel.lock().unwrap();
+    if let Some(cancel) = startup.as_ref() {
+        cancel.cancel();
+    }
+    while startup.is_some() {
+        startup = runtime.startup_done.wait(startup).unwrap();
+    }
+    drop(startup);
+    if runtime.startup_pending.swap(false, Ordering::SeqCst) {
+        runtime.startup_ready.notify_waiters();
+    }
     h.bg.kill_task(id);
     let task = h.tasks.blocking_read().get(id).cloned();
     if let Some(task) = task {
@@ -3156,6 +3479,12 @@ async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
     let gh_token = s.plugins.github.token.clone();
     let mcp_stored = s.mcp.clone();
     let mut next: Settings = serde_json::from_value(cur).map_err(|e| e.to_string())?;
+    // Store doc-selection paths normalized, like a trust decision's: the UI
+    // filters by normalized path when it replaces a project's rule, so leaving a
+    // raw spelling here would let two spellings of one folder accumulate.
+    for r in next.project_docs.iter_mut() {
+        r.path = agent::trust::norm_path(&r.path);
+    }
     next.providers = providers;
     next.spend = spend;
     next.accounts = accts;
@@ -3189,7 +3518,10 @@ async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
     }
     // Trust can also arrive through the generic patch. Keep the prompt cache and
     // every already-frozen task prefix in step with the exact trust change.
-    let trust_prefixes = changed_trust_prefixes(&s.trust, &next.trust);
+    let mut trust_prefixes = changed_trust_prefixes(&s.trust, &next.trust);
+    // The per-project instruction selection can arrive the same way, and a frozen
+    // prefix built under the old selection must be dropped for the same reason.
+    trust_prefixes.extend(changed_doc_prefixes(&s.project_docs, &next.project_docs));
     // Cancel before the swap, under the same lock used by OAuth persistence.
     // Otherwise deleting and recreating a resource could revive an old flow.
     agent::mcp_oauth::invalidate_config_changes(&s.mcp, &next.mcp).await?;
@@ -4196,15 +4528,31 @@ async fn mcp_reconnect(h: H<'_>) -> Result<(), String> {
 #[tauri::command]
 async fn project_info(h: H<'_>, path: String) -> Result<Value, String> {
     let is_git = git::is_repo(&path);
-    let inject_global_claude = h.settings.read().await.inject_global_claude;
+    let (inject_global_claude, disabled_docs) = {
+        let s = h.settings.read().await;
+        (
+            s.inject_global_claude,
+            agent::prompt::disabled_docs(&s.project_docs, &path),
+        )
+    };
     Ok(json!({
+        // Echoed back so the UI can tell which folder this inventory describes:
+        // the settings panel offers a per-file switch whose write goes to
+        // whatever project is *currently* selected, and a stale answer from a
+        // previous folder must not be presented as this one's files.
+        "path": path,
         "exists": std::path::Path::new(&path).is_dir(),
         "git": is_git,
         "branch": if is_git { git::current_branch(&path) } else { String::new() },
         "branches": if is_git { git::branches(&path) } else { vec![] },
         // What actually reaches the prompt, not the raw inventory: for an
         // untrusted folder this is the globals alone.
-        "memory": agent::prompt::memory_for_prompt(&path, inject_global_claude).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "memory": agent::prompt::memory_for_prompt(&path, inject_global_claude, &disabled_docs).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        // The project's own instruction files that exist, whether or not the
+        // user has switched them off — the Settings row offers a toggle per
+        // name, so it needs the inventory, not what survived the selection.
+        "docs": agent::prompt::project_files(&path, &[]).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "disabled_docs": disabled_docs,
         "trusted": agent::trust::trusted_now(&path),
         "decided": agent::trust::decided(&agent::trust::current(), &path),
     }))
@@ -4356,6 +4704,42 @@ fn changed_trust_prefixes(
         };
         if decision(old) != decision(new) {
             record_trust_prefix(&mut prefixes, &path, kind);
+        }
+    }
+    prefixes
+}
+
+/// The projects whose per-project instruction selection changed. Unlike trust,
+/// a doc rule governs only its exact folder (see `prompt::disabled_docs`), so
+/// every one of these is an exact-path invalidation.
+fn changed_doc_prefixes(
+    old: &[store::ProjectDocRule],
+    new: &[store::ProjectDocRule],
+) -> Vec<TrustPrefix> {
+    let mut keys: Vec<String> = Vec::new();
+    for r in old.iter().chain(new) {
+        let key = invalidation_path(&r.path);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    let mut prefixes = Vec::new();
+    for path in keys {
+        // The disabled list is a set: order carries no meaning to the loader
+        // (`project_files` asks "is this name in there"), so compare sorted —
+        // otherwise a hand-edited or re-imported settings.json that reorders one
+        // project's list would drop every warm prefix in that project for nothing.
+        let rule = |list: &[store::ProjectDocRule]| {
+            list.iter()
+                .find(|r| invalidation_path(&r.path) == path)
+                .map(|r| {
+                    let mut d = r.disabled.clone();
+                    d.sort();
+                    d
+                })
+        };
+        if rule(old) != rule(new) {
+            record_trust_prefix(&mut prefixes, &path, agent::trust::TrustKind::Folder);
         }
     }
     prefixes
@@ -4683,6 +5067,35 @@ fn register_toast_identity(app: &tauri::App) {
 /// by the time this goes out.
 pub const TOAST_CLICK: &str = "ol://toast-click";
 
+/// The toast-click hand-off between the COM activator and the window.
+///
+/// A click can arrive before the window is listening for one: when the app was
+/// closed, the shell launches it to deliver the click, and the activation lands
+/// during setup, while the frontend is still booting. An event emitted then
+/// reaches nothing, so the click is held as `pending` until the frontend calls
+/// `take_toast_click` (which also marks it `listening`). After that, clicks go
+/// straight out as `TOAST_CLICK` events.
+#[derive(Default)]
+struct ToastClicks {
+    listening: bool,
+    pending: Option<String>,
+}
+
+static TOAST_CLICKS: std::sync::Mutex<ToastClicks> = std::sync::Mutex::new(ToastClicks {
+    listening: false,
+    pending: None,
+});
+
+/// The chat a toast click asked for, if one arrived before the window was
+/// listening. Also marks the window as listening from here on, so the caller
+/// must invoke this only once its `TOAST_CLICK` listener is attached.
+#[tauri::command]
+fn take_toast_click() -> Option<String> {
+    let mut clicks = TOAST_CLICKS.lock().unwrap_or_else(|e| e.into_inner());
+    clicks.listening = true;
+    clicks.pending.take()
+}
+
 /// Show a desktop toast that opens `task_id` when clicked.
 ///
 /// This exists instead of `sendNotification` because the plugin's desktop path
@@ -4723,8 +5136,17 @@ fn install_toast_click_handler(app: &tauri::AppHandle) {
         std::sync::Arc::new(move |task: Option<String>| {
             show_main(&handle);
             let Some(task) = task else { return };
-            use tauri::Emitter;
-            let _ = handle.emit(TOAST_CLICK, json!({ "task_id": task }));
+            let listening = {
+                let mut clicks = TOAST_CLICKS.lock().unwrap_or_else(|e| e.into_inner());
+                if !clicks.listening {
+                    clicks.pending = Some(task.clone());
+                }
+                clicks.listening
+            };
+            if listening {
+                use tauri::Emitter;
+                let _ = handle.emit(TOAST_CLICK, json!({ "task_id": task }));
+            }
         });
     // Best-effort: a click that cannot be delivered leaves the user with the
     // toast they had before, which is strictly better than an app that will not
@@ -4771,6 +5193,7 @@ fn toast_icon_file(png: &[u8]) -> Option<std::path::PathBuf> {
 pub fn run() {
     tauri::Builder::default()
         .manage(visualization::Registry::default())
+        .manage(updates::Updates::default())
         .register_uri_scheme_protocol("openleash-viz", |context, request| {
             visualization::respond(context.app_handle(), request)
         })
@@ -4795,6 +5218,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Before anything can emit a toast: an unregistered AppUserModelID
             // is dropped by the Windows shell without an error, so this has to
@@ -4894,6 +5318,7 @@ pub fn run() {
             build_tray(app)?;
             set_taskbar_icon(app.handle());
             install_toast_click_handler(app.handle());
+            updates::start(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -4912,6 +5337,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            updates::app_update_check,
+            updates::app_update_download,
+            updates::app_update_install,
+            updates::app_update_status,
             visualization::visualization_publish,
             visualization::visualization_read,
             visualization::visualization_release,
@@ -5028,7 +5457,8 @@ pub fn run() {
             trust_set,
             trust_clear,
             usage_get,
-            toast_show
+            toast_show,
+            take_toast_click
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -5036,6 +5466,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    // The `test_home` guard must span the whole test to serialize
+    // `OPENLEASH_HOME` across tokio tests, so it is deliberately held across
+    // `.await` points. See AGENTS.md: do not drop the lock to quiet the lint.
+    #![allow(clippy::await_holding_lock)]
+
     use super::*;
     use crate::agent::runner;
     use crate::agent::store::Route;
@@ -5075,6 +5510,136 @@ mod tests {
                 "chat {id} that was not paused must keep its manual position"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bootstraps_a_new_chat_before_background_workspace_setup() {
+        let dir = std::env::temp_dir().join(format!("openleash-startup-{}", agent::new_id()));
+        let _home = store::test_home(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.to_string_lossy().to_string();
+        let h = Arc::new(harness(vec![]));
+        let id = "startup".to_string();
+        let task = chat(&id);
+        let mut task = task;
+        task.project = path.clone();
+        task.cwd = path;
+        let startup = Item::new(
+            "notice",
+            "Preparing your first message…",
+            json!({"startup": true}),
+        );
+        let _startup_id = startup.id.clone();
+        task.items.push(startup);
+        h.tasks
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(task)));
+        let rt = h.runtime(&id);
+        rt.startup_pending.store(true, Ordering::SeqCst);
+        let startup_guard = StartupGuard::new(rt.clone());
+        let task_ref = h.task(&id).await.unwrap();
+        let task_guard = task_ref.lock().await;
+        store::save_task(&task_guard);
+        drop(task_guard);
+
+        let wait_h = h.clone();
+        let wait_id = id.clone();
+        let waiting = tokio::spawn(async move { wait_for_task_startup(&wait_h, &wait_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "follow-up must wait while workspace setup is pending"
+        );
+
+        prepare_task_workspace(
+            &h,
+            &id,
+            &project.to_string_lossy(),
+            "",
+            false,
+            "initial prompt",
+        )
+        .await;
+        assert!(
+            rt.startup_pending.load(Ordering::SeqCst),
+            "workspace setup keeps first-message gate until send dispatches"
+        );
+        let result = dispatch(h.clone(), id.clone(), "first prompt".to_string()).await;
+        assert!(result.is_ok());
+        drop(startup_guard);
+        assert!(!rt.startup_pending.load(Ordering::SeqCst));
+        assert!(waiting.await.is_ok());
+        assert!(
+            store::read_task_full(&store::task_path(&id)).is_ok(),
+            "the task body is persisted"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_chat_cancels_startup_and_releases_waiting_sends() {
+        let dir = std::env::temp_dir().join(format!("openleash-startup-stop-{}", agent::new_id()));
+        let _home = store::test_home(&dir);
+        let h = Arc::new(harness(vec![chat("startup-stop")]));
+        let runtime = h.runtime("startup-stop");
+        runtime.startup_pending.store(true, Ordering::SeqCst);
+        let guard = StartupGuard::new(runtime.clone());
+        let cancel = guard.cancel.clone();
+        let startup = tokio::spawn(async move {
+            cancel.cancelled().await;
+            drop(guard);
+        });
+        let wait_h = h.clone();
+        let waiting =
+            tokio::spawn(async move { wait_for_task_startup(&wait_h, "startup-stop").await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        runner::stop_tokens(&h, "startup-stop");
+        startup.await.unwrap();
+        assert!(!runtime.startup_pending.load(Ordering::SeqCst));
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("stop releases waiting sends")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_chat_cancels_startup_and_releases_waiting_sends() {
+        let dir =
+            std::env::temp_dir().join(format!("openleash-startup-delete-{}", agent::new_id()));
+        let _home = store::test_home(&dir);
+        let h = Arc::new(harness(vec![chat("startup-delete")]));
+        let runtime = h.runtime("startup-delete");
+        runtime.startup_pending.store(true, Ordering::SeqCst);
+        let guard = StartupGuard::new(runtime.clone());
+        let cancel = guard.cancel.clone();
+        let startup = tokio::spawn(async move {
+            cancel.cancelled().await;
+            drop(guard);
+        });
+        let wait_h = h.clone();
+        let waiting =
+            tokio::spawn(async move { wait_for_task_startup(&wait_h, "startup-delete").await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        let delete_h = h.clone();
+        tokio::task::spawn_blocking(move || purge_task(&delete_h, "startup-delete", false))
+            .await
+            .unwrap()
+            .unwrap();
+        startup.await.unwrap();
+
+        assert!(!runtime.startup_pending.load(Ordering::SeqCst));
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("deletion releases waiting sends")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5117,8 +5682,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut s = Settings::default();
-        s.project = project.clone();
+        let mut s = Settings {
+            project: project.clone(),
+            ..Default::default()
+        };
         // Same visible id may exist in user and project scopes; approval must
         // use the exact pair, never the first entry with this id.
         s.hooks.push(agent::checks::Hook {
@@ -5205,6 +5772,83 @@ mod tests {
                 "`{longer}` is a longer word, so the line is an ordinary message"
             );
         }
+    }
+
+    /// The Claude subscription integration is an opt-in decided by a file beside
+    /// the running executable — not a setting (which would travel with
+    /// `OPENLEASH_HOME` between installs) and not a source-tree flag. This pins
+    /// the read: the exe's own folder, the marker being a regular file, and its
+    /// contents never mattering.
+    #[test]
+    fn claude_is_off_until_an_allow_claude_file_sits_beside_the_executable() {
+        let dir = std::env::temp_dir().join(format!("openleash-allow-claude-{}", agent::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("openleash.exe");
+
+        assert!(!claude_allowed_in(&dir), "an unmarked install stays off");
+        assert!(!claude_allowed_with(Some(&exe)));
+        // No executable path at all is unusual, and the safe answer is closed
+        // rather than opening the gate on a directory the user never marked.
+        assert!(!claude_allowed_with(None));
+
+        // A *directory* called ALLOW_CLAUDE is not the marker; only a file is.
+        std::fs::create_dir_all(dir.join(ALLOW_CLAUDE)).unwrap();
+        assert!(!claude_allowed_in(&dir));
+        std::fs::remove_dir_all(dir.join(ALLOW_CLAUDE)).unwrap();
+
+        // Contents are never read, so a stray "false"/newline/BOM from an editor
+        // still counts as opted in.
+        std::fs::write(dir.join(ALLOW_CLAUDE), "false\n").unwrap();
+        assert!(claude_allowed_in(&dir));
+        assert!(
+            claude_allowed_with(Some(&exe)),
+            "the marker is read from the executable's own folder"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Hiding the provider in the UI is not the gate. The import paths have to
+    /// refuse a Claude account themselves, or a second frontend, a replayed IPC
+    /// call or a UI regression could still park a subscription where every chat
+    /// will route it — and the switch must not disturb the other account kinds.
+    #[test]
+    fn importing_a_claude_account_needs_the_opt_in() {
+        let err =
+            account_import_allowed("claude", false).expect_err("no opt-in, no Claude account");
+        assert!(
+            err.contains(ALLOW_CLAUDE),
+            "the refusal has to name the file that turns it on: {err}"
+        );
+        assert!(account_import_allowed("claude", true).is_ok());
+        for kind in ["codex", "opencode-go", "anthropic"] {
+            assert!(
+                account_import_allowed(kind, false).is_ok(),
+                "{kind} must not be affected by the Claude switch"
+            );
+        }
+    }
+
+    /// The refusal lives in the command, not only in the screen that calls it.
+    /// This account carries a refresh token, so the probe that normally gates a
+    /// Claude import is skipped and the opt-in check is the only thing standing
+    /// between it and `settings.accounts`.
+    #[tokio::test]
+    async fn the_account_command_refuses_claude_without_the_opt_in() {
+        let h = Arc::new(harness(vec![]));
+        let a: agent::store::Account = serde_json::from_value(json!({
+            "kind": "claude", "access_token": "sk-ant-oat-test", "refresh_token": "test-refresh"
+        }))
+        .unwrap();
+
+        let Err(err) = add_account_with(&h, a, false).await else {
+            panic!("an account import must refuse without the opt-in");
+        };
+        assert!(err.contains(ALLOW_CLAUDE), "{err}");
+        assert!(
+            h.settings.read().await.accounts.is_empty(),
+            "a refused import must not leave an account behind"
+        );
     }
 
     /// An MCP server's bearer token must not ride the settings broadcast to the
@@ -5478,17 +6122,16 @@ mod tests {
     /// test otherwise — and the gate is the whole point of the change.
     #[test]
     fn a_global_swap_leaves_subagent_types_alone_unless_asked() {
-        let mk = || {
-            let mut s = Settings::default();
-            s.model = "gpt-sol".into();
-            s.effort = 2;
-            s.agents = vec![AgentDef {
+        let mk = || Settings {
+            model: "gpt-sol".into(),
+            effort: 2,
+            agents: vec![AgentDef {
                 id: "reviewer".into(),
                 name: "Reviewer".into(),
                 model: "gpt-sol".into(),
                 ..Default::default()
-            }];
-            s
+            }],
+            ..Default::default()
         };
         let map: HashMap<String, String> = [("gpt-sol".to_string(), "fable-5".to_string())].into();
 
@@ -6905,12 +7548,14 @@ mod tests {
             tasks.push(task);
         }
         let h = harness(tasks);
-        let mut settings = Settings::default();
-        settings.trust = vec![trust_decision(
-            "/work",
-            agent::trust::TrustKind::Parent,
-            agent::trust::TrustState::Trusted,
-        )];
+        let settings = Settings {
+            trust: vec![trust_decision(
+                "/work",
+                agent::trust::TrustKind::Parent,
+                agent::trust::TrustState::Trusted,
+            )],
+            ..Default::default()
+        };
         let patched = vec![trust_decision(
             "/work",
             agent::trust::TrustKind::Parent,
@@ -6960,6 +7605,69 @@ mod tests {
         );
         let sibling = h.task("sibling").await.unwrap();
         assert!(sibling.lock().await.plugins.computer.enabled);
+    }
+
+    #[tokio::test]
+    async fn a_doc_selection_change_invalidates_only_that_project() {
+        // Switching a file off changes what the prompt says, so a frozen prefix
+        // built under the old selection has to go — otherwise a chat opened
+        // before the toggle keeps injecting the file for the life of its prefix.
+        // The rule governs one exact folder, so a nested project is untouched.
+        let mut exact = chat("docs-exact");
+        exact.project = "/work/a".into();
+        exact.system = "stale docs prefix".into();
+        let mut child = chat("docs-child");
+        child.project = "/work/a/child".into();
+        child.system = "keep child prefix".into();
+        let h = harness(vec![exact, child]);
+
+        let rule = |path: &str, disabled: &[&str]| store::ProjectDocRule {
+            path: path.into(),
+            disabled: disabled.iter().map(|s| s.to_string()).collect(),
+        };
+        let prefixes = changed_doc_prefixes(&[], &[rule("/work/a", &["CLAUDE.md"])]);
+        assert_eq!(prefixes.len(), 1);
+        assert!(
+            !prefixes[0].descendants,
+            "a doc rule never reaches child folders"
+        );
+        invalidate_trust_prefixes(&h, &prefixes).await;
+
+        let tasks: Vec<_> = h.tasks.read().await.values().cloned().collect();
+        for task in tasks {
+            let task = task.lock().await;
+            if task.id == "docs-exact" {
+                assert!(task.system.is_empty(), "the stale prefix is dropped");
+            } else {
+                assert_eq!(
+                    task.system, "keep child prefix",
+                    "a nested project is not governed by the parent's rule"
+                );
+            }
+        }
+
+        // A no-op write (same rule again) must not invalidate anything: every
+        // unrelated settings save would otherwise drop every warm prefix.
+        assert!(changed_doc_prefixes(
+            &[rule("/work/a", &["CLAUDE.md"])],
+            &[rule("/work/a", &["CLAUDE.md"])]
+        )
+        .is_empty());
+        // Reordering the disabled list is not a change either.
+        assert!(changed_doc_prefixes(
+            &[rule("/work/a", &["CLAUDE.md", "AGENTS.md"])],
+            &[rule("/work/a", &["AGENTS.md", "CLAUDE.md"])]
+        )
+        .is_empty());
+        // Switching a file back on is.
+        assert_eq!(
+            changed_doc_prefixes(
+                &[rule("/work/a", &["CLAUDE.md"])],
+                &[rule("/work/a", &["CLAUDE.md", "AGENTS.md"])]
+            )
+            .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -7182,27 +7890,53 @@ mod tests {
         let _home = store::test_home(&dir);
         let mut pinned = chat("pinned");
         pinned.pinned = true;
+        let mut paused = chat("paused");
+        paused.status = "running".into();
+        paused.step = "Paused for review".into();
+        paused.paused = Some(agent::Pause {
+            kind: "manual".into(),
+            reason: "review".into(),
+            ..Default::default()
+        });
         let mut already = chat("already");
         already.archived = true;
         let mut alive = chat("alive");
         alive.archived = true;
-        let h = harness(vec![pinned, already, alive]);
+        let h = harness(vec![pinned, paused, already, alive]);
 
         assert_eq!(
-            archive_chats(&h, &["pinned".into(), "already".into(), "ghost".into()])
-                .await
-                .unwrap(),
-            1,
-            "only the pinned chat was live to archive; a vanished id is not work done"
+            archive_chats(
+                &h,
+                &[
+                    "pinned".into(),
+                    "paused".into(),
+                    "already".into(),
+                    "ghost".into()
+                ]
+            )
+            .await
+            .unwrap(),
+            2,
+            "only the pinned and paused chats were live to archive; a vanished id is not work done"
         );
         assert_eq!(
             archived_ids(&h).await,
             vec![
                 "alive".to_string(),
                 "already".to_string(),
+                "paused".to_string(),
                 "pinned".to_string()
             ]
         );
+        {
+            let paused = h.task("paused").await.unwrap();
+            let paused = paused.lock().await;
+            assert_eq!(paused.status, "stopped", "archiving a pause stops it");
+            assert!(
+                paused.paused.is_none(),
+                "the archived chat no longer counts as paused"
+            );
+        }
         assert!(
             !h.task("pinned").await.unwrap().lock().await.pinned,
             "archiving unpins, same as the single-chat patch"
@@ -7217,6 +7951,7 @@ mod tests {
             vec![
                 "alive".to_string(),
                 "already".to_string(),
+                "paused".to_string(),
                 "pinned".to_string()
             ],
             "and it left the rest alone"

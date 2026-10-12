@@ -53,15 +53,17 @@ describe("non-blocking informational notices", () => {
     expect(screen.queryByText("Unity Editor")).toBeNull();
   });
 
-  it("dismisses only its own item, without answering or changing run state", async () => {
-    const dismiss = vi.spyOn(api, "dismissAgentNotice").mockResolvedValue(undefined);
+  it("hides the card at once, before the save resolves, and dismisses only its own item", async () => {
+    let finish!: () => void;
+    const dismiss = vi.spyOn(api, "dismissAgentNotice").mockReturnValue(new Promise<void>((resolve) => { finish = resolve; }));
     const answer = vi.spyOn(api, "answerNonBlocking");
     const respond = vi.spyOn(api, "respond");
     render(<AgentNotice it={notice()} taskId="t1" />);
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" })); });
-    expect(dismiss).toHaveBeenCalledExactlyOnceWith("t1", "n1");
     fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
-    expect(dismiss).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unity Editor")).toBeNull();
+    expect(dismiss).toHaveBeenCalledExactlyOnceWith("t1", "n1");
+    await act(async () => { finish(); });
+    expect(screen.queryByText("Unity Editor")).toBeNull();
     expect(answer).not.toHaveBeenCalled();
     expect(respond).not.toHaveBeenCalled();
     expect(get().tasks.t1?.status).toBe("running");

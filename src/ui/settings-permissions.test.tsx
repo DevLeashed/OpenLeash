@@ -31,7 +31,7 @@ beforeEach(() => {
     settingsTab: "perms",
     home: { ...get().home, perm: "auto" },
   });
-  vi.mocked(invoke).mockImplementation(async (command: string, args?: Record<string, any>) => {
+  (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (command: string, args?: { patch?: Record<string, unknown> }) => {
     if (command === "settings_update") return { ...settings(DEFAULT_PERM), ...args?.patch } as never;
     return null as never;
   });

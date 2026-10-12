@@ -579,7 +579,7 @@ pub fn server_name_error(name: &str) -> Option<String> {
     let bad = name
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || *c == '-'));
-    let Some(c) = bad else { return None };
+    let c = bad?;
     let why = if c == '_' {
         "an underscore collides with the `__` that separates the server from the tool".to_string()
     } else {

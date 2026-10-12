@@ -376,7 +376,7 @@ fn name_parts(name: &str) -> Vec<String> {
         prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
     }
     spaced
-        .split(|c| c == '_' || c == '-')
+        .split(['_', '-'])
         .filter(|s| !s.is_empty())
         .map(|s| s.to_lowercase())
         .collect()

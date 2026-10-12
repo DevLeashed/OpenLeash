@@ -248,7 +248,7 @@ impl AccountRt {
     }
 
     /// Update windows from rate-limit headers that ride along on every response.
-    pub fn from_headers(&self, kind: &str, id: &str, headers: &reqwest::header::HeaderMap) {
+    pub fn update_from_headers(&self, kind: &str, id: &str, headers: &reqwest::header::HeaderMap) {
         let get = |k: &str| {
             headers
                 .get(k)
@@ -877,7 +877,7 @@ pub async fn claude_probe(h: &Harness, a: &Account) -> Result<(), String> {
         .await
         .map_err(|e| format!("couldn't reach Claude: {e}"))?;
     let status = resp.status().as_u16();
-    h.accts.from_headers("claude", &a.id, resp.headers());
+    h.accts.update_from_headers("claude", &a.id, resp.headers());
     let text = resp.text().await.unwrap_or_default();
     let msg = serde_json::from_str::<Value>(&text)
         .ok()

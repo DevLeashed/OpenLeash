@@ -13,12 +13,12 @@ const H = 76;
 
 /** `ctxPlace` works in app-root pixels, so the window is described at zoom 1. */
 function atZoom(z: number, innerWidth: number, innerHeight: number) {
-  (globalThis as any).window = { innerWidth, innerHeight };
+  (globalThis as { window?: unknown }).window = { innerWidth, innerHeight };
   return z;
 }
 
 describe("context menu placement", () => {
-  afterEach(() => { delete (globalThis as any).window; });
+  afterEach(() => { delete (globalThis as { window?: unknown }).window; });
 
   it("opens at the cursor when there is room below it", () => {
     const at = ctxPlace(200, 300, W, H, atZoom(1, 1440, 900));

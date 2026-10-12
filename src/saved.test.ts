@@ -7,8 +7,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // whole thing, so a write that only carries `saved_prompts` still returns the
 // project it left alone. Modelling that matters: `loadPrompt` writes settings
 // twice, and a mock that echoed back only the patch would drop the project.
-let onDisk: Record<string, any> = {};
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (cmd: string, args: any) => {
+let onDisk: Record<string, unknown> = {};
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (cmd: string, args: { patch?: Record<string, unknown>; path?: string } = {}) => {
   if (cmd === "settings_update") {
     onDisk = { ...onDisk, ...args.patch };
     return { ...onDisk };
@@ -16,7 +16,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (cmd: string, args:
   // `project_info` answers for real folders only: the path a prompt was saved
   // under can have been deleted since, and that has to be a refusal, not a
   // silent switch to a directory that isn't there.
-  if (cmd === "project_info") return { exists: !args.path.includes("gone"), git: false, branch: "", branches: [], memory: [] };
+  if (cmd === "project_info") return { exists: !args.path?.includes("gone"), git: false, branch: "", branches: [], memory: [] };
   return null;
 }) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -27,7 +27,7 @@ import { dropPrompt, get, loadPrompt, savePrompt, set } from "./store";
 describe("saved prompts", () => {
   // Every path here reports through `flash`, which wants a window for its timer.
   beforeEach(() => {
-    (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+    (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
     set({ settings: { project: "D:/work/app", saved_prompts: [] } as unknown as Settings, draft: "", attach: {}, view: "home", task: null });
   });
   const p = (extra: Partial<SavedPrompt> = {}): SavedPrompt => ({

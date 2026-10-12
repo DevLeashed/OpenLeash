@@ -61,13 +61,14 @@ const feed = (items: Item[]) =>
 const claimsWork = (items: Item[]) => feed(items).includes("tg-now");
 
 beforeEach(() => {
-  (globalThis as any).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
+  (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
   // The home rows' `MorphText` reads the reduced-motion query on mount and asks
   // for live animations when its text changes or it is torn down. jsdom has none
   // of these, and the pause chip is one of the things it morphs.
-  (window as any).matchMedia ??= () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
-  (Element.prototype as any).getAnimations ??= () => [];
-  (Element.prototype as any).animate ??= () => ({ cancel() {}, finish() {}, addEventListener() {}, removeEventListener() {}, finished: Promise.resolve() });
+  window.matchMedia ??= (() => ({ matches: false, addEventListener() {}, removeEventListener() {} })) as unknown as typeof window.matchMedia;
+  const proto = Element.prototype as unknown as { getAnimations?: () => unknown[]; animate?: () => unknown };
+  proto.getAnimations ??= () => [];
+  proto.animate ??= () => ({ cancel() {}, finish() {}, addEventListener() {}, removeEventListener() {}, finished: Promise.resolve() });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 

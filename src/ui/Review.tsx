@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, FileDiff, ATTRIBUTIONS, Attribution } from "../api";
 import { flash, go, saveSettings, useStore } from "../store";
 import { Tooltip } from "./primitives";
@@ -31,18 +31,25 @@ export function Review() {
   const [err, setErr] = useState("");
   const [genning, setGenning] = useState(false);
   const [genErr, setGenErr] = useState("");
+  const taskId = task?.id;
   const load = useCallback(() => {
-    if (!task) return;
+    if (!taskId) return;
     setErr("");
-    api.review(task.id).then(setData).catch((e) => { setData(null); setErr(String(e)); flash(String(e)); });
-  }, [task?.id]);
+    api.review(taskId).then(setData).catch((e) => { setData(null); setErr(String(e)); flash(String(e)); });
+  }, [taskId]);
   useEffect(load, [load]);
-  useEffect(() => { setMsg(task?.title ?? ""); setGenErr(""); }, [task?.id]);
+  // The newest title, for the seed effect: it must seed the box when the chat
+  // changes, not on every title change the user makes while editing.
+  const titleRef = useRef(task?.title);
+  titleRef.current = task?.title;
+  useEffect(() => { setMsg(titleRef.current ?? ""); setGenErr(""); }, [taskId]);
 
   const attribution: Attribution = settings?.git_attribution ?? "co-authored-by";
   const verify = settings?.git_commit_verify === true;
 
-  const files = data?.files ?? [];
+  // Its own hook so the `shownFiles` memo below has a stable dependency instead
+  // of a fresh `[]`/array literal every render.
+  const files = useMemo(() => data?.files ?? [], [data]);
   const cur = files[Math.min(sel, files.length - 1)];
   const nextUnreviewed = (r: Record<string, string>) => {
     for (let i = 1; i <= files.length; i++) {

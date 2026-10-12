@@ -173,7 +173,23 @@ mod imp {
     /// that tells the shell *how* to start us — has to live. Separate from the
     /// AUMID key because a toast click activates the CLSID, not the AUMID.
     pub(super) fn clsid_key_for(clsid: GUID) -> Option<Vec<u16>> {
-        wide(&format!(r"Software\Classes\CLSID\{}", guid_str(clsid)))
+        wide(&clsid_path(clsid))
+    }
+
+    /// The CLSID key as a path string. Both the key and its `LocalServer32` child
+    /// are built from this, so the two cannot disagree about where the server is.
+    fn clsid_path(clsid: GUID) -> String {
+        format!(r"Software\Classes\CLSID\{}", guid_str(clsid))
+    }
+
+    /// `LocalServer32` under the activator's CLSID, built from the path string.
+    /// Not `clsid_key_for` with `"LocalServer32"` appended as a second buffer: a
+    /// `wide` result ends in its NUL, so an appended buffer is cut off at that NUL
+    /// and the registry call quietly opens the CLSID key itself. The result is a
+    /// class with no server line, which the shell cannot launch once the app has
+    /// been closed.
+    pub(super) fn server_key_for(clsid: GUID) -> Option<Vec<u16>> {
+        wide(&format!(r"{}\LocalServer32", clsid_path(clsid)))
     }
 
     /// `GUID` in the braced form the registry uses.
@@ -308,19 +324,13 @@ mod imp {
         let Some(base) = clsid_key_for(ACTIVATOR_CLSID) else {
             return;
         };
-        let Some(server) = wide("LocalServer32") else {
+        let Some(server) = server_key_for(ACTIVATOR_CLSID) else {
             return;
         };
-        // `RegCreateKeyExW` makes one level at a time, so the parent has to
-        // exist before the subkey is opened.
-        let sub = base
-            .iter()
-            .copied()
-            .chain(server.iter().copied())
-            .collect::<Vec<u16>>();
+        // The parent key first, then the server key under it.
         unsafe {
             with_key(&base, |_h| Ok(()));
-            with_key(&sub, |h| {
+            with_key(&server, |h| {
                 // The default value is what COM launches, so the name is empty
                 // rather than a real value name.
                 set_str(h, "", exe)?;
@@ -656,6 +666,24 @@ mod tests {
         // `register` short-circuits on these; assert it does not panic.
         super::register("", "OpenLeash", None);
         super::register("com.openleash.app", "", None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_activator_server_key_is_local_server32_under_its_clsid() {
+        // A toast click on a closed app launches the server named by
+        // `LocalServer32`. The key has to be that child of the CLSID key, with
+        // exactly one NUL — the terminator — so no path is cut short of it.
+        let k = super::imp::server_key_for(ACTIVATOR_CLSID).unwrap();
+        let s = String::from_utf16(&k[..k.len() - 1]).unwrap();
+        assert_eq!(
+            s,
+            format!(
+                r"Software\Classes\CLSID\{}\LocalServer32",
+                super::imp::guid_str(ACTIVATOR_CLSID)
+            )
+        );
+        assert_eq!(k.iter().filter(|&&c| c == 0).count(), 1);
     }
 
     #[cfg(windows)]
