@@ -7,7 +7,7 @@ on:
       build_updater:
         description: Build signed updater extras (requires Tauri signing secrets)
         type: boolean
-        default: false
+        default: true
       release_tag:
         description: Release tag for updater URLs (blank = package version, no v)
         type: string
