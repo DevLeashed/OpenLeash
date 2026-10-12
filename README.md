@@ -45,7 +45,8 @@ The full list is in [docs/features.md](docs/features.md).
 
 ## Roadmap
 
-- Remote connectivity targeted for 0.1.2
+- Remote connectivity, targeted for 0.1.2
+- Agent sandboxes, targeted for 0.1.3
 
 ## Getting started
 
