@@ -3,7 +3,7 @@ import type { CSSProperties } from "react";
 
 /**
  * The accent grid. One palette, one "pick something else" control, one custom
- * colour input — previously written out twice: once for sub-agents in the agent
+ * colour input — previously written out twice: once for subagents in the agent
  * dialog, and once more inline as a bare `<input type="color">` over a 9px dot
  * in the model picker, which is why picking a model colour felt like a different,
  * much smaller feature than picking a subagent colour.

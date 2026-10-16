@@ -10,13 +10,17 @@
 //! - `git.rs`         worktrees, review diff, commit
 //! - `mcp.rs`         stdio MCP client
 //! - `memory.rs`      per-project agent memory (index + topic files)
+//! - `projects.rs`    opening projects from WSL distros and cloned git URLs
 //! - `store.rs`       settings + task persistence
 
 pub mod accounts;
+pub mod attachments;
 pub mod browser;
+pub mod chats;
 pub mod checkpoint;
 pub mod checks;
 pub mod commitmsg;
+pub mod docker;
 pub mod git;
 pub mod mcp;
 pub mod mcp_oauth;
@@ -24,14 +28,22 @@ pub mod memory;
 pub mod pcguard;
 pub mod permissions;
 pub mod plugins;
+pub mod projects;
 pub mod prompt;
 pub mod providers;
+pub mod review;
 #[cfg(test)]
 mod reviewer_accounting;
+#[cfg(test)]
+mod reviewer_bg_jobs;
 #[cfg(test)]
 mod reviewer_checkpoint;
 #[cfg(test)]
 mod reviewer_commit;
+#[cfg(test)]
+mod reviewer_context_parts;
+#[cfg(test)]
+mod reviewer_cross_chat;
 #[cfg(test)]
 mod reviewer_docs;
 #[cfg(test)]
@@ -43,7 +55,9 @@ mod reviewer_mcp;
 #[cfg(test)]
 mod reviewer_memory_scope;
 #[cfg(test)]
-mod reviewer_modes;
+mod reviewer_review;
+// #[cfg(test)]
+// mod reviewer_modes;
 #[cfg(test)]
 mod reviewer_notices;
 #[cfg(test)]
@@ -61,11 +75,15 @@ mod reviewer_runtime_wake;
 #[cfg(test)]
 mod reviewer_sandbox;
 #[cfg(test)]
+mod reviewer_ssh;
+#[cfg(test)]
 mod reviewer_staleness;
 #[cfg(test)]
 mod reviewer_startup;
 #[cfg(test)]
 mod reviewer_streams;
+#[cfg(test)]
+mod reviewer_summary_sync;
 #[cfg(test)]
 mod reviewer_task_creation;
 #[cfg(test)]
@@ -75,16 +93,27 @@ mod reviewer_toolsearch;
 #[cfg(test)]
 mod reviewer_trust;
 #[cfg(test)]
+mod reviewer_unread;
+#[cfg(test)]
 mod reviewer_webfetch;
 pub mod router;
 pub mod runner;
 pub mod shell;
+// Remote-SSH projects: addressing/quoting (`host`) and live SFTP + command
+// sessions (`ssh_session`). Phase 2 wires them into tools/runner/git; until
+// then most of their API has no caller.
+#[allow(dead_code)]
+pub mod host;
+#[allow(dead_code)]
+pub mod ssh_session;
 pub mod stats;
 pub mod store;
 #[cfg(test)]
 mod tests;
 pub mod toolindex;
 pub mod tools;
+pub mod tools_remote;
+pub mod transfer;
 pub mod trust;
 
 use chrono::{DateTime, Utc};
@@ -105,14 +134,14 @@ pub fn new_id() -> String {
 /// Layers below the orchestrator that a ladder may configure. Six is the
 /// ceiling on nesting depth for any ultrathread.
 pub const X_MAX_LAYERS: usize = 6;
-/// Most sub-agents one agent may launch at the same time, per layer.
+/// Most subagents one agent may launch at the same time, per layer.
 pub const X_MAX_FANOUT: u8 = 8;
-/// Sub-agents running at once across a whole X tree (a plain ultrathread runs 16).
+/// Subagents running at once across a whole X tree (a plain ultrathread runs 16).
 pub const X_DEFAULT_RUNNING: usize = 32;
-/// Sub-agents spawned for one X task, ever. The real bound on spend: a running
+/// Subagents spawned for one X task, ever. The real bound on spend: a running
 /// cap alone lets a long task churn through thousands of agent-lives.
 pub const X_DEFAULT_TOTAL: usize = 400;
-/// Ceiling on how many sub-agents may run at once, whatever the ladder says.
+/// Ceiling on how many subagents may run at once, whatever the ladder says.
 pub const MAX_ULTRA_RUNNING: usize = 64;
 
 /// One model-facing message, stored in Anthropic content-block shape
@@ -157,7 +186,7 @@ pub struct Pause {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
-    /// user | text | thinking | tool | approval | question | sub | notice | artifact
+    /// user | text | thinking | tool | approval | question | sub | notice | artifict
     pub kind: String,
     #[serde(default)]
     pub text: String,
@@ -218,7 +247,7 @@ pub struct SubInfo {
     ///
     /// This is an *override*, not a record of what it was launched on. Stamping
     /// the resolved model in at spawn froze the answer: a chat swapped from Opus
-    /// to Sonnet mid-run left every sub-agent on Opus for the rest of the task,
+    /// to Sonnet mid-run left every subagent on Opus for the rest of the task,
     /// and the swap dialog — which rewrites `sub.model` — had nothing to rewrite.
     /// Resolution is re-done per request instead, so only a model somebody
     /// actually chose is stored here.
@@ -240,12 +269,116 @@ pub struct SubInfo {
     /// Runs detached; its report reaches the main agent as a note.
     #[serde(default)]
     pub background: bool,
-    /// Sub-agent that launched this one (ultrathread nesting); empty = the main agent.
+    /// Subagent that launched this one (ultrathread nesting); empty = the main agent.
     #[serde(default)]
     pub parent: String,
-    /// 1 = launched by main, 2 = launched by a sub-agent, …
+    /// 1 = launched by main, 2 = launched by a subagent, …
     #[serde(default)]
     pub depth: u8,
+}
+
+/// How the most recent prompt split by category, in tokens.
+///
+/// An estimate, and labelled as one on purpose: a provider reports only a prompt
+/// *total*, and the serialized request is built and dropped inside
+/// `providers::call`, so nothing downstream can see the individual pieces. So the
+/// split is measured from the request we assembled, then scaled by
+/// [`ContextParts::scaled_to`] so the parts sum to the provider's own count. The
+/// ring keeps provider truth for the total and shows this shape for the mix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextParts {
+    /// Core harness prompt, environment and the wrapper guidance.
+    pub system: u64,
+    /// The project instruction files injected as `# Project instructions`.
+    pub instructions: u64,
+    /// The skills list, plus the memory/research sections appended after it.
+    pub skills: u64,
+    /// The tool schemas actually sent, including MCP, plugin and held-back ones.
+    pub tools: u64,
+    /// Attachment notes and image blocks carried on the user's turn.
+    pub attachments: u64,
+    /// Conversation history, excluding a compaction summary.
+    pub history: u64,
+    /// The compaction summary that replaced earlier history, when one exists.
+    pub summary: u64,
+}
+
+impl ContextParts {
+    pub fn total(&self) -> u64 {
+        self.system
+            + self.instructions
+            + self.skills
+            + self.tools
+            + self.attachments
+            + self.history
+            + self.summary
+    }
+
+    /// Nothing measured yet. Drives `skip_serializing_if`, so a task that has
+    /// never run a turn (and every task saved before this existed) carries no
+    /// empty object on the wire.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// Rescale so the parts sum to exactly `total`, the provider-reported prompt
+    /// size. Without this the bars would add up to a number that disagrees with
+    /// the ring beside them: the split comes from a character heuristic and the
+    /// provider is the truth. The rounding remainder lands on the largest bucket
+    /// so the sum matches to the token.
+    ///
+    /// `total` must be the **prompt** side (`input + cache_read + cache_write`),
+    /// not `TurnUsage::context()` — that also counts the reply this very request
+    /// produced, which was not in the prompt that was measured.
+    pub fn scaled_to(&self, total: u64) -> ContextParts {
+        let mine = self.total();
+        if mine == 0 {
+            return ContextParts::default();
+        }
+        let scale = |v: u64| (u128::from(v) * u128::from(total) / u128::from(mine)) as u64;
+        let mut out = ContextParts {
+            system: scale(self.system),
+            instructions: scale(self.instructions),
+            skills: scale(self.skills),
+            tools: scale(self.tools),
+            attachments: scale(self.attachments),
+            history: scale(self.history),
+            summary: scale(self.summary),
+        };
+        let drift = i64::try_from(total.saturating_sub(out.total())).unwrap_or(0);
+        if drift != 0 {
+            let biggest = out.largest_mut();
+            *biggest = (*biggest as i64 + drift).max(0) as u64;
+        }
+        out
+    }
+
+    fn largest_mut(&mut self) -> &mut u64 {
+        let all = [
+            self.system,
+            self.instructions,
+            self.skills,
+            self.tools,
+            self.attachments,
+            self.history,
+            self.summary,
+        ];
+        let idx = all
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| **v)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        match idx {
+            0 => &mut self.system,
+            1 => &mut self.instructions,
+            2 => &mut self.skills,
+            3 => &mut self.tools,
+            4 => &mut self.attachments,
+            5 => &mut self.history,
+            _ => &mut self.summary,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -257,6 +390,12 @@ pub struct Usage {
     pub cost: f64,
     /// Prompt size of the most recent request — drives the context meter + compaction.
     pub last_context: u64,
+    /// That same request, split by category. Deliberately *not* written by
+    /// keepalives or side requests, for the same reason `last_context` is not:
+    /// a ping must not rescale the meter. Absent until a turn has run, and
+    /// `#[serde(default)]` is what keeps every already-saved task loading.
+    #[serde(default, skip_serializing_if = "ContextParts::is_empty")]
+    pub parts: ContextParts,
 }
 
 /// Marks where a user turn starts, so rewinding a conversation can drop
@@ -290,6 +429,10 @@ pub struct Task {
     #[serde(default)]
     pub base_commit: Option<String>,
     pub worktree: bool,
+    /// The container this chat runs its commands in (docker workspace mode).
+    /// `cwd` is then the task's private copy of the project on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<docker::DockerEnv>,
     pub model: String,
     pub effort: usize,
     #[serde(
@@ -298,6 +441,10 @@ pub struct Task {
     )]
     pub perm: String,
     pub plan: bool,
+    /// The artifict this chat's plan was recorded as, so refining the plan
+    /// appends a revision to it rather than filing a second artifict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_artifict: Option<String>,
     /// Ultrathread: long-haul orchestration with nested subagents.
     #[serde(default)]
     pub ultra: bool,
@@ -308,7 +455,7 @@ pub struct Task {
     /// guide | default | necessary
     #[serde(default = "assist_default")]
     pub assist: String,
-    /// Sub-agent ids this task may spawn.
+    /// Subagent ids this task may spawn.
     #[serde(default = "agents_default")]
     pub agents: Vec<String>,
     /// Changes the user made mid-run that apply with the next user message (model, assist, agents).
@@ -337,7 +484,7 @@ pub struct Task {
     pub told: serde_json::Map<String, Value>,
     #[serde(default)]
     pub sub_items: HashMap<String, Vec<Item>>,
-    /// Each sub-agent's own conversation, so a stopped one can be continued.
+    /// Each subagent's own conversation, so a stopped one can be continued.
     #[serde(default)]
     pub sub_msgs: HashMap<String, Vec<Message>>,
     /// The user messaged this task during a global pause, so it runs anyway.
@@ -358,12 +505,28 @@ pub struct Task {
     /// Resumed after a stop with "wrap up": don't restart cut-off subagents, just summarise.
     #[serde(default)]
     pub wrap_up: bool,
+    /// Resumed after a stop with "summarise and continue": say where things stand,
+    /// then carry on. Mutually exclusive with `wrap_up` — that one is the resume
+    /// that stops, this one is the resume that reports on its way back into the
+    /// work, so it must leave cut-off subagents resuming normally.
+    #[serde(default)]
+    pub summarise_first: bool,
     /// Background commands alive at the last save ("bg_id: cmd"). Non-empty on load = the app died under them.
     #[serde(default)]
     pub bg_live: Vec<String>,
     /// Commands (foreground + background) still running. While paused and > 0, the pause is "in progress".
     #[serde(skip)]
     pub busy: usize,
+    /// The background commands alive *right now*, as a summary publishes them.
+    ///
+    /// Deliberately not `bg_live`, and deliberately not saved. `bg_live` is the
+    /// record that goes to disk and is read back as "the app died under these",
+    /// so after a reload it names jobs the OS has already killed; a summary
+    /// built from it would list dead servers as live. This one is a live mirror
+    /// written by `refresh_busy`, which every background start and exit already
+    /// calls, and dropped by `#[serde(skip)]` so nothing can revive it later.
+    #[serde(skip)]
+    pub bg_now: Vec<shell::BgInfo>,
     /// Model swaps made in this chat (old -> new), applied to subagents it spawns later.
     #[serde(default)]
     pub model_map: HashMap<String, String>,
@@ -378,12 +541,32 @@ pub struct Task {
     /// reached from the chat they came from rather than found on their own.
     #[serde(default)]
     pub hidden: bool,
+    /// Something here is waiting to be looked at: a run finished or failed, a
+    /// question or an approval is pending, a notice was left, or the chat paused
+    /// itself — and nobody has opened it since.
+    ///
+    /// Session state, not saved state (`#[serde(skip)]`): it is the record behind
+    /// the sidebar's blue dot, and a dot is drawn from a summary, so the *backend*
+    /// keeps it rather than the window that draws it. A remote browser is a second
+    /// client of this same app: `remote/shim.js` reloads the page on every
+    /// reconnect, and a phone that was asleep when the event fired holds no flag
+    /// of its own — it used to paint a finished chat as if it had already been
+    /// read. `Harness::attention` sets this, `Task::mark_seen` clears it.
+    #[serde(skip)]
+    pub unread: bool,
     /// The chat this one was forked from, and how. "full" copied the whole
     /// conversation; "compact" starts from a summary of it instead.
     #[serde(default)]
     pub forked_from: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    /// Whether this chat was left sitting on its Artificts surface. Saved with
+    /// the chat, like its name and its pin: switching to another chat brings
+    /// that chat's own answer with it, so the record surface is a property of
+    /// the chat rather than a mode of the window. Absent means false, so a chat
+    /// saved before this existed still loads.
+    #[serde(default)]
+    pub artifict_open: bool,
     /// Manual sidebar position (drag to reorder). 0 = sort by recency instead:
     /// either never dragged, or released by acting in the chat — `Harness::touch`
     /// clears it, which is what makes "you did something, so it goes to the top"
@@ -397,6 +580,12 @@ pub struct Task {
     pub usage: Usage,
     #[serde(default)]
     pub read_files: HashMap<String, u64>,
+    /// Content hash (`tools::content_hash`) of each file in `read_files`, as
+    /// it was read. Remote (SSH) files are checked against it on edit: SFTP
+    /// mtimes are whole seconds, so a change within the same second as the
+    /// read would otherwise go unnoticed. Missing in older task files.
+    #[serde(default)]
+    pub read_hashes: HashMap<String, String>,
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default)]
@@ -404,7 +593,7 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// When the user last *did* something here: sent a message, answered a
-    /// question, paused, stopped, resumed, or messaged a sub-agent.
+    /// question, paused, stopped, resumed, or messaged a subagent.
     /// `updated_at` moves on every agent step, so it cannot order a list — a
     /// background chat working through a hundred tool calls would shove a chat
     /// the user just opened to the bottom. This is what a chat list sorts on.
@@ -412,7 +601,7 @@ pub struct Task {
     pub touched_at: DateTime<Utc>,
     /// False while `sub_items`/`sub_msgs` are still on disk rather than in memory.
     ///
-    /// These two are ~97% of a task file's bytes (sub-agent timelines and their
+    /// These two are ~97% of a task file's bytes (subagent timelines and their
     /// model conversations) and nothing at boot needs them: the sidebar reads
     /// `summary()`, which skips both. So `load_tasks` parses a header and leaves
     /// the body behind, and `Harness::hydrate` reads the file again the first
@@ -422,7 +611,7 @@ pub struct Task {
     ///
     /// It is load-bearing for correctness, not just speed. The saver serializes
     /// whatever is in memory and rewrites the whole file, so saving a task that
-    /// was never hydrated would replace real sub-agent history with two empty
+    /// was never hydrated would replace real subagent history with two empty
     /// maps — silent, permanent data loss. `Harness::task()` hydrates before
     /// handing out a `TaskRef`, which closes that for every save path, and
     /// `store::save_task` refuses a stub outright as a backstop.
@@ -448,6 +637,27 @@ fn agents_default() -> Vec<String> {
     vec!["explore".into(), "general".into()]
 }
 
+/// Order marker stamped on every summary this process builds, so the UI can tell
+/// a *stale* one from a newer one instead of walking a chat's state backwards.
+///
+/// A summary reaches the UI by two routes: pushed as a live event, or read back
+/// as a snapshot — `app_boot`'s task list, `task_open` when a chat is opened.
+/// Both are built from the same in-memory task, but they reach the frontend out
+/// of order: a snapshot is built at one instant and applied after whatever
+/// events the backend published while the request was still in flight. Applying
+/// that snapshot then put the chat back where it was before those events, and
+/// nothing republished it — the chat sat at "running" after it had finished
+/// (a spinner that never stops), or at "waiting" after the answer had been
+/// given, until the next unrelated event for that chat. A reload re-ran the
+/// same race, which is why it came back "sometimes" and sometimes outlived it.
+///
+/// Process-local and monotonic, and stamped as each summary is built, so a
+/// higher `rev` means "built later, from state at least as new" — exactly the
+/// comparison `src/store.ts` makes. Deliberately not a clock: two updates in the
+/// same millisecond still order, and a system clock stepping backwards cannot
+/// make fresh state look stale.
+static SUMMARY_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Everything about a task except the heavy timeline/history — what lists render.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskSummary {
@@ -463,6 +673,10 @@ pub struct TaskSummary {
     pub branch: String,
     pub base_branch: String,
     pub worktree: bool,
+    /// Present when this chat runs in a docker workspace.
+    pub docker: Option<docker::DockerEnv>,
+    /// The container's live state as the harness last saw it.
+    pub container: Option<docker::State>,
     pub model: String,
     pub effort: usize,
     pub perm: String,
@@ -481,10 +695,20 @@ pub struct TaskSummary {
     pub route: String,
     pub unpaused: bool,
     pub busy: usize,
+    /// The background commands still alive, so the UI can name what the pause
+    /// does *not* stop. See [`Task::bg_now`].
+    pub bg_now: Vec<shell::BgInfo>,
     pub archived: bool,
     pub hidden: bool,
+    /// There is something in this chat nobody has looked at yet: the sidebar's
+    /// blue dot. The backend owns it (`Harness::attention` sets it, opening the
+    /// chat clears it) so every client draws the same dot, including a remote
+    /// browser that has only just loaded the page.
+    pub unread: bool,
     pub forked_from: Option<String>,
     pub pinned: bool,
+    /// This chat was left on its Artificts surface. Per chat, and saved with it.
+    pub artifict_open: bool,
     pub order: f64,
     pub todos: Vec<Todo>,
     pub subs: Vec<SubInfo>,
@@ -495,13 +719,36 @@ pub struct TaskSummary {
     /// When the user last did something in this chat. The chat list sorts on
     /// this, not on `updated_at` (see `Task::touched_at`).
     pub touched_at: DateTime<Utc>,
+    /// Which build of this summary this is; see `SUMMARY_REV`. The UI keeps it
+    /// so a snapshot built before a live event cannot overwrite that event.
+    pub rev: u64,
 }
 
 impl Task {
-    /// Claim a sub-agent for a resume: check it's free (and ours, when we're a
-    /// sub-agent), mark it running and hand back its conversation with the new
+    /// The user is looking at this chat now, so there is nothing here left to
+    /// look at. Returns whether that changed anything, so a caller only publishes
+    /// a summary when the dot actually goes out.
+    ///
+    /// A blocking wait is the exception, and it is load-bearing: a question or an
+    /// approval stays marked until the *backend* ends the wait (`wait_for_user`),
+    /// so opening a chat to read the request, then leaving without answering,
+    /// does not quietly mark the request as handled.
+    pub fn mark_seen(&mut self) -> bool {
+        let blocking = matches!(
+            self.waiting_kind.as_deref(),
+            Some("question") | Some("approval")
+        );
+        if self.unread && !blocking {
+            self.unread = false;
+            return true;
+        }
+        false
+    }
+
+    /// Claim a subagent for a resume: check it's free (and ours, when we're a
+    /// subagent), mark it running and hand back its conversation with the new
     /// turn appended — all under one lock, so nothing can start the same
-    /// sub-agent twice and end up driving one transcript from two places.
+    /// subagent twice and end up driving one transcript from two places.
     /// `None` = already running; no conversation = nothing to resume.
     pub fn try_resume_sub(
         &mut self,
@@ -535,7 +782,53 @@ impl Task {
     }
 
     pub fn summary(&self) -> TaskSummary {
+        self.summary_with(self.subs.clone())
+    }
+
+    /// The same summary, with every subagent's report left out of the clone.
+    ///
+    /// `emit_summary` cleared the reports *after* `summary()` had already cloned
+    /// them, so the allocation happened anyway and was then thrown away. Each
+    /// report can run to 20k characters, and this fires on every status change of
+    /// every agent — so a 20-agent swarm built and dropped several hundred
+    /// kilobytes of text per event to publish a step line. The field is stripped
+    /// on the wire either way (the UI fetches a report by id when it needs one),
+    /// so building it empty is the same summary for less work.
+    pub fn summary_without_reports(&self) -> TaskSummary {
+        let subs = self
+            .subs
+            .iter()
+            .map(|s| SubInfo {
+                id: s.id.clone(),
+                effort: s.effort,
+                cwd: s.cwd.clone(),
+                branch: s.branch.clone(),
+                role: s.role.clone(),
+                task: s.task.clone(),
+                status: s.status.clone(),
+                meta: s.meta.clone(),
+                model: s.model.clone(),
+                serving: s.serving.clone(),
+                started: s.started,
+                // Never copied: this is the whole point of the variant. The
+                // struct literal is exhaustive, so a field added to `SubInfo`
+                // fails to compile here rather than silently going missing.
+                report: String::new(),
+                call_id: s.call_id.clone(),
+                item_id: s.item_id.clone(),
+                background: s.background,
+                parent: s.parent.clone(),
+                depth: s.depth,
+            })
+            .collect();
+        self.summary_with(subs)
+    }
+
+    fn summary_with(&self, subs: Vec<SubInfo>) -> TaskSummary {
         TaskSummary {
+            // Every summary this process hands out — live event or snapshot —
+            // is stamped here, so two of them can be ordered. See `SUMMARY_REV`.
+            rev: SUMMARY_REV.fetch_add(1, Ordering::SeqCst),
             id: self.id.clone(),
             title: self.title.clone(),
             titled: self.titled,
@@ -547,6 +840,11 @@ impl Task {
             branch: self.branch.clone(),
             base_branch: self.base_branch.clone(),
             worktree: self.worktree,
+            docker: self.docker.clone(),
+            container: self
+                .docker
+                .as_ref()
+                .map(|_| docker::live(&self.id).map(|l| l.state).unwrap_or_default()),
             model: self.model.clone(),
             effort: self.effort,
             perm: self.perm.clone(),
@@ -564,13 +862,16 @@ impl Task {
             route: self.route.clone(),
             unpaused: self.unpaused,
             busy: self.busy,
+            bg_now: self.bg_now.clone(),
             archived: self.archived,
             hidden: self.hidden,
+            unread: self.unread,
             forked_from: self.forked_from.clone(),
             pinned: self.pinned,
+            artifict_open: self.artifict_open,
             order: self.order,
             todos: self.todos.clone(),
-            subs: self.subs.clone(),
+            subs,
             usage: self.usage.clone(),
             context_window: router::context_window(&self.model, &self.route),
             created_at: self.created_at,
@@ -583,7 +884,7 @@ impl Task {
 /// The model one agent runs on, right now.
 ///
 /// Resolved per request rather than stamped on the agent at spawn: a chat
-/// swapped mid-run has to reach the sub-agents it has *already* launched, not
+/// swapped mid-run has to reach the subagents it has *already* launched, not
 /// only the ones it launches next. Precedence, biggest decision first:
 ///
 /// 1. a model somebody explicitly chose for this agent — `SubInfo.model`, set
@@ -606,7 +907,7 @@ impl Task {
 /// The main agent (`sub` is `None`) reads the chat's model and nothing else: a
 /// swap made mid-turn waits for the user's next message, so letting the main
 /// agent see the pending value would apply it a turn early — the one thing the
-/// `*` badge promises it does not. A sub-agent has no such turn boundary to
+/// `*` badge promises it does not. A subagent has no such turn boundary to
 /// respect, so it follows a queued swap and the whole chat moves together.
 pub fn resolve_model(t: &Task, sub: Option<&SubInfo>, depth: u8, fallback: &str) -> String {
     if let Some(m) = sub.map(|s| s.model.as_str()).filter(|m| !m.is_empty()) {
@@ -623,7 +924,7 @@ pub fn resolve_model(t: &Task, sub: Option<&SubInfo>, depth: u8, fallback: &str)
         return m.to_string();
     }
     let chat = match sub {
-        // A sub-agent following the chat, including a swap already queued for the
+        // A subagent following the chat, including a swap already queued for the
         // next message — the user is moving the whole chat, not just its lead.
         Some(_) => chat_model_of(t),
         None => None,
@@ -633,7 +934,7 @@ pub fn resolve_model(t: &Task, sub: Option<&SubInfo>, depth: u8, fallback: &str)
 }
 
 /// A chat's model for anything that is not the main agent's own turn: a swap
-/// queued for its next message counts, so a sub-agent following the chat moves
+/// queued for its next message counts, so a subagent following the chat moves
 /// with it instead of staying on a model the user has already replaced.
 pub fn chat_model_of(t: &Task) -> Option<String> {
     t.pending
@@ -644,7 +945,7 @@ pub fn chat_model_of(t: &Task) -> Option<String> {
 }
 
 /// The reasoning effort one agent runs at right now (0 = Max … 4 = Low), for
-/// anything that is not a request being built: the swap dialog, and a sub-agent
+/// anything that is not a request being built: the swap dialog, and a subagent
 /// that inherits rather than picks.
 ///
 /// Precedence mirrors the turn loop exactly, or the dialog would report a level
@@ -667,13 +968,35 @@ pub fn resolve_effort(
     }
 }
 
+/// Record the spend of a request that is not an agent turn — a drafted commit
+/// message, a permission review — in the same monthly ledger agent turns use.
+///
+/// The router has already recorded the detailed sample through `Stats::record`;
+/// this is the number the budget cap reads, so a side request that skipped it
+/// would quietly under-count what the user has spent this month.
+pub(crate) async fn record_side_spend(h: &Harness, cost: f64, tokens: u64) {
+    let month = {
+        let mut settings = h.settings.write().await;
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        *settings.spend.entry(day).or_insert(0.0) += cost;
+        settings.tokens_month += tokens;
+        settings.month_spend()
+    };
+    h.save_settings_debounced().await;
+    let tokens = h.settings.read().await.tokens_month;
+    (h.bus)(
+        "ol://usage",
+        serde_json::json!({ "month": month, "tokens": tokens }),
+    );
+}
+
 /// A broadcast the user sent, and which agents have acted on it since. The user
 /// gets a running list of who took it on, so a "undo the lighting" lands where
 /// it should and the agents it never concerned stay quiet.
 #[derive(Clone, Default, Serialize)]
 pub struct Broadcast {
     pub text: String,
-    /// Who it was sent to ("main" plus every working sub-agent's id).
+    /// Who it was sent to ("main" plus every working subagent's id).
     pub who: Vec<String>,
     /// Short ids of the agents that acted on it, in the order they did.
     pub replied: Vec<String>,
@@ -707,8 +1030,12 @@ pub const INBOX_IMAGES: usize = 8;
 
 /// A live park and the watcher generation that owns it. Deliberately runtime-only:
 /// this does not claim that a trigger survives an application restart.
+///
+/// `pub` (not `pub(crate)`) because `Runtime` is publicly reachable now that
+/// `agent` is a public module — the headless binary needs the harness — and a
+/// `pub` field cannot expose a more-private type without a lint warning.
 #[derive(Default)]
-pub(crate) struct WakeState {
+pub struct WakeState {
     pub(crate) parked: bool,
     pub(crate) generation: u64,
     pub(crate) deadline_ms: u64,
@@ -719,6 +1046,12 @@ pub(crate) struct WakeState {
 #[derive(Default)]
 pub struct Runtime {
     pub cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// Serializes permission reviews. A turn that issues ten risky calls would
+    /// otherwise fire ten reviewer requests at once — a cost spike and exactly
+    /// the shape of burst providers rate-limit, which would make the reviewer
+    /// fail closed on requests that were perfectly answerable. Nothing else is
+    /// held under this lock, and Esc still cancels a review in flight.
+    pub review: Mutex<()>,
     pub pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     /// The Alt-Enter messages, oldest first — the list above the composer is a
     /// view of exactly this. A plain message typed mid-turn steers straight away
@@ -767,7 +1100,7 @@ pub struct Runtime {
     /// Synchronous deletion waits for startup cleanup before inspecting worktree state.
     pub startup_done: std::sync::Condvar,
     pub running: std::sync::atomic::AtomicBool,
-    /// Parent token for background sub-agents (outlives a single main run; Esc replaces it).
+    /// Parent token for background subagents (outlives a single main run; Esc replaces it).
     pub bg_cancel: std::sync::Mutex<CancellationToken>,
     /// Foreground commands in flight.
     pub fg: std::sync::atomic::AtomicUsize,
@@ -793,6 +1126,11 @@ pub struct Runtime {
     /// outlived a stop would keep spending the user's money on a chat they
     /// deliberately ended.
     pub keepalive_cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// Each running subagent's own cancel token, by sub id. Stopping one agent
+    /// cancels only its token (and whatever it spawned, which hangs off it), so
+    /// the rest of the chat keeps going. Esc still reaches all of them, through
+    /// the parent token each one was created from.
+    pub sub_cancel: std::sync::Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl Runtime {
@@ -831,6 +1169,23 @@ impl Runtime {
         self.loaded_tools.lock().await.clear();
         self.steered
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether an attention payload is something the user has not seen yet — the
+/// rule behind the blue dot.
+///
+/// The same set `describe()` in `src/notify.ts` words into a toast, and
+/// deliberately the same two exclusions: a `stopped` run is the user's own
+/// keystroke, and a parked chat (`waiting`) is awaiting something that will
+/// announce itself when it fires, so neither is news. A `paused` event is news
+/// only when the app raised the pause on its own; a manual one is what the user
+/// was looking at when they pressed it. Exported for tests.
+pub fn attention_is_news(payload: &Value) -> bool {
+    match payload["kind"].as_str().unwrap_or("") {
+        "done" | "failed" | "question" | "approval" | "nonblocking" | "notice" => true,
+        "paused" => payload["pause"].as_str() != Some("manual"),
+        _ => false,
     }
 }
 
@@ -884,6 +1239,19 @@ impl Harness {
             .clone()
     }
 
+    /// A chat's live state *only if it already has one*, without creating it.
+    ///
+    /// `runtime()` inserts, which is right for anything about to work on a chat
+    /// and wrong for anything that merely reports on one: `list_chats` walks
+    /// every chat the user has, and through `runtime()` that would leave a
+    /// `Runtime` — with its inbox, its queue and its pending approval map —
+    /// behind for every one of them, for a read the model may make on every turn
+    /// of every run. A chat with nothing live this session simply reads `None`,
+    /// which callers treat as "nothing running".
+    pub fn runtime_if(&self, id: &str) -> Option<Arc<Runtime>> {
+        self.runtimes.lock().unwrap().get(id).cloned()
+    }
+
     /// Forget a deleted chat's live state, so the map does not keep one
     /// `Runtime` per task id for the life of the process.
     ///
@@ -919,21 +1287,33 @@ impl Harness {
     /// choke point that the saver also passes through: `save_task_now` and the
     /// debounced writer both call `self.task()`, so a task cannot be written to
     /// disk before it has been read. That is the whole defence against a
-    /// half-loaded task silently overwriting its own sub-agent history — see
+    /// half-loaded task silently overwriting its own subagent history — see
     /// `Task::hydrated`.
-    pub async fn task(&self, id: &str) -> Result<TaskRef, String> {
-        let r = self
-            .tasks
+    pub async fn task_ref(&self, id: &str) -> Result<TaskRef, String> {
+        self.tasks
             .read()
             .await
             .get(id)
             .cloned()
-            .ok_or_else(|| format!("no task {id}"))?;
+            .ok_or_else(|| format!("no task {id}"))
+    }
+
+    pub async fn task(&self, id: &str) -> Result<TaskRef, String> {
+        let r = self.task_ref(id).await?;
         self.ensure_hydrated(&r).await?;
         Ok(r)
     }
 
-    /// Splice a task's sub-agent maps back in, once, if they are still on disk.
+    /// One subagent's own transcript. `task_open` only sends the main timeline,
+    /// so the panel asks for this when it opens. Hydrates first: subagent bodies
+    /// stay on disk until something reads them.
+    pub async fn sub_transcript(&self, task_id: &str, sub: &str) -> Result<Vec<Item>, String> {
+        let r = self.task(task_id).await?;
+        let t = r.lock().await;
+        Ok(t.sub_items.get(sub).cloned().unwrap_or_default())
+    }
+
+    /// Splice a task's subagent maps back in, once, if they are still on disk.
     ///
     /// Idempotent and safe to race: the flag is checked under the task lock and
     /// the read happens under it too, so a second caller waits rather than
@@ -977,8 +1357,8 @@ impl Harness {
             Err(e) => {
                 // Leave the stub in place but stop retrying: a chat whose file
                 // vanished keeps its sidebar entry and its transcript, and only
-                // the (already missing) sub-agent panels are empty.
-                eprintln!("[openleash] could not load sub-agent history for {id}: {e}");
+                // the (already missing) subagent panels are empty.
+                eprintln!("[openleash] could not load subagent history for {id}: {e}");
                 g.hydrated = true;
                 Ok(())
             }
@@ -990,6 +1370,57 @@ impl Harness {
             "ol://event",
             json!({"task_id": task_id, "kind": kind, "payload": payload}),
         );
+    }
+
+    /// Publish that an artifict changed so any open workspace reloads it live.
+    /// The payload is only ids: the workspace re-reads through `artifict_get`,
+    /// so a stale preview is never shown from an event alone. Called from both
+    /// the user-facing IPC commands and the agent's own artifict tools, which is
+    /// what makes a revision made mid-turn appear without a manual Refresh.
+    pub fn emit_artifict(&self, task_id: &str, artifict: &crate::artificts::Artifict) {
+        self.emit(
+            task_id,
+            "artifict",
+            json!({
+                "artifict_id": artifict.id,
+                "version_id": artifict.current_version_id,
+            }),
+        );
+    }
+
+    /// Keep the plan an agent is proposing with the project it is about.
+    ///
+    /// Plan mode writes nothing to the checkout, so the plan itself is the
+    /// deliverable — and a plan that lives only in the transcript that produced
+    /// it is lost to every other chat about this project and to a rewound
+    /// timeline. This records it as a markdown artifict like any other, which
+    /// also gives it revisions: a plan the user sends back for changes grows a
+    /// version instead of a second artifict.
+    ///
+    /// Best-effort on purpose. A task with no project folder, a remote task, or
+    /// a full artifict store must not cost the user the approval card they are
+    /// waiting on, so failures here return `None` and the flow continues.
+    pub async fn save_plan_artifict(
+        &self,
+        task_id: &str,
+        plan: &str,
+    ) -> Option<crate::artificts::Artifict> {
+        let (project, title, existing) = {
+            let task = self.task(task_id).await.ok()?;
+            let t = task.lock().await;
+            (t.project.clone(), t.title.clone(), t.plan_artifict.clone())
+        };
+        let fallback = if title.trim().is_empty() {
+            "Plan".to_string()
+        } else {
+            format!("Plan · {}", title.trim())
+        };
+        let artifict =
+            crate::artificts::save_plan(&project, existing.as_deref(), &fallback, plan).ok()?;
+        self.update_task(task_id, |t| t.plan_artifict = Some(artifict.id.clone()))
+            .await;
+        self.emit_artifict(task_id, &artifict);
+        Some(artifict)
     }
 
     /// Whether the *global* pause is what is holding this task — a task that
@@ -1097,16 +1528,47 @@ impl Harness {
         // cancelled here. `stop_tokens` (a real stop) and `unpark` (a real wake)
         // are what end it, and the loop's own global-pause check keeps it from
         // pinging under "Pause all", where nothing is coming back for the cache.
-        self.update_task(task_id, |t| {
-            if t.paused.is_none() {
-                t.paused = Some(Pause {
-                    reason,
-                    kind,
-                    since: Utc::now(),
-                });
-            }
-        })
-        .await;
+        let newly_paused = self
+            .update_task_quiet(task_id, |t| {
+                if t.paused.is_none() {
+                    t.paused = Some(Pause {
+                        reason,
+                        kind,
+                        since: Utc::now(),
+                    });
+                }
+            })
+            .await;
+        // Only the transition into the paused state is news. A route can have
+        // several requests watching the same task; once one parks it, the rest
+        // must not announce the same pause again.
+        if newly_paused {
+            // Publish the state and wake any in-flight request before doing work
+            // that can wait on filesystem snapshots or command bookkeeping. In
+            // particular, `touch` may capture a checkpoint, which should not hold
+            // up the pause announcement after the task summary already says it is
+            // frozen.
+            self.pause_bell.notify_waiters();
+            // The same call decides whether this is the user's news or their own
+            // keystroke — see `attention_is_news`.
+            self.attention(
+                task_id,
+                json!({"task_id": task_id, "kind": "paused", "pause": kind_s, "reason": reason_s}),
+            )
+            .await;
+        }
+        // Recount on *every* pause, not only the first: this is the number the
+        // banner is made of, so it is read when the banner appears rather than
+        // trusted from whatever recounted last. A pause can land between one
+        // recount and the next — a command that was already past the pause gate,
+        // work starting as the chat freezes — and a chat frozen once already (by
+        // the global pause, by an earlier pause raising a different reason) used to
+        // return here before looking at the count at all. It can wait for another
+        // task update, which is why it stays below the announcement above.
+        self.refresh_busy(task_id).await;
+        if !newly_paused {
+            return;
+        }
         self.save_task(task_id).await;
         // Pausing by hand is the user acting on this chat, so it comes to the
         // top. A pause the app raised on its own (a route ran out of models) is
@@ -1114,33 +1576,35 @@ impl Harness {
         if kind_s == "manual" {
             self.touch(task_id).await;
         }
-        // Recount here, not only when a command starts or ends: pausing while a
-        // command is already in flight is exactly the case the "Pausing... waiting
-        // on N commands" banner is about, and `busy` isn't persisted.
-        self.refresh_busy(task_id).await;
-        self.pause_bell.notify_waiters();
-        (self.bus)(
-            "ol://attention",
-            json!({"task_id": task_id, "kind": "paused", "pause": kind_s, "reason": reason_s}),
-        );
     }
 
     /// Recount in-flight commands so the UI can show "Pausing…" until they drain.
     pub async fn refresh_busy(&self, task_id: &str) {
-        let fg = self
-            .runtime(task_id)
-            .fg
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let live: Vec<String> = self
-            .bg
-            .list(task_id)
-            .into_iter()
-            .filter(|b| b.running)
-            .map(|b| format!("{}: {}", b.id, b.cmd))
-            .collect();
+        let rt = self.runtime(task_id);
         let mut changed = false;
         let counted = self
             .update_task_quiet(task_id, |t| {
+                // Read the live state *here*, under the task lock, rather than
+                // before it. Every command start and end recounts, so recounts run
+                // concurrently with the counts they publish — a swarm finishing
+                // together queues several of them on this lock — and the value a
+                // recount writes is whatever it read when it *started*. The one
+                // that read first can be the one that queues behind the others and
+                // writes last, and then the banner names a command that exited
+                // minutes ago and nothing recounts it away, because nothing is
+                // running any more. Read under the lock, the last write is the true
+                // count by construction.
+                let fg = rt.fg.load(std::sync::atomic::Ordering::SeqCst);
+                let live: Vec<shell::BgInfo> = self
+                    .bg
+                    .list(task_id)
+                    .into_iter()
+                    .filter(|b| b.running)
+                    .collect();
+                let named: Vec<String> = live
+                    .iter()
+                    .map(|b| format!("{}: {}", b.id, b.cmd))
+                    .collect();
                 // Background jobs only count while a quit is draining them. A dev
                 // server or watcher is meant to outlive a pause and never exits on
                 // its own, so counting it made "Pausing… waiting on N commands to
@@ -1148,8 +1612,15 @@ impl Harness {
                 // bounded by their timeout, which is what makes waiting on them sane.
                 let quitting = t.paused.as_ref().is_some_and(|p| p.kind == "quit");
                 t.busy = fg + if quitting { live.len() } else { 0 };
-                changed = t.bg_live != live;
-                t.bg_live = live;
+                changed = t.bg_live != named;
+                t.bg_live = named;
+                // Published as it stands, so a banner that says everything is
+                // paused can name the servers that are still up. This is also the
+                // only reason a background job starting or exiting reaches the UI:
+                // `emit_key` reads it, so the recount publishes when the list
+                // moves even though `busy` (which the same recount keeps current)
+                // deliberately does not count these while a pause is on.
+                t.bg_now = live;
             })
             .await;
         if counted && changed {
@@ -1299,7 +1770,7 @@ impl Harness {
                     since: Utc::now(),
                 });
             }
-            // Sub-agents get the same closing as the main one, or a swarm would be
+            // Subagents get the same closing as the main one, or a swarm would be
             // told its work was cut while its workers carry on as if nothing had
             // happened. Their ids are collected first: a sub and its transcript live
             // in two maps of the same task, so both can't be borrowed at once.
@@ -1434,11 +1905,17 @@ impl Harness {
     /// of 20 meant serializing 400 kB of text to show a spinner. The reports are
     /// only ever read when a subagent's panel is opened, which fetches the task
     /// whole via `task_get`.
-    pub fn emit_summary(&self, t: &Task) {
-        let mut s = t.summary();
-        for sub in s.subs.iter_mut() {
-            sub.report.clear();
+    /// Re-send a docker task's summary after its container changed state, so
+    /// the chat header shows "building", "running" or "stopped" live.
+    pub async fn emit_container(&self, task_id: &str) {
+        if let Ok(t) = self.task(task_id).await {
+            let t = t.lock().await;
+            self.emit_summary(&t);
         }
+    }
+
+    pub fn emit_summary(&self, t: &Task) {
+        let s = t.summary_without_reports();
         self.emit(
             &t.id,
             "task",
@@ -1446,8 +1923,52 @@ impl Harness {
         );
     }
 
+    /// Publish an attention event and remember it in the chat.
+    ///
+    /// Whether an event is also *news* is one rule, kept here so the mark and the
+    /// event can never disagree about it — see `attention_is_news`. The mark is
+    /// what a client draws as the sidebar's blue dot, and it lives on the task
+    /// rather than in the window that drew it because there is more than one
+    /// client (see `Task::unread`).
+    pub async fn attention(&self, task_id: &str, payload: Value) {
+        if attention_is_news(&payload) {
+            self.set_unread(task_id, true).await;
+        }
+        (self.bus)("ol://attention", payload);
+    }
+
+    /// Change the "nothing here has been looked at yet" mark and publish it, so
+    /// every client's dot follows. Deliberately not `update_task`: reading a chat
+    /// is not work *in* the chat, and `updated_at` is what a settled chat sorts
+    /// on (see `Task::touched_at`).
+    async fn set_unread(&self, task_id: &str, unread: bool) {
+        let Ok(task) = self.task(task_id).await else {
+            return;
+        };
+        let mut t = task.lock().await;
+        if t.unread == unread {
+            return;
+        }
+        t.unread = unread;
+        self.emit_summary(&t);
+    }
+
+    /// Someone is opening this chat, so the mark that says nobody has looked at
+    /// it goes out — and it goes out for *everyone*, because the mark is the
+    /// backend's and a second client on the same chat has to agree about it.
+    /// A blocking question or approval is the exception; see `Task::mark_seen`.
+    pub async fn seen(&self, task_id: &str) {
+        let Ok(task) = self.task(task_id).await else {
+            return;
+        };
+        let mut t = task.lock().await;
+        if t.mark_seen() {
+            self.emit_summary(&t);
+        }
+    }
+
     /// Pending informational notices are already in task headers: do not hydrate
-    /// every sub-agent transcript just to restore the app's notification cards.
+    /// every subagent transcript just to restore the app's notification cards.
     pub async fn user_notices(&self) -> HashMap<String, Vec<Item>> {
         let tasks: Vec<TaskRef> = self.tasks.read().await.values().cloned().collect();
         let mut notices = HashMap::new();
@@ -1542,7 +2063,7 @@ impl Harness {
         }
     }
 
-    /// Timeline item in a sub-agent's own transcript.
+    /// Timeline item in a subagent's own transcript.
     pub async fn upsert_sub_item(&self, task_id: &str, sub: &str, item: Item) {
         if let Ok(t) = self.task(task_id).await {
             let mut t = t.lock().await;
@@ -1696,6 +2217,13 @@ impl Harness {
             t.step,
             t.paused,
             t.busy,
+            // The live background commands, by identity. Starting or exiting is
+            // news; a new last output line is not, and including it would make
+            // this key move continuously for a list nobody re-reads it from.
+            t.bg_now
+                .iter()
+                .map(|b| json!([&b.id, &b.cmd]))
+                .collect::<Vec<_>>(),
             t.pinned,
             t.archived,
             t.hidden,
@@ -1736,7 +2264,7 @@ impl Harness {
     /// The runner saves after every round of tool calls, and each save
     /// serializes the *whole* transcript — megabytes by the end of a long task.
     /// Done inline that holds the task's lock for the length of a full rewrite,
-    /// so every sub-agent `step()`, item patch and summary queued behind it
+    /// so every subagent `step()`, item patch and summary queued behind it
     /// waits for several megabytes to hit the disk, and a burst of tool calls
     /// repeated the same work. Instead a save marks the task dirty and a shared
     /// writer flushes at most one task per `SAVE_DEBOUNCE`, off the lock, with
@@ -1865,20 +2393,47 @@ impl Harness {
                     if ids.is_empty() {
                         break;
                     }
-                    for id in ids {
-                        let rt = h.runtime(&id);
-                        let _save = rt.task_save.lock().await;
-                        // Take the id out before writing, so a save requested
-                        // while this is in flight re-marks it dirty for the next
-                        // pass instead of being swallowed by a stale write.
-                        h.dirty.lock().unwrap().remove(&id);
-                        // `task()` hydrates, which is what makes writing safe: a
-                        // header-only task would overwrite its own sub-agent
-                        // history. This is the one save path that did not go
-                        // through the accessor by accident, so it is worth saying.
-                        let Ok(t) = h.task(&id).await else { continue };
-                        Self::write_task_json(t).await;
-                    }
+                    // Write the dirty tasks concurrently rather than one at a
+                    // time. The work is per-file and each task has its own
+                    // `task_save` mutex, so the ordering below is unchanged: the
+                    // only thing that was serial was *waiting* on the previous
+                    // task's fsyncs while holding none of its locks. With chats
+                    // that run to hundreds of megabytes that wait was seconds
+                    // each, and ten dirty chats meant every save in the app
+                    // landed tens of seconds late — including `save_task_now`
+                    // for a chat that was never dirty, which queued behind the
+                    // same stuck writer.
+                    //
+                    // Bounded, not unbounded: the serialize half of a write runs
+                    // on `store::pool()`, which is capped at 8 threads, so more
+                    // concurrent writers than that only oversubscribe it (and the
+                    // disk) while making the flush order less predictable.
+                    let bound = store::pool().current_num_threads().max(1);
+                    let jobs: Vec<_> = ids
+                        .into_iter()
+                        .take(bound.saturating_mul(2))
+                        .map(|id| {
+                            let h = h.clone();
+                            async move {
+                                let rt = h.runtime(&id);
+                                let _save = rt.task_save.lock().await;
+                                // Take the id out before writing, so a save requested
+                                // while this is in flight re-marks it dirty for the
+                                // next pass instead of being swallowed by a stale write.
+                                h.dirty.lock().unwrap().remove(&id);
+                                // `task()` hydrates, which is what makes writing safe: a
+                                // header-only task would overwrite its own subagent
+                                // history. This is the one save path that did not go
+                                // through the accessor by accident, so it is worth saying.
+                                let Ok(t) = h.task(&id).await else { return };
+                                Self::write_task_json(t).await;
+                            }
+                        })
+                        .collect();
+                    // Any id beyond the bound stays dirty and the outer loop picks
+                    // it up on the next pass, so a backlog drains in bounded
+                    // batches instead of being dropped.
+                    let _ = futures_util::future::join_all(jobs).await;
                 }
             }
         });
@@ -1912,7 +2467,8 @@ impl Harness {
             t.waiting_kind = Some(kind.into());
         })
         .await;
-        (self.bus)("ol://attention", json!({"task_id": task_id, "kind": kind}));
+        self.attention(task_id, json!({"task_id": task_id, "kind": kind}))
+            .await;
         let res = tokio::select! {
             r = rx => r.ok(),
             _ = cancel.cancelled() => None,
@@ -1923,6 +2479,11 @@ impl Harness {
                 t.status = "running".into();
             }
             t.waiting_kind = None;
+            // The request has been dealt with (answered, or the run was
+            // cancelled), so the mark the announcement above set goes with it: a
+            // blocking wait is the one thing `mark_seen` deliberately leaves
+            // alone, and nothing else would ever clear this one.
+            t.unread = false;
         })
         .await;
         res

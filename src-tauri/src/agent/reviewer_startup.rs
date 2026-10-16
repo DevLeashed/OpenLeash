@@ -16,7 +16,7 @@ use super::store::{
 };
 use super::{Item, Message, Pause, SubInfo};
 
-/// A saved chat with a sub-agent, so there is a body worth deferring.
+/// A saved chat with a subagent, so there is a body worth deferring.
 ///
 /// Built from the shared `tests::task` fixture rather than a literal of its own:
 /// `Task` has ~50 fields, and a second copy of that literal would rot silently
@@ -74,9 +74,9 @@ fn the_header_load_leaves_the_sub_agent_body_on_disk() {
     );
 
     // Everything the sidebar and the review view read is still there: only the
-    // two sub-agent fields are deferred.
+    // two subagent fields are deferred.
     assert_eq!(t.items.len(), 1, "the transcript is parsed eagerly");
-    assert_eq!(t.subs.len(), 1, "sub-agent rows come from the header");
+    assert_eq!(t.subs.len(), 1, "subagent rows come from the header");
     assert_eq!(t.title, "t", "the header carries the summary fields");
     assert_eq!(t.summary().subs.len(), 1, "the list can still render it");
 
@@ -132,7 +132,7 @@ fn hydrating_restores_the_body_and_keeps_later_edits() {
 fn saving_a_task_whose_body_was_never_loaded_is_refused() {
     // The guard that matters. A stub in memory plus a normal save would rewrite
     // the file with two empty maps, and nothing would report it until the user
-    // went looking for a sub-agent transcript that had been there all along.
+    // went looking for a subagent transcript that had been there all along.
     let root = std::env::temp_dir().join(format!("ol-guard-{}", std::process::id()));
     let _home = super::store::test_home(&root.join("home"));
     seed_task_with_sub("guard1");
@@ -150,7 +150,7 @@ fn saving_a_task_whose_body_was_never_loaded_is_refused() {
     );
     assert!(
         raw("guard1").contains("sub transcript"),
-        "the sub-agent history is still on disk"
+        "the subagent history is still on disk"
     );
     let _ = std::fs::remove_dir_all(root);
 }
@@ -202,7 +202,7 @@ fn the_boot_pass_skips_rather_than_materialises_the_body() {
             .sub_msgs
             .len(),
         0,
-        "the boot pass did not materialise {bytes} bytes of sub-agent history"
+        "the boot pass did not materialise {bytes} bytes of subagent history"
     );
     assert_eq!(
         full_read.sub_msgs["s1"].len(),
@@ -215,7 +215,7 @@ fn the_boot_pass_skips_rather_than_materialises_the_body() {
 
 #[test]
 fn a_task_file_with_no_body_still_loads() {
-    // Chat with no sub-agents at all: the common case, and the one that must not
+    // Chat with no subagents at all: the common case, and the one that must not
     // regress into "unhydrated forever".
     let root = std::env::temp_dir().join(format!("ol-nobody-{}", std::process::id()));
     let _home = super::store::test_home(&root.join("home"));
@@ -237,5 +237,35 @@ fn a_task_file_with_no_body_still_loads() {
     hydrate_task(&mut t);
     assert!(t.hydrated);
     assert!(t.sub_items.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The brief and work of a subagent in a chat reopened after launch. Boot holds
+/// only the header, and `task_open` never sends subagent bodies, so the panel
+/// has to read them through the harness. This is that path, end to end.
+#[tokio::test]
+async fn a_chat_reopened_after_launch_gives_back_its_subagent_transcript() {
+    let root = std::env::temp_dir().join(format!("ol-subtx-{}", std::process::id()));
+    let _home = super::store::test_home(&root.join("home"));
+    seed_task_with_sub("subtx1");
+    let header = read_task_header(&task_path("subtx1")).unwrap();
+    assert!(!header.hydrated, "boot holds the header only");
+
+    let (h, _events) =
+        crate::agent::tests::harness(super::store::Settings::default(), vec![header]);
+    let body = h.sub_transcript("subtx1", "s1").await.unwrap();
+    assert_eq!(
+        body.len(),
+        40,
+        "the subagent's transcript is read back from disk"
+    );
+    assert_eq!(body[0].text, "item-0");
+    assert!(
+        h.sub_transcript("subtx1", "nobody")
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unknown subagent has no transcript rather than an error"
+    );
     let _ = std::fs::remove_dir_all(root);
 }

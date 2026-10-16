@@ -3,8 +3,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { DragDropEvent } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { api, ASSISTS, Assist, clampEffort, countOptionalAgents, defaultX, DEFAULT_PERM, EFFORTS, effortLabel, effortSteps, FileRef, fmt$, fmtK, Item, normPath, Perm, PERMS, TaskPatch, TaskSummary, UltraX, withRequiredAgents, xDepth, xOn } from "../api";
-import { defaultRoute, flash, get, go, isConnected, Menu, modelInfo, persistDraft, savePrompt, saveSettings, set, shownProviders, type State, useStore, zoom } from "../store";
+import { api, ASSISTS, Assist, clampEffort, countOptionalAgents, defaultX, DEFAULT_PERM, EFFORTS, effortLabel, effortSteps, FileRef, fmt$, fmtK, Item, normPath, Perm, PERMS, ResumeMode, TaskPatch, TaskSummary, UltraX, withRequiredAgents, xDepth, xOn } from "../api";
+import { remoteApi } from "../remote";
+import { enterSendsMessage, messageSendKey } from "../keys";
+import { defaultRoute, flash, get, go, isConnected, isPhoneClient, Menu, modelInfo, persistDraft, requestPause, savePrompt, saveSettings, set, shownProviders, type State, useStore, zoom } from "../store";
 import { I } from "./icons";
 import { annotationBlock } from "./SelectionNote";
 import { ProviderIcon } from "./ProviderIcon";
@@ -127,7 +129,7 @@ export async function setOpts(patch: TaskPatch): Promise<OptsResult> {
 export function afterChange(label: string, now: boolean) {
   const t = currentTask();
   const live = t && (t.status === "running" || t.status === "waiting");
-  if (live && !now) flash(`${label} · applies with your next message (Shift-click to apply now)`);
+  if (live && !now) flash(`${label} · applies with your next message (Alt-click to apply now)`);
 }
 
 export function togglePlan() {
@@ -180,13 +182,14 @@ export function openUltraXEditor() {
   }
   set({ ultraXOpen: true, menu: null, pal: false });
 }
-/** After a stop: the agent needs to know whether to pick the work back up or wrap it up. */
+/** After a stop: the agent needs to know whether to pick the work back up, report on
+ *  its way back into it, or stop and wrap up. */
 function ResumeChoice({ id }: { id: string }) {
   const [open, setOpen] = useState(false);
-  const go = (mode: "continue" | "wrap") => { setOpen(false); api.resume(id, undefined, mode).catch((e) => flash(String(e))); };
+  const go = (mode: ResumeMode) => { setOpen(false); api.resume(id, undefined, mode).catch((e) => flash(String(e))); };
   return (
     <span style={{ position: "relative", display: "inline-flex" }}>
-      <RoundButton label="Resume · continue or wrap up" className="cont" onClick={() => setOpen(!open)}>{I.play(10)}</RoundButton>
+      <RoundButton label="Resume · wrap up, summarise and continue, or continue" className="cont" onClick={() => setOpen(!open)}>{I.play(10)}</RoundButton>
       {open && (
         <>
           <MenuScrim onClick={() => setOpen(false)} />
@@ -196,6 +199,12 @@ function ResumeChoice({ id }: { id: string }) {
               <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
                 <span>Wrap up</span>
                 <span style={{ fontSize: 11, color: "var(--mut3)" }}>Don't continue · summarise what got done and what's left</span>
+              </div>
+            </MenuRow>
+            <MenuRow onClick={() => go("summarise")}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                <span>Summarise and continue</span>
+                <span style={{ fontSize: 11, color: "var(--mut3)" }}>Say where things stand, then carry on (subagents too)</span>
               </div>
             </MenuRow>
             <MenuRow onClick={() => go("continue")}>
@@ -309,6 +318,7 @@ export const MAX_FILES = 12;
 /** The cap on one pasted image, shared with the message editor. */
 export const MAX_IMAGE = 5 * 1024 * 1024;
 export const MAX_IMAGES = 8;
+export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 
 /**
  * Did this window-level drag land on the composer? The window reports one
@@ -356,6 +366,29 @@ export function addImages(key: string, files: File[]) {
   return imgs.length > 0;
 }
 
+export async function addRemoteFiles(key: string, files: File[]) {
+  // The new-task composer has no chat yet, so it stages under the selected
+  // project folder. Without one there is nothing to scope the upload to.
+  const project = key === "new-chat" ? (get().settings?.project ?? "") : key;
+  if (!project) { flash("Pick a project folder before attaching files"); return; }
+  const accepted = files.filter((f) => f.size <= MAX_FILE_BYTES);
+  if (accepted.length !== files.length) flash("Remote uploads are limited to 64 MiB per file");
+  for (const file of accepted) {
+    try {
+      const ref = await remoteApi.remoteUpload(project, file.name || "attachment", await file.arrayBuffer());
+      if (ref.image) {
+        if (ref.size > MAX_IMAGE) { flash(`${ref.name} is over 5 MB`); continue; }
+        const image = await api.fileDataUrl(ref.path);
+        if ((get().attach[key] ?? []).length >= MAX_IMAGES) { flash(`Only ${MAX_IMAGES} images at a time`); continue; }
+        set((s) => ({ attach: { ...s.attach, [key]: [...(s.attach[key] ?? []), image] }, attachFiles: { ...s.attachFiles, [key]: [...(s.attachFiles[key] ?? []), { ...ref, imageDataUrl: image, imageIndex: (s.attach[key] ?? []).length }] } }));
+      } else {
+        if ((get().attachFiles[key] ?? []).length >= MAX_FILES) { flash(`Only ${MAX_FILES} files at a time`); continue; }
+        set((s) => ({ attachFiles: { ...s.attachFiles, [key]: [...(s.attachFiles[key] ?? []), ref] } }));
+      }
+    } catch (e) { flash(String(e)); }
+  }
+}
+
 /** Add files the agent should read, by path.
  *
  *  The model can only *see* an image, so those are also inlined as image
@@ -367,7 +400,11 @@ export async function addFiles(key: string, paths: string[]) {
   if (!paths.length) return;
   let refs: FileRef[];
   try {
-    refs = await api.filesAttach(paths);
+    // The chat's folder (or, for a new chat, the selected project): a remote
+    // (SSH) one can't open local non-image files, and the backend says so.
+    const st = get();
+    const cwd = key === "new-chat" ? st.settings?.project : st.tasks[key]?.cwd;
+    refs = await api.filesAttach(paths, cwd);
   } catch (e) {
     flash(String(e));
     return;
@@ -471,13 +508,12 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
   // What the user actually typed, before the attachment list goes on. A failed
   // send puts this back, not the decorated version.
   const typed = text;
-  // Attached files ride along as paths in the text: the agent has read_file,
-  // glob and friends, so a path is all it needs to get at the bytes. Images
-  // are already inlined above, so they're left out of this list.
-  if (files.length) {
-    const paths = files.filter((f) => !f.image).map((f) => f.path);
-    if (paths.length) text = (text ? text + "\n\n" : "") + "Attached files (read these with your tools, they are not inlined):\n" + paths.map((p) => `- ${p}`).join("\n");
-  }
+  // Non-image file paths and image names are sent separately, and the backend
+  // copies each under OpenLeash's temp folder and tells the model the staged
+  // path. A path spliced into the text here would name the user's own file and
+  // would land in the visible transcript.
+  const filePaths = files.filter((f) => !f.image).map((f) => f.path);
+  const imageNames = images.map((_, i) => files.find((f) => f.image && f.imageIndex === i)?.name ?? `image-${i + 1}`);
   if (text.startsWith("/") && localSlash(text, mode)) return clear();
   if (text === "/goal" && mode === "home") return flash("Say what done looks like, e.g. /goal all tests pass on Windows");
   if (mode === "home") {
@@ -486,7 +522,7 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
     clear();
     try {
       const h = s.home;
-      const t = await api.create({ prompt: text, project, model: h.model, effort: h.effort, perm: h.perm, plan: h.plan, worktree: h.worktree && !!s.projectInfo?.git, base_branch: h.branch, subagents: h.agents.length > 0, assist: h.assist, agents: h.agents, route: h.route, images, ultra: h.ultra, ultra_wt: h.ultra_wt, ultra_x: h.ultra_x });
+      const t = await api.create({ prompt: text, project, model: h.model, effort: h.effort, perm: h.perm, plan: h.plan, worktree: !h.docker && h.worktree && !!s.projectInfo?.git, workspace: h.docker ? "docker" : h.worktree && s.projectInfo?.git ? "worktree" : "local", base_branch: h.branch, subagents: h.agents.length > 0, assist: h.assist, agents: h.agents, route: h.route, images, image_names: imageNames, files: filePaths, ultra: h.ultra, ultra_wt: h.ultra_wt, ultra_x: h.ultra_x });
       set((st) => ({ tasks: { ...st.tasks, [t.id]: t }, home: { ...st.home, plan: false, ultra: false, ultra_wt: false, ultra_x: null } }));
       if (!stayOnHome) go("session", { task: t.id });
     } catch (e) {
@@ -516,7 +552,7 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
       return { pendingMessages };
     });
     try {
-      await api.send(s.task, body, later, images.length ? images : undefined);
+      await api.send(s.task, body, later, images.length ? images : undefined, filePaths, imageNames);
       removeOptimistic();
     } catch (e) {
       removeOptimistic();
@@ -571,12 +607,25 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
   const home = useStore((s) => s.home);
   const draft = useStore((s) => (mode === "home" ? s.draft : s.sessionDrafts[s.task ?? ""] ?? ""));
   const sendWith = useStore((s) => s.settings?.send_with ?? "enter");
+  const phoneEnterSends = useStore((s) => s.settings?.phone_enter_sends === true);
+  // A phone driving this computer, where the keyboard is the on-screen one. Its
+  // Return key cannot be relied on to report whether Shift is held, which is
+  // the whole reason Enter has its own setting there: no modifier can decide.
+  const phone = isPhoneClient();
+  // The key that sends, if any — `send_with` in the window, `phone_enter_sends`
+  // in a phone browser. Empty means no key sends and only the button does,
+  // which is where a phone starts: Enter is a newline, so nothing can be sent
+  // by a Return key that may or may not have been shifted. The box beside a
+  // subagent asks the same helper (`SubInput` in `ui/Session.tsx`).
+  const sendKey = messageSendKey(phone, sendWith, phoneEnterSends);
   const project = useStore((s) => s.settings?.project ?? "");
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
   const models = useStore((s) => s.models);
   const providers = useStore((s) => s.providers);
-  useStore((s) => s.accounts);
-  useStore((s) => s.settings?.routes);
+  // No subscription to `accounts` or `settings.routes` here: neither is read in
+  // this component, and a subscription costs a re-render on every event that
+  // field receives — an `ol://accounts` event re-rendered the whole composer for
+  // nothing. The fallback-route chip that does need routes reads them itself.
   const ref = useRef<HTMLTextAreaElement>(null);
   const [hi, setHi] = useState(0);
   const [slashOff, setSlashOff] = useState(false);
@@ -638,7 +687,9 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
   const sel = Math.min(hi, Math.max(0, matches.length - 1));
 
   useEffect(() => {
-    ref.current?.focus();
+    // Not on a touch screen: focusing there raises the on-screen keyboard over
+    // half the page every time a chat is opened just to be read.
+    if (!window.matchMedia?.("(pointer: coarse)").matches) ref.current?.focus();
   }, [mode, task?.id]);
   useEffect(() => {
     const el = ref.current;
@@ -675,17 +726,18 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
       }
     }
     if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
-    const mod = e.ctrlKey || e.metaKey;
-    const wants = sendWith === "enter" ? !e.shiftKey && !mod : mod;
+    // Shift is never the send, whatever the mode: on any keyboard, held it is
+    // the newline. Only a bare Enter (or the Ctrl Enter mode's chord) sends.
+    const wants = enterSendsMessage(sendKey, e);
     if (wants || (e.altKey && !e.shiftKey)) {
       e.preventDefault();
       void submit(mode, e.altKey, mode === "home" && e.altKey);
     }
   };
 
-  const ph = mode === "home"
+  const ph = phone ? "Message" : mode === "home"
     ? project ? "Describe a task, or / for commands like /goal and /plan" : "Open a project folder to start"
-    : paused ? "Paused · type a message and hit Resume, or just resume" : task && (task.status === "stopped" || task.status === "failed") ? "Stopped · Resume to continue or wrap up, or say what to do instead" : running ? "Steer the agent now · Alt Enter to send after this turn" : "Follow up, or / for commands";
+    : paused ? "Paused · type a message and hit Resume, or just resume" : task && (task.status === "stopped" || task.status === "failed") ? "Stopped · Resume to carry on, summarise and continue, or wrap up — or say what to do instead" : running ? "Steer the agent now · Alt Enter to send after this turn" : "Follow up, or / for commands";
 
   return (
     <div className={"composer" + (mode === "session" ? " float" : "") + (paused ? " paused" : "") + (dropAt ? " dropping" : "")} style={{ position: "relative" }}>
@@ -725,7 +777,7 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
         </div>
       )}
       <TextArea ref={ref} className={dropAt ? "dropping" : ""} value={draft} onChange={(e) => onDraft(e.currentTarget.value)} onKeyDown={onKey} placeholder={ph} rows={mode === "home" ? 3 : 2}
-        onPaste={(e) => { if (addImages(akey, Array.from(e.clipboardData.files))) e.preventDefault(); }} />
+        onPaste={(e) => { const pasted = Array.from(e.clipboardData.files); if (addImages(akey, pasted)) e.preventDefault(); else if (isPhoneClient() && pasted.length) { e.preventDefault(); void addRemoteFiles(akey, pasted); } }} />
       <div className="bar">
         <div className="bl">
           <IconButton label="Plan mode, compact, MCP" style={{ color: "var(--mut)" }} onClick={(e) => openMenu("plus", e)}>{I.plus()}</IconButton>
@@ -735,6 +787,13 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
           <Tooltip content="Attach files for the agent to read · or drop them onto the box">
             <span className="attachbtn">
               <IconButton label="Attach files" onClick={async () => {
+                if (isPhoneClient()) {
+                  const picker = document.createElement("input");
+                  picker.type = "file"; picker.multiple = true;
+                  picker.onchange = () => { if (picker.files?.length) void addRemoteFiles(akey, Array.from(picker.files)); };
+                  picker.click();
+                  return;
+                }
                 const picked = await open({ multiple: true, title: "Attach files" });
                 const paths = (Array.isArray(picked) ? picked : picked ? [picked] : []).filter((p): p is string => typeof p === "string");
                 if (paths.length) void addFiles(akey, paths);
@@ -756,7 +815,7 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
         </div>
         <div className="bc">
           {modelReady ? <>
-            <Tooltip content={pend.model ? `Switching from ${modelInfo(o.model).name} after this turn` : "Model · Shift-click a model to switch mid-turn"}><MenuButton className="mbtn" onClick={(e) => openMenu("model", e)}>
+            <Tooltip content={pend.model ? `Switching from ${modelInfo(o.model).name} after this turn` : "Model · Shift-click a model to apply on next message"}><MenuButton className="mbtn" onClick={(e) => openMenu("model", e)}>
               <ProviderIcon provider={mi.provider} size={14} />
               <span key={mi.id} className="mname" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{mi.name}</span>
               {pend.model && <PendingStar />}
@@ -794,11 +853,14 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
             <ResumeChoice id={task.id} />
           ) : running && !has ? (
             <>
-              <RoundButton label="Pause · Esc · lets the current command finish, then freezes. Resume carries on as if nothing happened." className="pausebtn" onClick={() => task && api.pause(task.id).catch((e) => flash(String(e)))}>{I.pause(10)}</RoundButton>
+              <RoundButton label="Pause · Esc · lets the current command finish, then freezes. Resume carries on as if nothing happened." className="pausebtn" onClick={() => task && requestPause(task.id)?.catch((e) => flash(String(e)))}>{I.pause(10)}</RoundButton>
               <RoundButton label="Stop · Esc Esc · cancels everything in flight, including background commands (dev servers, watchers). The agent is told what got cut off." className="stop" onClick={() => task && api.interrupt(task.id).catch((e) => flash(String(e)))}>{I.close(12)}</RoundButton>
             </>
           ) : (
-            <RoundButton label={running ? "Steer now · Enter · Alt-click to send after this turn" : "Send · Enter"} className={has ? "ready" : ""} onClick={(e) => submit(mode, e.altKey)}>{I.up()}</RoundButton>
+            // The tooltip names the sending key only when a key does send: on a
+            // phone with Enter-to-send off, promising Enter would misdescribe
+            // the one key that inserts a line break.
+            <RoundButton label={running ? `Steer now${sendKey ? ` · ${sendKey}` : ""} · Shift-click to send after this turn` : `Send${sendKey ? ` · ${sendKey}` : ""}`} className={has ? "ready" : ""} onClick={(e) => submit(mode, e.shiftKey)}>{I.up()}</RoundButton>
           )}
         </div>
       </div>

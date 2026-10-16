@@ -139,18 +139,18 @@ describe("attaching files for the agent", () => {
     expect(get().attachFiles["new-chat"]).toEqual([]);
   });
 
-  it("submits images once and only non-image paths in the text for home and session", async () => {
+  it("submits images once and non-image paths as staging input, not text", async () => {
     const send = vi.spyOn(api, "send").mockResolvedValueOnce(undefined);
     const create = vi.spyOn(api, "create").mockRejectedValueOnce(new Error("dummy failure"));
     set({ task: "t1", settings: { project: "C:/x" } as Settings });
     await addFiles("t1", ["C:/x/a.png", "C:/x/report.pdf"]);
     await submit("session");
-    expect(send).toHaveBeenCalledWith("t1", expect.stringContaining("- C:/x/report.pdf"), false, ["data:image/png;base64,QUJD"]);
-    expect(send.mock.calls[0]![1]).not.toContain("a.png");
+    expect(send).toHaveBeenCalledWith("t1", "", false, ["data:image/png;base64,QUJD"], ["C:/x/report.pdf"], ["a.png"]);
+    expect(send.mock.calls[0]![1]).not.toContain("report.pdf");
     await addFiles("new-chat", ["C:/x/a.png", "C:/x/report.pdf"]);
     await submit("home");
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({ images: ["data:image/png;base64,QUJD"], prompt: expect.stringContaining("- C:/x/report.pdf") }));
-    expect(create.mock.calls[0]![0].prompt).not.toContain("a.png");
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ images: ["data:image/png;base64,QUJD"], files: ["C:/x/report.pdf"], image_names: ["a.png"] }));
+    expect(create.mock.calls[0]![0].prompt).not.toContain("report.pdf");
     expect(get().attachFiles["new-chat"]![0]!.imageIndex).toBe(0);
     removeImage("new-chat", 0);
     expect(get().attachFiles["new-chat"]!.map((f) => f.name)).toEqual(["report.pdf"]);

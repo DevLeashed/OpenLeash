@@ -55,7 +55,7 @@ const sub = (extra: Partial<SubInfo> = {}): SubInfo =>
 const chat = (extra: Partial<TaskSummary> = {}): TaskSummary => ({
   id: "t1", title: "jelly", status: "running", paused: null, unpaused: false, busy: 0,
   model: "codex/gpt-6-luna", pending: {}, branch: "main", project: "D:/work/app",
-  ultra: true, subs: [], archived: false,
+  ultra: true, subs: [], archived: false, unread: false,
   updated_at: "2026-09-26T00:00:00Z", touched_at: "2026-09-26T00:00:00Z",
   ...extra,
 } as TaskSummary);
@@ -73,9 +73,11 @@ const listed = (t: TaskSummary) => set({
 const dotColor = () => document.querySelector<HTMLElement>(".srow .dot")?.style.background ?? "";
 
 beforeEach(() => {
-  // The store is module-level, so an unread dot set by one case would outrank the
-  // colour every later case is asserting on.
-  set({ unread: {} });
+  // The flag lives on the summary now, not on the store, and every fixture above
+  // starts `unread: false` — so a marked chat in one case cannot outrank the
+  // colour the next case asserts on. What the store *does* have to be reset is
+  // which chat is on screen: a row showing the open chat never shouts.
+  set({ view: "home", task: null });
 });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -146,22 +148,58 @@ describe("what the dot is not allowed to become", () => {
     expect(dotColor()).toBe("var(--st-pause)");
   });
 
-  it("still lets an unread chat outrank the model colour", () => {
-    // Unread is the other thing that has to survive: the dot is how you notice
-    // a chat that raised its hand while you were somewhere else.
-    set({ unread: { t1: true } });
-    listed(chat({ ultra: true, subs: [sub()] }));
+  it("shows unread separately without changing the running status color", () => {
+    listed(chat({ ultra: true, subs: [sub()], unread: true }));
     render(createElement(Sidebar));
-    expect(dotColor()).toBe("var(--st-unread)");
+    expect(dotColor(), "running remains the actual chat state").toBe(asDot(CODEX));
+    expect(document.querySelector(".unread-mark"), "unread is a distinct visual marker").not.toBeNull();
+  });
+
+  it("does not shout about the chat that is on screen", () => {
+    // The mark is the backend's, and the backend cannot know which chat a client
+    // is showing: you are already reading this one, so its dot keeps the status
+    // colour until you look away and come back — opening it is what clears the
+    // mark (`Task::mark_seen`).
+    listed(chat({ status: "done", ultra: false, subs: [], unread: true }));
+    set({ view: "session", task: "t1" });
+    render(createElement(Sidebar));
+    expect(dotColor()).toBe("var(--st-done)");
   });
 
   it.each(["question", "approval"] as const)("keeps an unanswered %s red instead of unread blue", (waiting_kind) => {
-    // The wait itself is the ongoing attention marker. Unread blue used to mask
-    // the red status color, even though this chat still needs an answer.
-    listed(chat({ status: "waiting", waiting_kind }));
-    set({ unread: { t1: true } });
+    listed(chat({ status: "waiting", waiting_kind, unread: true }));
     render(createElement(Sidebar));
     expect(dotColor()).toBe("var(--st-wait)");
+    expect(document.querySelector(".unread-mark"), "the blocking wait already communicates attention").toBeNull();
+  });
+
+  it("shows a question as waiting even if the summary status is stale", () => {
+    listed(chat({ status: "running", waiting_kind: "question", unread: true }));
+    render(createElement(Sidebar));
+    expect(dotColor()).toBe("var(--st-wait)");
+    expect(document.querySelector(".badge")?.textContent).toBe("Answer");
+    expect(document.querySelector(".unread-mark")).toBeNull();
+  });
+
+  it("keeps an unclassified wait visible instead of masking it as unread", () => {
+    listed(chat({ status: "waiting", waiting_kind: null, unread: true }));
+    render(createElement(Sidebar));
+    expect(dotColor()).toBe("var(--st-wait)");
+    expect(document.querySelector(".unread-mark")).toBeNull();
+    // Opening hides the unread marker, but must not be the first time the row
+    // tells the user this chat is waiting on them.
+    set({ view: "session", task: "t1" });
+    expect(dotColor()).toBe("var(--st-wait)");
+  });
+
+  it("paints a finished chat that is unread as a full unread-coloured dot", () => {
+    // A done chat has nothing to say but "I finished", so the unread mark is the
+    // whole signal: the full dot takes the unread colour, as it did before the
+    // corner speck. A 4px notch on a grey dot read as a dot that had gone wrong.
+    listed(chat({ status: "done", ultra: false, subs: [], unread: true }));
+    render(createElement(Sidebar));
+    expect(dotColor()).toBe("var(--st-unread)");
+    expect(document.querySelector(".unread-mark"), "the full dot is the mark now").toBeNull();
   });
 
   it("leaves a chat that is not running on its status colour", () => {

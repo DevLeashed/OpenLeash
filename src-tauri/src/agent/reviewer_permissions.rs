@@ -273,6 +273,44 @@ fn plan_mode_denies_writes_even_at_full_access_and_even_with_an_always_rule() {
     );
 }
 
+/// Filing the plan is the harness recording the proposal it is already showing
+/// the user; it must not become a door the agent can walk through. The plan's
+/// own tool is read-only classified, while every model-initiated artifict write
+/// stays refused in plan mode — even at Full Access and even with an
+/// `artifict_create *` rule pre-approved.
+#[test]
+fn filing_a_plan_does_not_open_artifict_writes_in_plan_mode() {
+    let planning = Ctx {
+        plan: true,
+        perm: "full",
+        allow: &[allow_rule("artifict_create *", PROJECT)],
+        ..ctx(&[])
+    };
+    assert!(
+        is_allow(&check(
+            "exit_plan_mode",
+            &json!({"plan": "# P"}),
+            None,
+            &planning
+        )),
+        "the agent has to be able to propose at all"
+    );
+    for tool in ["artifict_create", "artifict_revise", "artifict_respond"] {
+        let d = check(
+            tool,
+            &json!({}),
+            Some(&in_cwd(".openleash/artificts/x.json")),
+            &planning,
+        );
+        assert_eq!(
+            deny_reason(&d),
+            Some(DENY_EXPECTED_PLAN),
+            "plan mode must still refuse the agent's own {tool}: {}",
+            show(&d)
+        );
+    }
+}
+
 /// Plan mode's own message is the contract with the user: it has to name
 /// `exit_plan_mode`, or the agent is stuck with an unexplained refusal.
 #[test]
@@ -900,10 +938,11 @@ fn a_deny_rule_is_checked_before_the_read_only_shortcut_and_before_every_rung() 
         &turbo_plan
     ))
     .is_some());
-    // A deny on a plugin action beats Turbo too.
+    // A deny on a plugin action beats Turbo too. `computer` takes a batch of
+    // `actions` (it has no `action` field), so the fixture is a real batch.
     let d = check(
         "computer",
-        &json!({ "action": "left_click" }),
+        &json!({ "actions": [{ "type": "click", "x": 10, "y": 20 }] }),
         None,
         &Ctx {
             perm: "turbo",

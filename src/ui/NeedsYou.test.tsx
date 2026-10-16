@@ -12,6 +12,10 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const task = (kind: "question" | "approval"): TaskSummary => ({
   id: `chat-${kind}`, title: `${kind} chat`, status: "waiting", waiting_kind: kind, paused: null,
+  // The backend marks a chat as waiting to be looked at, and a blocking wait is
+  // the one kind of mark that survives opening the chat (`Task::mark_seen`) —
+  // which is what the two assertions in the test below are about.
+  unread: true,
 } as TaskSummary);
 const item = (kind: "question" | "approval"): Item => kind === "question"
   ? { id: "question-id", kind, text: "", data: { questions: [{ question: "Which database should I use?", type: "single", options: [] }] }, ts: new Date(Date.now() - 125_000).toISOString() }
@@ -21,7 +25,10 @@ it.each(["question", "approval"] as const)("shows a pending %s preview and opens
   const waiting = task(kind);
   const pending = item(kind);
   const fetchTask = vi.spyOn(api, "task").mockResolvedValue({ summary: waiting, items: [pending], sub_items: {}, bg: [] });
-  set({ tasks: { [waiting.id]: waiting }, items: {}, unread: { [waiting.id]: true }, view: "home", task: null });
+  // Opening a chat pages its newest slice; the mock is the shape `task_open` returns.
+  const fetchOpen = vi.spyOn(api, "taskOpen").mockResolvedValue({ summary: waiting, items: [pending], bg: [], cursor: null, total: 1 });
+  vi.spyOn(api, "draftGet").mockResolvedValue("");
+  set({ tasks: { [waiting.id]: waiting }, items: {}, view: "home", task: null });
 
   render(<NeedsYou />);
   const entry = screen.getByRole("button", { name: /Needs you inbox · 1 pending/ });
@@ -30,14 +37,15 @@ it.each(["question", "approval"] as const)("shows a pending %s preview and opens
   expect(await screen.findByText(kind === "question" ? "Which database should I use?" : "npm test")).toBeTruthy();
   expect(screen.getByText("Waiting 2m")).toBeTruthy();
   expect(fetchTask).toHaveBeenCalledTimes(1); // Preview only after opening the inbox.
-  expect(get().unread[waiting.id], "opening the inbox does not acknowledge the chat").toBe(true);
+  expect(get().tasks[waiting.id]?.unread, "opening the inbox does not acknowledge the chat").toBe(true);
 
   fireEvent.click(screen.getByRole("button", { name: `Open ${waiting.title} · ${kind}` }));
   await waitFor(() => expect(get().view).toBe("session"));
   expect(get().task).toBe(waiting.id);
-  expect(get().unread[waiting.id], "the existing blocking wait keeps its unread semantics").toBe(true);
-  expect(fetchTask).toHaveBeenCalledTimes(2); // Normal chat navigation re-loads the session.
-  expect(fetchTask).toHaveBeenNthCalledWith(2, waiting.id);
+  expect(get().tasks[waiting.id]?.unread, "the existing blocking wait keeps its unread semantics").toBe(true);
+  expect(fetchOpen).toHaveBeenCalledTimes(1); // Normal chat navigation re-loads the session.
+  expect(fetchOpen).toHaveBeenNthCalledWith(1, waiting.id);
+  expect(fetchTask, "the full-history read is not used for navigation").toHaveBeenCalledTimes(1);
 });
 
 it("keeps an entry visible at zero and Escape closes the drawer without navigation", () => {

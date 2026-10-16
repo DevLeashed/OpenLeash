@@ -67,7 +67,7 @@ describe("interactive visualizations", () => {
     expect(screen.queryByText(source)).toBeNull();
     expect(invoke).not.toHaveBeenCalled();
   });
-  it("does not start an artifact preview until requested; source and stop work", async () => {
+  it("does not start an artifict preview until requested; source and stop work", async () => {
     invoke.mockResolvedValueOnce("one").mockResolvedValue(undefined);
     render(<Visualization source={source} />);
     expect(invoke).not.toHaveBeenCalled(); expect(document.querySelector("iframe")).toBeNull();
@@ -198,7 +198,7 @@ describe("interactive visualizations", () => {
     expect((screen.getByRole("button", { name: "Source" }) as HTMLButtonElement).style.fontSize).toBe("11.5px");
     expect((screen.getByRole("button", { name: "Copy source" }) as HTMLButtonElement).style.height).toBe("27px");
   });
-  it("does not offer manual artifact creation from a preview", () => {
+  it("does not offer manual artifict creation from a preview", () => {
     render(<Visualization source={source} />);
     expect(screen.queryByRole("button", { name: "Save to project workspace" })).toBeNull();
   });

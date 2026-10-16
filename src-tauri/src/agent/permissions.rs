@@ -1,7 +1,8 @@
 //! Permission policy: four escalating rungs (disabled / allowlist / auto /
 //! turbo) plus plan mode, a user-editable allow *and deny* list, command
 //! patterns, and read-only command detection so the agent can explore freely
-//! without nagging.
+//! without nagging. `reviewer` is a fifth id that shares allowlist's rung and
+//! adds a second model in place of the user's click — see `crate::agent::review`.
 //!
 //! The deny tier is evaluated first — ahead of the read-only shortcut, plan
 //! mode and every rung — so a deny always wins. That is the whole point of the
@@ -57,6 +58,17 @@ pub struct Ctx<'a> {
 /// places (settings, every task, every saved prompt), so there is no single
 /// load site a migration could reach. `ask` was this ladder's middle rung under
 /// its old name; `full` is `turbo`.
+/// The mode in which a second, cheap model answers the permission prompt in the
+/// user's place.
+///
+/// It is a *value* rather than a rung: [`Rung::of`] maps it to `Allowlist`, so
+/// everything below the Ask decision — the deny tier, the read-only shortcut,
+/// allow rules, plan mode, the doom-loop guard — behaves exactly as it does in
+/// allowlist mode and the classifier only ever fills in for the *click*. That
+/// also means a build that predates it reads the id as an unknown value and
+/// fails closed onto the same rung, instead of onto Full Access.
+pub const REVIEW_PERM: &str = "reviewer";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rung {
     /// Only read-only commands run. Everything else is refused, not asked.
@@ -76,6 +88,12 @@ impl Rung {
             "full" | "turbo" => Rung::Turbo,
             "auto" => Rung::Auto,
             "disabled" => Rung::Disabled,
+            // Reviewer mode asks the same questions allowlist does — a second
+            // model answers them instead of the user. Naming it here rather
+            // than letting it fall through to the catch-all is deliberate: the
+            // coincidence is load-bearing, not accidental, and this is where a
+            // future rung would otherwise silently swallow it.
+            "reviewer" => Rung::Allowlist,
             // "ask" is this rung's old name, and the catch-all means an id
             // written by a newer build lands on the middle rung rather than on
             // Turbo — an unknown value must fail *closed*.
@@ -433,10 +451,17 @@ pub fn is_read_only_tool(name: &str) -> bool {
             | "goal_complete"
             | "start_ultrathread"
             | "list_dir"
-            | "artifact_preview"
-            | "artifact_list"
-            | "artifact_get"
-            | "artifact_feedback_list"
+            | "artifict_preview"
+            | "artifict_list"
+            | "artifict_get"
+            | "artifict_feedback_list"
+            // Reads the user's *other* chats — titles, state, steps — and
+            // changes none of them. It is a read the way `list_agents` is, only
+            // of conversations rather than agents, so plan mode and the
+            // Disabled rung let it through: a plan is built out of facts, and
+            // "what else is open on this" is one. `message_chat`, which does
+            // change another chat, is deliberately absent and asks instead.
+            | "list_chats"
     )
 }
 
@@ -699,7 +724,7 @@ pub fn is_read_only_command(cmd: &str) -> bool {
         // here. Without this, `env curl …`, `find … -fprintf /path …`,
         // `sort -o /path …` and `git diff --output=/path …` were all classified
         // read-only and auto-approved in every mode, including a read-only
-        // sub-agent — arbitrary code execution and arbitrary file writes with
+        // subagent — arbitrary code execution and arbitrary file writes with
         // no prompt at all. These are cheap to detect and never appear in the
         // honest `ls -la` / `grep foo .` forms the list exists for.
         if spawns_or_writes(seg) {
@@ -883,11 +908,39 @@ pub fn inside_public(path: &str, root: &str) -> bool {
 }
 
 fn inside(path: &str, root: &str) -> bool {
+    if super::host::is_ssh(path) || super::host::is_ssh(root) {
+        return remote_relative(path, root).is_some();
+    }
     let (p, r) = (
         normalized_filesystem_path(Path::new(path)),
         normalized_filesystem_path(Path::new(root)),
     );
     component_relative_path(&p, &r).is_some()
+}
+
+/// Containment for remote-SSH paths: both must be `ssh://` URIs on the same
+/// host, and `path` at or below `root` — compared case-sensitively, as POSIX
+/// paths are (the local check folds case on Windows). Returns the part below
+/// the root (`""` for the root itself).
+///
+/// This is lexical, so it is only a containment proof when *both* strings are
+/// realpaths: the runner resolves a remote write target and the project root
+/// with `ssh_session::realpath` before asking, and then writes exactly the
+/// path it checked. Never resolved here: this module stays synchronous, and
+/// treating an unresolved `ssh://` string as a local `Path` would make
+/// `proj/link -> /etc` look inside the root.
+fn remote_relative(path: &str, root: &str) -> Option<String> {
+    let p = super::host::parse_ssh(path)?;
+    let r = super::host::parse_ssh(root)?;
+    if p.host != r.host || !super::host::inside(&r.path, &p.path) {
+        return None;
+    }
+    let rest = if r.path == "/" {
+        &p.path[1..]
+    } else {
+        p.path[r.path.len()..].trim_start_matches('/')
+    };
+    Some(rest.to_string())
 }
 
 /// Resolve existing ancestors (including symlinks) before comparing paths, and
@@ -1000,6 +1053,26 @@ pub fn file_restriction_denial(
 ) -> Option<String> {
     if !has_file_restriction(Some(pattern)) {
         return None;
+    }
+    if super::host::is_ssh(cwd) || super::host::is_ssh(resolved_path) {
+        let relative = remote_relative(resolved_path, cwd);
+        let display_path = relative
+            .clone()
+            .unwrap_or_else(|| resolved_path.to_string());
+        let matches = regex::Regex::new(pattern)
+            .map(|re| relative.is_some_and(|r| !r.is_empty() && re.is_match(&r)))
+            .unwrap_or(false);
+        if matches {
+            return None;
+        }
+        let description = if description.is_empty() {
+            String::new()
+        } else {
+            format!(" — {description}")
+        };
+        return Some(format!(
+            "FileRestrictionError: Agent `{agent_name}` cannot use `{tool}` on `{display_path}`; the path must be inside the project and match fileRegex `{pattern}`{description}."
+        ));
     }
 
     let candidate = Path::new(resolved_path);
@@ -1231,8 +1304,8 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 rule: None,
             }
         }
-        "artifact_create" | "artifact_revise" | "artifact_respond" => {
-            // Artifacts are project-scoped durable writes, not arbitrary model
+        "artifict_create" | "artifict_revise" | "artifict_respond" => {
+            // Artificts are project-scoped durable writes, not arbitrary model
             // paths. Use the project root as the scope checked by the same
             // permission ladder as file writes; an isolated subagent worktree
             // is deliberately outside that root and therefore needs approval.
@@ -1257,21 +1330,21 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 return Decision::Deny(DISABLED_MSG.into());
             }
             let verb = match tool {
-                "artifact_create" => "Create artifact",
-                "artifact_revise" => "Revise artifact",
-                _ => "Respond to artifact feedback",
+                "artifict_create" => "Create artifict",
+                "artifict_revise" => "Revise artifict",
+                _ => "Respond to artifict feedback",
             };
             let summary = match tool {
-                "artifact_create" => format!(
+                "artifict_create" => format!(
                     "{} · {}",
                     input["title"].as_str().unwrap_or("Untitled"),
-                    input["kind"].as_str().unwrap_or("artifact")
+                    input["kind"].as_str().unwrap_or("artifict")
                 ),
-                "artifact_revise" => format!(
+                "artifict_revise" => format!(
                     "{} · {} · {}",
-                    input["id"].as_str().unwrap_or("artifact"),
+                    input["id"].as_str().unwrap_or("artifict"),
                     input["title"].as_str().unwrap_or("Untitled"),
-                    input["kind"].as_str().unwrap_or("artifact")
+                    input["kind"].as_str().unwrap_or("artifict")
                 ),
                 _ => format!(
                     "{} · {}",
@@ -1283,9 +1356,9 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 title: format!("{verb} in {}", short(path, ctx.cwd)),
                 detail: format!("{path}\n{summary}"),
                 reason: if outside {
-                    "This artifact is outside the task's working directory.".into()
+                    "This artifict is outside the task's working directory.".into()
                 } else {
-                    "Allowlist-only mode: every artifact change needs your approval.".into()
+                    "Allowlist-only mode: every artifict change needs your approval.".into()
                 },
                 rule: Some(rule),
             }
@@ -1326,8 +1399,19 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
         // Plugins: the runner only gates GitHub writes and computer actions (reads/screenshots skip this).
         "github" | "computer" => {
             let action = input["action"].as_str().unwrap_or("");
+            // `computer` carries a batch of `actions`, not an `action`, so the
+            // thing a refusal names is the batch summary. Naming the (always
+            // absent) `action` left the user with a message about `` `  ` ``.
+            let named = if tool == "computer" {
+                super::plugins::computer_summary(input)
+                    .chars()
+                    .take(60)
+                    .collect::<String>()
+            } else {
+                action.to_string()
+            };
             if ctx.plan {
-                return Decision::Deny(format!("Plan mode is active: {tool} `{action}` is disabled until the plan is approved. Read-only actions still work."));
+                return Decision::Deny(format!("Plan mode is active: {tool} `{named}` is disabled until the plan is approved. Read-only actions still work."));
             }
             let rule = if tool == "github" {
                 format!("github:{action}")
@@ -1403,6 +1487,49 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 rule: Some(rule),
             }
         }
+        // A message that starts a turn in a *different* chat. Not covered by the
+        // read-only shortcut (only `list_chats` is read-only), so it lands here:
+        // plan mode refuses it like any other "do something" action, and the
+        // approval card offers a permanent rule.
+        //
+        // One blanket rule, not one per chat: the tool takes an id or a title,
+        // ids are twelve hex characters nobody types into a settings row, and a
+        // title the rule could key on is something the agent renames as the work
+        // moves on — so a per-chat rule would quietly stop matching the chat it
+        // was written for. The reason line says what the blanket grant covers.
+        "message_chat" if input["to"].as_str().is_some_and(|t| !t.trim().is_empty()) => {
+            if ctx.plan {
+                return Decision::Deny(
+                    "Plan mode is active: messaging another chat is disabled until the plan is approved. `list_chats` still reads.".into(),
+                );
+            }
+            let rule = "message_chat *".to_string();
+            let allowed = ctx
+                .allow
+                .iter()
+                .any(|r| deny_pattern(&r.pattern).is_none() && r.pattern == rule);
+            if rung == Rung::Turbo || allowed {
+                return Decision::Allow;
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            let to = input["to"].as_str().unwrap_or("").trim();
+            let note = input["message"].as_str().unwrap_or("").trim();
+            Decision::Ask {
+                title: format!("Message the chat `{to}`"),
+                detail: note.chars().take(600).collect::<String>(),
+                reason: "This sends a message to another chat's agent, which will act on it there, in a conversation you are not looking at. That chat's own permissions still govern whatever it then does.".into(),
+                rule: Some(rule),
+            }
+        }
+        // Fail closed on a call with no chat named. The tool itself reports the
+        // same thing; reaching here means the model called it without `to`, and
+        // an approval card headed "which chat?" is not a question the user can
+        // usefully answer.
+        "message_chat" => {
+            Decision::Deny("`to` is required: a chat id or title from `list_chats`.".into())
+        }
         t if t.starts_with("mcp__") => {
             if ctx.plan {
                 return Decision::Deny(
@@ -1463,6 +1590,12 @@ pub fn check_with_repeats(
 }
 
 pub fn short(path: &str, cwd: &str) -> String {
+    if super::host::is_ssh(path) || super::host::is_ssh(cwd) {
+        return match remote_relative(path, cwd) {
+            Some(r) if !r.is_empty() => r,
+            _ => path.to_string(),
+        };
+    }
     let p = Path::new(path);
     p.strip_prefix(cwd)
         .map(|r| r.to_string_lossy().replace('\\', "/"))
@@ -1486,11 +1619,11 @@ mod tests {
                 allow: &[],
             };
             assert!(matches!(
-                check("artifact_preview", &input, None, &ctx),
+                check("artifict_preview", &input, None, &ctx),
                 Decision::Allow
             ));
         }
-        assert!(is_read_only_tool("artifact_preview"));
+        assert!(is_read_only_tool("artifict_preview"));
     }
 
     #[test]

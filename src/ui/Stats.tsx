@@ -6,7 +6,25 @@ import { flash, modelColor, modelInfo, saveSettings, useStore } from "../store";
 import { MorphText, Loader, Tooltip, Button, Dropdown, Input, Segmented, Switch } from "./primitives";
 import { openChatStats } from "./ChatStats";
 
-export interface Counter { requests: number; input: number; output: number; cache_read: number; cache_write: number; reasoning?: number; errors: number; total_ms: number; ttft_ms: number; ttft_n: number; cost: number; last_used: string }
+export interface Counter {
+  requests: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  reasoning?: number;
+  errors: number;
+  /** Failure rate as a fraction (0–1): `errors / (requests + errors)`. Optional
+   *  because a stats file written before the field existed has no such key; the
+   *  UI re-derives from the two counts instead of trusting it, so a stale value
+   *  can never be shown. */
+  failure_rate?: number;
+  total_ms: number;
+  ttft_ms: number;
+  ttft_n: number;
+  cost: number;
+  last_used: string
+}
 /** One tool's tally. */
 export interface ToolCount { calls: number; errors: number }
 /** One chat's record: its totals, the models that served it, the tools it called
@@ -47,15 +65,25 @@ const day = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart
 const hour = (d: Date) => `${day(d)}T${String(d.getHours()).padStart(2, "0")}`;
 const tokens = (c: Counter) => c.input + c.cache_read + c.cache_write + c.output;
 const hitRate = (c: Counter) => { const all = c.input + c.cache_read + c.cache_write; return all ? c.cache_read / all : 0; };
+/** The share of attempts that failed: `errors / (requests + errors)`.
+ *
+ *  Attempts, not requests: a failed attempt is recorded as an error and does
+ *  not increment `requests` (see `Stats::error` in `agent/stats.rs`), so
+ *  dividing by `requests` alone would exceed 100%. Derived here rather than read
+ *  from the counter's stored `failure_rate`, so it is right for a range total
+ *  (which `sum` builds from buckets the backend never computed a rate for) and
+ *  for a stats file written before the field existed. */
+const failureRate = (c: Counter) => { const attempts = c.requests + c.errors; return attempts ? c.errors / attempts : 0; };
 const secs = (ms: number) => (ms >= 10_000 ? Math.round(ms / 1000) + "s" : (ms / 1000).toFixed(1) + "s");
 const pct = (x: number) => Math.round(x * 100) + "%";
 /** `part` as a share of `whole`, as a percentage string. */
 const pctOf = (part: number, whole: number) => (whole ? Math.round((part / whole) * 100) + "%" : "—");
 
 // Shared with the per-chat panel (`ui/ChatStats.tsx`), which has to agree with
-// this screen on what a token count, a cache hit rate and a duration read as —
-// two spellings of the same number on two screens is how one of them rots.
-export { tokens, hitRate, secs, pct, pctOf, EMPTY };
+// this screen on what a token count, a cache hit rate, an error rate and a
+// duration read as — two spellings of the same number on two screens is how one
+// of them rots.
+export { tokens, hitRate, failureRate, secs, pct, pctOf, EMPTY };
 
 /** Pure: the last `n` days (oldest first), zero-filled. Exported for tests. */
 export function lastDays(daily: Record<string, Counter>, n: number, now = new Date()): { key: string; c: Counter }[] {
@@ -295,7 +323,7 @@ function ChatsPanel({ rows, onOpen }: { rows: { id: string; c: ChatStat }[]; onO
       {rows.map((r, i) => {
         const t = r.c.total;
         const title = tasks[r.id]?.title ?? "";
-        const errRate = t.errors / (t.requests + t.errors || 1);
+        const errRate = failureRate(t);
         return (
           <Tooltip key={r.id} content={`${t.requests} requests · ${pct(hitRate(t))} cached · ${t.requests ? secs(t.total_ms / t.requests) : "-"} avg${t.errors ? ` · ${t.errors} errors` : ""}${t.cost ? ` · ${fmt$(t.cost)}` : ""}`}>
             <button className="crow" style={{ animationDelay: i * 24 + "ms" }} onClick={() => onOpen(r.id)}>
@@ -348,15 +376,30 @@ function ModelTable({ rows, sel, toggle }: { rows: { id: string; c: Counter }[];
       <div className="chead"><span>By model</span><span className="legend muted">click a row to filter</span></div>
       <div className="stable-wrap">
         <table className="stable">
-          <thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th><th>Avg</th><th>Est. cost</th></tr></thead>
+          <thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th><th>Fail rate</th><th>Avg</th><th>Est. cost</th></tr></thead>
           <tbody>
-            {rows.map(({ id, c }) => (
-              <tr key={id} className={sel.includes(id) ? "on" : undefined} onClick={() => toggle(id)}>
-                <td><i className="tdotc" style={{ background: modelColor(id) }} />{modelInfo(id).name}</td>
-                <td>{fmtK(c.requests)}</td><td>{fmtK(c.input + c.cache_write)}</td><td>{fmtK(c.cache_read)}</td><td>{fmtK(c.output)}</td>
-                <td>{pct(hitRate(c))}</td><td>{c.requests ? secs(c.total_ms / c.requests) : "—"}</td><td>{fmt$(c.cost)}</td>
-              </tr>
-            ))}
+            {rows.map(({ id, c }) => {
+              const rate = failureRate(c);
+              return (
+                <tr key={id} className={sel.includes(id) ? "on" : undefined} onClick={() => toggle(id)}>
+                  <td><i className="tdotc" style={{ background: modelColor(id) }} />{modelInfo(id).name}</td>
+                  <td>{fmtK(c.requests)}</td><td>{fmtK(c.input + c.cache_write)}</td><td>{fmtK(c.cache_read)}</td><td>{fmtK(c.output)}</td>
+                  <td>{pct(hitRate(c))}</td>
+                  {/* A model that mostly fails is the one worth dropping, and a
+                      rawer "N errors" column would not say whether that was 3 of
+                      4 or 3 of 4000. Blank below a tenth so an ordinary row is
+                      not noisy; the tooltip carries the counts behind it. */}
+                  <td>
+                    {rate > 0 ? (
+                      <Tooltip content={`${c.errors} failed of ${c.requests + c.errors} attempts`}>
+                        <span className={rate > 0.1 ? "rate-warn" : undefined}>{pct(rate)}</span>
+                      </Tooltip>
+                    ) : "—"}
+                  </td>
+                  <td>{c.requests ? secs(c.total_ms / c.requests) : "—"}</td><td>{fmt$(c.cost)}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
         {!rows.length && <div className="empty" style={{ padding: 12 }}>No model activity in this range</div>}
@@ -449,7 +492,7 @@ export function StatsTab() {
       : <Loader className="loading-state" size={16} label="Loading stats…" />}
   </>;
   const { buckets, hourly, tot, rows, perSince, gap } = view;
-  const errRate = tot.requests + tot.errors ? tot.errors / (tot.requests + tot.errors) : 0;
+  const errRate = failureRate(tot);
   const known = Object.entries(data.models).sort((a, b) => tokens(b[1]) - tokens(a[1])).map(([id]) => id);
   const toggle = (id: string) => setSel((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
   const rangeLabel = range === "24h" ? "last 24h" : range === "all" ? "all time" : `last ${range}d`;
@@ -460,7 +503,7 @@ export function StatsTab() {
       key: k, label: label(k), value: tokens(c),
       right: `${fmtK(tokens(c))} · ${c.requests ? secs(c.total_ms / c.requests) : "-"}`,
       sub: `${c.requests} requests · ${pct(hitRate(c))} cached · ${c.ttft_n ? secs(c.ttft_ms / c.ttft_n) + " to first token" : "no TTFT"}${c.errors ? ` · ${c.errors} errors` : ""}${c.cost ? ` · ${fmt$(c.cost)}` : ""}`,
-      warn: c.errors > 0 && c.errors / (c.requests + c.errors) > 0.1,
+      warn: failureRate(c) > 0.1,
     }));
   const tools = Object.entries(data.tools).sort((a, b) => b[1].calls - a[1].calls).slice(0, 10).map(([k, t]) => ({ key: k, label: k.replace(/^mcp__/, "").replace("__", " · "), value: t.calls, right: `${t.calls}${t.errors ? ` · ${Math.round((t.errors / t.calls) * 100)}% err` : ""}`, warn: t.errors / t.calls > 0.25 }));
   // Chats, all time — unlike the model table this has no range filter, because a

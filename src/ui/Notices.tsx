@@ -1,11 +1,12 @@
 // In-app attention notices. The window is focused, so an OS toast would either
 // be ignored or cover the chat you're reading — these slide in instead.
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { Check, CircleAlert, CircleQuestionMark, CircleX, MessageCircleQuestionMark, Pause, type LucideIcon } from "lucide-react";
 import type { Needs } from "../notify";
 import { dismissNotice, type Notice, useStore } from "../store";
 import { AgentNotice, pendingNotices } from "./AgentNotice";
+import { useNoticePresence } from "./notice-presence";
 
 /** Pure: how a notice looks and how long it lingers. Exported for tests. */
 export function noticeMeta(needs: Needs): { icon: LucideIcon; color: string; cta: string; linger: number } {
@@ -24,16 +25,16 @@ export function noticeMeta(needs: Needs): { icon: LucideIcon; color: string; cta
   }
 }
 
-export function NoticeCard({ n }: { n: Notice }) {
+export function NoticeCard({ n, exiting = false }: { n: Notice; exiting?: boolean }) {
   const { icon: Icon, color, cta, linger } = noticeMeta(n.needs);
   const blocking = linger === 0;
   useEffect(() => {
-    if (!linger) return;
+    if (!linger || exiting) return;
     const t = window.setTimeout(() => dismissNotice(n.key), linger);
     return () => window.clearTimeout(t);
-  }, [n.key, linger]);
+  }, [n.key, linger, exiting]);
   return (
-    <div className={"notice" + (blocking ? " blocking" : "")} role={blocking ? "alert" : "status"} style={{ borderColor: `color-mix(in srgb, ${color} 34%, transparent)` }}>
+    <div className={"notice" + (blocking ? " blocking" : "") + (exiting ? " notice-exiting" : "")} inert={exiting} aria-hidden={exiting || undefined} role={blocking ? "alert" : "status"} style={{ borderColor: `color-mix(in srgb, ${color} 34%, transparent)` }}>
       <span className="nico" style={{ color }}><Icon size={16} strokeWidth={1.8} aria-hidden="true" /></span>
       <div className="nbody">
         {/* The glyph is already on the left; don't repeat it in the title. */}
@@ -53,16 +54,18 @@ export function Notices() {
   const activeTask = useStore((s) => s.view === "session" ? s.task : null);
   // These cards are persisted items, not transient toasts: navigation, new
   // attention events, and timeouts must never acknowledge them for the user.
-  const persistent = Object.entries(items).flatMap(([taskId, list]) => {
+  const persistent = useMemo(() => Object.entries(items).flatMap(([taskId, list]) => {
     const task = tasks[taskId];
     return !task || task.hidden || task.archived || taskId === activeTask ? []
       : pendingNotices(list).map((it) => ({ taskId, chatTitle: task.title, it }));
-  });
-  if (!notices.length && !persistent.length) return null;
+  }), [items, tasks, activeTask]);
+  const visibleNotices = useNoticePresence(notices, (n) => n.key);
+  const visiblePersistent = useNoticePresence(persistent, (n) => `${n.taskId}:${n.it.id}`);
+  if (!visibleNotices.length && !visiblePersistent.length) return null;
   return createPortal(
     <div className="notices">
-      {notices.map((n) => <NoticeCard key={n.key} n={n} />)}
-      {persistent.map(({ taskId, chatTitle, it }) => <AgentNotice key={`${taskId}:${it.id}`} it={it} taskId={taskId} chatTitle={chatTitle} />)}
+      {visibleNotices.map(({ key, value, exiting }) => <NoticeCard key={key} n={value} exiting={exiting} />)}
+      {visiblePersistent.filter(({ value: { taskId } }) => taskId !== activeTask && !!tasks[taskId] && !tasks[taskId].hidden && !tasks[taskId].archived).map(({ key, value: { taskId, chatTitle, it }, exiting }) => <AgentNotice key={key} it={it} taskId={taskId} chatTitle={chatTitle} exiting={exiting} />)}
     </div>,
     document.body,
   );

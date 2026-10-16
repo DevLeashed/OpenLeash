@@ -56,6 +56,13 @@ describe("per-chat stats", () => {
     expect(none.errRate).toBe(0);
   });
 
+  it("never reads above 100% when every attempt failed", () => {
+    // The shape that broke `errors / requests`: no successful request at all, so
+    // the denominator has to be the attempts, or the panel prints "300%".
+    const f = chatFacts(stat({ requests: 0, errors: 3 }));
+    expect(f.errRate).toBe(1);
+  });
+
   it("never reports a negative span when the clock disagrees with itself", () => {
     // `last_used` is written per request and `started` per chat; a chat whose
     // stamps come back out of order should read as zero-length, not as a

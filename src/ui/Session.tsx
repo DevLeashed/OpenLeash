@@ -1,24 +1,24 @@
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ContainerChip } from "./Workspaces";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { copyText, mdComponents, MdInline, remarkOl } from "./mdx";
-import { CommandReceipt } from "./CommandReceipt";
+import { copyText, mdComponents, MD_PLUGINS as MD_PLUGINS_SHARED, MdInline, replyUrlTransform } from "./mdx";
 import { RecoverySummary } from "./RecoverySummary";
 import { AssistantMarkdown } from "./Visualization";
-import { ArtifactWorkspace } from "./ArtifactWorkspace";
-import { InlineArtifactCard, hasArtifactCardSlot, type ArtifactWorkspaceSelection } from "./InlineArtifactCard";
+import { ArtifictWorkspace } from "./ArtifictWorkspace";
+import { InlineArtifictCard, hasArtifictCardSlot, type ArtifictWorkspaceSelection } from "./InlineArtifictCard";
 import { BrowserPanel } from "./BrowserPanel";
 import { FindBar } from "./Find";
 import { api, ago, effortLabel, fmt$, Bg, FileRef, Item, ItemData, ToolAction, ToolInput, SubInfo, TaskSummary, xDepth, xOn } from "../api";
-import { flash, get, go, chatModel, modelColor, modelInfo, openTask, set, subModel, useStore, useThrottled, zoom } from "../store";
+import { flash, get, go, isPhoneClient, loadPreviousHistory, loadSubTranscript, chatModel, modelColor, modelInfo, newerSummary, openTask, requestPause, set, subModel, useStore, useThrottled, zoom } from "../store";
 import { Composer, humanBytes, MAX_FILES, MAX_IMAGE, PendingStar } from "./Composer";
 import { openSwap } from "./ModelSwap";
-import { Annotations, SentAnnotationMessage } from "./SelectionNote";
+import { Annotations, AttachmentChips, SentAnnotationMessage, stripHarnessBlocks } from "./SelectionNote";
 import { heldByGlobal, isPaused } from "./Paused";
-import { I, StatusIcon } from "./icons";
+import { enterSendsMessage, messageSendKey } from "../keys";
+import { I, StatusIcon, chatStatus } from "./icons";
 import { Question } from "./Question";
 import { AskNonBlockingList } from "./AskNonBlocking";
 import { AgentNoticeList } from "./AgentNotice";
@@ -38,7 +38,8 @@ const NO_ITEMS: Item[] = [];
 
 // Hoisted: rebuilding these objects on every render throws away react-markdown's
 // own identity checks, and the streaming message re-renders on every token.
-const MD_PLUGINS = [remarkGfm, remarkOl];
+// Both come from `mdx` so every markdown surface in the app shares one stack.
+const MD_PLUGINS = MD_PLUGINS_SHARED;
 const MD_COMPONENTS = mdComponents;
 
 /** How often a streaming reply's markdown is re-parsed. Parsing is the most
@@ -54,7 +55,7 @@ const Md = memo(function Md({ text, interactive = false, streaming = false }: { 
   // rendering mode) changes so those renders do not re-run the markdown parser.
   return useMemo(() => (
     <div className="md">
-      {interactive ? <AssistantMarkdown text={shown} streaming={streaming} /> : <ReactMarkdown remarkPlugins={MD_PLUGINS} components={MD_COMPONENTS}>{shown}</ReactMarkdown>}
+      {interactive ? <AssistantMarkdown text={shown} streaming={streaming} /> : <ReactMarkdown remarkPlugins={MD_PLUGINS} components={MD_COMPONENTS} urlTransform={replyUrlTransform}>{shown}</ReactMarkdown>}
     </div>
   ), [shown, interactive, streaming]);
 });
@@ -112,6 +113,10 @@ function toolView(d: ItemData, cwd: string) {
     case "grep": return { icon: li(Search), color: G, verb: "Search", target: (inp.pattern ?? "") + (inp.glob ? `  in ${inp.glob}` : "") };
     case "list_agents": return { icon: li(Bot), color: G, verb: "Agents", target: "list" };
     case "send_message": return { icon: li(Send), color: G, verb: "Message", target: `→ ${inp.to ?? ""}  ${String(inp.message ?? "").slice(0, 80)}` };
+    // The two cross-chat tools. Kept as their own rows rather than folded into
+    // the generic fallback, which would read the whole input blob as the target.
+    case "list_chats": return { icon: li(MessagesSquare), color: G, verb: "Chats", target: inp.query ? `search “${inp.query}”` : "list" };
+    case "message_chat": return { icon: li(Send), color: G, verb: "Message chat", target: `→ ${inp.to ?? ""}  ${String(inp.message ?? "").slice(0, 80)}` };
     case "wait": return { icon: li(Clock), color: G, verb: "Wait", target: (Array.isArray(inp.ids) && inp.ids.length ? inp.ids.join(", ") : "background jobs") + (inp.mode === "all" ? " · all" : " · any") };
     case "multi_edit": return { icon: li(FilePenLine), color: G, verb: "Edit", target: (inp.path ? rel(inp.path, cwd) : "") + (Array.isArray(inp.edits) ? `  ×${inp.edits.length}` : "") };
     case "edit_file": return { icon: li(FilePenLine), color: G, verb: "Edit", target: inp.path ? rel(inp.path, cwd) : "" };
@@ -148,7 +153,18 @@ function toolView(d: ItemData, cwd: string) {
     }
     case "computer": {
       const acts: ToolAction[] = Array.isArray(inp.actions) ? inp.actions : [];
-      const one = (a: ToolAction) => a.type === "type" ? `type “${String(a.text ?? "").slice(0, 30)}”` : a.type === "keypress" ? (a.keys ?? []).join("+") : a.x != null ? `${String(a.type).replace(/_/g, " ")} ${a.x},${a.y}` : String(a.type ?? "");
+      const one = (a: ToolAction) => {
+        const t = String(a.type ?? "");
+        if (t === "type") return `type “${String(a.text ?? "").slice(0, 30)}”`;
+        // A zoomed screenshot is its region, a plain one is the display it came
+        // from: neither has the x/y a click has, so they read on their own.
+        if (t === "screenshot") {
+          return a.width != null ? `zoom ${a.width}×${a.height} @ ${a.x},${a.y}` : a.monitor != null ? `shot monitor ${a.monitor}` : "shot";
+        }
+        if (a.keys?.length) return `${t.replace(/_/g, " ")} ${a.keys.join("+")}`;
+        if (a.x != null) return `${t.replace(/_/g, " ")} ${a.x},${a.y}`;
+        return t.replace(/_/g, " ");
+      };
       return { icon: li(Monitor), color: G, verb: "Computer", target: acts.map(one).join(" → ") };
     }
     default:
@@ -205,7 +221,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
       <Pressable className="hd" onClick={() => setManual(!open)}>
         <span className="mono" style={{ width: 14, textAlign: "center", color: v.color, fontSize: 11 }}>{v.icon}</span>
         <span className="verb">{v.verb}</span>
-        <Tooltip content={v.target}><span className="tgt">{v.target || (status === "running" ? "…" : "")}</span></Tooltip>
+        <Tooltip content={v.target} truncated><span className="tgt">{v.target || (status === "running" ? "…" : "")}</span></Tooltip>
         {images.length > 0 && <Thumb src={images[0]!} items={imgs} index={0} alt={`${v.verb} image`} style={{ height: 22, maxWidth: 44, objectFit: "cover", borderRadius: 4, border: "1px solid var(--line, rgba(255,255,255,0.12))" }} />}
         {images.length > 1 && <span className="meta">+{images.length - 1}</span>}
         {dropped > 0 && <Tooltip content="Older images on this row were dropped from the transcript to keep memory in check. The tool result still has them — open it in the review view."><span className="meta">+{dropped} dropped</span></Tooltip>}
@@ -221,7 +237,6 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
         <span className="meta" style={{ color: status === "error" || status === "denied" ? "#ff8a8a" : undefined }}>{diffCounts ? <><span style={{ color: "var(--diff-add)" }}>+{diffCounts[1]}</span> <span style={{ color: "var(--diff-del)" }}>−{diffCounts[2]}</span></> : meta}</span>
         <span style={{ transform: `rotate(${open ? 180 : 0}deg)`, transition: "transform .22s cubic-bezier(.32,.72,0,1)", display: "flex" }}>{I.chev("var(--dim)")}</span>
       </Pressable>
-      <CommandReceipt data={d} cwd={cwd} />
       <div className="fold" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
         <div>
           {open && (
@@ -251,7 +266,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
   );
 });
 
-function Approval({ it, task }: { it: Item; task: TaskSummary }) {
+function Approval({ it, task, onOpenArtifict }: { it: Item; task: TaskSummary; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   const d = it.data ?? {};
   const [fb, setFb] = useState("");
   const [showFb, setShowFb] = useState(false);
@@ -260,7 +275,7 @@ function Approval({ it, task }: { it: Item; task: TaskSummary }) {
     const label = d.kind === "plan"
       ? denied ? "Kept planning" : "Plan approved"
       : d.kind === "ultra" ? denied ? "Kept going solo" : d.resolved === "worktrees" ? "Switched to ultrathread · worktrees" : "Switched to ultrathread"
-      : d.resolved === "cancelled" ? "Cancelled" : denied ? "Denied" : d.resolved === "always" ? "Always allowed" : "Allowed once";
+      : d.resolved === "cancelled" ? "Cancelled" : denied ? "Denied" : d.resolved === "reviewer" ? "Approved by reviewer" : d.resolved === "always" ? "Always allowed" : "Allowed once";
     return (
       <div className="resolved">
         <span style={{ color: denied ? "var(--red)" : "var(--mut2)", display: "flex" }}>{denied ? li(X, 12) : li(Check, 12)}</span>
@@ -309,6 +324,15 @@ function Approval({ it, task }: { it: Item; task: TaskSummary }) {
       {plan ? <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: 9, padding: "8px 12px", maxHeight: 420, overflow: "auto" }}><Md text={d.detail ?? ""} /></div>
         : d.kind === "command" ? <div className="cmdbox">$ {d.detail}</div>
         : <div className="cmdbox">{d.title}{d.kind === "mcp" ? "\n" + d.detail : ""}</div>}
+      {/* Approving a plan is not the only thing the user does with it: it is
+          filed in the project's artificts, so point at the record they will
+          come back to instead of leaving it to be found in a list. */}
+      {plan && d.plan_artifict?.id && d.plan_artifict.version_id && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 11.5, color: "var(--mut2)" }}>
+          <span>Filed in this project&rsquo;s artificts as <strong style={{ fontWeight: 600 }}>{d.plan_artifict.title || "this plan"}</strong>.</span>
+          {onOpenArtifict && <Button variant="ghost" style={{ height: 24, padding: "0 8px", fontSize: 11 }} onClick={() => onOpenArtifict({ artifictId: d.plan_artifict!.id!, versionId: d.plan_artifict!.version_id! })}>Open in Artificts</Button>}
+        </div>
+      )}
       {showFb && (
         <Input autoFocus value={fb} onChange={(e) => setFb(e.currentTarget.value)} placeholder={plan ? "What should change in the plan?" : "Tell the agent what to do instead"} onKeyDown={(e) => { if (e.key === "Enter") respond("deny"); }} />
       )}
@@ -345,7 +369,7 @@ function Sub({ it, task, held }: { it: Item; task: TaskSummary; held: boolean })
   const d = it.data ?? {};
   const running = d.status === "running";
   // A parked agent still says `running`, and the pill animates on that word —
-  // so a frozen swarm's transcript was full of sub-agent pills that looked in
+  // so a frozen swarm's transcript was full of subagent pills that looked in
   // flight. The chat decides, not the pill.
   const live = running && !held;
   const info = task.subs.find((s) => s.id === d.sub_id);
@@ -394,17 +418,33 @@ function BroadcastNotice({ text, replied }: { text: string; replied: string[] })
   );
 }
 
-/** Agent-to-agent message: one quiet line ("main sent a message"); click for the full text. */
-function MsgNotice({ text }: { text: string }) {
+/** Agent-to-agent message: one quiet line ("main sent a message"); click for the full text.
+ *
+ *  Cross-chat messages (`list_chats` / `message_chat`) come through the same
+ *  level, and carry `from`/`to` plus the other chat's id, so the line can name
+ *  which chat it was and offer to open it. Older items have neither: they fall
+ *  back to reading the line itself, exactly as before. */
+function MsgNotice({ it }: { it: Item }) {
   const [open, setOpen] = useState(false);
-  const m = text.match(/^(?:Message from )?([\w.-]+)\s*(?:→\s*([\w.-]+)\s*)?:\s*([\s\S]*)$/);
-  const who = m?.[1] ?? "An agent";
-  const body = m ? m[3] : text;
+  const chat = useStore((s) => (it.data?.chat_id ? s.tasks[it.data.chat_id as string] : null));
+  const chatId = typeof it.data?.chat_id === "string" ? it.data.chat_id : "";
+  const openChat = () => { if (chatId) { void openTask(chatId).then(() => go("session", { task: chatId })); } };
+  const m = it.text.match(/^(?:Message from )?([\w.-]+)\s*(?:→\s*([\w.-]+)\s*)?:\s*([\s\S]*)$/);
+  const who = (it.data?.from as string | undefined) ?? m?.[1] ?? "An agent";
+  const body = m ? m[3] : it.text;
+  // `to` is set only on the sender's own copy, which is what makes the two
+  // directions tell apart without reading the sentence.
+  const to = it.data?.to as string | undefined;
   return (
     <div className="resolved" style={{ alignItems: "flex-start", cursor: "pointer" }} onClick={() => setOpen(!open)} title={open ? undefined : "Show message"}>
       <span style={{ color: "var(--mut)", display: "flex" }}>{li(Info, 13)}</span>
       <span style={{ minWidth: 0 }}>
-        <span style={{ color: "var(--mut)" }}>{m?.[2] ? `${who} sent a message to ${m[2]}` : `Received a message from ${who}`}</span>
+        <span style={{ color: "var(--mut)" }}>
+          {to ? `Sent a message to ${to}` : m?.[2] ? `${who} sent a message to ${m[2]}` : `Received a message from ${who}`}
+          {chatId && (chat
+            ? <button type="button" style={{ marginLeft: 6, padding: 0, border: 0, background: "none", color: "var(--accent)", font: "inherit", cursor: "pointer" }} onClick={(e) => { e.stopPropagation(); openChat(); }}>open chat</button>
+            : <span style={{ color: "var(--mut3)" }}> · chat deleted</span>)}
+        </span>
         {open && <div className="sel" style={{ whiteSpace: "pre-wrap", marginTop: 3 }} onClick={(e) => e.stopPropagation()}>{body}</div>}
       </span>
     </div>
@@ -514,7 +554,7 @@ function Notice({ it }: { it: Item }) {
   if (lv === "btw") return <AsideNotice it={it} />;
   if (lv === "route" || lv === "event") return <div className="resolved route"><span style={{ color: "var(--mut2)", display: "flex" }}>{li(Network, 13)}</span><span className="sel">{it.text}</span></div>;
   if (lv === "subq" || lv === "ask") return <AskNotice it={it} />;
-  if (lv === "msg") return it.data?.global ? <BroadcastNotice text={it.text} replied={it.data?.replied ?? []} /> : <MsgNotice text={it.text} />;
+  if (lv === "msg") return it.data?.global ? <BroadcastNotice text={it.text} replied={it.data?.replied ?? []} /> : <MsgNotice it={it} />;
   if (lv === "worktree") return <WorktreeNotice it={it} />;
   const color = lv === "error" ? "var(--red)" : "var(--mut)";
   const glyph = lv === "error" ? li(CircleAlert, 13) : lv === "stopped" ? li(Square, 11) : li(Info, 13);
@@ -564,6 +604,13 @@ async function pickFiles(): Promise<string[]> {
   return (Array.isArray(picked) ? picked : picked ? [picked] : []).filter((p): p is string => typeof p === "string");
 }
 
+/** The staged temp copies the backend made for a message, as pickable file refs,
+ *  so an edited message can be resent with the attachments it went out with. */
+function stagedFiles(data: ItemData | undefined): FileRef[] {
+  const staged = Array.isArray(data?.attachments) ? data!.attachments! : [];
+  return staged.map((a, i) => ({ path: a.path, name: a.name || `attachment-${i + 1}`, size: a.size, isDir: false, image: false }));
+}
+
 /** One user message: the bubble, its attachments, and the editor it becomes when
  *  the user rewrites it (text and attachments both). Exported for a render test. */
 export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
@@ -579,7 +626,7 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
   // that went out with it are local to this one message (the composer keeps its
   // own), so the editor holds its own copies and sends them with the text.
   const [imgs, setImgs] = useState<string[]>(() => (Array.isArray(it.data?.images) ? (it.data.images as string[]) : []));
-  const [files, setFiles] = useState<FileRef[]>([]);
+  const [files, setFiles] = useState<FileRef[]>(() => stagedFiles(it.data));
   const box = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const el = box.current;
@@ -587,7 +634,7 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 360) + "px";
   }, [draft, editing]);
-  const startEdit = () => { setDraft(it.text); setImgs(Array.isArray(it.data?.images) ? (it.data.images as string[]) : []); setFiles([]); setEditing(true); setTimeout(() => { const el = box.current; if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 20); };
+  const startEdit = () => { setDraft(it.text); setImgs(Array.isArray(it.data?.images) ? (it.data.images as string[]) : []); setFiles(stagedFiles(it.data)); setEditing(true); setTimeout(() => { const el = box.current; if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 20); };
   const addEditFiles = async (paths: string[]) => {
     if (!paths.length) return;
     const refs = await api.filesAttach(paths).catch((e) => { flash(String(e)); return [] as FileRef[]; });
@@ -608,12 +655,18 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
       await stopAndSettle(task.id);
       await api.rewind(task.id, it.id);
       const r = await api.task(task.id);
-      set((s) => ({ items: { ...s.items, [task.id]: r.items }, tasks: { ...s.tasks, [task.id]: r.summary } }));
-      // Attached files ride as paths in the text, exactly as the composer sends
-      // them: the agent opens them with its own tools.
-      const paths = files.filter((f) => !f.image).map((f) => f.path);
-      const body = paths.length ? (text ? text + "\n\n" : "") + "Attached files (read these with your tools, they are not inlined):\n" + paths.map((p) => `- ${p}`).join("\n") : text;
-      await api.send(task.id, body, false, imgs.length ? imgs : undefined);
+      // The summary is folded in rather than assigned: the stop and the rewind
+      // each published one, and a later `task` event can have landed while
+      // `task_get` was in flight. See `newerSummary`.
+      set((s) => ({ items: { ...s.items, [task.id]: r.items }, tasks: { ...s.tasks, [task.id]: newerSummary(s.tasks[task.id], r.summary) } }));
+      // Editing a message re-sends its attachments: the backend keeps the staged
+      // temp copies on the message itself, so fall back to those when the editor
+      // holds no picks of its own, and the resend stages fresh copies of exactly
+      // what went out the first time.
+      const withStaged = files.length ? files : stagedFiles(it.data);
+      const paths = withStaged.filter((f) => !f.image).map((f) => f.path);
+      const imageNames = imgs.map((_, i) => withStaged.find((f) => f.image)?.name ?? `image-${i + 1}`);
+      await api.send(task.id, text, false, imgs.length ? imgs : undefined, paths, imageNames);
       setEditing(false);
     } catch (e) {
       flash(String(e));
@@ -673,7 +726,7 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
       {!live && <IconButton label="Rewind to here: pick a checkpoint and choose whether to put back the conversation, the files, or both." className="rw" onClick={() => setRwOpen(true)}>{I.rewind()}</IconButton>}
       {rwOpen && <Rewind taskId={task.id} itemId={it.id} onClose={() => setRwOpen(false)} />}
       <div className="ucol">
-      <div className="ubub">{Array.isArray(it.data?.images) && it.data.images.length > 0 && <div className="ubimgs">{it.data.images.map((src: string, i: number) => <Thumb key={i} src={src} items={(it.data.images as string[]).map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />)}</div>}<SentAnnotationMessage text={it.text} /></div>
+      <div className="ubub">{Array.isArray(it.data?.images) && it.data.images.length > 0 && <div className="ubimgs">{it.data.images.map((src: string, i: number) => <Thumb key={i} src={src} items={(it.data.images as string[]).map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />)}</div>}<AttachmentChips text={it.text} /><SentAnnotationMessage text={stripHarnessBlocks(it.text, it.data)} /></div>
       <div className="msgacts">
         <span onClick={() => copyText(it.text)}>Copy</span>
         <span onClick={startEdit}>Edit</span>
@@ -688,7 +741,7 @@ type FeedEntry = { key: string; it: Item } | { key: string; tools: Item[] };
 /** Agent-to-agent messages, questions and route switches are background chatter: they ride along in tool groups. */
 const isChatter = (it: Item) => it.kind === "notice" && (it.data?.level === "msg" || it.data?.level === "route" || it.data?.level === "event" || it.data?.level === "ask" || it.data?.level === "subq") && !it.data?.goal;
 
-/** Background work that has finished. A sub-agent settles when it reports back; a
+/** Background work that has finished. A subagent settles when it reports back; a
  *  background command when its process exits. Both are read off the live job list,
  *  so a command only counts as done once the harness has actually seen it exit —
  *  a job it knows nothing about (an older chat, a job pruned long ago) stays
@@ -712,8 +765,8 @@ function eventSum(it: Item): string | null {
 }
 
 /** Merge back-to-back tool calls into one group; hidden thinking doesn't break a run.
- *  Commands and settled sub-agents stay in that group when they end, so completion
- *  doesn't split the surrounding actions or reset an open fold. A sub-agent that is
+ *  Commands and settled subagents stay in that group when they end, so completion
+ *  doesn't split the surrounding actions or reset an open fold. A subagent that is
  *  still running keeps its own row: it is the one thing there still worth watching. */
 function groupFeed(items: Item[], showThinking: boolean): FeedEntry[] {
   const out: FeedEntry[] = [];
@@ -725,11 +778,11 @@ function groupFeed(items: Item[], showThinking: boolean): FeedEntry[] {
     // item stays in the transcript; only the grouping looks past it.
     if ((it.kind === "text" || it.kind === "thinking") && !it.text.trim()) continue;
     const prev = out[out.length - 1];
-    // A finished sub-agent rides along like a call: its row folds into the chain
+    // A finished subagent rides along like a call: its row folds into the chain
     // and still opens its own transcript, so the receipt cannot break the run.
     const settledSub = it.kind === "sub" && isSettledBg(it, null);
-    if (hasArtifactCardSlot(it)) {
-      // Artifact tools have a standalone transcript row: their building state
+    if (hasArtifictCardSlot(it)) {
+      // Artifict tools have a standalone transcript row: their building state
       // and complete preview must not be hidden inside a generic tool fold.
       out.push({ key: it.id, it });
     } else if (it.kind === "tool" || settledSub || isChatter(it)) {
@@ -758,6 +811,7 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   const by: Record<string, string[]> = {};
   let add = 0, del = 0, failed = 0;
   const from: string[] = [];
+  let sent = 0;
   let routes = 0;
   let asks = 0;
   let answered = 0;
@@ -770,10 +824,16 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
       else if (t.data?.level === "route") routes++;
       else if (t.data?.level === "ask") asks++;
       else if (t.data?.level === "subq") answered++;
-      else from.push((t.text.match(/^(?:Message from )?([\w.-]+)\s*(?:→|:)/)?.[1] ?? "").trim());
+      // A message to another chat is the one agent-message that went *out*:
+      // counting it as "got a message" read as the opposite of what happened.
+      else if (t.data?.level === "msg" && t.data?.to) sent++;
+      // `data.from` first: a cross-chat message names a chat *title*, which can
+      // contain spaces, and the text regex below only reads a single token out
+      // of "Message from X:" — the older in-chat form, where X is an agent id.
+      else from.push(String(t.data?.from ?? "").trim() || (t.text.match(/^(?:Message from )?([\w.-]+)\s*(?:→|:)/)?.[1] ?? "").trim());
       continue;
     }
-    // A finished sub-agent is not one of the verb groups below: it is a whole run
+    // A finished subagent is not one of the verb groups below: it is a whole run
     // of its own, so it reads as a count. A live one is never in here to count.
     if (t.kind === "sub") {
       subagents++;
@@ -809,10 +869,11 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
     const who = [...new Set(from.filter(Boolean))];
     parts.push(`got ${from.length === 1 ? "a message" : `${from.length} messages`}${who.length === 1 ? ` from ${who[0]}` : ""}`);
   }
+  if (sent) parts.push(sent === 1 ? "sent a message to another chat" : `sent ${sent} messages to other chats`);
   if (routes) parts.push(routes === 1 ? "switched model" : `switched model ${routes} times`);
   if (asks) parts.push(asks === 1 ? "asked the main agent" : `asked the main agent ${asks} questions`);
   if (answered) parts.push(answered === 1 ? "answered a question" : `answered ${answered} questions`);
-  if (subagents) parts.push(`${subagents} sub-agent${subagents === 1 ? "" : "s"} finished`);
+  if (subagents) parts.push(`${subagents} subagent${subagents === 1 ? "" : "s"} finished`);
   parts.push(...events);
   const text = parts.join(", ");
   return { text: text.charAt(0).toUpperCase() + text.slice(1), add, del, failed };
@@ -918,7 +979,7 @@ function splitTurns(items: Item[], live: boolean): (Item | Turn)[] {
     while (end > headN && isAnswer(t[end - 1]!)) end--;
     const mid = t.slice(headN, end);
     const actions = mid.filter((i) => i.kind === "tool" || i.kind === "sub").length;
-    if (!done || end === t.length || !mid.some((i) => WORK.has(i.kind)) || mid.some((i) => KEEP.has(i.kind) || hasArtifactCardSlot(i))) { out.push(...t); return; }
+    if (!done || end === t.length || !mid.some((i) => WORK.has(i.kind)) || mid.some((i) => KEEP.has(i.kind) || hasArtifictCardSlot(i))) { out.push(...t); return; }
     // A turn always has a head (the first item pushed into it is what made it), and
     // `t[headN] ?? t[0]` picks the user's message when there is one.
     const start = new Date((t[headN] ?? t[0]!).ts).getTime();
@@ -932,7 +993,7 @@ function splitTurns(items: Item[], live: boolean): (Item | Turn)[] {
   return out;
 }
 
-function Worked({ turn, task, showThinking, onOpenArtifact }: { turn: Turn; task: TaskSummary; showThinking: boolean; onOpenArtifact?: (selection: ArtifactWorkspaceSelection) => void }) {
+function Worked({ turn, task, showThinking, onOpenArtifict }: { turn: Turn; task: TaskSummary; showThinking: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="it">
@@ -941,7 +1002,7 @@ function Worked({ turn, task, showThinking, onOpenArtifact }: { turn: Turn; task
         <span className="tg-chev" style={{ transform: `rotate(${open ? 90 : 0}deg)` }}><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M3.5 2 L6.5 5 L3.5 8" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
       </Pressable>
       <div className="fold" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
-        <div>{open && <div className="worked-body"><FeedRows items={turn.work} task={task} showThinking={showThinking} onOpenArtifact={onOpenArtifact} /></div>}</div>
+        <div>{open && <div className="worked-body"><FeedRows items={turn.work} task={task} showThinking={showThinking} onOpenArtifict={onOpenArtifict} /></div>}</div>
       </div>
     </div>
   );
@@ -955,7 +1016,7 @@ function isVisibleFeedItem(item: Item): boolean {
 }
 
 /** Plain feed rows. Exported so a render test can pin what the transcript shows. */
-export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOpenArtifact }: { items: Item[]; task: TaskSummary; showThinking: boolean; bgs?: Bg[]; streamingItemId?: string; onOpenArtifact?: (selection: ArtifactWorkspaceSelection) => void }) {
+export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOpenArtifict }: { items: Item[]; task: TaskSummary; showThinking: boolean; bgs?: Bg[]; streamingItemId?: string; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   // A queued message hasn't been sent yet, so it has no place in the transcript
   // — it lives in the list above the composer until the agent reads it, and
   // rejoins the feed as an ordinary message the moment that happens. An
@@ -969,7 +1030,7 @@ export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOp
   const stored = useStore((s) => s.bg[task.id] ?? NO_BGS);
   const jobs = bgs ?? stored;
   // Read once here for the same reason: the freeze is a property of the chat, and
-  // a sub-agent pill or a tool row that asks for itself cannot know it.
+  // a subagent pill or a tool row that asks for itself cannot know it.
   const held = isPaused(task, useStore((s) => s.settings?.paused_all ?? false));
   const rows = useMemo(() => groupFeed(sent, showThinking), [sent, showThinking]);
   return (
@@ -977,12 +1038,12 @@ export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOp
       {rows.map((e) =>
         "tools" in e
           ? <div key={e.key} className="it" data-item={e.key}><ToolGroup tools={e.tools} task={task} held={held} bgs={jobs} /></div>
-          : <Row key={e.key} it={e.it} task={task} showThinking={showThinking} held={held} streaming={e.it.id === streamingItemId} onOpenArtifact={onOpenArtifact} />)}
+          : <Row key={e.key} it={e.it} task={task} showThinking={showThinking} held={held} streaming={e.it.id === streamingItemId} onOpenArtifict={onOpenArtifict} />)}
     </>
   );
 }
 
-function Feed({ items, task, live, showThinking, onOpenArtifact }: { items: Item[]; task: TaskSummary; live: boolean; showThinking: boolean; onOpenArtifact?: (selection: ArtifactWorkspaceSelection) => void }) {
+function Feed({ items, task, live, showThinking, onOpenArtifict }: { items: Item[]; task: TaskSummary; live: boolean; showThinking: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   let latest: Item | undefined;
   if (live) {
     for (let i = items.length - 1; i >= 0; i--) {
@@ -994,13 +1055,13 @@ function Feed({ items, task, live, showThinking, onOpenArtifact }: { items: Item
   const parts = useMemo(() => splitTurns(items, live), [items, live]);
   const rows: React.ReactNode[] = [];
   let run: Item[] = [];
-  const flush = () => { if (run.length) rows.push(<FeedRows key={"r-" + run[0]!.id} items={run} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifact={onOpenArtifact} />); run = []; };
+  const flush = () => { if (run.length) rows.push(<FeedRows key={"r-" + run[0]!.id} items={run} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifict={onOpenArtifict} />); run = []; };
   for (const p of parts) {
     if ("work" in p) {
       flush();
-      rows.push(<FeedRows key={"h-" + p.key} items={p.head} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifact={onOpenArtifact} />);
-      rows.push(<Worked key={p.key} turn={p} task={task} showThinking={showThinking} onOpenArtifact={onOpenArtifact} />);
-      rows.push(<FeedRows key={"t-" + p.key} items={p.tail} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifact={onOpenArtifact} />);
+      rows.push(<FeedRows key={"h-" + p.key} items={p.head} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifict={onOpenArtifict} />);
+      rows.push(<Worked key={p.key} turn={p} task={task} showThinking={showThinking} onOpenArtifict={onOpenArtifict} />);
+      rows.push(<FeedRows key={"t-" + p.key} items={p.tail} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifict={onOpenArtifict} />);
     } else run.push(p);
   }
   flush();
@@ -1009,18 +1070,18 @@ function Feed({ items, task, live, showThinking, onOpenArtifact }: { items: Item
 
 /** A feed row. Memoized, because the timeline re-renders on every streamed delta
  *  and most rows are already-finished text that cannot have changed. */
-const Row = memo(function Row({ it, task, showThinking, held, streaming = false, onOpenArtifact }: { it: Item; task: TaskSummary; showThinking: boolean; held: boolean; streaming?: boolean; onOpenArtifact?: (selection: ArtifactWorkspaceSelection) => void }) {
+const Row = memo(function Row({ it, task, showThinking, held, streaming = false, onOpenArtifict }: { it: Item; task: TaskSummary; showThinking: boolean; held: boolean; streaming?: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   if (it.kind === "thinking" && !showThinking) return null;
   return (
     <div className="it" data-item={it.id}>
       {it.kind === "user" && (it.data?.brief ? <div className="brief"><div className="label" style={{ marginBottom: 4 }}>Brief from the main agent</div><Md text={it.text} /></div> : <UserMsg it={it} task={task} />)}
       {it.kind === "text" && <Reply it={it} streaming={streaming} />}
       {it.kind === "thinking" && <Thinking text={it.text} />}
-      {it.kind === "tool" && (hasArtifactCardSlot(it)
-        ? <InlineArtifactCard item={it} onOpenArtifact={onOpenArtifact} />
+      {it.kind === "tool" && (hasArtifictCardSlot(it)
+        ? <InlineArtifictCard item={it} taskId={task.id} onOpenArtifict={onOpenArtifict} />
         : <ToolItem it={it} cwd={task.cwd} held={held} />)}
-      {it.kind === "artifact" && <InlineArtifactCard item={it} onOpenArtifact={onOpenArtifact} />}
-      {it.kind === "approval" && <Approval it={it} task={task} />}
+      {it.kind === "artifict" && <InlineArtifictCard item={it} taskId={task.id} onOpenArtifict={onOpenArtifict} />}
+      {it.kind === "approval" && <Approval it={it} task={task} onOpenArtifict={onOpenArtifict} />}
       {it.kind === "question" && <Question it={it} task={task} />}
       {it.kind === "asklater" && (it.data?.answers || it.data?.dismissed) && <Question it={it} task={task} />}
       {it.kind === "sub" && <Sub it={it} task={task} held={held} />}
@@ -1049,15 +1110,16 @@ function useStick(dep: unknown) {
   return { ref, onScroll };
 }
 
-/** A subagent's own live transcript, model and status. */
-function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
+/** A subagent's own live transcript, model and status. Exported for its test: the
+ *  brief it was launched with has to show in a chat reopened after launch. */
+export function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
   const items = useStore((s) => s.subItems[task.id]?.[sub.id] ?? NO_ITEMS);
   const agents = useStore((s) => s.agents);
   const showThinking = useStore((s) => s.settings?.show_thinking ?? false);
   const def = agents.find((a) => a.id === sub.role);
   const { ref, onScroll } = useStick(sub.id);
   const running = sub.status === "running";
-  // A frozen chat freezes every agent in it, and this is where a sub-agent's own
+  // A frozen chat freezes every agent in it, and this is where a subagent's own
   // state is read — so it asks the chat, not `sub.status`: a parked agent still
   // reads `running`, which is right on its own and wrong here.
   const held = isPaused(task, useStore((s) => s.settings?.paused_all ?? false));
@@ -1081,6 +1143,16 @@ function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
     else setReport(sub.report);
     return () => { live = false; };
   }, [task.id, sub.id, sub.report]);
+  // The transcript is read when the panel opens, not with the chat: `task_open`
+  // sends only the main timeline. `loaded` stops the "no transcript" line from
+  // flashing while the read is still in flight.
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setLoaded(false);
+    void loadSubTranscript(task.id, sub.id).finally(() => { if (live) setLoaded(true); });
+    return () => { live = false; };
+  }, [task.id, sub.id]);
   return (
     <AgentColor.Provider value={modelColor(model)}>
     <div className="subpanel">
@@ -1090,6 +1162,11 @@ function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
           <div style={{ fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sub.task}</div>
           <div style={{ fontSize: 11, color: "var(--mut3)" }}>{def?.name ?? sub.role} · {running ? sub.meta || "running" : sub.status}{sub.started ? ` · ${ago(sub.started)}` : ""}{sub.branch ? <Tooltip content={`Own worktree: ${sub.cwd}`}><span className="mono" style={{ marginLeft: 6, color: "var(--violet)" }}>{sub.branch}</span></Tooltip> : null}</div>
         </div>
+        {running && (
+          <Tooltip content="Stop this subagent · the rest of the chat keeps going">
+            <IconButton label="Stop subagent" onClick={() => api.subStop(task.id, sub.id).catch((e) => flash(String(e)))}>{I.stop()}</IconButton>
+          </Tooltip>
+        )}
         <IconButton label="Close" onClick={() => set({ subOpen: null })}>{I.close()}</IconButton>
       </div>
       <div className="spmodel">
@@ -1106,7 +1183,7 @@ function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
         <Feed items={items} task={task} live={running} showThinking={showThinking} />
         {running && (
           // A frozen chat freezes every agent in it at once, and this panel is
-          // where a sub-agent's own state is read: the shimmer said "working" for
+          // where a subagent's own state is read: the shimmer said "working" for
           // an agent parked mid-turn. The chat's pause decides, not the agent's
           // status — a parked agent still reads `running`, which is correct on
           // its own and wrong here.
@@ -1118,7 +1195,7 @@ function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
           </div>
         )}
         {!running && report && <div className="report"><div className="label" style={{ marginBottom: 6 }}>Report to the main agent</div><Md text={report} /></div>}
-        {!items.length && !running && <div className="empty">No transcript saved for this subagent.</div>}
+        {!items.length && !running && loaded && <div className="empty">No transcript saved for this subagent.</div>}
       </div>
       <SubInput task={task} sub={sub} />
     </div>
@@ -1126,21 +1203,36 @@ function SubPanel({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
   );
 }
 
-/** Talk to one subagent directly: steers it if running, continues it if finished. */
-function SubInput({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
+/** Talk to one subagent directly: steers it if running, continues it if finished.
+ *
+ *  Exported for its test: this is the app's second message box, and the phone
+ *  rule (`messageSendKey`) has to be shown to hold here too, not only in the
+ *  composer. */
+export function SubInput({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
   const [text, setText] = useState("");
+  const [attachedImages, setAttachedImages] = useState<string[]>([]);
   const running = sub.status === "running";
+  const sendWith = useStore((s) => s.settings?.send_with);
+  const phoneEnterSends = useStore((s) => s.settings?.phone_enter_sends);
+  // The same rule the composer follows, for the same reason: a phone's on-screen
+  // Return key cannot report a held `Shift`, so there Enter starts a new line and
+  // only the button sends, unless `phone_enter_sends` is on. Left to "Enter sends
+  // always", this box sent the messages someone was breaking into paragraphs.
+  const sendKey = messageSendKey(isPhoneClient(), sendWith, phoneEnterSends);
   const send = () => {
     const t = text.trim();
     if (!t) return;
     setText("");
-    api.subSend(task.id, sub.id, t).catch((e) => flash(String(e)));
+    void api.subSend(task.id, sub.id, t, attachedImages, attachedImages.map((_, i) => `image-${i + 1}`)).catch((e) => flash(String(e)));
   };
   return (
     <div className="subinput">
-      <TextArea className="" rows={1} value={text} placeholder={running ? `Message ${sub.role} directly…` : `Follow up with ${sub.role}…`} onChange={(e) => setText(e.currentTarget.value)}
-        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
-      <RoundButton label="Send" className={text.trim() ? "ready" : ""} onClick={send}>{I.up(11)}</RoundButton>
+      <TextArea className="" rows={1} value={text} placeholder={running ? `Message ${sub.role} directly…` : `Follow up with ${sub.role}…`} onChange={(e) => setText(e.currentTarget.value)} onPaste={(e) => { const pasted = Array.from(e.clipboardData.files); if (pasted.some((f) => f.type.startsWith("image/"))) { e.preventDefault(); void pastedImages(pasted).then((images) => { if (images.length) setAttachedImages((old) => [...old, ...images]); }); } }}
+        onKeyDown={(e) => { if (e.key !== "Enter" || e.nativeEvent.isComposing) return; if (enterSendsMessage(sendKey, e)) { e.preventDefault(); send(); } }} />
+      {/* The label names the sending key only when a key sends: on a phone with
+          Enter-to-send off, promising Enter would teach the opposite of what
+          Enter does. */}
+      <RoundButton label={`Send${sendKey ? ` · ${sendKey}` : ""}`} className={text.trim() ? "ready" : ""} onClick={send}>{I.up(11)}</RoundButton>
     </div>
   );
 }
@@ -1175,7 +1267,7 @@ function PausedBar({ task }: { task: TaskSummary }) {
   const line = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const el = line.current;
-    if (el && !full) setClipped(el.scrollWidth > el.clientWidth + 1);
+    if (el && !full) setClipped(el.scrollHeight > el.clientHeight + 1);
     // Measured when the text to measure changes, not on every render: this is a
     // forced synchronous layout, and the pause banner re-renders on every task
     // event, so it used to measure once per agent status change.
@@ -1186,31 +1278,86 @@ function PausedBar({ task }: { task: TaskSummary }) {
   const usage = exhausted && /429|rate.?limit|quota|usage|credits?|billing|insufficient|limit reached|too many requests|free tier/i.test(reason);
   const long = clipped || full;
   const draining = task.busy > 0;
+  const title = draining ? `Pausing… waiting on ${task.busy} command${task.busy === 1 ? "" : "s"} to finish` : usage ? "Paused · out of usage" : exhausted ? "Paused · every model failed" : task.paused?.kind === "closed" ? "Paused · the app closed mid-run" : globally ? "Everything paused" : "Paused";
   return (
     <div className="pausebar">
-      <span className="pz">{I.pause(11)}</span>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <RecoverySummary task={task} />
-        <div style={{ fontWeight: 600, color: "#fde68a" }}>{draining ? `Pausing… waiting on ${task.busy} command${task.busy === 1 ? "" : "s"} to finish` : usage ? "Paused · out of usage" : exhausted ? "Paused · every model failed" : task.paused?.kind === "closed" ? "Paused · the app closed mid-run" : globally ? "Everything paused" : "Paused"}</div>
-        <div ref={line} className={full ? "sel" : undefined} style={{ fontSize: 11.5, color: "#b8a36a", lineHeight: 1.5, ...(full ? { whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 220, overflowY: "auto" } : { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }) }} title={full ? undefined : reason}>{reason}{task.paused ? ` · ${ago(task.paused.since)} ago` : ""}. Agents are frozen mid-step; nothing was sent to them.</div>
+      <span className="pz">{I.pause(12)}</span>
+      <div className="pb-main">
+        <div className="pb-title">{title}{task.paused ? <span className="pb-ago">{ago(task.paused.since)} ago</span> : null}</div>
+        <div ref={line} className={`pb-reason${full ? " open sel" : ""}`} title={full ? undefined : reason}>{reason}. Agents are frozen mid-step; nothing was sent to them.</div>
         {long && (
-          <div style={{ display: "flex", gap: 12, marginTop: 3, fontSize: 11 }}>
-            <span style={{ color: "#fde68a", cursor: "pointer" }} onClick={() => setFull(!full)}>{full ? "Show less" : "Show full message"}</span>
-            <span style={{ color: "#b8a36a", cursor: "pointer" }} onClick={() => copyText(reason)}>Copy</span>
+          <div className="pb-links">
+            <span onClick={() => setFull(!full)}>{full ? "Show less" : "Show full message"}</span>
+            <span onClick={() => copyText(reason)}>Copy</span>
           </div>
         )}
+        <RecoverySummary task={task} />
+        <div className="pb-actions">
+          <Button style={{ height: 28, background: "#fbbf24", color: "#1b1405", border: 0, fontWeight: 600 }} title={all ? "Resume this chat only — everything else stays frozen" : undefined} onClick={() => api.resume(task.id).catch((e) => flash(String(e)))}>{I.play(10)}Resume</Button>
+          {draining && <Button variant="ghost" style={{ height: 28, color: "#fde68a" }} title="Kill running commands now; the agent is told they were cut off and reruns them after resuming" onClick={() => (all ? api.forcePauseAll() : api.forcePause(task.id)).catch((e) => flash(String(e)))}>Force pause</Button>}
+          {exhausted && <Button variant="ghost" style={{ height: 28 }} onClick={() => go("settings", { settingsTab: "accounts" })}>Accounts</Button>}
+          {exhausted && <Button variant="ghost" style={{ height: 28 }} title="Point this chat at a model you still have" onClick={() => openSwap()}>Swap model</Button>}
+          <span style={{ flex: 1 }} />
+          <Button variant="ghost" style={{ height: 28, color: "var(--mut3)" }} title="Turn this pause into a stop: frozen work is cancelled and the agent is told when you continue" onClick={() => api.dismissPause(task.id).catch((e) => flash(String(e)))}>Dismiss</Button>
+        </div>
       </div>
-      {draining && <Button variant="ghost" style={{ height: 26, color: "#fde68a" }} title="Kill running commands now; the agent is told they were cut off and reruns them after resuming" onClick={() => (all ? api.forcePauseAll() : api.forcePause(task.id)).catch((e) => flash(String(e)))}>Force pause</Button>}
-      {exhausted && <Button variant="ghost" style={{ height: 26 }} onClick={() => go("settings", { settingsTab: "accounts" })}>Accounts</Button>}
-      {exhausted && <Button variant="ghost" style={{ height: 26 }} title="Point this chat at a model you still have" onClick={() => openSwap()}>Swap model</Button>}
-      <Button style={{ height: 26, background: "#fbbf24", color: "#1b1405", border: 0, fontWeight: 600 }} title={all ? "Resume this chat only — everything else stays frozen" : undefined} onClick={() => api.resume(task.id).catch((e) => flash(String(e)))}>{I.play(10)}Resume</Button>
-      <Button variant="ghost" style={{ height: 26 }} title="Turn this pause into a stop: frozen work is cancelled and the agent is told when you continue" onClick={() => api.dismissPause(task.id).catch((e) => flash(String(e)))}>Dismiss</Button>
     </div>
   );
 }
 
+/** Announces a reply to a screen reader without announcing it token by token.
+ *
+ *  The transcript itself is deliberately *not* a live region: a streaming reply
+ *  re-renders on every token, so a live region on the text would read the answer
+ *  out one fragment at a time. This says the two things that are actually useful
+ *  — that a reply started, and what it said once it was finished — and only for
+ *  a turn that happened while this chat was open, so opening an old chat does
+ *  not read its last message aloud. */
+function LiveReply({ live, text }: { live: boolean; text: string }) {
+  const [say, setSay] = useState("");
+  const wasLive = useRef(false);
+  useEffect(() => {
+    if (live) {
+      wasLive.current = true;
+      setSay("Assistant is replying");
+      return;
+    }
+    if (wasLive.current && text.trim()) {
+      wasLive.current = false;
+      setSay(text);
+    }
+  }, [live, text]);
+  return <div className="sr-only" role="status" aria-live="polite">{say}</div>;
+}
+
+/** How long the run has gone without a sign of progress.
+ *
+ *  A stalled run used to look exactly like a thinking one: the spinner kept
+ *  spinning and the step line kept saying what it was doing. This counts the
+ *  seconds since the transcript last grew, which is the difference between
+ *  "working" and "stuck" — and past a minute it says so outright, because that
+ *  is the point at which the user should be deciding whether to stop it.
+ *  `tail` is the transcript's growth key, so any real progress resets the count. */
+function Waiting({ tail }: { tail: string }) {
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    setSecs(0);
+    if (typeof window === "undefined") return;
+    const id = window.setInterval(() => setSecs((n) => n + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [tail]);
+  if (secs < 5) return null;
+  const mins = Math.floor(secs / 60);
+  return (
+    <span className="waiting-for" title="Time since the last sign of progress">
+      {mins ? `${mins}m ${secs % 60}s` : `${secs}s`}
+      {secs >= 60 ? " · still running" : ""}
+    </span>
+  );
+}
+
 /** The transcript. Exported so a render test can pin the scroll anchoring. */
-export function Timeline({ task, onOpenArtifact }: { task: TaskSummary; onOpenArtifact?: (selection: ArtifactWorkspaceSelection) => void }) {
+export function Timeline({ task, onOpenArtifict }: { task: TaskSummary; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   const items = useStore((s) => s.items[task.id]);
   const pending = useStore((s) => s.pendingMessages[task.id] ?? NO_ITEMS);
   const visibleItems = useMemo(() => pending.length ? [...(items ?? []), ...pending] : items, [items, pending]);
@@ -1222,6 +1369,14 @@ export function Timeline({ task, onOpenArtifact }: { task: TaskSummary; onOpenAr
   // render: reading scrollHeight forces a synchronous layout, and paying it per
   // streamed token is what made long chats crawl.
   const tail = `${items?.length ?? 0}:${last?.text.length ?? 0}:${pending.length}`;
+  const lastReply = useMemo(() => {
+    const list = visibleItems ?? [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const it = list[i];
+      if (it && it.kind === "text" && it.text.trim()) return it.text;
+    }
+    return "";
+  }, [visibleItems]);
   useLayoutEffect(() => {
     const el = ref.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
@@ -1269,10 +1424,15 @@ export function Timeline({ task, onOpenArtifact }: { task: TaskSummary; onOpenAr
     if (el && card && card.offsetTop < 0) el.scrollTop = card.offsetTop - 12;
   }, [unanswered, tail]);
   return (
-    <div ref={ref} className="timeline" onScroll={(e) => { const el = e.currentTarget; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
+    <div ref={ref} className="timeline" onScroll={(e) => {
+      const el = e.currentTarget;
+      stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      if (el.scrollTop < 100) void loadPreviousHistory(task.id, el);
+    }}>
+      <LiveReply live={live} text={lastReply} />
       <div className="timeline-in">
         {!items && !pending.length && <Loader variant="agent" className="loading-state" size={13} label="Loading conversation…" />}
-        {visibleItems && <Feed items={visibleItems} task={task} live={live} showThinking={showThinking} onOpenArtifact={onOpenArtifact} />}
+        {visibleItems && <Feed items={visibleItems} task={task} live={live} showThinking={showThinking} onOpenArtifict={onOpenArtifict} />}
         {live && !streaming && (
           <div className="working">
             {/* A frozen chat keeps its step line but loses both animations: the
@@ -1283,9 +1443,10 @@ export function Timeline({ task, onOpenArtifact }: { task: TaskSummary; onOpenAr
               ? <StatusIcon status="paused" />
               : <StatusIcon status="running" color={modelColor(chatModel(task))} />}
             <span className={paused ? "" : "shimmer"}>{task.step || (paused ? "Frozen" : "Working")}</span>
+            {!paused && <Waiting tail={tail} />}
             {paused
               ? <span style={{ fontSize: 11, color: "var(--dim2)" }}>Resume to carry on</span>
-              : <span style={{ fontSize: 11, color: "var(--dim2)" }}>Esc to pause · Esc Esc to stop</span>}
+              : <span className="working-keyhint" style={{ fontSize: 11, color: "var(--dim2)" }}>Esc to pause · Esc Esc to stop</span>}
           </div>
         )}
       </div>
@@ -1357,7 +1518,7 @@ function elapsed(since: string | null) {
 }
 
 /** One agent's row. Memoized on the node: the backend republishes the whole
- *  sub-agent list on every status event, so `task.subs` is a new array each
+ *  subagent list on every status event, so `task.subs` is a new array each
  *  time. Without this, one agent taking a step re-rendered all 80 mounted
  *  rows; now only its own does, because `node.sub` is the same object for
  *  every agent that didn't change. */
@@ -1474,12 +1635,18 @@ function bgFailed(b: Bg): boolean {
 
 /** One background command row, running or finished. */
 function BgRow({ task, b }: { task: TaskSummary; b: Bg }) {
+  // Click to expand: the full command, wrapped and selectable. It used to be a
+  // centred, non-interactive tooltip that vanished as the pointer moved toward
+  // it, so a long command could be neither read in full nor copied.
+  const [open, setOpen] = useState(false);
+  const wrap = open ? { whiteSpace: "pre-wrap" as const, wordBreak: "break-all" as const, userSelect: "text" as const, cursor: "text" } : { whiteSpace: "nowrap" as const, overflow: "hidden", textOverflow: "ellipsis", cursor: "pointer" };
   return (
     <div className="drow">
       <span style={{ marginTop: 4 }}><StatusIcon status={b.running ? "running" : "done"} /></span>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <Tooltip content={b.cmd}><div className="mono" style={{ fontSize: 11.5, color: "#e4e4e7", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{b.cmd}</div></Tooltip>
-        <div className="mono" style={{ fontSize: 10.5, color: bgFailed(b) ? "var(--st-fail)" : "var(--mut3)", marginTop: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{b.running ? b.last_line || "running" : `${b.exit} · ${b.last_line}`}</div>
+        <div className={`mono${open ? " sel" : ""}`} style={{ fontSize: 11.5, color: "#e4e4e7", ...wrap }} title={open ? undefined : "Click to show the whole command"} onClick={() => { if (!window.getSelection()?.toString()) setOpen(!open); }}>{b.cmd}</div>
+        <div className="mono" style={{ fontSize: 10.5, color: bgFailed(b) ? "var(--st-fail)" : "var(--mut3)", marginTop: 3, whiteSpace: open ? "pre-wrap" : "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{b.running ? b.last_line || "running" : `${b.exit} · ${b.last_line}`}</div>
+        {open && <div style={{ display: "flex", gap: 12, marginTop: 3, fontSize: 11, color: "var(--mut3)" }}><span style={{ cursor: "pointer" }} onClick={() => copyText(b.cmd, "Command copied")}>Copy</span><span style={{ cursor: "pointer" }} onClick={() => setOpen(false)}>Show less</span></div>}
       </div>
       {b.running && <IconButton label="Stop" style={{ width: 22, height: 22 }} onClick={() => api.bgKill(task.id, b.id)}><StatusIcon status="stopped" size={11} /></IconButton>}
     </div>
@@ -1528,6 +1695,9 @@ export function BgCommands({ task, bgs }: { task: TaskSummary; bgs: Bg[] }) {
 
 function Details({ task }: { task: TaskSummary }) {
   const open = useStore((s) => s.details);
+  // Off by default, so the meter is the measured pair until the user asks for
+  // the estimated split (Settings → General → Context breakdown).
+  const breakdown = useStore((s) => s.settings?.ctx_breakdown ?? false);
   const subOpen = useStore((s) => s.subOpen);
   const bgs = useStore((s) => s.bg[task.id] ?? NO_BG);
   const sub = subOpen ? task.subs.find((s) => s.id === subOpen) : null;
@@ -1548,7 +1718,7 @@ function Details({ task }: { task: TaskSummary }) {
         <BgCommands task={task} bgs={bgs} />
         <div className="dsec">
           <div className="dh"><span style={{ flex: 1 }}>Context window</span><span>{fmt$(task.usage.cost)}</span></div>
-          <ContextRing used={task.usage.last_context} limit={task.context_window} />
+          <ContextRing used={task.usage.last_context} limit={task.context_window} parts={task.usage.parts} breakdown={breakdown} />
           {task.serving && <div className="mono" style={{ padding: "0 6px", fontSize: 10.5, color: "var(--mut3)", wordBreak: "break-all" }}>via {task.serving}</div>}
           <div className="mono" style={{ fontSize: 10.5, color: "var(--dim2)", wordBreak: "break-all" }}>{task.cwd}</div>
         </div>
@@ -1614,15 +1784,45 @@ function StatusButton({ task }: { task: TaskSummary }) {
 
 export function Session() {
   const task = useStore((s) => (s.task ? s.tasks[s.task] : null));
+  const openId = useStore((s) => s.task);
+  const openError = useStore((s) => s.openError);
   const details = useStore((s) => s.details);
   const find = useStore((s) => s.find);
   // Subscribed, not read through get(): a global pause arrives as a settings
   // event, and this header has to re-render when it lands.
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
   const browserEnabled = useStore((s) => s.settings?.plugins?.browser.enabled ?? false);
-  const [browserTask, setBrowserTask] = useState<string | null>(null);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
-  const [workspaceSelection, setWorkspaceSelection] = useState<ArtifactWorkspaceSelection | null>(null);
+  // Whether this chat is on its Artificts surface is the chat's own answer,
+  // saved with the chat like its name and its pin: switching to another chat
+  // carries that chat's answer with it, so the record surface belongs to the
+  // chat rather than to the window. The two rails read the same field, which is
+  // how they stand down for whichever chat is showing a record.
+  const workspaceOpen = useStore((s) => (s.task ? s.tasks[s.task]?.artifict_open ?? false : false));
+  // One surface, one or two views. The browser plugin used to open a floating
+  // dialog of its own; it is a view of this pane now, and the pane is the frame.
+  const [workspaceTab, setWorkspaceTab] = useState<"artificts" | "browser">("artificts");
+  const [workspaceExpanded, setWorkspaceExpanded] = useState(false);
+  const setWorkspaceOpen = useCallback((open: boolean) => {
+    const id = get().task;
+    if (!id) return;
+    // Optimistic, because the surface is the thing the click asked for; the
+    // backend's own summary lands on the next event and settles it.
+    set((s) => (s.tasks[id] ? { tasks: { ...s.tasks, [id]: { ...s.tasks[id]!, artifict_open: open } } } : {}));
+    void api.update(id, { artifict_open: open }).catch(() => {});
+  }, []);
+  const [workspaceSelection, setWorkspaceSelection] = useState<ArtifictWorkspaceSelection | null>(null);
+  // Stable identity on purpose. This is handed to `Timeline` and passed down to
+  // every row: as an inline arrow it was a new prop on every Session render, and
+  // Session re-renders on every summary event for this chat (status, step, cost,
+  // transcript extent). A new function identity defeats `memo` on every row, so
+  // the whole transcript re-rendered for one chat-level change. Every setter it
+  // needs is stable — three state setters and the `useCallback` above — so this
+  // never has to change.
+  const openArtifict = useCallback((selection: ArtifictWorkspaceSelection) => {
+    setWorkspaceSelection(selection);
+    setWorkspaceTab("artificts");
+    setWorkspaceOpen(true);
+  }, [setWorkspaceOpen]);
   const bg = useStore((s) => (s.task ? s.bg[s.task] : undefined) ?? NO_BG);
   const [stats, setStats] = useState<{ add: number; del: number; n: number } | null>(null);
   const taskId = task?.id;
@@ -1631,7 +1831,23 @@ export function Session() {
     if (!taskId || taskStatus === "running") return;
     api.review(taskId).then((r) => setStats({ n: r.files.length, add: r.files.reduce((a, f) => a + f.add, 0), del: r.files.reduce((a, f) => a + f.del, 0) })).catch(() => setStats(null));
   }, [taskId, taskStatus]);
-  if (!task) return <div className="empty">Task not found</div>;
+  if (!task) {
+    // A failure the store recorded for *this* chat. Shows why, and offers the
+    // two things worth offering — retry, or get out. Without this the user got
+    // "Task not found" for both "the harness errored" and "no such chat", which
+    // reads as a dead end rather than a failure.
+    const why = openError && openError.id === openId ? openError.why : null;
+    return (
+      <div className="empty chat-open-failed" role="alert">
+        <div style={{ color: "var(--fg)" }}>{why ? "That chat could not be opened" : "Task not found"}</div>
+        {why && <div className="mono" style={{ fontSize: 11, color: "var(--mut2)", maxWidth: 460, wordBreak: "break-word" }}>{why}</div>}
+        <div style={{ display: "flex", gap: 8 }}>
+          {why && openId && <Button variant="primary" style={{ height: 26 }} onClick={() => { void openTask(openId); }}>Try again</Button>}
+          <Button variant="ghost" style={{ height: 26 }} onClick={() => go("home")}>Back to chats</Button>
+        </div>
+      </div>
+    );
+  }
   const paused = isPaused(task, pausedAll);
   // The agent colour follows `chatModel`, not `task.model`, so the header agrees
   // with the sidebar dot about a swap the user queued mid-turn (the `*` badge).
@@ -1641,7 +1857,9 @@ export function Session() {
   return (
     <AgentColor.Provider value={agentColor}>
       <div className={"shdr" + (task.ultra ? " ultra " + swarmState(task, heldByGlobal(task, pausedAll)) : "")}>
-        <StatusIcon status={paused ? "paused" : task.status} />
+        {/* A parked chat's own quiet status: the header must not raise the red
+            "needs you" alert for a wait on a trigger. See `chatStatus`. */}
+        <StatusIcon status={paused ? "paused" : chatStatus(task)} />
         <div className="shdr-title" style={{ fontWeight: 600, fontSize: 13.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>{task.title}</div>
         {task.ultra && (() => {
           const ux = task.ultra_x;
@@ -1667,42 +1885,43 @@ export function Session() {
           );
         })()}
         {task.branch && <div className="branchtag shdr-optional">{task.branch}</div>}
+        <ContainerChip task={task} />
         {task.goal && <Tooltip content={task.goal.text}><div className={"goalchip shdr-optional " + task.goal.status}>{task.goal.status === "active" ? "Goal" : task.goal.status === "achieved" ? "Goal met" : task.goal.status === "blocked" ? "Goal blocked" : "Goal stopped"}</div></Tooltip>}
         {task.goal && <Button className="shdr-optional" variant="ghost" title="Remove the current goal" aria-label="Remove current goal" style={{ width: 24, height: 22, padding: 0, fontSize: 11 }} onClick={() => api.send(task.id, "/goal clear").catch((e) => flash(String(e)))}>{I.close(11)}</Button>}
         {task.pending.model && <Tooltip content="Switches with your next message"><div className="goalchip shdr-optional">{modelInfo(task.pending.model).name}<PendingStar /></div></Tooltip>}
         <div className="shdr-spacer" />
         <Button className="shdr-control" variant={workspaceOpen ? "ghost" : "default"} aria-pressed={!workspaceOpen} onClick={() => setWorkspaceOpen(false)}>Chat</Button>
-        <Button className="shdr-control" variant={workspaceOpen ? "primary" : "ghost"} aria-pressed={workspaceOpen} onClick={() => { setWorkspaceSelection(null); setWorkspaceOpen(true); }}>Artifacts</Button>
-        {browserEnabled && <Button className="shdr-optional" onClick={() => setBrowserTask(task.id)}><Globe size={13} aria-hidden="true" />Browser</Button>}
+        <Button className="shdr-control" variant={workspaceOpen ? "primary" : "ghost"} aria-pressed={workspaceOpen} onClick={() => { setWorkspaceSelection(null); setWorkspaceTab("artificts"); setWorkspaceOpen(true); }}>Artificts</Button>
         <div className="shdr-optional"><TodoChip todos={task.todos} /></div>
         {task.ultra && task.subs.length > 0 && <div className="shdr-optional"><SwarmChip task={task} held={paused} /></div>}
         {(live || paused) && (
           paused
             ? <Button className="shdr-optional" style={{ color: "#fbbf24", borderColor: "rgba(251,191,36,0.3)" }} title={pausedAll && !task.paused ? "Resume this chat only — everything else stays frozen" : undefined} onClick={() => api.resume(task.id).catch((e) => flash(String(e)))}>{I.play(10)}Resume</Button>
-            : <Tooltip content="Freeze this task and its subagents"><Button className="shdr-optional" variant="ghost" aria-label="Pause" onClick={() => api.pause(task.id).catch((e) => flash(String(e)))}>{I.pause(10)}</Button></Tooltip>
+            : <Tooltip content="Freeze this task and its subagents"><Button className="shdr-optional" variant="ghost" aria-label="Pause" onClick={() => requestPause(task.id)?.catch((e) => flash(String(e)))}>{I.pause(10)}</Button></Tooltip>
         )}
         {stats && stats.n > 0 && (
           <Button className="shdr-optional" onClick={() => go("diff")}>Review<span className="mono" style={{ fontSize: 10.5, color: "var(--diff-add)" }}>+{stats.add}</span><span className="mono" style={{ fontSize: 10.5, color: "var(--diff-del)" }}>−{stats.del}</span></Button>
         )}
         <StatusButton task={task} />
-        <Tooltip content="Details · Ctrl J"><Button className="shdr-control" aria-label="Details" style={{ background: details ? "rgba(255,255,255,0.08)" : "transparent", borderColor: "transparent", color: details ? "#f4f4f5" : "var(--mut)" }} onClick={() => set({ details: !details })}>
+        {!workspaceOpen && <Tooltip content="Details · Ctrl J"><Button className="shdr-control" aria-label="Details" style={{ background: details ? "rgba(255,255,255,0.08)" : "transparent", borderColor: "transparent", color: details ? "#f4f4f5" : "var(--mut)" }} onClick={() => set({ details: !details })}>
           {I.panel()}
           {busy > 0 && <span style={{ minWidth: 16, height: 16, padding: "0 4px", borderRadius: 8, display: "grid", placeItems: "center", background: "rgba(167,139,250,0.14)", color: "var(--violet)", fontSize: 10, fontWeight: 600 }}>{busy}</span>}
-        </Button></Tooltip>
+        </Button></Tooltip>}
       </div>
       <div className={workspaceOpen ? "session-collaboration-layout" : undefined} style={{ flex: 1, minHeight: 0, display: "flex" }}>
         {/* `data-task` is how the selection layer knows which chat a selection
             came from: the note it opens has to go to this chat's composer, and
             the pane is what identifies it. */}
-        <div className={workspaceOpen ? "session-pane collaboration-chat" : "session-pane"} data-task={task.id} style={{ flex: workspaceOpen ? "0 0 38%" : 1, minWidth: 300, position: "relative" }}>
-          <Timeline task={task} onOpenArtifact={(selection) => { setWorkspaceSelection(selection); setWorkspaceOpen(true); }} />
+        <div className={workspaceOpen ? "session-pane collaboration-chat" : "session-pane"} data-task={task.id} style={{ flex: workspaceOpen ? (workspaceExpanded ? "0 0 0%" : "0 0 34%") : 1, minWidth: 300, position: "relative", display: workspaceOpen && workspaceExpanded ? "none" : undefined }}>
+          <Timeline task={task} onOpenArtifict={openArtifict} />
           {find && <FindBar onClose={() => set({ find: false })} />}
           <CFloat task={task} />
         </div>
-        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}><div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div><ArtifactWorkspace key={`${task.id}:${workspaceSelection?.artifactId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} /></div>}
-        <Details task={task} />
+        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}>{browserEnabled && <div className="workspace-tabs" aria-label="Workspace views"><Button variant={workspaceTab === "artificts" ? "primary" : "ghost"} aria-pressed={workspaceTab === "artificts"} onClick={() => setWorkspaceTab("artificts")}>Artificts</Button><Button variant={workspaceTab === "browser" ? "primary" : "ghost"} aria-pressed={workspaceTab === "browser"} onClick={() => setWorkspaceTab("browser")}><Globe size={13} aria-hidden="true" />Browser</Button></div>}<div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div>{workspaceTab === "browser" && browserEnabled ? <BrowserPanel embedded key={task.id} taskId={task.id} onClose={() => setWorkspaceTab("artificts")} /> : <ArtifictWorkspace key={`${task.id}:${workspaceSelection?.artifictId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} onExpandedChange={setWorkspaceExpanded} />}</div>}
+        {/* The record surface owns the width while it is open, so the
+            subagent/background rail stands down with its own toggle. */}
+        {!workspaceOpen && <Details task={task} />}
       </div>
-      {browserEnabled && browserTask === task.id && <BrowserPanel key={task.id} taskId={task.id} onClose={() => setBrowserTask(null)} />}
     </AgentColor.Provider>
   );
 }

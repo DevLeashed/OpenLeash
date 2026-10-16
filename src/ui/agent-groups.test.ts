@@ -1,10 +1,10 @@
-// Tests for the Subagents editor's group/step helpers. Pure functions, so this
+// Tests for the Subagents editor's group helpers. Pure functions, so this
 // runs without mounting the dialog. The properties under test are the ones the
 // Rust side also enforces — the point is that the dialog catches a bad pattern
 // *before* the settings write, with the same verdict.
 import { describe, expect, it } from "vitest";
 import type { ToolGroup } from "../api";
-import { GROUP_NAMES, groupsOf, hasEditRestriction, restrictionLabel, stepsLabel, toToolGroups, validateGroups } from "./agent-groups";
+import { GROUP_NAMES, groupsOf, hasEditRestriction, restrictionLabel, toToolGroups, validateGroups } from "./agent-groups";
 
 describe("groupsOf", () => {
   it("reads both wire shapes", () => {
@@ -73,16 +73,5 @@ describe("hasEditRestriction / restrictionLabel", () => {
   it("prefers the description in the label when there is one", () => {
     expect(restrictionLabel([{ name: "edit", fileRegex: "\\.md$", description: "docs only" }])).toBe("edits docs only");
     expect(restrictionLabel([{ name: "edit", fileRegex: "\\.md$", description: "" }])).toBe("edits matching \\.md$");
-  });
-});
-
-describe("stepsLabel", () => {
-  it("says no limit at zero or absent", () => {
-    expect(stepsLabel(0)).toBe("no step limit");
-    expect(stepsLabel(undefined)).toBe("no step limit");
-  });
-  it("counts steps and gets the singular right", () => {
-    expect(stepsLabel(1)).toBe("stops after 1 step");
-    expect(stepsLabel(60)).toBe("stops after 60 steps");
   });
 });

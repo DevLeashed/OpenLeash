@@ -226,7 +226,7 @@ fn items_without_images_are_left_completely_alone() {
 
 #[test]
 fn a_sub_agents_own_timeline_is_swept_too() {
-    // Sub-agent transcripts are a separate list that grows exactly the same way,
+    // Subagent transcripts are a separate list that grows exactly the same way,
     // and a swarm keeps one per agent. Sweeping only the main list left the
     // larger half of a computer-use swarm's screenshots untouched.
     let mut t = task("t1", "gpt");

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#0f0f11" />
+<meta name="referrer" content="no-referrer" />
+<title>Pair with OpenLeash</title>
+<style>
+  :root { color-scheme: dark; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  html, body { margin: 0; height: 100%; background: #0f0f11; color: #e8e8ea; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  /* Padded out of the notch and home indicator (viewport-fit=cover above), and
+     sized to the visible viewport so the card stays centred with the keyboard up. */
+  main { min-height: 100%; min-height: 100dvh; display: flex; align-items: center; justify-content: center; box-sizing: border-box; padding: max(24px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+  .card { width: 100%; max-width: 360px; background: #19191c; border: 1px solid #2a2a2e; border-radius: 14px; padding: 28px 24px; box-sizing: border-box; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  p { margin: 0 0 18px; color: #a2a2a8; font-size: 14px; }
+  label { display: block; font-size: 13px; color: #a2a2a8; margin-bottom: 6px; }
+  input { width: 100%; box-sizing: border-box; font: 600 26px/1 ui-monospace, "SF Mono", Consolas, monospace; letter-spacing: .35em; text-align: center; padding: 12px 8px; border-radius: 10px; border: 1px solid #33333a; background: #0f0f11; color: inherit; }
+  input:focus { outline: 2px solid #ff6363; outline-offset: 1px; }
+  button { margin-top: 14px; width: 100%; min-height: 48px; padding: 12px; border: 0; border-radius: 10px; background: #ff6363; color: #140707; font: 600 16px system-ui, sans-serif; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  button:disabled { opacity: .6; cursor: default; }
+  .msg { min-height: 1.4em; margin-top: 12px; font-size: 13px; color: #ff8a8a; }
+  .note { margin-top: 18px; font-size: 12px; color: #77777e; }
+  @media (max-width: 360px) { .card { padding: 22px 16px; } input { letter-spacing: .25em; } }
+</style>
+</head>
+<body>
+<main>
+  <form class="card" id="f" novalidate>
+    <h1>Pair this device</h1>
+    <p>On the computer, open <b>Settings → Remote</b> and either scan the QR code or create a pairing code.</p>
+    <label for="code">Pairing code</label>
+    <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000000" autofocus />
+    <button id="go" type="submit">Pair</button>
+    <div class="msg" id="msg" role="alert">{{message}}</div>
+    <div class="note">A paired device can do everything you can do at the computer, including running commands through agents. Only pair devices you own.</div>
+  </form>
+</main>
+<script src="/__openleash/login.js"></script>
+</body>
+</html>

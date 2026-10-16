@@ -9,7 +9,7 @@ import { api, fmt$, fmtK } from "../api";
 import { modelColor, modelInfo, set, useStore } from "../store";
 import { Button, Loader, Modal, Tooltip } from "./primitives";
 import "./ChatStats.css";
-import { BarList, ChatStat, Counter, EMPTY, hitRate, pct, pctOf, secs, tokens } from "./Stats";
+import { BarList, ChatStat, Counter, EMPTY, failureRate, hitRate, pct, pctOf, secs, tokens } from "./Stats";
 
 /** Events the router counts, in the order a reader wants them: what went wrong
  *  before what was merely interesting. `compactions` is last because a chat that
@@ -29,7 +29,6 @@ const EVENTS: { key: string; label: string; hint: string }[] = [
  *  labelled, for exactly that reason. */
 export function chatFacts(c: ChatStat) {
   const t = c.total;
-  const spent = t.requests + t.errors;
   const started = c.started ? new Date(c.started) : null;
   const ended = t.last_used ? new Date(t.last_used) : null;
   const span = started && ended ? Math.max(0, ended.getTime() - started.getTime()) : 0;
@@ -37,7 +36,7 @@ export function chatFacts(c: ChatStat) {
     tokens: tokens(t),
     requests: t.requests,
     errors: t.errors,
-    errRate: spent ? t.errors / spent : 0,
+    errRate: failureRate(t),
     cost: t.cost,
     // Wall-clock end to end, as opposed to the sum of request times below.
     spanMs: span,
@@ -205,9 +204,9 @@ export function ChatStatsPanel() {
 
             <MixBar c={stat.total} />
 
-            {/* The Cline-style "what did each sub-agent cost on its own" view: the
+            {/* The Cline-style "what did each subagent cost on its own" view: the
                 headline `total` is one number, and this is the only place that says
-                which sub-agent or background task (compaction, keepalive) spent it.
+                which subagent or background task (compaction, keepalive) spent it.
                 Additive to that headline — the rows sum to it — so a single "Main
                 agent" row is still worth drawing: it confirms nothing hid in the
                 total. Old stats files have no `by_agent` at all, hence the guard. */}
@@ -231,16 +230,31 @@ export function ChatStatsPanel() {
                 </div>
                 <div className="stable-wrap">
                   <table className="stable">
-                    <thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th><th>Avg</th><th>Est. cost</th></tr></thead>
+                    <thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th><th>Fail rate</th><th>Avg</th><th>Est. cost</th></tr></thead>
                     <tbody>
-                      {Object.entries(stat.models).sort((a, b) => tokens(b[1]) - tokens(a[1])).map(([mid, c]) => (
-                        <tr key={mid}>
-                          <td><i className="tdotc" style={{ background: modelColor(mid) }} />{modelInfo(mid).name}</td>
-                          <td>{c.requests}</td><td>{fmtK(c.input + c.cache_write)}</td><td>{fmtK(c.cache_read)}</td>
-                          <td>{fmtK(c.output)}</td><td>{pct(hitRate(c))}</td>
-                          <td>{c.requests ? secs(c.total_ms / c.requests) : "—"}</td><td>{fmt$(c.cost)}</td>
-                        </tr>
-                      ))}
+                      {Object.entries(stat.models).sort((a, b) => tokens(b[1]) - tokens(a[1])).map(([mid, c]) => {
+                        const rate = failureRate(c);
+                        return (
+                          <tr key={mid}>
+                            <td><i className="tdotc" style={{ background: modelColor(mid) }} />{modelInfo(mid).name}</td>
+                            <td>{c.requests}</td><td>{fmtK(c.input + c.cache_write)}</td><td>{fmtK(c.cache_read)}</td>
+                            <td>{fmtK(c.output)}</td><td>{pct(hitRate(c))}</td>
+                            {/* Which model the chat's failures landed on is the
+                                question the error total raises and cannot answer:
+                                a chat that fell back after three connection
+                                errors shows a third of its attempts failing here,
+                                and the one that finally served it shows none. */}
+                            <td>
+                              {rate > 0 ? (
+                                <Tooltip content={`${c.errors} failed of ${c.requests + c.errors} attempts`}>
+                                  <span className={rate > 0.1 ? "rate-warn" : undefined}>{pct(rate)}</span>
+                                </Tooltip>
+                              ) : "—"}
+                            </td>
+                            <td>{c.requests ? secs(c.total_ms / c.requests) : "—"}</td><td>{fmt$(c.cost)}</td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

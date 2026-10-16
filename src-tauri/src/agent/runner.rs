@@ -1,15 +1,15 @@
 //! The agent loop.
 //!
 //!   user turn → [compact?] → route a model request → tool calls → permission gate →
-//!   execute (read-only calls and sub-agents in parallel) → tool results (+ notes) → loop
+//!   execute (read-only calls and subagents in parallel) → tool results (+ notes) → loop
 //!
 //! Prompt-cache discipline: the system prompt and tool list are frozen per task
 //! (until compaction) and history is append-only. Anything that changes
-//! mid-task — assist mode, the sub-agent list, plan mode, steering — is
+//! mid-task — assist mode, the subagent list, plan mode, steering — is
 //! *announced* as a <system-reminder> in the next user turn, never edited
 //! into earlier messages.
 //!
-//! Sub-agents run the same loop with a fresh history, their own model and a
+//! Subagents run the same loop with a fresh history, their own model and a
 //! narrower tool set. Their transcripts stream into `task.sub_items`, their
 //! approvals surface in the main timeline, and their questions go to the main
 //! agent first, then (depending on assist mode) to the user.
@@ -32,12 +32,15 @@ mod computer_objection_tests {
 }
 
 use super::permissions::{self, Decision};
+// Tool dispatch for remote-SSH tasks; a child module so it shares `Agent`.
+#[path = "runner_remote.rs"]
+mod remote;
 use super::providers::{self, ChatRequest, StreamEvent};
 use super::router::{self, RouteErr, Who};
 use super::store::{self, AgentDef, AllowRule, UltraX};
 use super::{
-    checkpoint, checks, git, prompt, resolve_model, toolindex, tools, Broadcast, Checkpoint,
-    Harness, Item, Message, QueuedMsg, Runtime, SubInfo, Task, Todo,
+    checkpoint, checks, git, prompt, resolve_model, review, toolindex, tools, Broadcast,
+    Checkpoint, ContextParts, Harness, Item, Message, QueuedMsg, Runtime, SubInfo, Task, Todo,
 };
 use futures_util::future::join_all;
 use serde_json::{json, Value};
@@ -50,6 +53,22 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A task handle that aborts its task when the guard is dropped.
+///
+/// Dropping a `JoinHandle` *detaches* the task — it keeps running — which is the
+/// opposite of what an inline `await` did: dropping that future dropped
+/// everything below it. Used where a subagent's run moved onto its own task
+/// (`run_sub_on_own_stack`) and the caller still must not outlive it silently.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
 
 /// A url, trimmed to something that fits on one line of a transcript.
 fn short(s: impl AsRef<str>) -> String {
@@ -67,6 +86,9 @@ fn browser_target(raw: &str, cwd: &str) -> Result<String, String> {
     }
     if l.contains("://") {
         return Err(format!("`{raw}` isn't a url this browser will load. Use http://, https://, file://, or a path to a local .html file."));
+    }
+    if super::host::is_ssh(cwd) {
+        return Err("This project is on an SSH host, so its files can't be opened in the local browser. Navigate to a URL (for example a dev server the project serves).".into());
     }
     let full = tools::resolve(cwd, raw);
     if !full.is_file() {
@@ -103,9 +125,9 @@ fn text_result(v: &Value, empty: &str) -> Value {
     json!(s)
 }
 
-fn artifact_input(input: &Value) -> Result<crate::artifacts::ArtifactInput, String> {
+fn artifict_input(input: &Value) -> Result<crate::artificts::ArtifictInput, String> {
     serde_json::from_value(input.clone())
-        .map_err(|error| format!("Invalid artifact input: {error}"))
+        .map_err(|error| format!("Invalid artifict input: {error}"))
 }
 
 #[derive(Clone)]
@@ -173,9 +195,9 @@ const MAX_GOAL_NUDGES: u32 = 25;
 /// decision, so a run that can't produce one in a couple of rounds should end
 /// and leave the chat visibly still in plan mode rather than burn the context.
 const MAX_PLAN_NUDGES: u32 = 3;
-/// Ultrathread: how deep sub-agents may nest below the main agent.
+/// Ultrathread: how deep subagents may nest below the main agent.
 const ULTRA_MAX_DEPTH: u8 = 2;
-/// Ultrathread: sub-agents running at once across the whole tree. Well above the
+/// Ultrathread: subagents running at once across the whole tree. Well above the
 /// depth cap's plausible fan-out: at depth 2 with no per-layer fanout, the tree
 /// only *needs* this many running agents to look wide, and a cap lower than that
 /// just makes the orchestrator poll `task_status` instead of working.
@@ -255,7 +277,107 @@ async fn main_tool_list(
         settings.tool_search,
     );
     let loaded = toolindex::loaded(&h.runtime(task_id), "main").await;
-    deferral.tool_list(core, &loaded)
+    dedup_tools(deferral.tool_list(core, &loaded))
+}
+
+/// A provider rejects the whole request when the `tools` array repeats a name
+/// (`tools contains duplicate names`), so no list may carry the same name twice.
+///
+/// The names have to agree by *name*, not by schema pointer: `frozen_prefix`
+/// builds the MCP/plugin tail, `deferral.tool_list` appends the deferred half
+/// including `tool_search`, and a caller that already put a tool in the tail
+/// would otherwise hand the gateway the same name twice and lose the turn.
+fn dedup_tools(tools: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .into_iter()
+        .filter(|t| seen.insert(t["name"].as_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+/// Opens the single message that replaces the whole history after a compaction,
+/// written by `compact` below. Named so the attribution scan recognises a
+/// summary by the same bytes the writer emits.
+pub const COMPACT_SUMMARY_MARKER: &str =
+    "This session continues from an earlier conversation that was compacted to free up context.";
+
+/// Split one content block into `(conversation, attachment)` token estimates.
+///
+/// Attachments are counted apart from the conversation because they are the one
+/// category a user can do something about mid-chat, and because a single pasted
+/// screenshot can dwarf everything else in the window.
+fn block_tokens(b: &Value) -> (u64, u64) {
+    if let Some(text) = b["text"].as_str() {
+        if let Some(at) = text.find(super::attachments::ATTACHMENT_MARKER) {
+            // The note is *appended* to the user's own text, so the bytes before
+            // the marker still belong to the conversation — minus the blank-line
+            // padding that is part of the attachment block's own formatting.
+            // Splitting at `head.len()` rather than at `at` keeps the two slices
+            // exact: no byte is dropped and none is counted twice.
+            let head = text[..at].trim_end();
+            return (
+                prompt::token_estimate(head),
+                prompt::token_estimate(&text[head.len()..]),
+            );
+        }
+        return (prompt::token_estimate(text), 0);
+    }
+    if let Some(data) = b["source"]["data"].as_str() {
+        // A base64 image block. The model pays for the decoded bytes, which are
+        // ~3/4 of the encoded length, at ~4 bytes a token.
+        return (0, (data.len() as u64) * 3 / 16);
+    }
+    (prompt::token_estimate(&b.to_string()), 0)
+}
+
+/// How the request we are about to send splits by category.
+///
+/// Measurement only, and deliberately so: `system`, `messages` and `tools` are
+/// all inside the provider's cached prefix (see the module header), so even
+/// re-serialising a tool schema into place would invalidate the cache for every
+/// chat. Every number here is derived from the bytes as they already stand, and
+/// the caller rescales them onto the provider's own prompt count
+/// (`ContextParts::scaled_to`) so the ring and its breakdown agree.
+///
+/// The results are estimates, not a trace: a provider reports only a total.
+pub fn context_parts(system: &str, tools: &[Value], messages: &[Message]) -> ContextParts {
+    let (system_tok, instructions, skills) = prompt::split_system(system);
+    // Serialised as a *copy* — this never feeds back into the request.
+    let tools_tok = serde_json::to_string(tools)
+        .map(|s| prompt::token_estimate(&s))
+        .unwrap_or(0);
+
+    let mut summary = 0u64;
+    let mut history = 0u64;
+    let mut attachments = 0u64;
+    for (i, m) in messages.iter().enumerate() {
+        // After a compaction the conversation *is* the summary, and it is the
+        // first message.
+        let is_summary = i == 0
+            && m.content.iter().any(|b| {
+                b["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(COMPACT_SUMMARY_MARKER))
+            });
+        for b in &m.content {
+            let (conv, att) = block_tokens(b);
+            attachments += att;
+            if is_summary {
+                summary += conv;
+            } else {
+                history += conv;
+            }
+        }
+    }
+    ContextParts {
+        system: system_tok,
+        instructions,
+        skills,
+        tools: tools_tok,
+        attachments,
+        history,
+        summary,
+    }
 }
 
 /// Which external thing a parked task is waiting on.
@@ -368,7 +490,7 @@ fn ultra_max_depth(x: Option<&UltraX>) -> u8 {
     }
 }
 
-/// How many sub-agents may run at once in this task's tree. An X ladder can
+/// How many subagents may run at once in this task's tree. An X ladder can
 /// raise it; the ceiling is MAX_ULTRA_RUNNING.
 fn ultra_running_cap(x: Option<&UltraX>) -> usize {
     match x {
@@ -382,7 +504,7 @@ fn task_x(t: &Task) -> Option<&UltraX> {
     t.ultra_x.as_ref().filter(|x| x.on())
 }
 
-/// Cap on how many sub-agents one agent may launch at the same time. Plain
+/// Cap on how many subagents one agent may launch at the same time. Plain
 /// ultrathread leans on the global cap and the "several at once" prompt instead;
 /// an X ladder sets it per layer.
 fn layer_fanout(x: Option<&UltraX>, depth: u8) -> Option<u8> {
@@ -424,10 +546,73 @@ fn parse_todos(input: &Value) -> Result<Vec<Todo>, String> {
 
 // ───────────────────────────── entry points ─────────────────────────────
 
+/// Stage attachment bytes into an OpenLeash-owned temp folder, tell the model
+/// where they went, and preserve the existing image send state machine.
+///
+/// Staging lives in this one function so every path that can carry an
+/// attachment (a new task's first prompt, a queued or steered message, an edited
+/// resend, and a subagent send) gets the same temp copies and the same note.
+pub async fn send_attachments(
+    h: Arc<Harness>,
+    task_id: String,
+    text: String,
+    images: Vec<String>,
+    files: Vec<String>,
+    image_names: Vec<String>,
+    later: bool,
+) -> Result<(), String> {
+    let t = h.task(&task_id).await?;
+    let (project, docker) = {
+        let t = t.lock().await;
+        (t.project.clone(), t.docker.is_some())
+    };
+    let staged = super::attachments::stage_user_attachments(
+        &project,
+        &task_id,
+        &super::new_id(),
+        &images,
+        &image_names,
+        &files,
+        docker,
+    )
+    .await?;
+    // The model reads the typed text plus the staged paths; the timeline keeps
+    // the typed text alone, so no path ends up in chat history or in the text a
+    // later resent message shows back to the user.
+    let model_text = format!(
+        "{}{note}",
+        text,
+        note = super::attachments::prompt_paths(&staged.model_paths)
+    );
+    send_images_staged(h, task_id, text, model_text, images, later, staged).await
+}
 /// A user message. Starts a run, or — if one is in flight — queues it as
 /// steering that gets folded into the very next model call.
 pub async fn send(h: Arc<Harness>, task_id: String, text: String) -> Result<(), String> {
     send_as(h, task_id, text.clone(), text).await
+}
+
+/// A docker task's container is stopped when it sits idle. A new message
+/// starts it again in the background, so it is usually up by the time the
+/// agent's first command needs it; that command still waits on the same
+/// start (`ensure_running` is serialized per task) if it is not.
+async fn warm_container(h: &Arc<Harness>, task_id: &str, t: &super::TaskRef) {
+    let Some(denv) = t.lock().await.docker.clone() else {
+        return;
+    };
+    let (h, id) = (h.clone(), task_id.to_string());
+    tokio::spawn(async move {
+        let h2 = h.clone();
+        let id2 = id.clone();
+        let progress = move |_: &str| {
+            let (h2, id2) = (h2.clone(), id2.clone());
+            tokio::spawn(async move { h2.emit_container(&id2).await });
+        };
+        let auto_rebuild = h.settings.read().await.docker_auto_rebuild;
+        let _ =
+            super::docker::ensure_running_with_rebuild(&id, &denv, auto_rebuild, &progress).await;
+        h.emit_container(&id).await;
+    });
 }
 
 /// Changes the user made mid-run take effect with their next message.
@@ -500,6 +685,7 @@ pub async fn send_opts(
 ) -> Result<(), String> {
     let rt = h.runtime(&task_id);
     let t = h.task(&task_id).await?;
+    warm_container(&h, &task_id, &t).await;
     let (project, cwd) = {
         let guard = t.lock().await;
         (guard.project.clone(), guard.cwd.clone())
@@ -597,6 +783,7 @@ pub async fn send_opts(
             // model call, the way it always has. Only Alt-Enter waits.
             steer_now(&h, &task_id, &text).await;
             h.upsert_item(&task_id, item).await;
+            restart_if_ended(h, task_id);
             return Ok(());
         }
         let mut item = item;
@@ -644,23 +831,47 @@ fn image_blocks(images: &[String]) -> Result<Vec<Value>, String> {
     Ok(blocks)
 }
 
-/// A user message with pasted images (`data:<mime>;base64,<data>` URLs).
-///
-/// Mid-run a plain message steers: the photos go to the agent on its next model
-/// call as real image blocks. Alt-Enter waits for the end of the turn instead,
-/// which is what puts it in the queue list above the composer.
-pub async fn send_images(
+/// The single image-sender. `display` is what the timeline shows, `text` is
+/// what the model reads; the staged copies' metadata rides on the item's own
+/// field rather than through the text, so editing a message later can rebuild
+/// the same send without a path ever appearing in the visible transcript.
+async fn send_images_staged(
     h: Arc<Harness>,
     task_id: String,
+    display: String,
     text: String,
     images: Vec<String>,
     later: bool,
+    staged: super::attachments::StagedMessage,
 ) -> Result<(), String> {
+    if let Ok(t) = h.task(&task_id).await {
+        warm_container(&h, &task_id, &t).await;
+    }
     let rt = h.runtime(&task_id);
     let mut blocks = image_blocks(&images)?;
     if !text.is_empty() {
         blocks.push(json!({"type": "text", "text": text.clone()}));
     }
+    // What the bubble shows, plus the staged copies' names, paths and sizes.
+    let user_item = |images: &[String], staged: &super::attachments::StagedMessage| {
+        let mut data = json!({"images": images});
+        if !staged.model_paths.is_empty() {
+            let refs: Vec<Value> = staged
+                .model_paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    json!({
+                        "path": p,
+                        "name": staged.names.get(i).cloned().unwrap_or_default(),
+                        "size": staged.sizes.get(i).copied().unwrap_or(0),
+                    })
+                })
+                .collect();
+            data["attachments"] = json!(refs);
+        }
+        Item::new("user", display.clone(), data)
+    };
     let t = h.task(&task_id).await?;
     // Same as `send_opts`: the user sent this, so the chat goes to the top.
     h.touch(&task_id).await;
@@ -691,7 +902,7 @@ pub async fn send_images(
             t.checkpoints.push(cp);
             t.messages.push(Message::user(blocks.clone()));
         }
-        let item = Item::new("user", text, json!({"images": images}));
+        let item = user_item(&images, &staged);
         h.upsert_item(&task_id, item).await;
         // Same hand-off as `send_opts`: the router is told to rebuild, and a
         // chat with nothing running gets a run so these photos are looked at.
@@ -732,15 +943,15 @@ pub async fn send_images(
                 })
                 .collect();
             h.note_images(&task_id, "main", imgs).await;
-            h.upsert_item(&task_id, Item::new("user", text, json!({"images": images})))
-                .await;
+            h.upsert_item(&task_id, user_item(&images, &staged)).await;
+            restart_if_ended(h, task_id);
             return Ok(());
         }
-        let mut item = Item::new("user", text, json!({"images": images}));
+        let mut item = user_item(&images, &staged);
         enqueue(&h, &task_id, &mut item, blocks).await;
         return Ok(());
     }
-    let item = Item::new("user", text, json!({"images": images}));
+    let item = user_item(&images, &staged);
     {
         let mut t = t.lock().await;
         apply_pending(&mut t);
@@ -754,6 +965,40 @@ pub async fn send_images(
     h.upsert_item(&task_id, item).await;
     spawn_run(h, task_id);
     Ok(())
+}
+
+/// The sender's half of the late-steer handshake (see `late_steer`). The
+/// message was steered because the run *looked* alive, but it may have ended
+/// between that check and the note landing; then nobody would ever read it.
+/// Checked after the note is in, so either this or the ending run sees it.
+/// `spawn_run` is a no-op when the ending run already restarted itself.
+fn restart_if_ended(h: Arc<Harness>, task_id: String) {
+    if !h.runtime(&task_id).running.load(Ordering::SeqCst) {
+        spawn_run(h, task_id);
+    }
+}
+
+/// A user message steered into the main inbox that no turn has read yet.
+///
+/// The turn loop checks the inbox before it accepts a final answer, but the run
+/// stays `running` a while after that (stop hooks, save, session-end hooks): a
+/// message sent then was steered, the run ended, and the note sat unread until
+/// some later run — the agent "didn't see" it. Only the user's own messages
+/// count; harness notes (finished background jobs, agent mail) never restarted
+/// a finished chat and still don't.
+async fn late_steer(rt: &Runtime) -> bool {
+    let user = rt
+        .inbox
+        .lock()
+        .await
+        .get("main")
+        .is_some_and(|v| v.iter().any(|n| n.starts_with("<kind:user-msg>")));
+    user || rt
+        .inbox_images
+        .lock()
+        .await
+        .get("main")
+        .is_some_and(|v| !v.is_empty())
 }
 
 pub fn spawn_run(h: Arc<Harness>, task_id: String) {
@@ -777,7 +1022,7 @@ pub fn spawn_run(h: Arc<Harness>, task_id: String) {
     });
 }
 
-/// Cancel the agent and every sub-agent, without touching background commands.
+/// Cancel the agent and every subagent, without touching background commands.
 /// `interrupt` is this plus the kill; `purge_task` is this plus its own, because
 /// it runs on a blocking thread that can't await the async half.
 pub fn stop_tokens(h: &Harness, task_id: &str) {
@@ -808,7 +1053,7 @@ pub fn stop_tokens(h: &Harness, task_id: &str) {
     }
 }
 
-/// Esc: stops the main agent and every sub-agent, background ones included.
+/// Esc: stops the main agent and every subagent, background ones included.
 ///
 /// Everything the chat had running dies with it — the foreground commands die
 /// with `cancel` (each `bash` waits on a child token), and the background ones
@@ -846,17 +1091,67 @@ pub async fn interrupt(h: &Harness, task_id: &str) {
     h.refresh_busy(task_id).await;
 }
 
-/// Counts one foreground command in `Runtime::fg` for exactly as long as it lives.
-struct FgGuard(Arc<super::Runtime>);
+/// Counts one foreground command in `Runtime::fg` for exactly as long as it lives,
+/// and republishes the count the moment it stops counting it.
+///
+/// The guard exists because a trailing `fetch_sub` never runs when a future is
+/// dropped mid-command (an aborted turn, a cancelled batch), and a leaked count
+/// reads as "waiting on 1 command to finish" for the rest of the session. Giving the
+/// count back is only half of it: the number is *read* — the pause banner names it,
+/// and `has_active_work` refuses to restart the app for an update over it — so a
+/// count given back and never republished is just as wrong as one never given back,
+/// in the other direction. `release` is the normal path: the decrement and the
+/// recount the caller would have made, in one step. The `Drop` covers every path
+/// that never reaches it, and finishes a `release` that was interrupted halfway.
+struct FgGuard {
+    h: Arc<Harness>,
+    rt: Arc<super::Runtime>,
+    task_id: String,
+    /// The decrement is still owed. Cleared by `release` and by the `Drop`.
+    owed: bool,
+    /// A recount still has to be published. `release` clears it once the recount
+    /// has happened; the `Drop` publishes one whenever it is set — including when it
+    /// did not do the decrement itself, because an interrupted `release` leaves the
+    /// count given back and unpublished, which is the same wrong number this guard
+    /// exists to prevent, only low instead of high.
+    unpublished: bool,
+}
 impl FgGuard {
-    fn new(rt: Arc<super::Runtime>) -> Self {
+    fn new(h: Arc<Harness>, task_id: &str) -> Self {
+        let rt = h.runtime(task_id);
         rt.fg.fetch_add(1, Ordering::SeqCst);
-        FgGuard(rt)
+        FgGuard {
+            h,
+            rt,
+            task_id: task_id.to_string(),
+            owed: true,
+            unpublished: true,
+        }
+    }
+    /// The command is over: give the count back and publish it before the caller
+    /// carries on, so what the banner says and what the row shows move together.
+    async fn release(mut self) {
+        self.owed = false;
+        self.rt.fg.fetch_sub(1, Ordering::SeqCst);
+        self.h.refresh_busy(&self.task_id).await;
+        self.unpublished = false;
     }
 }
 impl Drop for FgGuard {
     fn drop(&mut self) {
-        self.0.fg.fetch_sub(1, Ordering::SeqCst);
+        if self.owed {
+            self.rt.fg.fetch_sub(1, Ordering::SeqCst);
+        }
+        if !self.unpublished {
+            return;
+        }
+        // `refresh_busy` awaits the task lock, which a `Drop` cannot do, so the
+        // recount is handed to the runtime instead. Spawned through Tauri's handle
+        // rather than `tokio::spawn`: a drop can land on a thread with no reactor
+        // under it — the tray's `block_on`, a cancelled batch's teardown — and a
+        // panic here would take the process with it.
+        let (h, id) = (self.h.clone(), self.task_id.clone());
+        tauri::async_runtime::spawn(async move { h.refresh_busy(&id).await });
     }
 }
 
@@ -864,6 +1159,26 @@ impl Drop for FgGuard {
 /// once is for the orchestrator to sort out: the rest pick it up on their own
 /// next step, and waking each one for a message it should ignore just burns a turn.
 const MAIL_KINDS: &str = "agent-msg";
+
+/// The prefix of a user broadcast as each running subagent receives it while
+/// the main agent is being steered (`resume` with a message mid-run).
+const BROADCAST: &str = "<system-reminder>Message from the user to all agents:";
+
+/// Whether an inbox note ends a `wait` early: untagged harness notes, peer
+/// mail, and anything the user addressed to *this* agent (steering the main
+/// agent, or messaging a subagent directly). Those used to be excluded with
+/// broadcasts, so "stop waiting and do X" sat unread behind a `wait` for up
+/// to its full 30-minute timeout. A broadcast still doesn't wake a subagent
+/// (see `MAIL_KINDS`), but it does wake the main agent, who sorts it out.
+fn wakes_wait(n: &str, main: bool) -> bool {
+    if !n.starts_with("<kind:") || n.contains(MAIL_KINDS) {
+        return true;
+    }
+    let Some(body) = n.strip_prefix("<kind:user-msg>\n") else {
+        return false;
+    };
+    main || !(body.starts_with(BROADCAST) || body.starts_with(&broadcast_note("")))
+}
 
 /// A harness note, tagged with who it is from so a receiver can tell an
 /// ordinary note apart from one it should drop everything to read.
@@ -880,6 +1195,17 @@ impl Kinded {
     fn agent(text: &str) -> Self {
         Self(format!("<kind:agent-msg>\n{text}"))
     }
+}
+
+/// A note an agent wrote, tagged as agent mail at the source.
+///
+/// The tag is what `wakes_wait` and `late_steer` read to tell peer mail apart
+/// from the user's own words, so it has to be applied where the note is written
+/// rather than by whoever delivers it: `Harness::note` takes a plain string and
+/// does not know who is speaking. `Kinded` stays private to this file; this is
+/// the one door other modules need.
+pub(crate) fn agent_note(text: &str) -> String {
+    Kinded::agent(text).0
 }
 
 /// Steer the main agent with a message the user typed mid-turn and has now asked
@@ -947,9 +1273,13 @@ pub async fn answer_nonblocking(
     Ok(())
 }
 
-/// Hand a finished background sub-agent's report to the main agent: as a note
+/// Hand a finished background subagent's report to the main agent: as a note
 /// if it's working, otherwise as a new turn so it can react right away.
-async fn deliver_to_main(h: &Arc<Harness>, task_id: &str, text: String) {
+///
+/// Also the hand-off for a message from another chat (`chats::send`), which is
+/// the same shape of thing — an agent's note arriving when nobody is reading it
+/// — except that its text is already tagged by the caller.
+pub(crate) async fn deliver_to_main(h: &Arc<Harness>, task_id: &str, text: String) {
     h.note(task_id, "main", Kinded::agent(&text).0).await;
     if !h.runtime(task_id).running.load(Ordering::SeqCst) {
         spawn_run(h.clone(), task_id.to_string());
@@ -974,7 +1304,7 @@ fn broadcast_note(text: &str) -> String {
 }
 
 /// The user broadcasts a message to every working agent in the task: the main
-/// agent plus every sub-agent, nested ultrathread workers included. Returns who
+/// agent plus every subagent, nested ultrathread workers included. Returns who
 /// it reached.
 pub async fn broadcast(h: &Arc<Harness>, task_id: &str, text: &str) -> Result<Vec<String>, String> {
     let msg = text.trim();
@@ -986,7 +1316,7 @@ pub async fn broadcast(h: &Arc<Harness>, task_id: &str, text: &str) -> Result<Ve
     // action on that chat alone — it must not reorder anything else.
     h.touch(task_id).await;
     let note = broadcast_note(msg);
-    // Every sub-agent is in `subs`, however deep, so this one loop covers them all.
+    // Every subagent is in `subs`, however deep, so this one loop covers them all.
     let subs: Vec<SubInfo> = t
         .lock()
         .await
@@ -1065,24 +1395,54 @@ async fn mark_replied(h: &Harness, task_id: &str, agent: &str) {
     }
 }
 
-/// The user typed into a sub-agent's panel. A running sub-agent gets it on its
+/// The user pressed Stop on one subagent. Only that agent's token is cancelled
+/// (plus whatever it spawned, which hangs off it), so the rest of the chat keeps
+/// going. The run ends as "stopped", the same as a chat-wide stop, so the
+/// subagent can be resumed later with its context intact.
+pub async fn sub_stop(h: &Arc<Harness>, task_id: &str, sub_id: &str) -> Result<(), String> {
+    let token = h
+        .runtime(task_id)
+        .sub_cancel
+        .lock()
+        .unwrap()
+        .get(sub_id)
+        .cloned();
+    match token {
+        Some(c) => {
+            c.cancel();
+            Ok(())
+        }
+        None => Err("That subagent isn't running.".into()),
+    }
+}
+
+/// What `drive_sub` returns for a subagent cut off by a stop, its own or the chat's.
+const SUB_STOPPED: &str = "Subagent stopped: interrupted";
+
+/// What a foreground `task` call returns when the user stopped its subagent.
+fn stopped_by_user_note(role: &str, sid: &str) -> String {
+    format!("The user stopped the `{role}` subagent (id `{sid}`) before it finished, so there is no report. Don't relaunch it on your own; if its work still matters, it can be continued with task_resume.")
+}
+
+/// The user typed into a subagent's panel. A running subagent gets it on its
 /// next request; a finished one continues with it, and its follow-up report
 /// goes to the main agent.
-/// The user typed into a sub-agent's panel. A running sub-agent gets it on its
-/// next request; a finished one continues with it, and its follow-up report
-/// goes to the main agent. Pasted images ride along as real image blocks.
+///
+/// A photo sent here is staged the same way a main-chat one is: the model is told
+/// where the copy lives and still gets real image blocks.
 pub async fn sub_message(
     h: &Arc<Harness>,
     task_id: &str,
     sub_id: &str,
     text: String,
     images: Vec<String>,
+    image_names: Vec<String>,
 ) -> Result<(), String> {
     let t = h.task(task_id).await?;
-    // Typing into a sub-agent's panel is the user working in this chat, so it
+    // Typing into a subagent's panel is the user working in this chat, so it
     // counts the same as a message to the main agent.
     h.touch(task_id).await;
-    let (info, saved, project, assist) = {
+    let (info, saved, assist) = {
         let t = t.lock().await;
         let info = t
             .subs
@@ -1090,22 +1450,59 @@ pub async fn sub_message(
             .find(|s| s.id == sub_id)
             .cloned()
             .ok_or("That subagent is gone.")?;
-        (
-            info,
-            t.sub_msgs.get(sub_id).cloned(),
-            t.project.clone(),
-            t.assist.clone(),
-        )
+        (info, t.sub_msgs.get(sub_id).cloned(), t.assist.clone())
     };
     let img_blocks = image_blocks(&images)?;
+    // A subagent shares its parent task's project and container, so the same
+    // staging rules (and the same remote mount) apply.
+    let (project, docker) = {
+        let t = t.lock().await;
+        (t.project.clone(), t.docker.is_some())
+    };
+    let staged = super::attachments::stage_user_attachments(
+        &project,
+        task_id,
+        &super::new_id(),
+        &images,
+        &image_names,
+        &[],
+        docker,
+    )
+    .await?;
+    let note_text = format!(
+        "<system-reminder>The user sent you this message directly.</system-reminder>\n{text}{}",
+        super::attachments::prompt_paths(&staged.model_paths)
+    );
     let mut data = json!({"direct": true});
     if !images.is_empty() {
         data["images"] = json!(images);
+        data["attachments"] = json!(staged
+            .model_paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({
+                "path": p,
+                "name": staged.names.get(i).cloned().unwrap_or_default(),
+                "size": staged.sizes.get(i).copied().unwrap_or(0),
+            }))
+            .collect::<Vec<_>>());
     }
     h.upsert_sub_item(task_id, sub_id, Item::new("user", text.clone(), data))
         .await;
     if info.status == "running" {
-        h.note(task_id, sub_id, Kinded::user(&format!("<system-reminder>The user sent you this message directly. Take it into account right away:</system-reminder>\n{text}")).0).await;
+        // The staged paths ride with the note here too: a running subagent
+        // picks the message up on its next request, and the copy has to be
+        // named for the same reason a finished one is told.
+        h.note(
+            task_id,
+            sub_id,
+            Kinded::user(&format!(
+                "<system-reminder>The user sent you this message directly. Take it into account right away:</system-reminder>\n{text}{}",
+                super::attachments::prompt_paths(&staged.model_paths)
+            ))
+            .0,
+        )
+        .await;
         h.note_images(
             task_id,
             sub_id,
@@ -1125,7 +1522,7 @@ pub async fn sub_message(
     let mut init = saved
         .ok_or("This subagent's conversation wasn't saved (it ran before this feature existed).")?;
     let mut blocks = img_blocks;
-    blocks.push(json!({"type": "text", "text": format!("<system-reminder>The user sent you this message directly.</system-reminder>\n{text}")}));
+    blocks.push(json!({"type": "text", "text": note_text}));
     push_user_blocks(&mut init, blocks);
     let defs = store::all_agents(&*h.settings.read().await, &project);
     let def = defs
@@ -1721,24 +2118,68 @@ fn latest_pr_mark(snapshot: &Value) -> Option<String> {
         .max()
 }
 
-/// Resume a stopped chat the way the user chose: `continue` (retry what was cut off and
-/// carry on) or `wrap` (don't continue; summarise where things stand).
-pub async fn resume_after_stop(h: &Arc<Harness>, task_id: &str, mode: &str) -> Result<(), String> {
-    let wrap = mode == "wrap";
-    let extra = if wrap {
+/// The three ways to resume a stopped chat, resolved from the mode string the
+/// frontend sends. Anything unrecognised falls back to `continue`, which is what
+/// an older client (or a plain resume) means.
+///
+/// `wrap_up` stops the work, `summarise_first` reports on the way back into it.
+/// They are deliberately separate flags rather than one enum so the existing
+/// `wrap_up` readers (subagent resumption, rewind, transfer) keep working, and
+/// they are never both set: `wrap` is the mode that does *not* carry on.
+pub fn resume_mode_flags(mode: &str) -> (bool, bool) {
+    (mode == "wrap", mode == "summarise")
+}
+
+/// What the agent is told about the resume it just woke up in. `mode` is the
+/// same string as {@link resume_mode_flags}.
+pub fn resume_mode_note(mode: &str) -> &'static str {
+    let (wrap, summarise) = resume_mode_flags(mode);
+    if wrap {
         "<system-reminder>The user does NOT want you to continue this work. Don't retry the cancelled calls and don't start anything new (reading files or `git status`/`git diff` to check the state is fine). Reply with a summary for the user: what got done, what was cut off or is left half-finished (and whether anything is now broken), and what would be left to do. Subagents that were stopped stay stopped; mention what they were doing.</system-reminder>"
+    } else if summarise {
+        "<system-reminder>The user wants a status report and then the work carried on. Start with a short summary for the user: what got done, what was cut off or is left half-finished (and whether anything is now broken), and what is left to do. Then keep going: check the current state, retry the cancelled calls and carry on with the task. Keep the summary brief — it is a progress note on the way back into the work, not the deliverable.</system-reminder>"
     } else {
         "<system-reminder>The user wants you to CONTINUE: check the current state, retry whatever was cut off, and carry on with the task.</system-reminder>"
-    };
+    }
+}
+
+/// Resume a stopped chat the way the user chose: `continue` (retry what was cut off and
+/// carry on), `summarise` (report where things stand, then carry on) or `wrap` (don't
+/// continue; summarise where things stand).
+pub async fn resume_after_stop(h: &Arc<Harness>, task_id: &str, mode: &str) -> Result<(), String> {
+    // "Summarise and continue" is the middle rung: the user wants the report *and*
+    // the work. It is deliberately not a flavour of `wrap` — that one exists to stop
+    // the work, so it leaves cut-off subagents stopped, whereas this one carries on
+    // and must let them resume with everything else.
+    let (wrap, summarise) = resume_mode_flags(mode);
+    let extra = resume_mode_note(mode);
     h.update_task(task_id, |t| {
         t.stop_note = Some(format!("{}{extra}", t.stop_note.take().unwrap_or_default()));
         t.wrap_up = wrap;
+        t.summarise_first = summarise;
     })
     .await;
     resume(h, task_id, None).await
 }
 
-/// Unpause one task. `message` (optional) goes to the main agent and every live sub-agent.
+/// The instruction a resumed chat is handed when its last turn ended on an
+/// assistant message and there is nothing else to say.
+///
+/// The three resume choices are one decision — does this run continue the work,
+/// and does it report first — so they live in one place rather than in three
+/// branches at the call site. A missing case here is a resume that silently
+/// behaves like a different choice.
+pub fn resume_reminder(wrap_up: bool, summarise_first: bool) -> &'static str {
+    if wrap_up {
+        "Don't continue the task: summarise where things stand."
+    } else if summarise_first {
+        "First summarise where things stand for the user, then continue the task."
+    } else {
+        "Continue the task from where you stopped."
+    }
+}
+
+/// Unpause one task. `message` (optional) goes to the main agent and every live subagent.
 /// A task that isn't running (e.g. after the app was closed) is restarted where it stopped.
 pub async fn resume(
     h: &Arc<Harness>,
@@ -1790,7 +2231,7 @@ pub async fn resume(
     // runs: the chain comes back empty, not one request is even sent, the pause is
     // raised again and the agent is parked once more. Every press repeats it
     // against the same bench, which is why the count felt arbitrary — and a swarm
-    // makes it worse, since each parked sub-agent walks the same empty chain and
+    // makes it worse, since each parked subagent walks the same empty chain and
     // re-raises the pause behind the user.
     //
     // A key that is really out answers 429 and benches itself again, so a resume
@@ -1810,18 +2251,14 @@ pub async fn resume(
     if rt.running.load(Ordering::SeqCst) {
         if let Some(m) = &msg {
             // A Resume message steers, like any other message sent mid-turn. The
-            // note to the live sub-agents goes out with it.
+            // note to the live subagents goes out with it.
             let item = Item::new("user", m.clone(), json!({}));
             steer_now(h, task_id, m).await;
             for s in t.lock().await.subs.iter().filter(|s| s.status == "running") {
                 h.note(
                     task_id,
                     &s.id,
-                    Kinded::user(&format!(
-                        "<system-reminder>Message from the user to all agents:</system-reminder>
-{m}"
-                    ))
-                    .0,
+                    Kinded::user(&format!("{BROADCAST}</system-reminder>\n{m}")).0,
                 )
                 .await;
             }
@@ -1838,11 +2275,7 @@ pub async fn resume(
                 let mut t = t.lock().await;
                 fix_dangling(&mut t.messages);
                 if t.messages.last().is_some_and(|m| m.role == "assistant") {
-                    let next = if t.wrap_up {
-                        "Don't continue the task: summarise where things stand."
-                    } else {
-                        "Continue the task from where you stopped."
-                    };
+                    let next = resume_reminder(t.wrap_up, t.summarise_first);
                     t.messages.push(Message::user_text(format!(
                         "<system-reminder>{next}</system-reminder>"
                     )));
@@ -1916,8 +2349,11 @@ async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: Cancellatio
         .map(String::as_str)
         .unwrap_or_else(|e| e.as_str());
     let _ = checks::session_end(&hooks, summary, &cwd, &project, &task_id, &cancel).await;
-    rt.running.store(false, Ordering::SeqCst);
+    // Token first, then the flag. The moment `running` reads false a send may
+    // start the next run, which installs its own token; clearing after that
+    // dropped the *new* run's token, and Esc then stopped nothing.
     *rt.cancel.lock().unwrap() = None;
+    rt.running.store(false, Ordering::SeqCst);
 
     let (status, step) = match &res {
         Ok(_) => ("done", None),
@@ -1929,6 +2365,13 @@ async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: Cancellatio
     // would relabel the chat "Done" and clear the kind out from under it, which
     // is the park vanishing the instant the turn loop returns.
     let parked = rt.wake_state.lock().unwrap().parked;
+    // A message sent after `running` went false starts a new run (`spawn_run`),
+    // which publishes "running" before this run reaches the status write below.
+    // Writing "done" over that left a live run showing as finished until it ended.
+    // Checked under the task lock, the same lock the new run takes for its own
+    // "running" write, so either this write lands first and the new run overwrites
+    // it, or the new run has already set `running` and this write is skipped.
+    let mut superseded = false;
     if let Err(e) = &res {
         let text = if e == INTERRUPTED {
             "Interrupted · tell the agent what to do instead".to_string()
@@ -1945,6 +2388,12 @@ async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: Cancellatio
             for s in t.subs.iter_mut().filter(|s| s.status == "running") {
                 s.status = "stopped".into();
             }
+            return;
+        }
+        if rt.running.load(Ordering::SeqCst) {
+            // A newer run owns this chat now: its status, step and subagents are
+            // its own, not this finished run's to write.
+            superseded = true;
             return;
         }
         if status == "stopped" {
@@ -1990,26 +2439,33 @@ async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: Cancellatio
     // Only an ordinary finish can hand over to a queued follow-up. A parked run
     // is waiting, and a stopped run leaves its queue alone (both below), so they
     // take nothing here.
-    let drained = if parked || status == "stopped" {
+    // A superseded run leaves the queue alone: the run that owns the chat takes it.
+    let drained = if parked || superseded || status == "stopped" {
         Vec::new()
     } else {
         drain_queue(&rt).await
     };
+    // Read after `running` went false above, so a steer that lands later is the
+    // sender's to restart (`restart_if_ended`), never lost between the two.
+    let late = !parked && !superseded && status == "done" && late_steer(&rt).await;
     // "Done" means nothing more is coming. A queued follow-up restarts the run
     // straight below, so announcing a finish here rang for a chat still working.
     // A failure is announced regardless: the run did fail, whatever runs next.
-    if drained.is_empty() || status == "failed" {
-        (h.bus)(
-            "ol://attention",
+    if (!superseded && drained.is_empty() && !late) || status == "failed" {
+        // The announcement also decides whether this is news the user has not seen
+        // yet — a `stopped` run and a park are not. See `Harness::attention`.
+        h.attention(
+            &task_id,
             json!({"task_id": task_id, "kind": if parked { "waiting" } else { status }}),
-        );
+        )
+        .await;
     }
 
     // A parked run is *waiting*, not finished, so it gets neither the queued
     // turn nor a keepalive: the watcher owns what happens next, and a keepalive
     // would keep paying to warm a prefix the model is not coming back to read
     // until the trigger fires. `park_waiting` cancelled any keepalive already.
-    if parked {
+    if parked || superseded {
         return;
     }
     // A stopped run is the user saying "enough" — so the queue is left alone.
@@ -2022,7 +2478,7 @@ async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: Cancellatio
     // An ordinary finish: the queue may hold a follow-up turn, which restarts
     // the run below and serves its own idle. Only if there is none is this the
     // end of the run, and so the moment the cache-keepalive loop becomes useful.
-    if drained.is_empty() {
+    if drained.is_empty() && !late {
         if status == "done" {
             start_keepalive(h.clone(), task_id);
         }
@@ -2037,8 +2493,11 @@ async fn run_main_reserved(h: Arc<Harness>, task_id: String, cancel: Cancellatio
             let mut t = t.lock().await;
             apply_pending(&mut t);
             fix_dangling(&mut t.messages);
-            // One user turn, not several in a row.
-            push_user_blocks(&mut t.messages, pending);
+            // One user turn, not several in a row. A late steer alone adds
+            // nothing here: the turn loop delivers it from the inbox.
+            if !pending.is_empty() {
+                push_user_blocks(&mut t.messages, pending);
+            }
         }
         mark_delivered(&h, &task_id, &drained).await;
         Box::pin(run_main(h, task_id)).await;
@@ -2070,7 +2529,7 @@ pub async fn mark_delivered(h: &Arc<Harness>, task_id: &str, sent: &[QueuedMsg])
 }
 
 /// What the agent is told after the user stopped a run: which tool calls in its
-/// last turn were cancelled before finishing. Sub-agent calls are left out —
+/// last turn were cancelled before finishing. Subagent calls are left out —
 /// `resume_subs` continues those on its own.
 pub fn stop_note(msgs: &[Message]) -> String {
     let mut cut: Vec<String> = vec![];
@@ -2224,7 +2683,7 @@ fn drop_item_images(i: &mut Item) {
     i.data["images_dropped"] = json!(n);
 }
 
-/// Sweep the main transcript and every sub-agent's own.
+/// Sweep the main transcript and every subagent's own.
 ///
 /// Done here rather than in the turn loop because this is bookkeeping about
 /// what the process holds, and the saver already rewrites the whole task: it
@@ -2241,7 +2700,7 @@ pub fn prune_task_images(t: &mut Task) -> bool {
 }
 
 /// Every tool_use needs a tool_result right after it. Repairs histories cut
-/// short by a crash, app close, or interrupted sub-agents.
+/// short by a crash, app close, or interrupted subagents.
 pub fn fix_dangling(msgs: &mut Vec<Message>) {
     fix_dangling_with(
         msgs,
@@ -2253,6 +2712,7 @@ pub fn fix_dangling(msgs: &mut Vec<Message>) {
 pub const CRASHED: &str = "This tool call was interrupted before it finished: the app closed or crashed while it was running, so it did NOT complete. Run it again.";
 
 pub fn fix_dangling_with(msgs: &mut Vec<Message>, text: &str) {
+    drop_stray_results(msgs);
     let mut i = 0;
     while i < msgs.len() {
         if msgs[i].role == "assistant" {
@@ -2283,18 +2743,146 @@ pub fn fix_dangling_with(msgs: &mut Vec<Message>, text: &str) {
     }
 }
 
+fn result_id(b: &Value) -> Option<&str> {
+    if b["type"] == "tool_result" {
+        b["tool_use_id"].as_str()
+    } else {
+        None
+    }
+}
+
+/// A tool_result is only valid in the user turn right after the assistant turn
+/// that made the call, once. The API merges consecutive user messages, so a
+/// result in a *second* user message after that turn (or a second result for
+/// the same call) is a hard 400 on every retry, and the chat is stuck for good.
+/// Histories like that were written when results landed after a message the
+/// user had sent mid-tools; this pulls each call's result back into the turn
+/// after its call and drops results with no matching call.
+///
+/// When a call has more than one result, the last one wins: the placeholder
+/// `fix_dangling` writes always comes before the real result that raced it.
+/// Message count is never changed, because checkpoints index into it.
+fn drop_stray_results(msgs: &mut [Message]) {
+    // A result is stray when its call was dropped from the assistant turn (compaction
+    // or an interrupted call that never recorded its id) or when it is a second answer
+    // for a call that already has one. Either way the gateway answers 400 and
+    // `rejects_request` stops retrying, so the chat is stuck until this runs.
+    //
+    // Blocks are filtered out of each user message in place — the messages themselves
+    // are never merged or dropped. Consecutive user turns are the user's own sends,
+    // and the API accepts several in a row as long as each one is well-formed.
+    //
+    // *Which* answer survives matters. A call can be answered twice because the user
+    // typed mid-tools: the real result then lands in a second user turn, after the
+    // placeholder `fix_dangling` wrote when the run was cut short. The real one is
+    // the newer one and the placeholder is worthless, so the newest result wins —
+    // keeping the first, as this did, repaired the wire shape and kept the lie.
+    let mut last_call_ids: Vec<String> = vec![];
+    // Every place each call's result appears, oldest first.
+    let mut places: std::collections::HashMap<String, Vec<(usize, usize)>> = Default::default();
+    for (mi, msg) in msgs.iter().enumerate() {
+        if msg.role == "assistant" {
+            last_call_ids = msg
+                .content
+                .iter()
+                .filter(|b| b["type"] == "tool_use")
+                .filter_map(|b| b["id"].as_str().map(String::from))
+                .collect();
+            continue;
+        }
+        if msg.role != "user" {
+            continue;
+        }
+        for (bi, b) in msg.content.iter().enumerate() {
+            if let Some(id) = result_id(b) {
+                if last_call_ids.iter().any(|x| x == id) {
+                    places.entry(id.to_string()).or_default().push((mi, bi));
+                }
+            }
+        }
+    }
+    // The first place is the only legal one — the user turn right after the call —
+    // so the newest content moves there and every other copy goes.
+    let mut keep: std::collections::HashSet<(usize, usize)> = Default::default();
+    for list in places.values() {
+        let (first, last) = (list[0], *list.last().unwrap());
+        let real = msgs[last.0].content[last.1].clone();
+        msgs[first.0].content[first.1] = real;
+        keep.insert(first);
+    }
+    for (mi, msg) in msgs.iter_mut().enumerate() {
+        if msg.role != "user" {
+            continue;
+        }
+        // `retain` visits the blocks in order, so this counts the original index
+        // while dropping the duplicates and the results with no call at all.
+        let mut bi = 0;
+        msg.content.retain(|b| {
+            let keep_it = result_id(b).is_none() || keep.contains(&(mi, bi));
+            bi += 1;
+            keep_it
+        });
+    }
+}
+
+/// Put one turn's tool results (plus any harness notes) right after the
+/// assistant turn that made the calls.
+///
+/// Usually that turn is the end of history and this is a plain push. But
+/// history can grow while the tools run — a message sent into a paused chat
+/// goes straight in — and pushing a fresh user turn then put the results in a
+/// second user message after the user's, which `fix_dangling` later "repaired"
+/// with placeholders: two results per call, and a 400 the chat never recovered
+/// from. So the results go into the turn after their call, ahead of whatever
+/// was added, replacing any placeholder for the same call.
+pub fn attach_results(msgs: &mut Vec<Message>, results: Vec<Value>) {
+    let first = results.iter().find_map(result_id).map(String::from);
+    let at = first.and_then(|id| {
+        msgs.iter().rposition(|m| {
+            m.role == "assistant"
+                && m.content
+                    .iter()
+                    .any(|b| b["type"] == "tool_use" && b["id"].as_str() == Some(id.as_str()))
+        })
+    });
+    let Some(i) = at.filter(|&i| i + 1 < msgs.len()) else {
+        // The common case, or no call to anchor to (nothing to misplace).
+        msgs.push(Message::user(results));
+        return;
+    };
+    if msgs[i + 1].role != "user" {
+        msgs.insert(i + 1, Message::user(vec![]));
+    }
+    let (res, notes): (Vec<Value>, Vec<Value>) = results
+        .into_iter()
+        .partition(|b| b["type"] == "tool_result");
+    let ids: Vec<String> = res.iter().filter_map(result_id).map(String::from).collect();
+    let next = &mut msgs[i + 1].content;
+    next.retain(|b| result_id(b).is_none_or(|id| !ids.iter().any(|x| x == id)));
+    let rest = std::mem::take(next);
+    *next = res.into_iter().chain(rest).chain(notes).collect();
+    drop_stray_results(msgs);
+}
+
 /// Extra prompt sections for the features that change how an agent works.
 ///
 /// Read once, when the frozen prefix is built, so the tools and the rules that
 /// govern them land in the same cached block. The deep-research tools are part of
-/// the kit now and carry no switch, so their section is unconditional; only
-/// memory is a choice, and sub-agents never get it — memory is the
-/// conversation's own knowledge, and a fan-out of sub-agents each writing to the
-/// same index would fight over it.
+/// the kit now and carry no switch, so their section is unconditional; memory is
+/// a choice and subagents never get it — memory is the conversation's own
+/// knowledge, and a fan-out of subagents each writing to the same index would
+/// fight over it. Cross-chat is the same shape of choice, and main-agent-only
+/// for a stronger reason: see `tools::schemas`.
 fn feature_sections(settings: &store::Settings) -> String {
     let mut s = String::new();
     if settings.memory {
         s.push_str(prompt::memory_section());
+    }
+    // Cross-chat tools are the main agent's: see `tools::schemas`. The section
+    // is built from the same switch the schema gate refuses on, so the rules and
+    // the capability cannot disagree.
+    if settings.cross_chat {
+        s.push_str(prompt::cross_chat_section());
     }
     s.push_str(prompt::research_section());
     // Plugin-built, like the tool list it has to agree with: `screen_section`
@@ -2310,7 +2898,7 @@ fn feature_sections(settings: &store::Settings) -> String {
 /// agent's system prompt was written under — serving live settings here could
 /// pair a tool list with a prompt describing different switches. A task whose
 /// prefix is not built yet has nothing to be consistent with, so it reads live
-/// settings; otherwise the very first sub-agent of a cold task would find
+/// settings; otherwise the very first subagent of a cold task would find
 /// `screenshot` missing and think the user had turned computer use off.
 async fn prefix_plugins(
     h: &Arc<Harness>,
@@ -2664,12 +3252,20 @@ pub async fn compact(
             .map(|g| format!("\n\n{}", prompt::goal_intro(&g.text)))
             .unwrap_or_default();
         t.messages = vec![Message::user_text(format!(
-            "This session continues from an earlier conversation that was compacted to free up context. Summary of everything so far:\n\n{summary}{todos}{goal}\n\nContinue the work from where it left off without asking the user to repeat anything."
+            "{COMPACT_SUMMARY_MARKER} Summary of everything so far:\n\n{summary}{todos}{goal}\n\nContinue the work from where it left off without asking the user to repeat anything."
         ))];
         t.checkpoints.clear();
         t.read_files.clear();
+        t.read_hashes.clear();
         t.usage.cost += cost;
         t.usage.last_context = usage.output + 2_000;
+        // The window now holds only the summary. Leaving the pre-compaction
+        // buckets here would draw a breakdown for a request that no longer
+        // exists, against a `last_context` that just shrank to the summary.
+        t.usage.parts = ContextParts {
+            summary: t.usage.last_context,
+            ..Default::default()
+        };
         // Fresh prefix: re-read project instructions + MCP tools, and re-announce modes.
         t.system.clear();
         t.mcp_tools.clear();
@@ -2938,7 +3534,7 @@ fn fallback_def(role: &str) -> AgentDef {
     d
 }
 
-/// Sub-agent definitions this task may use right now.
+/// Subagent definitions this task may use right now.
 async fn allowed_agents(h: &Harness, t: &Task) -> Vec<AgentDef> {
     let s = h.settings.read().await;
     let mut v: Vec<AgentDef> = store::all_agents(&s, &t.project)
@@ -2979,7 +3575,7 @@ impl Agent {
         d.max(1)
     }
 
-    /// Ultrathread lets sub-agents launch their own sub-agents, down to the
+    /// Ultrathread lets subagents launch their own subagents, down to the
     /// tree's depth cap: ULTRA_MAX_DEPTH for plain ultrathread, or the ladder's
     /// own height in ULTRATHREAD X.
     async fn can_nest(&self) -> bool {
@@ -3004,6 +3600,33 @@ impl Agent {
         self.sub_id().unwrap_or("main").to_string()
     }
 
+    /// Whether anything is waiting for this agent that has not been read yet:
+    /// a harness/broadcast note, or input the user aimed at this agent.
+    ///
+    /// The final check of a no-tool turn. A subagent marks itself `running`
+    /// until after its stop hook, so a message sent while that hook runs used to
+    /// land in the inbox of an agent that had already finished and would never
+    /// read it — the user saw their message acknowledged by the panel and
+    /// answered by nothing. Photos count too: a picture sent along with the text
+    /// sits in `inbox_images`, and the text alone must not end the run.
+    async fn has_pending_input(&self, h: &Harness) -> bool {
+        let key = self.inbox_key();
+        let notes = h
+            .runtime(&self.task_id)
+            .inbox
+            .lock()
+            .await
+            .get(&key)
+            .is_some_and(|v| !v.is_empty());
+        notes
+            || h.runtime(&self.task_id)
+                .inbox_images
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|v| !v.is_empty())
+    }
+
     /// The id this agent's own spend is attributed to in the per-chat by-agent
     /// split. `sub:<id>` and not the agent's *role* (`explore`, `general`, …):
     /// that role is what the app-wide `agents` dimension already keys on, and
@@ -3015,7 +3638,7 @@ impl Agent {
         }
     }
 
-    /// Save a sub-agent's conversation so it can be continued after a stop, a pause or an app restart.
+    /// Save a subagent's conversation so it can be continued after a stop, a pause or an app restart.
     async fn save_sub_history(&self, local: &[Message]) {
         if let Some(s) = &self.sub {
             if let Ok(t) = self.h.task(&self.task_id).await {
@@ -3024,7 +3647,7 @@ impl Agent {
         }
     }
 
-    /// On (re)start of the main agent: sub-agents that were cut off (Esc, app
+    /// On (re)start of the main agent: subagents that were cut off (Esc, app
     /// closed, crash) continue from their saved conversation, and their
     /// reports replace the "stopped" results the main agent hasn't seen yet.
     async fn resume_subs(&self) {
@@ -3032,7 +3655,16 @@ impl Agent {
             return;
         };
         // "Wrap up" after a stop: cut-off subagents stay stopped; the main agent summarises.
-        if std::mem::take(&mut t.lock().await.wrap_up) {
+        // `summarise_first` is cleared alongside it for the same reason: both describe
+        // *one* resume, and a stale one would put a report in front of a later plain
+        // "Continue". It does not stop the subagents below — that is `wrap_up`'s job alone.
+        let (wrap, _summarise) = {
+            let mut g = t.lock().await;
+            let wrap = std::mem::take(&mut g.wrap_up);
+            let summarise = std::mem::take(&mut g.summarise_first);
+            (wrap, summarise)
+        };
+        if wrap {
             return;
         }
         let (msgs, subs, saved, project) = {
@@ -3057,12 +3689,14 @@ impl Agent {
             Some(r) => {
                 let c = tools::tool_text(&r["content"]);
                 r["is_error"] == true
-                    && (c.starts_with("Sub-agent stopped")
+                    && (c.starts_with("Subagent stopped")
+                        // Transcripts saved before the rename carry the old spelling.
+                        || c.starts_with("Sub-agent stopped")
                         || c.starts_with("Interrupted")
                         || c.starts_with("This tool call was interrupted"))
             }
         };
-        // Background sub-agents that were cut off go back to the background.
+        // Background subagents that were cut off go back to the background.
         let defs0 = store::all_agents(&*self.h.settings.read().await, &project);
         for s in subs
             .iter()
@@ -3147,10 +3781,8 @@ impl Agent {
             let mut seen_wt: Option<bool> = None;
             let mut ultra_nudges = 0u32;
             let mut plan_nudges = 0u32;
-            let mut step_limited = false;
-            let mut step_nudges = 0u32;
 
-            // Sub-agents get their own (stable) prefix per run.
+            // Subagents get their own (stable) prefix per run.
             let sub_prefix = match &self.sub {
                 Some(s) => {
                     let (cwd, project, branch, worktree) = {
@@ -3165,7 +3797,7 @@ impl Agent {
                     };
                     let agent_id = format!("ol-{}/{}", self.task_id, s.id);
                     // The same snapshot the main agent's frozen prefix used, so a
-                    // sub-agent's `screenshot` presence matches the parent's.
+                    // subagent's `screenshot` presence matches the parent's.
                     let tg = t.lock().await;
                     let plugins = prefix_plugins(h, &tg).await;
                     drop(tg);
@@ -3196,7 +3828,15 @@ impl Agent {
                     );
                     let mut tl = tools::schemas(Some(&s.def.tools), &plugins);
                     let full_mcp = t.lock().await.mcp_tools.clone();
-                    tl.extend(full_mcp);
+                    // Plugin tools arrive inside this frozen list, so the policy
+                    // filter is applied as they are added rather than where they
+                    // are built: see `plugins::offered_to_sub`.
+                    tl.extend(full_mcp.into_iter().filter(|x| {
+                        super::plugins::offered_to_sub(
+                            &s.def.tools,
+                            x["name"].as_str().unwrap_or(""),
+                        )
+                    }));
                     if self.can_nest().await {
                         tl.extend(tools::schemas(None, &plugins).into_iter().filter(|x| {
                             x["name"] == "task"
@@ -3230,16 +3870,6 @@ impl Agent {
                     return Ok(last_text);
                 }
 
-                if let Some(s) = &self.sub {
-                    if s.def.steps > 0 && tool_uses_total >= s.def.steps && step_nudges == 0 {
-                        step_nudges = 1;
-                        let note = format!("<system-reminder>You have reached the {}-step ceiling for the `{}` agent. Do not start more work. Summarise what you did, what you found, and the remaining steps for the parent agent.</system-reminder>", s.def.steps, s.def.name);
-                        local.push(Message::user_text(note));
-                        self.step("Summarising at the agent step limit".into())
-                            .await;
-                        continue;
-                    }
-                }
                 // ── current settings (can change mid-run) ──
                 let (plan, effort, model, route_id) = {
                     let t = t.lock().await;
@@ -3247,7 +3877,7 @@ impl Agent {
                         .sub
                         .as_ref()
                         .and_then(|s| t.subs.iter().find(|x| x.id == s.id));
-                    // Resolved, not stored: a sub-agent with no model of its own
+                    // Resolved, not stored: a subagent with no model of its own
                     // follows the chat, so swapping the chat reaches the agents
                     // already running as well as the next ones spawned. The depth
                     // comes off the SubInfo we already hold — the task is locked,
@@ -3313,11 +3943,11 @@ impl Agent {
                         h.runtime(&self.task_id).queue.lock().await.extend(wait);
                     }
                 } else if plan {
-                    // A sub-agent in plan mode: its writes are refused by the same
+                    // A subagent in plan mode: its writes are refused by the same
                     // gate, but it has no `exit_plan_mode` to call, so without this it
                     // looks stuck rather than deliberate. Sent every turn, because
                     // plan mode can be switched on mid-run and this is what keeps a
-                    // sub-agent on the read-only path.
+                    // subagent on the read-only path.
                     reminders.push(prompt::plan_sub().into());
                 }
                 let notes: Vec<String> = h
@@ -3343,6 +3973,9 @@ impl Agent {
                     .remove(&self.inbox_key())
                     .unwrap_or_default();
                 let blocks = mid_turn_blocks(&reminders, &steer_blocks, &imgs);
+                // Whether this turn has anything new to read at all: the guard
+                // below needs to know before the blocks are moved into history.
+                let fresh = !blocks.is_empty();
                 if !blocks.is_empty() {
                     if self.is_main() {
                         let mut t = t.lock().await;
@@ -3363,6 +3996,29 @@ impl Agent {
                 };
                 if messages.is_empty() {
                     return Ok(String::new());
+                }
+                // Nothing new to read, and the model already had the last word:
+                // there is nothing to ask it. Every wake is a promise that there
+                // is something for the agent to read — a user message, an answer,
+                // a peer's report — and this is where a stale promise lands: a
+                // note another run already read and answered (a message delivered
+                // while the previous run was finishing, the answer to an
+                // `ask_nonblocking`), or a `spawn_run` that lost a race with the
+                // run it was meant to restart. Sending the request anyway repeats
+                // the previous one verbatim: a wasted call, and, when it fails,
+                // a chat left "running" inside the router's retries, which is
+                // indistinguishable from work in progress.
+                //
+                // Main agent only: a subagent's turn is always a deliberate job
+                // (its own `SpawnRun`-equivalent or a resume), never a wake that
+                // might be stale. `resume` is the one main-agent path that wants
+                // to carry on from an assistant-last history, and it pushes its
+                // own reminder turn first for exactly this reason.
+                if self.is_main()
+                    && !fresh
+                    && messages.last().is_some_and(|m| m.role == "assistant")
+                {
+                    return Ok(last_text);
                 }
 
                 // ── context + budget guards (main agent only) ──
@@ -3442,6 +4098,13 @@ impl Agent {
                     Some(s) => format!("ol-{}-{s}", self.task_id),
                     None => format!("ol-{}", self.task_id),
                 };
+                // Measured from the request we are about to send, and written
+                // with `last_context` below. Main agent only: a subagent's
+                // context is its own, and `last_context` already keeps it out of
+                // the task's field for the same reason.
+                let parts = self
+                    .is_main()
+                    .then(|| context_parts(&system, &tool_defs, &messages));
                 let req = ChatRequest {
                     system,
                     messages,
@@ -3489,11 +4152,11 @@ impl Agent {
                     Err(RouteErr::Refresh) => {
                         // Clear it for whoever is asking, not just the main
                         // agent. `steered` is per *task* and the router reads it
-                        // on the way out of every wait, main agent and sub-agent
-                        // alike — so a sub-agent that found it set rebuilt the
+                        // on the way out of every wait, main agent and subagent
+                        // alike — so a subagent that found it set rebuilt the
                         // identical request, was told to refresh again, and
                         // looped forever: the chat sat at "Working" with a
-                        // sub-agent that could never finish or let go.
+                        // subagent that could never finish or let go.
                         //
                         // Whoever rebuilds consumes the flag, which is the
                         // contract: `drop_undelivered` and the send paths own
@@ -3543,6 +4206,16 @@ impl Agent {
                     match &sid {
                         None => {
                             t.usage.last_context = turn.usage.context();
+                            if let Some(p) = parts {
+                                // Scale to the *prompt* side. `context()` also
+                                // counts the reply this request produced, which
+                                // was not in the prompt that was measured.
+                                t.usage.parts = p.scaled_to(
+                                    turn.usage.input
+                                        + turn.usage.cache_read
+                                        + turn.usage.cache_write,
+                                );
+                            }
                             t.serving = label;
                         }
                         Some(s) => {
@@ -3600,24 +4273,8 @@ impl Agent {
                     // Only notes keep the loop going. Alt-Enter messages deliberately
                     // don't: they asked to wait for this turn to end, and holding the
                     // run open for them would be the opposite of that.
-                    let rt = h.runtime(&self.task_id);
-                    let has_notes = rt
-                        .inbox
-                        .lock()
-                        .await
-                        .get(&self.inbox_key())
-                        .is_some_and(|v| !v.is_empty());
-                    if has_notes {
+                    if self.has_pending_input(h).await {
                         continue;
-                    }
-                    if let Some(sub) = &self.sub {
-                        if sub.def.steps > 0 && tool_uses_total >= sub.def.steps && !step_limited {
-                            step_limited = true;
-                            local.push(Message::user_text(format!("<system-reminder>You have reached the {}-step ceiling for `{}`. Do not start more work; summarise what you did, what remains, and any handoff advice for your parent agent.</system-reminder>", sub.def.steps, sub.def.name)));
-                            self.step("Summarising at the agent step limit".into())
-                                .await;
-                            continue;
-                        }
                     }
                     if turn.stop_reason == "max_tokens" {
                         let nudge = Message::user_text("<system-reminder>Your last response hit the output limit. Continue exactly where you stopped.</system-reminder>");
@@ -3826,7 +4483,13 @@ impl Agent {
                     }
                     if !is_err && matches!(name, "edit_file" | "multi_edit" | "write_file") {
                         if let Some(p) = c["input"]["path"].as_str() {
-                            edited.push(tools::resolve(&cwd, p));
+                            // Remote (SSH) edits run no automatic check
+                            // (`checks::diagnose` returns None for a remote
+                            // cwd), and the `ssh://` string must never become
+                            // a local path here.
+                            if !super::host::is_ssh(&cwd) {
+                                edited.push(tools::resolve(&cwd, p));
+                            }
                         }
                     }
                     if (name == "bash" || name == "shell")
@@ -3849,12 +4512,11 @@ impl Agent {
                         .into_iter()
                         .map(|n| json!({"type": "text", "text": n})),
                 );
-                let msg = Message::user(results);
                 if self.is_main() {
-                    t.lock().await.messages.push(msg);
+                    attach_results(&mut t.lock().await.messages, results);
                     h.save_task(&self.task_id).await;
                 } else {
-                    local.push(msg);
+                    attach_results(&mut local, results);
                     self.save_sub_history(&local).await;
                     if let Some(s) = &self.sub {
                         let n = tool_uses_total;
@@ -4058,7 +4720,7 @@ impl Agent {
     }
 
     /// Compare what the model was last told against the task's current
-    /// assist mode / sub-agent list and produce announcements for anything new.
+    /// assist mode / subagent list and produce announcements for anything new.
     async fn announce_changes(&self) -> Vec<String> {
         let Ok(t) = self.h.task(&self.task_id).await else {
             return vec![];
@@ -4105,16 +4767,17 @@ impl Agent {
         // running chat has them in hand even though the system prompt was built
         // before the user flipped the switch. Announce the change so the rules
         // that govern them arrive with the next turn.
-        let (mem, told_mem) = {
+        let (mem, told_mem, chats, told_chats) = {
             // Task first, settings second — never the other way round. Holding
             // the settings guard across a task-lock await would invert the order
             // the rest of the file uses, and a settings write landing in that
             // window would deadlock the turn.
             let g = t.lock().await;
             let told_mem = g.told.get("memory").and_then(|v| v.as_bool());
+            let told_chats = g.told.get("cross_chat").and_then(|v| v.as_bool());
             drop(g);
             let s = self.h.settings.read().await;
-            (s.memory, told_mem)
+            (s.memory, told_mem, s.cross_chat, told_chats)
         };
         if mem != told_mem.unwrap_or(false) {
             out.push(
@@ -4126,11 +4789,22 @@ impl Agent {
                 .to_string(),
             );
         }
+        if chats != told_chats.unwrap_or(false) {
+            out.push(
+                if chats {
+                    prompt::cross_chat_on_note()
+                } else {
+                    prompt::cross_chat_off_note()
+                }
+                .to_string(),
+            );
+        }
         if !out.is_empty() {
             let mut t = t.lock().await;
             t.told.insert("assist".into(), json!(assist));
             t.told.insert("agents".into(), json!(sig));
             t.told.insert("memory".into(), json!(mem));
+            t.told.insert("cross_chat".into(), json!(chats));
         }
         out
     }
@@ -4222,6 +4896,7 @@ impl Agent {
             };
             let effective_input = pre.updated_input.unwrap_or_else(|| input.clone());
             let blocked = pre.blocked;
+            let tool_started = std::time::Instant::now();
             let (content, is_err): (Value, bool) = if self.cancel.is_cancelled() {
                 (json!("Interrupted by user before this tool ran."), true)
             } else if let Some(b) = blocked {
@@ -4243,8 +4918,11 @@ impl Agent {
             } else if name == "view_image" {
                 let result: Result<Value, String> = async {
                     let path = effective_input["path"].as_str().ok_or("path is required")?;
-                    let resolved = tools::resolve(&cwd, path);
-                    let resolved = resolved.to_string_lossy().into_owned();
+                    let resolved = if super::host::is_ssh(&cwd) {
+                        super::tools_remote::resolve(&cwd, path)?.uri()
+                    } else {
+                        tools::resolve(&cwd, path).to_string_lossy().into_owned()
+                    };
                     self.gate(&name, &effective_input, Some(&resolved)).await?;
                     self.exec_view_image(&effective_input, item_id.as_deref())
                         .await
@@ -4326,47 +5004,33 @@ impl Agent {
             }
             let preview = tools::tool_text(&content);
             self.h.stats.tool_in(&self.task_id, &name, is_err);
+            // Opt-in trace export, off unless a collector is configured. Tool
+            // name, duration and outcome only — never arguments or output, which
+            // is where a secret or a file's contents would end up.
+            crate::trace::tool_call(&crate::trace::ToolCall {
+                tool: &name,
+                duration: tool_started.elapsed(),
+                error: is_err,
+            });
             if let Some(iid) = &item_id {
                 let content_c = content.clone();
                 let preview_c = preview.clone();
                 let denied = preview.starts_with("The user denied")
                     || preview.starts_with("Plan mode is active");
-                let is_image = content.is_array();
                 self.h
                     .patch_in(&self.task_id, self.sub_id(), iid, |it| {
-                        it.data["status"] = json!(if denied {
-                            "denied"
-                        } else if is_err {
-                            "error"
-                        } else {
-                            "ok"
-                        });
-                        if it.data["output"].is_null() {
-                            it.data["output"] =
-                                json!(preview_c.chars().take(20_000).collect::<String>());
-                            // Keep the image bytes out of the text output: the UI
-                            // renders `images` as thumbnails, providers get them
-                            // from the tool_result content array.
-                            if is_image {
-                                if let Some(arr) = content_c.as_array() {
-                                    let uris: Vec<Value> = arr
-                                        .iter()
-                                        .filter(|b| b["type"] == "image")
-                                        .filter_map(|b| {
-                                            let mt = b["source"]["media_type"].as_str()?;
-                                            let data = b["source"]["data"].as_str()?;
-                                            if data.len() > 12_000_000 {
-                                                return None;
-                                            }
-                                            Some(json!(format!("data:{mt};base64,{data}")))
-                                        })
-                                        .collect();
-                                    if !uris.is_empty() {
-                                        it.data["images"] = json!(uris);
-                                    }
-                                }
-                            }
-                        }
+                        update_tool_item_data(
+                            &mut it.data,
+                            &preview_c,
+                            &content_c,
+                            if denied {
+                                "denied"
+                            } else if is_err {
+                                "error"
+                            } else {
+                                "ok"
+                            },
+                        );
                     })
                     .await;
             }
@@ -4376,6 +5040,26 @@ impl Agent {
                 _ => false,
             };
             let mut out = json!({"type": "tool_result", "tool_use_id": id, "content": if empty { json!("(no output)") } else { content }});
+            // Path-scoped rules (`.openleash/rules/*.md`, and `.claude/rules/*.md`
+            // for interop): a rule that names the paths it applies to is injected
+            // when the agent touches one of them, and never otherwise. It rides on
+            // the tool result rather than in the system prompt, which is what keeps
+            // the frozen prefix — and its cache — byte-stable, and it is
+            // name-sorted by the module that builds it so the bytes are stable too.
+            if !is_err {
+                if let Some(path) = effective_input.get("path").and_then(|p| p.as_str()) {
+                    let rules = prompt::path_rules::path_rules_section(&project, path);
+                    if !rules.is_empty() {
+                        match &mut out["content"] {
+                            // A text result gains a second block. Anything else is
+                            // left alone rather than being coerced into a string.
+                            Value::String(s) => *s = format!("{s}\n\n{rules}"),
+                            Value::Array(a) => a.push(json!({"type": "text", "text": rules})),
+                            _ => {}
+                        }
+                    }
+                }
+            }
             if is_err {
                 out["is_error"] = json!(true);
             }
@@ -4390,8 +5074,11 @@ impl Agent {
         let t = self.h.task(&self.task_id).await?;
         let cwd = t.lock().await.cwd_for(self.sub_id()).0;
         let raw = input["path"].as_str().ok_or("path is required")?;
+        if super::host::is_ssh(&cwd) {
+            return self.remote_view_image(&cwd, raw, item_id).await;
+        }
         let p = tools::resolve(&cwd, raw);
-        // Sub-agents: view_image is read-only, allowed for every tool policy.
+        // Subagents: view_image is read-only, allowed for every tool policy.
         self.step(format!(
             "Viewing {}",
             permissions::short(&p.to_string_lossy(), &cwd)
@@ -4419,16 +5106,38 @@ impl Agent {
         let mon = input["monitor"].as_u64().map(|m| m as usize);
         self.step("Taking a screenshot".into()).await;
         // Screenshots can take a moment; don't block shutdown.
-        let (img, label) = tools::screenshot(mon)?;
-        let display = format!("screenshot ({label})");
-        self.finish_image(item_id, &display, &img).await;
-        Ok(tools::image_content(&display, &img))
+        let owner = self.pc_owner();
+        let view = super::plugins::view_for(&owner, mon);
+        let shot = tokio::task::spawn_blocking(move || tools::capture(&view, true))
+            .await
+            .map_err(|e| format!("screenshot thread failed: {e}"))??;
+        // Coordinates a model reads off this picture are ones the `computer`
+        // tool can act on, so record its geometry for this chat: a screenshot
+        // that could not be clicked from was half a tool.
+        super::plugins::remember(&owner, &shot);
+        let display = format!("screenshot ({label})", label = shot.label);
+        self.finish_image(item_id, &display, &shot.img).await;
+        let mut content = tools::image_content(&display, &shot.img);
+        content[0]["text"] = json!(super::plugins::shot_line(&shot));
+        Ok(content)
+    }
+
+    /// Which chat's screen geometry this agent reads and writes.
+    ///
+    /// Per agent (`<task>:<sub>`), not per process: coordinates are pixels of
+    /// the picture *that* agent was last shown, so a subagent resolving its
+    /// clicks against the main agent's screenshot — or a chat against another
+    /// chat's — is the same bug as clicking a window nobody chose. Same key
+    /// shape the browser sessions use.
+    fn pc_owner(&self) -> String {
+        format!("{}:{}", self.task_id, self.sub_id().unwrap_or("main"))
     }
 
     /// Computer-use plugin (OpenAI-style): run a batch of actions after approval,
-    /// then return one screenshot of the screen afterwards.
+    /// then return one screenshot of what the batch was working in.
     async fn exec_computer(&self, input: &Value, item_id: Option<&str>) -> Result<Value, String> {
         use super::plugins;
+        let owner = self.pc_owner();
         let (enabled, settle) = {
             let s = self.h.settings.read().await;
             (s.plugins.computer.enabled, s.plugins.computer.settle_ms)
@@ -4440,7 +5149,10 @@ impl Agent {
         let observe = plugins::computer_is_observe(input);
         if !observe {
             if let Some(s) = self.sub.as_ref().filter(|s| s.def.tools == "read_only") {
-                return Err(format!("The {} agent can only take screenshots.", s.def.id));
+                return Err(format!(
+                    "The {} agent can only take screenshots: use the `screenshot` tool.",
+                    s.def.id
+                ));
             }
             self.gate("computer", input, None).await?;
         }
@@ -4484,7 +5196,8 @@ impl Agent {
                 }
             })
         };
-        let (ran, failed) = plugins::computer_act(input.clone(), pc_token.clone()).await;
+        let (ran, failed) =
+            plugins::computer_act(input.clone(), owner.clone(), pc_token.clone()).await;
         watch_pc.abort();
         let _ = watch_pc.await;
         pc_token.cancel();
@@ -4509,15 +5222,36 @@ impl Agent {
             }))
             .await;
         }
-        let shot = tokio::task::spawn_blocking(plugins::computer_shot)
-            .await
-            .map_err(|e| format!("screenshot thread failed: {e}"))??;
+        let shot = {
+            let owner = owner.clone();
+            tokio::task::spawn_blocking(move || plugins::computer_shot(&owner))
+                .await
+                .map_err(|e| format!("screenshot thread failed: {e}"))?
+        };
+        let shot = match shot {
+            Ok(s) => s,
+            // The actions already happened, so a failed look must not throw away
+            // what they did: "N actions ran, then the screenshot failed" is the
+            // difference between "nothing happened" and "something did, go and
+            // see for yourself".
+            Err(e) => {
+                return Err(match &failed {
+                    Some(f) => format!(
+                        "{f} Then the screenshot failed too, so nothing can be confirmed: {e}"
+                    ),
+                    None => format!("{ran} action(s) ran, then the screenshot failed: {e}"),
+                })
+            }
+        };
         let display = format!("screen {}x{}", shot.shot.0, shot.shot.1);
         self.finish_image(item_id, &display, &shot.img).await;
         let mut content = tools::image_content(&display, &shot.img);
         content[0]["text"] = json!(match &failed {
-            Some(e) => format!("{e} ({ran} earlier action(s) ran.) Screen now: {display}."),
-            None => format!("Screen after the actions: {display}."),
+            Some(e) => format!(
+                "{e} ({ran} earlier action(s) ran.) {}",
+                plugins::shot_line(&shot)
+            ),
+            None => format!("After the actions: {}", plugins::shot_line(&shot)),
         });
         self.set_item(item_id, |i| {
             i.data["meta"] = json!(if failed.is_some() {
@@ -4733,6 +5467,18 @@ impl Agent {
             let t = t.lock().await;
             (t.plan, t.cwd_for(self.sub_id()).0, t.project.clone())
         };
+        // A remote write is judged against the root's realpath on the host
+        // (the target arrives realpath'd too; see `runner_remote`), so a
+        // symlinked project folder is still "inside" and a link out of it
+        // is not.
+        let cwd = if super::host::is_ssh(&cwd)
+            && path.is_some()
+            && matches!(name, "edit_file" | "multi_edit" | "write_file")
+        {
+            remote::real_root(&cwd).await?
+        } else {
+            cwd
+        };
         if let Some(s) = &self.sub {
             if let Some(reason) = subagent_file_restriction_denial(&s.def, name, path, &cwd) {
                 return Err(reason);
@@ -4784,6 +5530,59 @@ impl Agent {
                 } else {
                     "edit"
                 };
+                // Reviewer mode: a second model answers this question in the
+                // user's place. Everything that could have decided before Ask
+                // already did — the deny tier, the read-only shortcut, allow
+                // rules, plan mode and the chaining guard all run inside
+                // `permissions::check` — so this only ever fills in for the
+                // click. An `Ask` verdict (no reviewer configured, unreachable
+                // model, prose reply, cancelled run) falls through to the card
+                // below, which is why a broken reviewer costs prompts and never
+                // an unreviewed action.
+                if perm == permissions::REVIEW_PERM {
+                    let verdict = review::classify(
+                        h,
+                        &self.task_id,
+                        &self.cancel,
+                        name,
+                        input,
+                        &cwd,
+                        &project,
+                    )
+                    .await;
+                    let (resolved, feedback) = match verdict {
+                        review::Verdict::Allow => ("reviewer", String::new()),
+                        review::Verdict::Deny(why) => ("deny", why),
+                        // Not a decision: ask the user, exactly as normal.
+                        review::Verdict::Ask => ("", String::new()),
+                    };
+                    if !resolved.is_empty() {
+                        // The reviewer answered, so the run is not blocked and
+                        // the loop counter must not count this as a repeat.
+                        h.runtime(&self.task_id)
+                            .repeats
+                            .lock()
+                            .await
+                            .remove(&repeat_key);
+                        let item = Item::new(
+                            "approval",
+                            title.clone(),
+                            json!({"kind": kind, "tool": name, "title": title, "detail": detail, "reason": reason, "rule": rule, "repeat": false, "resolved": resolved, "feedback": feedback.clone(), "sub": self.sub.as_ref().map(|s| s.def.name.clone())}),
+                        );
+                        h.upsert_item(&self.task_id, item).await;
+                        if resolved == "deny" {
+                            // Final for this call: no rule is written and nothing
+                            // is remembered, so a chained command cannot be waved
+                            // through a second time. Adding an allow rule is the
+                            // user's override, and rules are matched before this.
+                            return Err(format!(
+                                "A reviewer model refused this action and it was not run: {feedback} \
+                                 Don't retry it. Explain what you were trying to do and let the user decide."
+                            ));
+                        }
+                        return Ok(());
+                    }
+                }
                 let item = Item::new(
                     "approval",
                     title.clone(),
@@ -4885,9 +5684,9 @@ impl Agent {
         let path_of = |k: &str| input[k].as_str().map(|p| tools::resolve(&cwd, p));
         // Tool sets are fixed for caching; enforce per-agent limits here.
         if let Some(s) = &self.sub {
-            if name == "artifact_preview" {
+            if name == "artifict_preview" {
                 return Err(format!(
-                    "The {} agent can't use artifact_preview; only the main agent can attach inline previews.",
+                    "The {} agent can't use artifict_preview; only the main agent can attach inline previews.",
                     s.def.id
                 ));
             }
@@ -4897,9 +5696,9 @@ impl Agent {
                     | "multi_edit"
                     | "write_file"
                     | "kill_bash"
-                    | "artifact_create"
-                    | "artifact_revise"
-                    | "artifact_respond"
+                    | "artifict_create"
+                    | "artifict_revise"
+                    | "artifict_respond"
             );
             if (s.def.tools == "read_only" && (writes || name.starts_with("mcp__")))
                 || (s.def.tools == "no_shell" && matches!(name, "bash" | "kill_bash"))
@@ -4915,6 +5714,14 @@ impl Agent {
                 }
             }
         }
+        // A remote (SSH) task: its file tools run on the host. Branched here,
+        // after the per-agent limits above and before any local `Path` is
+        // built from the `ssh://` cwd below.
+        if super::host::is_ssh(&cwd) {
+            if let Some(r) = self.exec_remote(name, input, item_id, &cwd).await {
+                return r;
+            }
+        }
         let path = if matches!(
             name,
             "read_file" | "view_image" | "edit_file" | "multi_edit" | "write_file"
@@ -4922,9 +5729,9 @@ impl Agent {
             Some(path_of("path").ok_or("path is required")?)
         } else if matches!(
             name,
-            "artifact_create" | "artifact_revise" | "artifact_respond"
+            "artifict_create" | "artifict_revise" | "artifict_respond"
         ) {
-            // Artifact storage is rooted at the task's original project, not its
+            // Artifict storage is rooted at the task's original project, not its
             // cwd: the cwd may be an isolated worktree. Reuse that fixed project
             // path for the normal permission gate instead of accepting a model
             // supplied path (or dropping the permission scope entirely).
@@ -4942,9 +5749,9 @@ impl Agent {
                 self.set_item(item_id, |i| i.data["meta"] = json!(format!("{total} lines"))).await;
                 Ok(out)
             }
-            "artifact_preview" => {
+            "artifict_preview" => {
                 self.gate(name, input, None).await?;
-                let preview = tools::validate_artifact_preview(input)?;
+                let preview = tools::validate_artifict_preview(input)?;
                 // The originating tool row becomes a chat-only card only after
                 // complete tool input has passed validation. Streamed input
                 // fragments remain inert draft metadata and never enter a frame.
@@ -4953,69 +5760,71 @@ impl Agent {
                     "kind": preview.kind,
                     "persistence": "session"
                 });
-                self.set_item(item_id, |i| i.data["artifact_card"] = card)
+                self.set_item(item_id, |i| i.data["artifict_card"] = card)
                     .await;
                 Ok("Temporary inline preview attached to this chat.".into())
             }
-            "artifact_list" => {
+            "artifict_list" => {
                 self.gate(name, input, None).await?;
-                let artifacts = crate::artifacts::list(&project)?;
-                serde_json::to_string_pretty(&artifacts).map_err(|e| format!("Could not format artifact list: {e}"))
+                let artificts = crate::artificts::list(&project)?;
+                serde_json::to_string_pretty(&artificts).map_err(|e| format!("Could not format artifict list: {e}"))
             }
-            "artifact_get" => {
+            "artifict_get" => {
                 self.gate(name, input, None).await?;
                 let id = input["id"].as_str().filter(|id| !id.trim().is_empty()).ok_or("id is required")?;
-                let artifact = crate::artifacts::get_for_agent(&project, id)?;
-                serde_json::to_string_pretty(&artifact).map_err(|e| format!("Could not format artifact: {e}"))
+                let artifict = crate::artificts::get_for_agent(&project, id)?;
+                serde_json::to_string_pretty(&artifict).map_err(|e| format!("Could not format artifict: {e}"))
             }
-            "artifact_feedback_list" => {
+            "artifict_feedback_list" => {
                 self.gate(name, input, None).await?;
-                let artifact_id = input["artifact_id"].as_str().filter(|id| !id.trim().is_empty());
-                let feedback = crate::artifacts::feedback_list_for_agent(&project, artifact_id)?;
-                serde_json::to_string_pretty(&feedback).map_err(|e| format!("Could not format artifact feedback: {e}"))
+                let artifict_id = input["artifict_id"].as_str().filter(|id| !id.trim().is_empty());
+                let feedback = crate::artificts::feedback_list_for_agent(&project, artifict_id)?;
+                serde_json::to_string_pretty(&feedback).map_err(|e| format!("Could not format artifict feedback: {e}"))
             }
-            "artifact_create" => {
-                let path = path.as_ref().ok_or("artifact project is required")?;
+            "artifict_create" => {
+                let path = path.as_ref().ok_or("artifict project is required")?;
                 self.gate(name, input, Some(&path.to_string_lossy())).await?;
-                let payload = artifact_input(input)?;
-                let artifact = crate::artifacts::create(&project, payload)?;
-                let agent_view = crate::artifacts::AgentArtifact::from(&artifact);
+                let payload = artifict_input(input)?;
+                let artifict = crate::artificts::create(&project, payload)?;
+                self.h.emit_artifict(&self.task_id, &artifict);
+                let agent_view = crate::artificts::AgentArtifict::from(&artifict);
                 let output = serde_json::to_string_pretty(&agent_view)
-                    .map_err(|e| format!("Could not format artifact: {e}"))?;
+                    .map_err(|e| format!("Could not format artifict: {e}"))?;
                 let card = json!({
-                    "title": artifact.title,
-                    "kind": artifact.kind,
+                    "title": artifict.title,
+                    "kind": artifict.kind,
                     "persistence": "project",
-                    "artifact_id": artifact.id,
-                    "version_id": artifact.current_version_id
+                    "artifict_id": artifict.id,
+                    "version_id": artifict.current_version_id
                 });
-                self.set_item(item_id, |i| i.data["artifact_card"] = card)
+                self.set_item(item_id, |i| i.data["artifict_card"] = card)
                     .await;
                 Ok(output)
             }
-            "artifact_revise" => {
-                let path = path.as_ref().ok_or("artifact project is required")?;
+            "artifict_revise" => {
+                let path = path.as_ref().ok_or("artifict project is required")?;
                 self.gate(name, input, Some(&path.to_string_lossy())).await?;
                 let id = input["id"].as_str().filter(|id| !id.trim().is_empty()).ok_or("id is required")?;
-                let parent = input["parent_version_id"].as_str().filter(|id| !id.trim().is_empty()).ok_or("parent_version_id is required; read the artifact's current_version_id first")?;
-                let payload = artifact_input(input)?;
-                let artifact = crate::artifacts::revise(&project, id, parent, payload)?;
-                let agent_view = crate::artifacts::AgentArtifact::from(&artifact);
+                let parent = input["parent_version_id"].as_str().filter(|id| !id.trim().is_empty()).ok_or("parent_version_id is required; read the artifict's current_version_id first")?;
+                let payload = artifict_input(input)?;
+                let artifict = crate::artificts::revise(&project, id, parent, payload)?;
+                self.h.emit_artifict(&self.task_id, &artifict);
+                let agent_view = crate::artificts::AgentArtifict::from(&artifict);
                 let output = serde_json::to_string_pretty(&agent_view)
-                    .map_err(|e| format!("Could not format artifact: {e}"))?;
+                    .map_err(|e| format!("Could not format artifict: {e}"))?;
                 let card = json!({
-                    "title": artifact.title,
-                    "kind": artifact.kind,
+                    "title": artifict.title,
+                    "kind": artifict.kind,
                     "persistence": "project",
-                    "artifact_id": artifact.id,
-                    "version_id": artifact.current_version_id
+                    "artifict_id": artifict.id,
+                    "version_id": artifict.current_version_id
                 });
-                self.set_item(item_id, |i| i.data["artifact_card"] = card)
+                self.set_item(item_id, |i| i.data["artifict_card"] = card)
                     .await;
                 Ok(output)
             }
-            "artifact_respond" => {
-                let path = path.as_ref().ok_or("artifact project is required")?;
+            "artifict_respond" => {
+                let path = path.as_ref().ok_or("artifict project is required")?;
                 self.gate(name, input, Some(&path.to_string_lossy())).await?;
                 let feedback_id = input["feedback_id"].as_str().filter(|id| !id.trim().is_empty()).ok_or("feedback_id is required")?;
                 let decision = input["decision"].as_str().ok_or("decision is required")?;
@@ -5024,15 +5833,16 @@ impl Agent {
                 }
                 // This tool can only address a handoff the user explicitly
                 // submitted. Do not let a guessed id expose or modify draft feedback.
-                let submitted = crate::artifacts::feedback_list_for_agent(&project, None)?;
+                let submitted = crate::artificts::feedback_list_for_agent(&project, None)?;
                 if !submitted.iter().any(|f| f.id == feedback_id) {
                     return Err("That feedback is not available to the agent; only user-submitted feedback can be answered.".into());
                 }
                 let response = input["response"].as_str().ok_or("response is required")?;
-                let artifact = crate::artifacts::feedback_respond(&project, feedback_id, decision, response)?;
-                let agent_view = crate::artifacts::AgentArtifact::from(&artifact);
+                let artifict = crate::artificts::feedback_respond(&project, feedback_id, decision, response)?;
+                self.h.emit_artifict(&self.task_id, &artifict);
+                let agent_view = crate::artificts::AgentArtifict::from(&artifict);
                 serde_json::to_string_pretty(&agent_view)
-                    .map_err(|e| format!("Could not format artifact: {e}"))
+                    .map_err(|e| format!("Could not format artifict: {e}"))
             }
             "tool_search" if self.is_main() => {
                 let task = self.h.task(&self.task_id).await?;
@@ -5103,6 +5913,7 @@ impl Agent {
             }
             "edit_file" | "multi_edit" | "write_file" => {
                 let p = path_of("path").ok_or("path is required")?;
+                tools::local_guard(&p)?;
                 let key = tools::path_key(&p);
                 let exists = p.exists();
                 // Read-before-write + staleness: never clobber what the model hasn't seen.
@@ -5172,8 +5983,34 @@ impl Agent {
                     return Err("Interrupted by user before this tool ran.".into());
                 }
                 self.step(desc).await;
+                // A docker workspace runs commands in its container: start (or
+                // build) it first, showing progress on this row, since the
+                // first command after an idle stop can take a few seconds and a
+                // first build several minutes.
+                let denv = t.lock().await.docker.clone();
+                if let Some(denv) = &denv {
+                    let (h2, tid) = (self.h.clone(), self.task_id.clone());
+                    let (sub, iid) = (self.sub_id().map(String::from), item_id.map(String::from));
+                    let progress = move |line: &str| {
+                        let Some(iid) = iid.clone() else { return };
+                        let (h2, tid, sub, line) = (h2.clone(), tid.clone(), sub.clone(), line.chars().take(200).collect::<String>());
+                        tokio::spawn(async move { h2.patch_in(&tid, sub.as_deref(), &iid, |i| i.data["meta"] = json!(line)).await });
+                    };
+                    // Boxed, like every docker future here: this match is inlined into
+                    // the tool-dispatch state machine, which nested subagents stack on
+                    // top of each other, and an inline container start was enough to
+                    // overflow a worker thread's stack in debug builds.
+                    let auto_rebuild = h.settings.read().await.docker_auto_rebuild;
+                    Box::pin(super::docker::ensure_running_with_rebuild(&self.task_id, denv, auto_rebuild, &progress)).await.map_err(|e| format!("The task's container isn't available: {e}"))?;
+                    self.h.emit_container(&self.task_id).await;
+                    super::docker::touch(&self.task_id);
+                }
                 if input["run_in_background"].as_bool().unwrap_or(false) {
-                    let id = h.bg.spawn(&self.task_id, &cmd, &cwd)?;
+                    let id = match &denv {
+                        Some(denv) => h.bg.spawn_docker(denv, &self.task_id, &cmd, &cwd)?,
+                        None if super::host::is_ssh(&cwd) => h.bg.spawn_remote(&self.task_id, &cmd, &cwd).await?,
+                        None => h.bg.spawn(&self.task_id, &cmd, &cwd)?,
+                    };
                     self.h.emit(&self.task_id, "bg", json!(h.bg.list(&self.task_id)));
                     if let Some(job) = h.bg.get(&id) {
                         let (h2, tid) = (self.h.clone(), self.task_id.clone());
@@ -5211,8 +6048,10 @@ impl Agent {
                 // A guard, not a bare add/sub pair: if this future is dropped while
                 // the command runs (an aborted turn, a cancelled batch) a trailing
                 // fetch_sub never executes, and the leaked count reads as "waiting on
-                // 1 command to finish" for the rest of the session.
-                let fg_guard = FgGuard::new(rt.clone());
+                // 1 command to finish" for the rest of the session. It republishes
+                // the count on the way out too, so the banner stops naming a command
+                // the moment it stops existing.
+                let fg_guard = FgGuard::new(self.h.clone(), &self.task_id);
                 self.h.refresh_busy(&self.task_id).await;
                 // The row is the only place the UI can tell a command that is still
                 // executing from a turn the pause has frozen. A pause blocks at the
@@ -5223,11 +6062,20 @@ impl Agent {
                 // so the transcript says "paused" about a process that is plainly
                 // still going. Cleared below, and by `exec` on the way out.
                 self.set_item(item_id, |i| i.data["exec"] = json!(true)).await;
-                let r = super::shell::run(&cmd, &cwd, timeout, &tok).await;
-                drop(fg_guard);
+                let r = match &denv {
+                    Some(denv) => Box::pin(super::shell::run_docker(denv, &cmd, &cwd, timeout, &tok)).await,
+                    None if super::host::is_ssh(&cwd) => super::shell::run_remote(&cmd, &cwd, timeout, &tok).await,
+                    None => super::shell::run(&cmd, &cwd, timeout, &tok).await,
+                };
+                if denv.is_some() {
+                    super::docker::touch(&self.task_id);
+                }
                 watch.abort();
+                // Clear the row's live mark before handing the count back: the row
+                // and the banner are saying the same fact, and this is the one place
+                // both stop saying it.
                 self.set_item(item_id, |i| i.data["exec"] = json!(false)).await;
-                self.h.refresh_busy(&self.task_id).await;
+                fg_guard.release().await;
                 let r = r?;
                 let forced = r.interrupted && force.is_cancelled() && !self.cancel.is_cancelled();
                 let meta = if r.timed_out { "timed out".into() } else if forced { "force paused".into() } else if r.interrupted { "interrupted".into() } else { format!("exit {}", r.code.map(|c| c.to_string()).unwrap_or("?".into())) };
@@ -5318,8 +6166,27 @@ impl Agent {
             }
             "list_agents" => self.list_agents().await,
             "send_message" => self.send_message(input).await,
+            // Other chats. Main agent only: a chat's main agent is the one with
+            // the wider view, and a fan-out of subagents each messaging other
+            // conversations is not something a brief asks for. The gate comes
+            // first, so a deny rule on `message_chat` still wins over the
+            // setting — and `list_chats` is genuinely a read, but it reads
+            // *other conversations*, so it is checked even though it cannot
+            // change one.
+            "list_chats" if self.is_main() => {
+                self.gate(name, input, None).await?;
+                super::chats::list(&self.h, &self.task_id, input).await
+            }
+            "list_chats" => Err("Only the main agent can look at other chats.".into()),
+            "message_chat" if self.is_main() => {
+                self.gate(name, input, None).await?;
+                super::chats::send(&self.h, &self.task_id, input).await
+            }
+            "message_chat" => {
+                Err("Only the main agent can message another chat; ask it to pass your message on.".into())
+            }
             "wait" => self.wait_for(input).await,
-            // Park the task on a trigger. Only the main agent: a sub-agent that
+            // Park the task on a trigger. Only the main agent: a subagent that
             // parks would leave its parent waiting on a `task` result that never
             // comes, which is a hang dressed as a feature.
             "wait_for_event" if self.is_main() => self.wait_for_event(input).await,
@@ -5350,7 +6217,7 @@ impl Agent {
     /// user turned this on, and the user hasn't claimed the name themselves.
     async fn set_title(&self, input: &Value) -> Result<String, String> {
         if !self.is_main() {
-            return Err("Only the main agent names the chat; sub-agents don't.".into());
+            return Err("Only the main agent names the chat; subagents don't.".into());
         }
         let raw: String = input["title"]
             .as_str()
@@ -5859,10 +6726,7 @@ impl Agent {
                 .lock()
                 .await
                 .get(&self.inbox_key())
-                .is_some_and(|v| {
-                    v.iter()
-                        .any(|n| !n.starts_with("<kind:") || n.contains(MAIL_KINDS))
-                });
+                .is_some_and(|v| v.iter().any(|n| wakes_wait(n, self.is_main())));
             if finished || timed_out || has_mail {
                 let mut out = String::new();
                 let finished_subs: Vec<SubInfo> = {
@@ -5912,7 +6776,7 @@ impl Agent {
                     ));
                 }
                 if has_mail && !finished {
-                    out.insert_str(0, "Stopped waiting: another agent sent you a message (below). Call wait again afterwards if you still need to.\n\n");
+                    out.insert_str(0, "Stopped waiting: a message arrived for you (below). Call wait again afterwards if you still need to.\n\n");
                 } else if timed_out && !finished {
                     out.insert_str(0, "Timed out waiting.\n\n");
                 }
@@ -6034,10 +6898,12 @@ impl Agent {
             json!({"questions": qs, "title": input["title"], "intro": input["intro"]}),
         );
         self.h.upsert_item(&self.task_id, item).await;
-        (self.h.bus)(
-            "ol://attention",
-            json!({"task_id": self.task_id, "kind": "nonblocking"}),
-        );
+        self.h
+            .attention(
+                &self.task_id,
+                json!({"task_id": self.task_id, "kind": "nonblocking"}),
+            )
+            .await;
         let asked: Vec<String> = qs
             .iter()
             .map(|q| q["question"].as_str().unwrap_or("").to_string())
@@ -6078,10 +6944,12 @@ impl Agent {
         );
         let id = item.id.clone();
         self.h.deliver_user_notice(&self.task_id, item).await?;
-        (self.h.bus)(
-            "ol://attention",
-            json!({"task_id": self.task_id, "kind": "notice", "item_id": id}),
-        );
+        self.h
+            .attention(
+                &self.task_id,
+                json!({"task_id": self.task_id, "kind": "notice", "item_id": id}),
+            )
+            .await;
         Ok(format!(
             "Delivered informational notice {id} to the app; not waiting for a response. \
              It remains available until the user dismisses it. Delivery does not confirm \
@@ -6089,11 +6957,11 @@ impl Agent {
         ))
     }
 
-    /// A sub-agent's question: the main agent answers from its context first
+    /// A subagent's question: the main agent answers from its context first
     /// (a side request on its cached prefix — its own history is untouched);
     /// if it can't, the question goes to the user unless assist mode is `necessary`.
     async fn sub_ask(&self, input: &Value) -> Result<String, String> {
-        let s = self.sub.as_ref().ok_or("not a sub-agent")?;
+        let s = self.sub.as_ref().ok_or("not a subagent")?;
         let question = input["question"]
             .as_str()
             .filter(|q| !q.trim().is_empty())
@@ -6129,13 +6997,13 @@ impl Agent {
         self.step("Waiting on the main agent".into()).await;
 
         let ask = format!(
-            "<system-reminder>Your sub-agent `{}` (working on: {}) asks you a question. Answer it from what you know about the user's intent and this conversation. Reply with the answer only, in plain text, and don't call tools. If you genuinely don't know and it's the user's call, reply with exactly `ASK_USER` on the first line, then the question rephrased for the user.</system-reminder>\n\nQuestion: {question}{}{}",
+            "<system-reminder>Your subagent `{}` (working on: {}) asks you a question. Answer it from what you know about the user's intent and this conversation. Reply with the answer only, in plain text, and don't call tools. If you genuinely don't know and it's the user's call, reply with exactly `ASK_USER` on the first line, then the question rephrased for the user.</system-reminder>\n\nQuestion: {question}{}{}",
             s.def.id,
             t.lock().await.subs.iter().find(|x| x.id == s.id).map(|x| x.task.clone()).unwrap_or_default(),
             if context.is_empty() { String::new() } else { format!("\nContext: {context}") },
             if options.is_empty() { String::new() } else { format!("\nOptions: {}", options.join(" / ")) },
         );
-        // Main's pending tool calls (this sub-agent among them) get placeholder results so the side request is valid.
+        // Main's pending tool calls (this subagent among them) get placeholder results so the side request is valid.
         fix_dangling(&mut messages);
         if let Some(last) = messages.last_mut() {
             if last.role == "user" {
@@ -6365,11 +7233,27 @@ impl Agent {
 
     async fn exit_plan(&self, input: &Value) -> Result<String, String> {
         let plan = input["plan"].as_str().unwrap_or("").to_string();
-        let item = Item::new(
-            "approval",
-            "Ready to implement this plan?",
-            json!({"kind": "plan", "title": "Ready to implement this plan?", "detail": plan, "reason": "Approving turns plan mode off."}),
-        );
+        // The plan is filed against the project *before* the user is asked to
+        // accept it: what they approve has to be readable outside this
+        // transcript, and refining it has to revise that same record rather
+        // than pile up near-identical plans. This is the harness recording the
+        // proposal it is already showing, not a write the agent found a way to
+        // make — plan mode still refuses the agent's own `artifict_create`.
+        let saved = self.h.save_plan_artifict(&self.task_id, &plan).await;
+        let mut data = json!({
+            "kind": "plan",
+            "title": "Ready to implement this plan?",
+            "detail": plan,
+            "reason": "Approving turns plan mode off."
+        });
+        if let Some(artifict) = &saved {
+            data["plan_artifict"] = json!({
+                "id": artifict.id,
+                "version_id": artifict.current_version_id,
+                "title": artifict.title
+            });
+        }
+        let item = Item::new("approval", "Ready to implement this plan?", data);
         let id = item.id.clone();
         self.h.upsert_item(&self.task_id, item).await;
         let r = self
@@ -6400,14 +7284,26 @@ impl Agent {
                 }
             })
             .await;
-        Ok("The user approved the plan. Plan mode is off — implement it now, tracking progress with todo_write.".into())
+        // Where the plan went is worth saying out loud: an agent that doesn't
+        // know it is already a project artifict tends to create a second copy of
+        // it, and the user then has two plans to reconcile.
+        let filed = match &saved {
+            Some(a) => format!(
+                " Your plan is saved as the project artifict “{}” — revise that record as you build on it.",
+                a.title
+            ),
+            None => String::new(),
+        };
+        Ok(format!(
+            "The user approved the plan. Plan mode is off — implement it now, tracking progress with todo_write.{filed}"
+        ))
     }
 
     async fn spawn_sub(&self, input: &Value, call_id: &str) -> Result<String, String> {
         let t = self.h.task(&self.task_id).await?;
         let snapshot = t.lock().await.clone();
         if !snapshot.subagents || snapshot.agents.is_empty() {
-            return Err("Sub-agents are turned off for this task. Do the work yourself.".into());
+            return Err("Subagents are turned off for this task. Do the work yourself.".into());
         }
         let want = input["subagent_type"]
             .as_str()
@@ -6416,7 +7312,7 @@ impl Agent {
         let defs = allowed_agents(&self.h, &snapshot).await;
         let def = defs.iter().find(|d| d.id == want).cloned().ok_or_else(|| {
             format!(
-                "`{want}` isn't an available sub-agent. Use one of: {}.",
+                "`{want}` isn't an available subagent. Use one of: {}.",
                 defs.iter()
                     .map(|d| d.id.as_str())
                     .collect::<Vec<_>>()
@@ -6437,7 +7333,7 @@ impl Agent {
         // A per-layer fanout cap is this agent's own limit on live children.
         let fanout = layer_fanout(x, self.depth().await);
 
-        // ULTRATHREAD X: a sub-agent runs on the ladder's model for its depth,
+        // ULTRATHREAD X: a subagent runs on the ladder's model for its depth,
         // which beats the agent type's own model — the layer is the bigger decision.
         let layer = x.and_then(|x| x.layer(depth));
         // Store a model on the new agent only when it is this *agent's* to choose:
@@ -6617,7 +7513,7 @@ impl Agent {
                 )
                 .await;
         }
-        // Images the parent hands over: the sub-agent sees them directly.
+        // Images the parent hands over: the subagent sees them directly.
         // Without this the brief's "see the screenshot" is a dead end — it has
         // no way to reach an image that only exists in the parent's context.
         let mut images: Vec<Value> = vec![];
@@ -6683,11 +7579,19 @@ impl Agent {
                 def.id
             ));
         }
-        self.drive_sub(sid, def, iid, init, parent, self.cancel.child_token())
+        let role = def.id.clone();
+        match self
+            .drive_sub(sid.clone(), def, iid, init, parent, self.cancel.child_token())
             .await
+        {
+            // Stopped on purpose: say so plainly, so the main agent doesn't read it
+            // as a crash and relaunch the same job.
+            Err(e) if e == SUB_STOPPED => Ok(stopped_by_user_note(&role, &sid)),
+            r => r,
+        }
     }
 
-    /// Run a sub-agent detached from the current turn; its report arrives as a note.
+    /// Run a subagent detached from the current turn; its report arrives as a note.
     fn launch_background(
         &self,
         sid: String,
@@ -6727,22 +7631,22 @@ impl Agent {
             };
             let note = format!("<system-reminder>Your background `{}` subagent (id `{sid}`) {label}. Its report:</system-reminder>\n{body}", def.id);
             match parent {
-                // Nested: the launching sub-agent picks it up on its next request.
+                // Nested: the launching subagent picks it up on its next request.
                 Some(p) => me.h.note(&me.task_id, &p, Kinded::agent(&note).0).await,
                 None => deliver_to_main(&me.h, &me.task_id, note).await,
             }
         });
     }
 
-    /// Continue a sub-agent that already exists, in its own context: it keeps
+    /// Continue a subagent that already exists, in its own context: it keeps
     /// everything it found, so a follow-up doesn't have to re-brief anyone.
     async fn resume_sub(&self, input: &Value) -> Result<String, String> {
         let t = self.h.task(&self.task_id).await?;
         if !t.lock().await.subagents {
-            return Err("Sub-agents are turned off for this task. Do the work yourself.".into());
+            return Err("Subagents are turned off for this task. Do the work yourself.".into());
         }
         // Read fresh: a coordinator that launched children seconds ago holds an
-        // older copy of this task, and its sub-agents aren't in that one.
+        // older copy of this task, and its subagents aren't in that one.
         let (s, snapshot) = {
             let g = t.lock().await;
             let s = g
@@ -6826,7 +7730,7 @@ impl Agent {
         });
         // Claim it and take its history in one atomic step: between reading the
         // task and marking it running, anything (the user, another agent) could
-        // have started the same sub-agent, and two runs would then share one
+        // have started the same subagent, and two runs would then share one
         // transcript.
         let init = t.lock().await.try_resume_sub(&id, self.sub_id(), &note);
         let Some(init) = init else {
@@ -6885,11 +7789,12 @@ impl Agent {
             .await;
         Ok(match report {
             Ok(r) => format!("`{}` (id `{id}`) finished. Report:\n{r}", s.role),
+            Err(e) if e == SUB_STOPPED => stopped_by_user_note(&s.role, &id),
             Err(e) => e,
         })
     }
 
-    /// Check on (or wait for) a sub-agent by id.
+    /// Check on (or wait for) a subagent by id.
     async fn task_status(&self, input: &Value) -> Result<String, String> {
         let id = input["id"].as_str().ok_or("id is required")?.to_string();
         let wait = input["wait"].as_bool().unwrap_or(false);
@@ -6939,8 +7844,48 @@ impl Agent {
         }
     }
 
-    /// Run (or continue) a sub-agent from `init` and record how it ended. `parent`
-    /// is the sub-agent whose transcript holds its pill (None = the main timeline).
+    /// Run a subagent's loop on a task of its own, so nesting cannot stack polls.
+    ///
+    /// The bug this exists for: ultrathread lets a subagent launch its own
+    /// subagents, and every level used to be polled *inside* its parent's poll.
+    /// `run_loop` and `exec` are boxed, so the big state machines live on the
+    /// heap — but a boxed future is still *polled* from the caller's stack, and
+    /// the frames between two subagents are what add up: `exec_inner`'s match
+    /// builds each call's items and JSON on the stack, three levels deep was
+    /// enough to overflow a 2 MB worker, and the app's own workers have the same
+    /// 2 MB. It showed up as `ultrathread_nests_subagents` dying with
+    /// STATUS_STACK_OVERFLOW once the frames around it grew.
+    ///
+    /// A task per level gives each one its own stack, so the arithmetic stops
+    /// depending on depth — which also means a future change to `ULTRA_MAX_DEPTH`
+    /// cannot walk into the same wall.
+    ///
+    /// The guard keeps the one property the inline await had that plain
+    /// `tokio::spawn` would lose: if this future is dropped mid-run — the parent's
+    /// task is aborted, a `select!` gives up — the subagent's task is aborted
+    /// with it instead of being left running detached. Cancelling the parent's
+    /// token still stops the child the way it always did, because the child's
+    /// token is a child of the parent's.
+    async fn run_sub_on_own_stack(child: Agent, init: Vec<Message>) -> Result<String, String> {
+        let handle = tokio::spawn(async move { child.run_loop(Some(init)).await });
+        let mut guard = AbortOnDrop(Some(handle));
+        let joined = guard
+            .0
+            .as_mut()
+            .expect("the handle is held until this function returns")
+            .await;
+        match joined {
+            Ok(res) => res,
+            // A panicking subagent used to take its parent's turn down with it.
+            // Reported as a failed subagent instead: the other subagents and the
+            // rest of the turn carry on, and the parent says what happened.
+            Err(e) if e.is_panic() => Err(format!("The subagent panicked: {e}")),
+            Err(e) => Err(format!("The subagent's run ended without a result: {e}")),
+        }
+    }
+
+    /// Run (or continue) a subagent from `init` and record how it ended. `parent`
+    /// is the subagent whose transcript holds its pill (None = the main timeline).
     async fn drive_sub(
         &self,
         sid: String,
@@ -6950,6 +7895,14 @@ impl Agent {
         parent: Option<String>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
+        // Registered so the user can stop this one agent. Registered before the
+        // run starts, so a Stop pressed the moment it launches still finds it.
+        self.h
+            .runtime(&self.task_id)
+            .sub_cancel
+            .lock()
+            .unwrap()
+            .insert(sid.clone(), cancel.clone());
         self.h
             .update_task(&self.task_id, |t| {
                 if let Some(x) = t.subs.iter_mut().find(|x| x.id == sid) {
@@ -6973,7 +7926,14 @@ impl Agent {
             cancel,
         };
         let started = std::time::Instant::now();
-        let res = child.run_loop(Some(init)).await;
+        // On a task of its own, never inline — see `run_sub_on_own_stack`.
+        let res = Self::run_sub_on_own_stack(child.clone(), init).await;
+        self.h
+            .runtime(&self.task_id)
+            .sub_cancel
+            .lock()
+            .unwrap()
+            .remove(&sid);
         let (hook_project, hook_cwd) = if let Ok(task) = self.h.task(&self.task_id).await {
             let task = task.lock().await;
             (task.project.clone(), task.cwd_for(Some(&sid)).0)
@@ -7024,13 +7984,21 @@ impl Agent {
         if let (Some((cwd, branch, desc)), "done") = (mine, status) {
             let c = cwd.clone();
             let msg = format!("ultrathread: {desc}");
-            let sha = tokio::task::spawn_blocking(move || git::commit(&c, &msg))
+            let outcome = tokio::task::spawn_blocking(move || git::commit_worktree(&c, &msg))
                 .await
-                .ok()
-                .and_then(|r| r.ok());
-            let what = match sha {
-                Some(s) => format!("committed as {s}"),
-                None => "nothing new to commit".to_string(),
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            // The three outcomes are deliberately distinct: a clean tree is
+            // "nothing new to commit", but a *refused* commit (a failing
+            // pre-commit hook, no git identity configured) is a real failure and
+            // has to be named as one — otherwise the fuze agent is told a worker
+            // produced nothing and its change is silently dropped.
+            let what = match outcome {
+                Ok(Some(s)) => format!("committed as {s}"),
+                Ok(None) => "nothing new to commit".to_string(),
+                Err(e) => {
+                    format!("COULD NOT COMMIT ({e}) — its changes are still only in the worktree")
+                }
             };
             report.push_str(&format!("\n\n[Worktree branch `{branch}` ({cwd}): {what}. Merge it into the main checkout with the `fuze` subagent.]"));
         }
@@ -7054,11 +8022,11 @@ impl Agent {
             .await;
         match res {
             Ok(r) => Ok(if r.trim().is_empty() {
-                "(the sub-agent finished without a report)".into()
+                "(the subagent finished without a report)".into()
             } else {
                 r
             }),
-            Err(e) => Err(format!("Sub-agent {status}: {e}")),
+            Err(e) => Err(format!("Subagent {status}: {e}")),
         }
     }
 }
@@ -7201,7 +8169,7 @@ pub fn push_user_blocks(msgs: &mut Vec<Message>, blocks: Vec<Value>) {
 // ───────────────────────────── streaming → UI ─────────────────────────────
 
 /// Turns provider stream events into timeline items (main timeline or a
-/// sub-agent's transcript). Text/thinking stream as deltas; each tool call
+/// subagent's transcript). Text/thinking stream as deltas; each tool call
 /// gets an item as soon as the model starts writing it.
 struct StreamUi {
     h: Arc<Harness>,
@@ -7393,6 +8361,32 @@ impl StreamUi {
     }
 }
 
+/// An image result can populate its readable preview before the common result
+/// updater runs; keep the image thumbnail update independent from that preview.
+fn update_tool_item_data(data: &mut Value, preview: &str, content: &Value, status: &str) {
+    data["status"] = json!(status);
+    if data["output"].is_null() {
+        data["output"] = json!(preview.chars().take(20_000).collect::<String>());
+    }
+    if let Some(arr) = content.as_array() {
+        let uris: Vec<Value> = arr
+            .iter()
+            .filter(|b| b["type"] == "image")
+            .filter_map(|b| {
+                let mt = b["source"]["media_type"].as_str()?;
+                let bytes = b["source"]["data"].as_str()?;
+                if bytes.len() > 12_000_000 {
+                    return None;
+                }
+                Some(json!(format!("data:{mt};base64,{bytes}")))
+            })
+            .collect();
+        if !uris.is_empty() {
+            data["images"] = json!(uris);
+        }
+    }
+}
+
 /// After a turn, attach each tool call's input to its timeline item.
 pub async fn attach_inputs(
     h: &Harness,
@@ -7419,6 +8413,19 @@ fn approve_auto_edits(task: &mut Task) {
 }
 
 #[cfg(test)]
+mod image_result_tests {
+    use super::*;
+    #[test]
+    fn image_attaches_when_preview_already_exists() {
+        let mut data = json!({"output":"Viewed chart.png (image/png, 100 bytes)."});
+        let content = json!([{"type":"text","text":"Viewed chart.png"},{"type":"image","source":{"media_type":"image/png","data":"AQID"}}]);
+        update_tool_item_data(&mut data, "unused", &content, "ok");
+        assert_eq!(data["output"], "Viewed chart.png (image/png, 100 bytes).");
+        assert_eq!(data["images"], json!(["data:image/png;base64,AQID"]));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     // The `test_home` guard must span the whole test to serialize
     // `OPENLEASH_HOME` across tokio tests, so it is deliberately held across
@@ -7426,6 +8433,131 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+
+    /// Stop on one subagent cancels that agent and nothing beside it: its
+    /// sibling and the chat's own run keep going.
+    #[tokio::test]
+    async fn stopping_one_subagent_leaves_its_siblings_running() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tss", "m/x")]);
+        let parent = CancellationToken::new();
+        let (a, b) = (parent.child_token(), parent.child_token());
+        {
+            let rt = h.runtime("tss");
+            let mut map = rt.sub_cancel.lock().unwrap();
+            map.insert("subA".into(), a.clone());
+            map.insert("subB".into(), b.clone());
+        }
+
+        sub_stop(&h, "tss", "subA").await.expect("subA is running");
+        assert!(a.is_cancelled(), "the stopped subagent is cancelled");
+        assert!(!b.is_cancelled(), "its sibling is not");
+        assert!(!parent.is_cancelled(), "the chat's run is not");
+        sub_stop(&h, "tss", "subA")
+            .await
+            .expect("a second press while it winds down is harmless");
+        assert!(sub_stop(&h, "tss", "nobody").await.is_err());
+    }
+
+    /// A subagent that ends, however it ends, leaves the stop registry; and a
+    /// subagent cut off by its own token is recorded as "stopped", not "failed",
+    /// so it can be resumed later.
+    #[tokio::test]
+    async fn a_stopped_subagent_is_recorded_stopped_and_deregistered() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tsd", "m/x")]);
+        let mut t = h.task("tsd").await.unwrap();
+        {
+            let mut g = t.lock().await;
+            g.subs.push(SubInfo {
+                id: "subC".into(),
+                role: "explore".into(),
+                task: "look".into(),
+                status: "running".into(),
+                item_id: "iC".into(),
+                ..Default::default()
+            });
+        }
+        drop(t);
+        let sub = Agent {
+            h: h.clone(),
+            task_id: "tsd".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let res = sub
+            .drive_sub(
+                "subC".into(),
+                store::AgentDef::default(),
+                "iC".into(),
+                vec![Message::user_text("look")],
+                None,
+                cancel,
+            )
+            .await;
+        assert_eq!(res, Err(SUB_STOPPED.to_string()));
+        t = h.task("tsd").await.unwrap();
+        let g = t.lock().await;
+        assert_eq!(g.subs[0].status, "stopped");
+        drop(g);
+        assert!(
+            !h.runtime("tsd").sub_cancel.lock().unwrap().contains_key("subC"),
+            "a finished subagent is no longer registered"
+        );
+        assert!(sub_stop(&h, "tsd", "subC").await.is_err());
+    }
+
+    /// The final check before an agent with no tool calls accepts its own
+    /// answer. A subagent stays `running` through its stop hook, so a message
+    /// sent in that window used to land in the inbox of an agent that had
+    /// already finished: the user saw their message taken and went unanswered.
+    #[tokio::test]
+    async fn a_finishing_agent_still_sees_input_aimed_at_it() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tpi", "m/x")]);
+        let main = Agent {
+            h: h.clone(),
+            task_id: "tpi".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+        let sub = Agent {
+            h: h.clone(),
+            task_id: "tpi".into(),
+            sub: Some(SubCtx {
+                id: "subA".into(),
+                def: store::AgentDef::default(),
+            }),
+            cancel: CancellationToken::new(),
+        };
+        assert!(!main.has_pending_input(&h).await, "nothing sent yet");
+        assert!(
+            !sub.has_pending_input(&h).await,
+            "not the subagent's either"
+        );
+
+        // Input aimed at the subagent only, sent as it finished.
+        h.note("tpi", "subA", Kinded::user("also do this").0).await;
+        assert!(
+            sub.has_pending_input(&h).await,
+            "the subagent's own follow-up keeps it going"
+        );
+        assert!(
+            !main.has_pending_input(&h).await,
+            "the main agent has nothing waiting"
+        );
+
+        // And a photo on its own: the text alone must not end the run.
+        h.note_images("tpi", "subA", vec![("image/png".into(), "AA".into())])
+            .await;
+        assert!(sub.has_pending_input(&h).await);
+    }
 
     #[test]
     fn notify_user_delivers_without_waiting_in_plan_and_disabled_modes() {
@@ -7510,7 +8642,7 @@ mod tests {
         assert_eq!(t.items[1].data["level"], "warning");
         drop(t);
 
-        // Tool declarations are not authority: a fabricated sub-agent call is
+        // Tool declarations are not authority: a fabricated subagent call is
         // refused even for workers with the full tool policy.
         for policy in ["all", "read_only", "no_shell"] {
             let subagent = Agent {
@@ -7628,22 +8760,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_preview_attaches_to_existing_item_without_project_storage() {
+    async fn artifict_preview_attaches_to_existing_item_without_project_storage() {
         use crate::agent::tests::{harness, task};
 
         let home = std::env::temp_dir().join(format!(
-            "openleash-artifact-preview-home-{}",
+            "openleash-artifict-preview-home-{}",
             uuid::Uuid::new_v4()
         ));
         let _home = store::test_home(&home);
         let project = std::env::temp_dir().join(format!(
-            "openleash-artifact-preview-project-{}",
+            "openleash-artifict-preview-project-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&project).unwrap();
         let project_path = project.to_string_lossy().into_owned();
 
-        let mut t = task("artifact-preview", "unused/model");
+        let mut t = task("artifict-preview", "unused/model");
         t.project = project_path;
         t.cwd = project.to_string_lossy().into_owned();
         t.perm = "disabled".into();
@@ -7651,54 +8783,54 @@ mod tests {
         let (h, _events) = harness(store::Settings::default(), vec![t]);
         let agent = Agent {
             h: h.clone(),
-            task_id: "artifact-preview".into(),
+            task_id: "artifict-preview".into(),
             sub: None,
             cancel: CancellationToken::new(),
         };
         let row = Item::new(
             "tool",
             "",
-            json!({"name":"artifact_preview", "status":"running", "tool_use_id":"preview-call"}),
+            json!({"name":"artifict_preview", "status":"running", "tool_use_id":"preview-call"}),
         );
         let row_id = row.id.clone();
-        h.upsert_item("artifact-preview", row).await;
+        h.upsert_item("artifict-preview", row).await;
         let input = json!({"title":"Live preview", "kind":"html", "content":"<h1>Inline</h1>"});
 
         agent
-            .exec_inner("artifact_preview", &input, Some(&row_id), "preview-call")
+            .exec_inner("artifict_preview", &input, Some(&row_id), "preview-call")
             .await
             .expect("temporary preview should be available in plan and disabled modes");
 
-        let task = h.task("artifact-preview").await.unwrap();
+        let task = h.task("artifict-preview").await.unwrap();
         let task = task.lock().await;
         let row = task.items.iter().find(|item| item.id == row_id).unwrap();
-        assert_eq!(row.data["artifact_card"]["title"], "Live preview");
-        assert_eq!(row.data["artifact_card"]["kind"], "html");
-        assert_eq!(row.data["artifact_card"]["persistence"], "session");
-        assert!(row.data["artifact_card"]["artifact_id"].is_null());
-        assert!(!project.join(".openleash/artifacts").exists());
+        assert_eq!(row.data["artifict_card"]["title"], "Live preview");
+        assert_eq!(row.data["artifict_card"]["kind"], "html");
+        assert_eq!(row.data["artifict_card"]["persistence"], "session");
+        assert!(row.data["artifict_card"]["artifict_id"].is_null());
+        assert!(!project.join(".openleash/artificts").exists());
         drop(task);
 
         // attach_inputs runs once the model turn is assembled; it adds the exact
         // source to the same item without replacing its card metadata.
         attach_inputs(
             &h,
-            "artifact-preview",
+            "artifict-preview",
             None,
             &[json!({"type":"tool_use", "id":"preview-call", "input":input})],
             &[("preview-call".into(), row_id.clone())],
         )
         .await;
-        let task = h.task("artifact-preview").await.unwrap();
+        let task = h.task("artifict-preview").await.unwrap();
         let task = task.lock().await;
         let row = task.items.iter().find(|item| item.id == row_id).unwrap();
         assert_eq!(row.data["input"]["content"], "<h1>Inline</h1>");
-        assert_eq!(row.data["artifact_card"]["persistence"], "session");
+        assert_eq!(row.data["artifict_card"]["persistence"], "session");
         drop(task);
 
         let subagent = Agent {
             h: h.clone(),
-            task_id: "artifact-preview".into(),
+            task_id: "artifict-preview".into(),
             sub: Some(SubCtx {
                 id: "worker".into(),
                 def: AgentDef {
@@ -7710,14 +8842,14 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         let error = subagent
-            .exec_inner("artifact_preview", &input, Some(&row_id), "sub-preview")
+            .exec_inner("artifict_preview", &input, Some(&row_id), "sub-preview")
             .await
             .unwrap_err();
         assert!(
             error.contains("only the main agent"),
             "unexpected refusal: {error}"
         );
-        assert!(crate::artifacts::list(&project.to_string_lossy())
+        assert!(crate::artificts::list(&project.to_string_lossy())
             .unwrap()
             .is_empty());
 
@@ -7726,48 +8858,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_mutations_bind_project_path_and_keep_write_policy() {
+    async fn artifict_mutations_bind_project_path_and_keep_write_policy() {
         use crate::agent::tests::{harness, task};
 
         let home = std::env::temp_dir().join(format!(
-            "openleash-artifact-dispatch-home-{}",
+            "openleash-artifict-dispatch-home-{}",
             uuid::Uuid::new_v4()
         ));
         let _home = store::test_home(&home);
         let project = std::env::temp_dir().join(format!(
-            "openleash-artifact-dispatch-project-{}",
+            "openleash-artifict-dispatch-project-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&project).unwrap();
         let project_path = project.to_string_lossy().into_owned();
 
-        let mut t = task("artifact-dispatch", "unused/model");
+        let mut t = task("artifict-dispatch", "unused/model");
         t.project = project_path.clone();
         // Deliberately different in principle: permission checks use the
-        // isolated working directory, but artifact storage uses task.project.
+        // isolated working directory, but artifict storage uses task.project.
         t.cwd = project_path.clone();
         t.perm = "full".into();
         let (h, _events) = harness(store::Settings::default(), vec![t]);
         let agent = Agent {
             h: h.clone(),
-            task_id: "artifact-dispatch".into(),
+            task_id: "artifict-dispatch".into(),
             sub: None,
             cancel: CancellationToken::new(),
         };
         let create = json!({
-            "title":"Dispatch test", "kind":"markdown", "content":"# Artifact",
+            "title":"Dispatch test", "kind":"markdown", "content":"# Artifict",
             "decisions":[], "constraints":[], "code_refs":[]
         });
         let row = Item::new(
             "tool",
             "",
-            json!({"name":"artifact_create", "status":"running", "tool_use_id":"create-call"}),
+            json!({"name":"artifict_create", "status":"running", "tool_use_id":"create-call"}),
         );
         let create_row_id = row.id.clone();
-        h.upsert_item("artifact-dispatch", row).await;
+        h.upsert_item("artifict-dispatch", row).await;
         let created = agent
             .exec_inner(
-                "artifact_create",
+                "artifict_create",
                 &create,
                 Some(&create_row_id),
                 "create-call",
@@ -7776,53 +8908,53 @@ mod tests {
             .expect(
                 "full-access mutation should pass through the normal dispatch and permission gate",
             );
-        let artifact: crate::artifacts::AgentArtifact = serde_json::from_str(&created).unwrap();
-        assert_eq!(artifact.title, "Dispatch test");
+        let artifict: crate::artificts::AgentArtifict = serde_json::from_str(&created).unwrap();
+        assert_eq!(artifict.title, "Dispatch test");
         {
-            let task = h.task("artifact-dispatch").await.unwrap();
+            let task = h.task("artifict-dispatch").await.unwrap();
             let task = task.lock().await;
             let row = task
                 .items
                 .iter()
                 .find(|item| item.id == create_row_id)
                 .unwrap();
-            assert_eq!(row.data["artifact_card"]["title"], artifact.title);
-            assert_eq!(row.data["artifact_card"]["kind"], artifact.kind);
-            assert_eq!(row.data["artifact_card"]["persistence"], "project");
-            assert_eq!(row.data["artifact_card"]["artifact_id"], artifact.id);
+            assert_eq!(row.data["artifict_card"]["title"], artifict.title);
+            assert_eq!(row.data["artifict_card"]["kind"], artifict.kind);
+            assert_eq!(row.data["artifict_card"]["persistence"], "project");
+            assert_eq!(row.data["artifict_card"]["artifict_id"], artifict.id);
             assert_eq!(
-                row.data["artifact_card"]["version_id"],
-                artifact.current_version_id
+                row.data["artifict_card"]["version_id"],
+                artifict.current_version_id
             );
         }
         assert!(project
-            .join(".openleash/artifacts")
-            .join(format!("{}.json", artifact.id))
+            .join(".openleash/artificts")
+            .join(format!("{}.json", artifict.id))
             .is_file());
 
         let private_annotation = "PRIVATE UNSENT REVIEW NOTE: do not disclose";
-        crate::artifacts::annotate(
+        crate::artificts::annotate(
             &project_path,
-            &artifact.id,
-            &artifact.current_version_id,
+            &artifict.id,
+            &artifict.current_version_id,
             private_annotation,
-            Some(json!({"selector": "h1", "target": "Artifact heading"})),
+            Some(json!({"selector": "h1", "target": "Artifict heading"})),
         )
         .unwrap();
 
         let row = Item::new(
             "tool",
             "",
-            json!({"name":"artifact_revise", "status":"running", "tool_use_id":"revise-call"}),
+            json!({"name":"artifict_revise", "status":"running", "tool_use_id":"revise-call"}),
         );
         let revise_row_id = row.id.clone();
-        h.upsert_item("artifact-dispatch", row).await;
+        h.upsert_item("artifict-dispatch", row).await;
         let revised_output = agent
             .exec_inner(
-                "artifact_revise",
+                "artifict_revise",
                 &json!({
-                    "id": artifact.id,
-                    "parent_version_id": artifact.current_version_id,
+                    "id": artifict.id,
+                    "parent_version_id": artifict.current_version_id,
                     "title":"Dispatch test revised", "kind":"markdown", "content":"# Updated",
                     "decisions":[], "constraints":[], "code_refs":[]
                 }),
@@ -7835,24 +8967,24 @@ mod tests {
             !revised_output.contains(private_annotation),
             "the raw tool response must not disclose an unsubmitted annotation"
         );
-        let revised: crate::artifacts::AgentArtifact =
+        let revised: crate::artificts::AgentArtifict =
             serde_json::from_str(&revised_output).unwrap();
         let revised_wire = serde_json::to_string(&revised).unwrap();
         assert_eq!(revised.versions.len(), 2);
         {
-            let task = h.task("artifact-dispatch").await.unwrap();
+            let task = h.task("artifict-dispatch").await.unwrap();
             let task = task.lock().await;
             let row = task
                 .items
                 .iter()
                 .find(|item| item.id == revise_row_id)
                 .unwrap();
-            assert_eq!(row.data["artifact_card"]["title"], revised.title);
-            assert_eq!(row.data["artifact_card"]["kind"], revised.kind);
-            assert_eq!(row.data["artifact_card"]["persistence"], "project");
-            assert_eq!(row.data["artifact_card"]["artifact_id"], revised.id);
+            assert_eq!(row.data["artifict_card"]["title"], revised.title);
+            assert_eq!(row.data["artifict_card"]["kind"], revised.kind);
+            assert_eq!(row.data["artifict_card"]["persistence"], "project");
+            assert_eq!(row.data["artifict_card"]["artifict_id"], revised.id);
             assert_eq!(
-                row.data["artifact_card"]["version_id"],
+                row.data["artifict_card"]["version_id"],
                 revised.current_version_id
             );
         }
@@ -7863,7 +8995,7 @@ mod tests {
             "feedback has not been submitted yet at revision time"
         );
 
-        crate::artifacts::feedback_submit(
+        crate::artificts::feedback_submit(
             &project_path,
             &revised.id,
             &revised.current_version_id,
@@ -7873,12 +9005,12 @@ mod tests {
         )
         .unwrap();
         let feedback_id =
-            crate::artifacts::feedback_list_for_agent(&project_path, Some(&revised.id)).unwrap()[0]
+            crate::artificts::feedback_list_for_agent(&project_path, Some(&revised.id)).unwrap()[0]
                 .id
                 .clone();
         let response_output = agent
             .exec_inner(
-                "artifact_respond",
+                "artifict_respond",
                 &json!({"feedback_id": feedback_id, "decision":"addressed", "response":"Updated the heading."}),
                 None,
                 "respond-call",
@@ -7889,7 +9021,7 @@ mod tests {
             !response_output.contains(private_annotation),
             "the raw tool response must not disclose an unsubmitted annotation"
         );
-        let response: crate::artifacts::AgentArtifact =
+        let response: crate::artificts::AgentArtifict =
             serde_json::from_str(&response_output).unwrap();
         let response_wire = serde_json::to_string(&response).unwrap();
         assert_eq!(response.feedback[0].status, "responded");
@@ -7897,12 +9029,12 @@ mod tests {
         assert!(response.submitted_annotations.is_empty());
         assert!(!response_wire.contains(private_annotation));
 
-        // Plan mode must block every artifact mutation before the backend writes.
-        h.update_task("artifact-dispatch", |t| t.plan = true).await;
+        // Plan mode must block every artifict mutation before the backend writes.
+        h.update_task("artifict-dispatch", |t| t.plan = true).await;
         for (name, input) in [
-            ("artifact_create", create.clone()),
+            ("artifict_create", create.clone()),
             (
-                "artifact_revise",
+                "artifict_revise",
                 json!({
                     "id": revised.id,
                     "parent_version_id": revised.current_version_id,
@@ -7911,7 +9043,7 @@ mod tests {
                 }),
             ),
             (
-                "artifact_respond",
+                "artifict_respond",
                 json!({
                     "feedback_id": "guessed-feedback-id", "decision":"addressed", "response":"Blocked"
                 }),
@@ -7926,13 +9058,13 @@ mod tests {
                 "{name}: unexpected refusal: {error}"
             );
         }
-        assert_eq!(crate::artifacts::list(&project_path).unwrap().len(), 1);
+        assert_eq!(crate::artificts::list(&project_path).unwrap().len(), 1);
 
         // Schemas may be omitted for a read-only worker, but dispatch remains a
         // hard backstop for a replayed/crafted tool call.
         let read_only = Agent {
             h: h.clone(),
-            task_id: "artifact-dispatch".into(),
+            task_id: "artifict-dispatch".into(),
             sub: Some(SubCtx {
                 id: "read-only-worker".into(),
                 def: AgentDef {
@@ -7944,14 +9076,14 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         let error = read_only
-            .exec_inner("artifact_create", &create, None, "readonly-call")
+            .exec_inner("artifict_create", &create, None, "readonly-call")
             .await
             .unwrap_err();
         assert!(
-            error.contains("can't use artifact_create"),
+            error.contains("can't use artifict_create"),
             "unexpected refusal: {error}"
         );
-        assert_eq!(crate::artifacts::list(&project_path).unwrap().len(), 1);
+        assert_eq!(crate::artificts::list(&project_path).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(project);
         let _ = std::fs::remove_dir_all(home);
@@ -8171,6 +9303,174 @@ mod tests {
         assert_eq!(m[4].content[0]["tool_use_id"], "c");
     }
 
+    fn call(ids: &[&str]) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: ids
+                .iter()
+                .map(|id| json!({"type":"tool_use","id":id,"name":"x","input":{}}))
+                .collect(),
+            model: String::new(),
+        }
+    }
+
+    fn res(id: &str, text: &str) -> Value {
+        json!({"type":"tool_result","tool_use_id":id,"content":text})
+    }
+
+    /// Every tool_result sits in the user turn right after its call, once.
+    fn assert_wire_valid(m: &[Message]) {
+        let mut prev_ids: Vec<String> = vec![];
+        let mut seen = std::collections::HashSet::new();
+        for (i, msg) in m.iter().enumerate() {
+            if msg.role == "assistant" {
+                prev_ids = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| b["id"].as_str().map(String::from))
+                    .collect();
+                seen.clear();
+                continue;
+            }
+            for b in &msg.content {
+                if let Some(id) = result_id(b) {
+                    assert!(
+                        i > 0 && m[i - 1].role == "assistant" && prev_ids.iter().any(|x| x == id),
+                        "stray tool_result {id} in message {i}"
+                    );
+                    assert!(seen.insert(id.to_string()), "duplicate tool_result {id}");
+                }
+            }
+        }
+    }
+
+    const CUT: &str = "This tool call was interrupted before it finished (the run was stopped).";
+
+    #[test]
+    fn repairs_results_after_a_mid_tool_user_message() {
+        // The stuck chat: placeholders + the user's message, then the real
+        // results in a second user turn — a 400 on every retry.
+        let mut m = vec![
+            Message::user_text("go"),
+            call(&["a", "b"]),
+            Message::user(vec![
+                res("a", CUT),
+                res("b", CUT),
+                json!({"type":"text","text":"i want that check fully gone"}),
+            ]),
+            Message::user(vec![
+                res("a", "real a"),
+                res("b", "real b"),
+                json!({"type":"text","text":"<system-reminder>note</system-reminder>"}),
+            ]),
+        ];
+        fix_dangling(&mut m);
+        assert_wire_valid(&m);
+        assert_eq!(m.len(), 4, "message count is kept for checkpoints");
+        assert_eq!(m[2].content[0]["content"], "real a");
+        assert_eq!(m[2].content[1]["content"], "real b");
+        assert_eq!(m[2].content[2]["text"], "i want that check fully gone");
+        assert_eq!(m[3].content.len(), 1, "the note survives");
+        // A result with no call at all is dropped.
+        let mut m = vec![
+            Message::user_text("go"),
+            call(&["a"]),
+            Message::user(vec![res("a", "ok")]),
+            Message::user(vec![res("zzz", "orphan")]),
+        ];
+        fix_dangling(&mut m);
+        assert_wire_valid(&m);
+        assert!(m[3].content.is_empty());
+    }
+
+    #[test]
+    fn attach_results_lands_after_its_call() {
+        // Plain case: a push.
+        let mut m = vec![Message::user_text("go"), call(&["a"])];
+        attach_results(
+            &mut m,
+            vec![res("a", "ok"), json!({"type":"text","text":"n"})],
+        );
+        assert_eq!(m.len(), 3);
+        assert_wire_valid(&m);
+        // History grew while the tool ran (user message + placeholder repair).
+        let mut m = vec![
+            Message::user_text("go"),
+            call(&["a"]),
+            Message::user_text("also do this"),
+        ];
+        fix_dangling(&mut m);
+        attach_results(
+            &mut m,
+            vec![res("a", "real"), json!({"type":"text","text":"n"})],
+        );
+        assert_eq!(m.len(), 3);
+        assert_wire_valid(&m);
+        assert_eq!(m[2].content[0]["content"], "real");
+        assert_eq!(m[2].content[1]["text"], "also do this");
+        assert_eq!(m[2].content[2]["text"], "n");
+        // Without a placeholder (no repair ran yet), too.
+        let mut m = vec![
+            Message::user_text("go"),
+            call(&["a"]),
+            Message::user_text("also do this"),
+        ];
+        attach_results(&mut m, vec![res("a", "real")]);
+        assert_wire_valid(&m);
+        assert_eq!(m[2].content[0]["content"], "real");
+    }
+
+    #[test]
+    fn wait_wakes_for_the_users_own_messages() {
+        let user = |s: &str| Kinded::user(s).0;
+        let direct = user("<system-reminder>The user sent you this message directly. Take it into account right away:</system-reminder>\nstop");
+        let steer = user("<system-reminder>The user sent this message while you were working. Take it into account right away:</system-reminder>\nstop");
+        let cast_a = user(&format!("{BROADCAST}</system-reminder>\nfyi"));
+        let cast_b = user(&broadcast_note("fyi"));
+        for main in [true, false] {
+            assert!(wakes_wait(&direct, main));
+            assert!(wakes_wait(&steer, main));
+            assert!(wakes_wait(&Kinded::agent("hi").0, main));
+            assert!(wakes_wait("plain harness note", main));
+            assert_eq!(wakes_wait(&cast_a, main), main, "broadcasts wake only main");
+            assert_eq!(wakes_wait(&cast_b, main), main, "broadcasts wake only main");
+        }
+    }
+
+    #[tokio::test]
+    async fn late_steer_counts_only_the_users_messages() {
+        let push = |rt: &Runtime, key: &str, n: String| {
+            rt.inbox
+                .try_lock()
+                .unwrap()
+                .entry(key.into())
+                .or_default()
+                .push(n)
+        };
+        let rt = Runtime::default();
+        assert!(!late_steer(&rt).await);
+        let bg = "<kind:agent-msg>\nbackground job finished".to_string();
+        push(&rt, "main", bg);
+        assert!(
+            !late_steer(&rt).await,
+            "harness notes don't restart a finished chat"
+        );
+        let user = Kinded::user("also do X").0;
+        push(&rt, "sub1", user.clone());
+        assert!(
+            !late_steer(&rt).await,
+            "a subagent's note is not the main agent's"
+        );
+        push(&rt, "main", user);
+        assert!(late_steer(&rt).await);
+        let rt = Runtime::default();
+        rt.inbox_images
+            .lock()
+            .await
+            .insert("main".into(), vec![("image/png".into(), "AA".into())]);
+        assert!(late_steer(&rt).await, "a photo sent alone counts too");
+    }
+
     #[test]
     fn prunes_old_screenshots_in_bulk() {
         let shot = |i: usize| {
@@ -8220,9 +9520,147 @@ mod tests {
         );
         assert!(
             !n.contains("read_file") && !n.contains("- task"),
-            "finished calls and sub-agents are left out: {n}"
+            "finished calls and subagents are left out: {n}"
         );
         assert!(stop_note(&[Message::user_text("hi")]).contains("No tool calls were cut off"));
+    }
+
+    /// "Summarise and continue" is the middle rung of the three resume choices,
+    /// and the only one that is easy to get wrong: it reports like "wrap up" but
+    /// must carry on like "continue". Its whole reason for existing is that the
+    /// user wanted the status report *and* the work, so it must not set `wrap_up`
+    /// — that flag leaves cut-off subagents stopped and asks for no further work.
+    #[test]
+    fn summarise_and_continue_reports_without_stopping_the_work() {
+        assert_eq!(
+            resume_mode_flags("summarise"),
+            (false, true),
+            "it continues, and it asks for a summary first"
+        );
+        let note = resume_mode_note("summarise");
+        assert!(
+            note.contains("status report") && note.contains("carry on"),
+            "it asks for the report and the work: {note}"
+        );
+        assert!(
+            !note.contains("does NOT want you to continue"),
+            "the report must not read as a stop: {note}"
+        );
+
+        // The two flags are never both set: `wrap` is the mode that stops.
+        assert_eq!(resume_mode_flags("wrap"), (true, false));
+        assert_eq!(resume_mode_flags("continue"), (false, false));
+        // An unknown mode (an older client, or a plain resume) is `continue`.
+        assert_eq!(resume_mode_flags("nonsense"), (false, false));
+    }
+
+    /// Each resume choice must reach the agent as its own instruction, and none of
+    /// them may inherit a previous choice's. A `summarise` left behind after the
+    /// run it described would put "first summarise, then continue" in front of a
+    /// later plain Continue, which is the bug the reminder is read from the task
+    /// (rather than from a stale field) to avoid.
+    #[test]
+    fn each_resume_choice_has_its_own_reminder() {
+        let wrap = resume_reminder(true, false);
+        let summarise = resume_reminder(false, true);
+        let plain = resume_reminder(false, false);
+        assert!(wrap.starts_with("Don't continue"), "{wrap}");
+        assert!(
+            summarise.contains("summarise where things stand") && summarise.contains("continue"),
+            "the middle choice asks for both: {summarise}"
+        );
+        assert_eq!(
+            plain, "Continue the task from where you stopped.",
+            "and nothing else changes the plain continue"
+        );
+        assert_ne!(wrap, summarise);
+        assert_ne!(summarise, plain);
+    }
+
+    /// Tool-use counts are progress metadata, not a reason to force a subagent
+    /// to hand off unfinished work. Old saved ceilings must not revive the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subagents_continue_past_former_step_ceilings() {
+        use crate::agent::tests::{custom, harness, openai_call, openai_ok, task, Mock};
+        let _g = router::ROUTES_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("openleash-sub-steps-{}", std::process::id()));
+        let _home = store::test_home(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fixture.txt"), "temporary test data").unwrap();
+        let mut defs: Vec<_> = store::builtin_agents()
+            .into_iter()
+            .map(|def| {
+                let count = if def.id == "explore" { 26 } else { 61 };
+                (def, count)
+            })
+            .collect();
+        defs.push((store::fuze_agent(), 61));
+        defs.push((
+            serde_json::from_value::<AgentDef>(json!({
+                "id": "legacy", "name": "Legacy", "tools": "read_only", "steps": 1
+            }))
+            .unwrap(),
+            2,
+        ));
+
+        for (def, count) in defs {
+            let m = Mock::start().await;
+            let (cp, key) = custom("sc", &m.base, false);
+            let mut settings = store::Settings::default();
+            settings.custom_providers.push(cp);
+            settings.providers.insert(key.0, key.1);
+            let mut t = task("ts", "sc/m");
+            t.cwd = dir.to_string_lossy().into_owned();
+            t.project = t.cwd.clone();
+            t.subs.push(SubInfo {
+                id: "worker".into(),
+                role: def.id.clone(),
+                depth: 1,
+                status: "running".into(),
+                ..Default::default()
+            });
+            let (h, _events) = harness(settings, vec![t]);
+            for _ in 0..count {
+                m.push(openai_call("read_file", json!({"path": "fixture.txt"})));
+            }
+            m.push(openai_ok("Finished the whole job."));
+            // The old runner requests an additional summary after the final
+            // answer. Keep it finite so the regression fails without retries.
+            m.push(openai_ok("Forced handoff."));
+            let agent = Agent {
+                h: h.clone(),
+                task_id: "ts".into(),
+                sub: Some(SubCtx {
+                    id: "worker".into(),
+                    def: def.clone(),
+                }),
+                cancel: CancellationToken::new(),
+            };
+            let res = agent
+                .run_loop(Some(vec![Message::user_text(
+                    "Read the fixture and finish.",
+                )]))
+                .await;
+            let reqs = m.reqs();
+            assert!(
+                reqs.iter()
+                    .all(|r| !r.body.to_string().contains("step ceiling")),
+                "{} must not receive a forced step-limit handoff",
+                def.id
+            );
+            assert_eq!(res.unwrap(), "Finished the whole job.");
+            assert_eq!(
+                reqs.len(),
+                count + 1,
+                "{} sends no extra summary request",
+                def.id
+            );
+            let t = h.task("ts").await.unwrap();
+            assert_eq!(t.lock().await.subs[0].meta, format!("{count} tool uses"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The model parking a task must end the turn *there*: the tool is the model
@@ -8272,5 +9710,544 @@ mod tests {
         // Tear the (still-parked) task down so its watcher cannot outlive the test.
         stop_tokens(&h, "tp");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A command whose future is dropped partway through — a cancelled batch, an
+    /// aborted turn — never reaches the code after the command, so it never reaches
+    /// the recount that follows it. The guard is what gives the count back, because
+    /// the number is *read* rather than only displayed: the pause banner names it
+    /// ("waiting on N commands to finish") and `has_active_work` refuses to restart
+    /// for an update over it. A count that outlives its command is wrong in both
+    /// places, and nothing else in the chat recounts it until another command runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_command_republishes_the_count_it_was_holding() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tgc", "m1")]);
+        let guard = FgGuard::new(h.clone(), "tgc");
+        h.refresh_busy("tgc").await;
+        assert_eq!(
+            h.task("tgc").await.unwrap().lock().await.busy,
+            1,
+            "the command is in flight and counted"
+        );
+
+        // Dropped, not released: this is the future that was abandoned mid-command.
+        drop(guard);
+        for _ in 0..300 {
+            if h.task("tgc").await.unwrap().lock().await.busy == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            h.task("tgc").await.unwrap().lock().await.busy,
+            0,
+            "the count cannot outlive the command that was holding it"
+        );
+    }
+
+    // ── a subagent's run gets its own task stack ──
+    //
+    // `run_sub_on_own_stack` exists because three levels of nested subagents
+    // used to share one 2 MB worker stack and overflowed it. The behavioural
+    // half of that change is the abort guard: the inline await this replaced
+    // dropped the child's future when it was dropped, and a bare
+    // `tokio::spawn` + `JoinHandle` would not — dropping a handle *detaches*.
+    #[tokio::test]
+    async fn dropping_the_guard_aborts_the_task_it_holds() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            // Never finishes on its own, so the task is only gone if it was
+            // aborted — and the sender goes with it, which is what the receiver
+            // below observes.
+            std::future::pending::<()>().await;
+            let _ = tx.send(());
+        });
+        let guard = AbortOnDrop(Some(handle));
+        drop(guard);
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
+        assert!(
+            waited.is_ok(),
+            "the task must not outlive the guard: a dropped handle would have detached it"
+        );
+        assert!(
+            waited.unwrap().is_err(),
+            "an aborted task drops its future, so nothing is ever sent"
+        );
+    }
+
+    // ── other chats (`list_chats` / `message_chat`) ──
+    //
+    // The feature's own tests live in `reviewer_cross_chat`. These only cover
+    // what needs this module's internals: which arm runs, what a subagent gets
+    // back, and that the frozen prompt and the tool list cannot disagree.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cross_chat_tools_dispatch_and_refuse_a_subagent() {
+        use crate::agent::tests::{harness, task};
+
+        let mut other = task("other", "unused/model");
+        other.title = "Payroll import".into();
+        other.status = "idle".into();
+        let mut me = task("cct", "unused/model");
+        // Full Access, so the message's own permission prompt does not block
+        // this test on an approval nobody is there to answer. That prompt is
+        // pinned by its own test below.
+        me.perm = "turbo".into();
+        let settings = store::Settings {
+            cross_chat: true,
+            ..Default::default()
+        };
+        let (h, _) = harness(settings, vec![me, other]);
+        let main = Agent {
+            h: h.clone(),
+            task_id: "cct".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+
+        let out = main
+            .exec_inner("list_chats", &json!({}), None, "call-list")
+            .await
+            .expect("the main agent can list chats while the switch is on");
+        assert!(out.contains("Payroll import"), "got: {out}");
+
+        // Parked, so the delivery stops at the note: an idle chat would also
+        // start a run, which means a model request this test has no server for.
+        h.runtime("other").wake_state.lock().unwrap().parked = true;
+        let out = main
+            .exec_inner(
+                "message_chat",
+                &json!({"to": "other", "message": "the schema moved to v3"}),
+                None,
+                "call-send",
+            )
+            .await
+            .expect("the main agent can message another chat");
+        assert!(out.contains("Sent to"), "got: {out}");
+        assert!(out.contains("parked"), "got: {out}");
+        assert_eq!(
+            h.runtime_if("other")
+                .unwrap()
+                .inbox
+                .lock()
+                .await
+                .get("main")
+                .map(Vec::len),
+            Some(1),
+            "the note landed in the other chat's inbox"
+        );
+
+        // A subagent is refused on both, and the refusal says who may.
+        let sub = Agent {
+            h: h.clone(),
+            task_id: "cct".into(),
+            sub: Some(SubCtx {
+                id: "w1".into(),
+                def: AgentDef {
+                    id: "general".into(),
+                    tools: "all".into(),
+                    ..Default::default()
+                },
+            }),
+            cancel: CancellationToken::new(),
+        };
+        for name in ["list_chats", "message_chat"] {
+            let err = sub
+                .exec_inner(name, &json!({"to": "other", "message": "hi"}), None, "sub")
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("Only the main agent"),
+                "{name} must be refused for a subagent: {err}"
+            );
+        }
+        // Nothing a subagent sent reached the other chat.
+        assert_eq!(
+            h.runtime_if("other")
+                .unwrap()
+                .inbox
+                .lock()
+                .await
+                .get("main")
+                .map(Vec::len),
+            Some(1),
+            "only the main agent's one message is there"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_chat_message_asks_for_approval_under_the_allowlist_rung() {
+        use crate::agent::tests::answer;
+        use crate::agent::tests::{harness, task};
+
+        // The gate test that would hang under Full Access: this is what makes
+        // messaging another chat need a yes. `list_chats` is a read and must not
+        // prompt, or every planning turn would cost the user a click.
+        let mut other = task("other", "unused/model");
+        other.title = "Elsewhere".into();
+        other.status = "idle".into();
+        let mut me = task("cct2", "unused/model");
+        me.perm = "allowlist".into();
+        let settings = store::Settings {
+            cross_chat: true,
+            ..Default::default()
+        };
+        let (h, _) = harness(settings, vec![me, other]);
+        let agent = Agent {
+            h: h.clone(),
+            task_id: "cct2".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+
+        // The read sails through with no card of any kind.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.exec_inner("list_chats", &json!({}), None, "list"),
+        )
+        .await
+        .expect("list_chats must never wait on the user")
+        .expect("list_chats is read-only, so the allowlist rung allows it");
+        assert!(
+            !h.task("cct2")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .items
+                .iter()
+                .any(|i| i.kind == "approval"),
+            "no approval card was drawn for a read"
+        );
+
+        // The message waits for one, and the card names the tool and the rule.
+        let send = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .exec_inner(
+                        "message_chat",
+                        &json!({"to": "Elsewhere", "message": "look at this"}),
+                        None,
+                        "send",
+                    )
+                    .await
+            }
+        });
+        let card = loop {
+            let found = h
+                .task("cct2")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .items
+                .iter()
+                .find(|i| i.kind == "approval")
+                .cloned();
+            if let Some(c) = found {
+                break c;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(card.data["tool"], "message_chat");
+        assert_eq!(card.data["rule"], "message_chat *");
+        assert!(
+            card.data["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not looking at"),
+            "the card says why it is worth a look: {:?}",
+            card.data["reason"]
+        );
+        // Answer it, and the message goes out.
+        answer(&h, "cct2", &card.id, json!({"decision": "once"})).await;
+        let out = send.await.unwrap().expect("allowed once");
+        assert!(out.contains("Elsewhere"), "got: {out}");
+
+        // Denied, nothing is delivered — the gate is what protects the other
+        // conversation, so it has to actually stop the send.
+        h.runtime_if("other")
+            .unwrap()
+            .wake_state
+            .lock()
+            .unwrap()
+            .parked = true;
+        let before = h
+            .runtime_if("other")
+            .unwrap()
+            .inbox
+            .lock()
+            .await
+            .get("main")
+            .map_or(0, Vec::len);
+        let send = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .exec_inner(
+                        "message_chat",
+                        &json!({"to": "Elsewhere", "message": "second try"}),
+                        None,
+                        "send2",
+                    )
+                    .await
+            }
+        });
+        let card = loop {
+            let found = h
+                .task("cct2")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .items
+                .iter()
+                .rev()
+                .find(|i| i.kind == "approval" && i.data["resolved"].is_null())
+                .cloned();
+            if let Some(c) = found {
+                break c;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        answer(&h, "cct2", &card.id, json!({"decision": "deny"})).await;
+        let err = send.await.unwrap().unwrap_err();
+        assert!(
+            err.contains("Denied") || err.contains("denied"),
+            "got: {err}"
+        );
+        assert_eq!(
+            h.runtime_if("other")
+                .unwrap()
+                .inbox
+                .lock()
+                .await
+                .get("main")
+                .map_or(0, Vec::len),
+            before,
+            "a denied message never reaches the other chat"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cross_chat_tools_stay_declared_and_refuse_while_off() {
+        use crate::agent::tests::{harness, task};
+
+        // The frozen-prefix invariant: the tools are in the list the model is
+        // choosing from whether or not the switch is on (the choice `memory`
+        // makes), and dispatch is what refuses. Otherwise flipping the setting
+        // mid-chat would leave the request's tool list disagreeing with the
+        // cached system prompt that describes it.
+        let (h, _) = harness(
+            store::Settings::default(),
+            vec![task("off1", "unused/model")],
+        );
+        let agent = Agent {
+            h: h.clone(),
+            task_id: "off1".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+        let out = agent
+            .exec_inner("list_chats", &json!({}), None, "call-list")
+            .await
+            .unwrap_err();
+        assert!(out.contains("turned off"), "got: {out}");
+
+        let (sys, _mcp, _plugins) = frozen_prefix(&h, "off1").await.unwrap();
+        assert!(
+            !sys.contains("list_chats") && !sys.contains("message_chat"),
+            "the prompt must not name a capability the switch is off for"
+        );
+        h.settings.write().await.cross_chat = true;
+        let mut t = task("on1", "unused/model");
+        t.id = "on1".into();
+        let (h2, _) = harness(h.settings.read().await.clone(), vec![t]);
+        let (sys, _mcp, _plugins) = frozen_prefix(&h2, "on1").await.unwrap();
+        assert!(
+            sys.contains("list_chats") && sys.contains("message_chat"),
+            "and with it on, both tools and their rules are in the cached block: {sys}"
+        );
+    }
+
+    #[test]
+    fn the_cross_chat_section_carries_the_rules_the_feature_leads_on() {
+        let off = store::Settings::default();
+        let on = store::Settings {
+            cross_chat: true,
+            ..Default::default()
+        };
+        let off_sections = feature_sections(&off);
+        let on_sections = feature_sections(&on);
+        assert!(!off_sections.contains("Other chats"), "got: {off_sections}");
+        assert!(!off_sections.contains("list_chats"));
+        for rule in [
+            "# Other chats",
+            "list_chats",
+            "message_chat",
+            "never as the user speaking",
+            "one-way",
+            "paused",
+            "peer's note",
+        ] {
+            assert!(
+                on_sections.contains(rule),
+                "the section is the only place the model is told any of this, so it must say {rule:?}: {on_sections}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_chat_flip_is_announced_once_with_the_rules() {
+        use crate::agent::tests::{harness, task};
+
+        // The tools are in the frozen list either way, so a running chat has
+        // them in hand whatever the setting says. The announcement is what keeps
+        // the prompt from disagreeing with the tool list.
+        let (h, _) = harness(
+            store::Settings::default(),
+            vec![task("flip", "unused/model")],
+        );
+        let agent = Agent {
+            h: h.clone(),
+            task_id: "flip".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+        assert!(
+            !agent
+                .announce_changes()
+                .await
+                .iter()
+                .any(|n| n.contains("Other chats")),
+            "an untouched default announces nothing"
+        );
+
+        h.settings.write().await.cross_chat = true;
+        let notes = agent.announce_changes().await;
+        let note = notes
+            .iter()
+            .find(|n| n.contains("Other chats"))
+            .expect("turning it on is announced");
+        assert!(note.contains("list_chats") && note.contains("message_chat"));
+        assert!(
+            note.contains("never as the user speaking") && note.contains("peer's note"),
+            "and it carries the rules that govern them: {note}"
+        );
+        assert!(
+            !agent
+                .announce_changes()
+                .await
+                .iter()
+                .any(|n| n.contains("Other chats")),
+            "said once, not every turn"
+        );
+
+        h.settings.write().await.cross_chat = false;
+        let off = agent.announce_changes().await;
+        let note = off
+            .iter()
+            .find(|n| n.contains("Other chats"))
+            .expect("turning it back off is announced too");
+        assert!(
+            note.contains("refuse"),
+            "and says they now refuse, so the model stops calling them: {note}"
+        );
+    }
+
+    /// Plan mode writes nothing to the checkout, so the plan is the deliverable
+    /// — and it has to leave this transcript to be one. The approval card must
+    /// carry the exact record the plan was filed as, and the chat must remember
+    /// which record is its plan so refining it revises rather than duplicates.
+    #[tokio::test]
+    async fn a_proposed_plan_is_filed_as_a_project_artifict_the_card_points_at() {
+        use crate::agent::tests::{harness, task};
+
+        let home = std::env::temp_dir().join(format!("ol-plan-home-{}", crate::agent::new_id()));
+        let project = std::env::temp_dir().join(format!("ol-plan-proj-{}", crate::agent::new_id()));
+        std::fs::create_dir_all(&project).unwrap();
+        let _home = store::test_home(&home);
+
+        let mut t = task("filed", "unused/model");
+        t.project = project.to_string_lossy().into();
+        t.cwd = t.project.clone();
+        t.plan = true;
+        let (h, _) = harness(store::Settings::default(), vec![t]);
+        let agent = Agent {
+            h: h.clone(),
+            task_id: "filed".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+
+        let plan =
+            "# File plans as artificts\n\n1. Save it before asking.\n2. Point the card at it.\n";
+        let input = json!({"plan": plan});
+        let fut = agent.exit_plan(&input);
+        tokio::pin!(fut);
+        // The card is the user's move: answer it the moment it is on screen,
+        // exactly as the IPC command would.
+        let mut answered = false;
+        let rt = h.runtime("filed");
+        let outcome = loop {
+            if !answered {
+                let mut pending = rt.pending.lock().await;
+                if let Some(id) = pending.keys().next().cloned() {
+                    answered = true;
+                    if let Some(tx) = pending.remove(&id) {
+                        let _ = tx.send(json!({"decision": "once"}));
+                    }
+                }
+            }
+            if let std::task::Poll::Ready(r) = futures_util::poll!(&mut fut) {
+                break r;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            answered,
+            "the user must be asked before anything is implemented"
+        );
+        let message = outcome.expect("an approved plan ends plan mode");
+        assert!(message.contains("approved the plan"), "{message}");
+
+        let (item, record, still_planning) = {
+            let task = h.task("filed").await.unwrap();
+            let task = task.lock().await;
+            let item = task
+                .items
+                .iter()
+                .find(|i| i.kind == "approval")
+                .expect("the approval card is in the timeline")
+                .clone();
+            (item, task.plan_artifict.clone(), task.plan)
+        };
+        let saved = &item.data["plan_artifict"];
+        assert_eq!(
+            saved["id"].as_str(),
+            record.as_deref(),
+            "the chat records the plan it filed: {}",
+            item.data
+        );
+        assert!(saved["version_id"].is_string() && saved["title"] == "File plans as artificts");
+        assert_eq!(item.data["detail"].as_str(), Some(plan));
+
+        // Durable and shared: the project's artifict list, not just the card.
+        let listed = crate::artificts::list(&project.to_string_lossy()).unwrap();
+        assert_eq!(listed.len(), 1, "one plan, filed once");
+        assert_eq!(listed[0].id, saved["id"].as_str().unwrap());
+        assert_eq!(listed[0].kind, "markdown");
+        assert_eq!(listed[0].title, "File plans as artificts");
+        assert!(!still_planning, "approving turns plan mode off");
+        assert!(
+            message.contains("File plans as artificts"),
+            "the agent is told where the plan went: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(project);
+        let _ = std::fs::remove_dir_all(home);
     }
 }

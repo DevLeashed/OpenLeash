@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ago, api, baseName, oneLine, type TaskSummary } from "../api";
 import { chatModel, flash, go, modelColor, useStore } from "../store";
-import { sortKey } from "./Chrome";
+import { bySortKey } from "./Chrome";
 import { I, StatusIcon } from "./icons";
 import { Button, Input, Pressable, Tooltip } from "./primitives";
 
@@ -91,12 +91,21 @@ export function Paused() {
   const [picked, setPicked] = useState<Record<string, true>>({});
   // The chat you paused last is at the top: ordered by when the user last acted,
   // the same rule as the sidebar (see `sortKey`).
-  const list = Object.values(tasks)
-    .filter((t) => isPaused(t, pausedAll))
-    .sort((a, b) => sortKey(b) - sortKey(a));
-  const ids = list.map((t) => t.id);
-  // One string, not an array: `ids` is rebuilt every render, so it can never be a
-  // dependency. Its contents are the only thing the effect below cares about.
+  //
+  // Memoized: the sidebar memoizes the identical filter/sort, and this one ran in
+  // the render body, so every task event from every chat re-sorted the whole list
+  // to draw the same rows. The reorder setting is a subscription rather than
+  // something `sortKey` reads off the live store, because inside a memo that read
+  // would not be a dependency and the order could go stale.
+  const automaticReorder = useStore((s) => s.settings?.automatic_chat_reorder !== false);
+  const list = useMemo(() => bySortKey(
+    Object.values(tasks).filter((t) => isPaused(t, pausedAll)),
+    automaticReorder,
+  ), [tasks, pausedAll, automaticReorder]);
+  const ids = useMemo(() => list.map((t) => t.id), [list]);
+  // One string, not the array: the effect below is about *which* chats are on the
+  // list, and a joined string compares by value, so it re-runs only when the
+  // membership actually changes rather than whenever the array identity does.
   const roster = ids.join("|");
   const chosen = ids.filter((id) => picked[id]);
   // `chosen` only ever names chats still on the list, so a tick can't outlive its

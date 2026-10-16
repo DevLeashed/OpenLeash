@@ -25,6 +25,37 @@ export function chord(text: string | undefined): string | undefined {
   return text.replace(/\b(ctrl|shift|alt|cmd)\b\s*/gi, (word) => MAC_MODS[word.toLowerCase()] ?? word);
 }
 
+/** The key that sends a message, if any.
+ *
+ *  `send_with` decides in the window. A phone browser is decided on its own:
+ *  its keyboard is a touch one, so there is no `Ctrl` to press, and its
+ *  on-screen Return key cannot be relied on to report whether `Shift` is held —
+ *  which is the whole reason `phone_enter_sends` exists. `""` means no key
+ *  sends and only the button does, which is where a phone starts.
+ *
+ *  Every box that sends a message asks this, so the composer and the box beside
+ *  a subagent cannot drift apart; getting it wrong is quiet, and it sends the
+ *  messages someone was breaking into paragraphs.
+ */
+export function messageSendKey(phone: boolean, sendWith: string | undefined, phoneEnterSends: boolean | undefined): "" | "Enter" | "Ctrl Enter" {
+  if (phone) return phoneEnterSends === true ? "Enter" : "";
+  return sendWith === "ctrl-enter" ? "Ctrl Enter" : "Enter";
+}
+
+/**
+ * Whether an Enter press in a message box is the send, for a box whose sending
+ * key is `sendKey`.
+ *
+ * `Shift` is never the send — on any keyboard, held it is the newline. When no
+ * key sends, only the `Ctrl Enter` chord can, which a phone has no way to press.
+ * The caller still has to keep the newline when this is false: a box that
+ * "does not send" by eating the key strands the user on one line.
+ */
+export function enterSendsMessage(sendKey: string, e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }): boolean {
+  const mod = e.ctrlKey || e.metaKey;
+  return sendKey === "Enter" ? !e.shiftKey && !mod : mod;
+}
+
 /**
  * True when a key event came from somewhere the user is typing.
  *

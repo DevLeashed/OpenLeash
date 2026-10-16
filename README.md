@@ -10,8 +10,11 @@
 
 # OpenLeash
 
-**A desktop harness for coding agents.**
+**A desktop harness for coding agents, with a permission layer you can trust.**
 
+Run language models against your real machine, with real tools, parallel tasks and a leash on what they can do.
+
+[![CI](https://github.com/DevLeashed/OpenLeash/actions/workflows/ci.yml/badge.svg)](https://github.com/DevLeashed/OpenLeash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/core-Rust-DEA584?logo=rust&logoColor=white)
@@ -21,32 +24,30 @@
 
 ## What is OpenLeash?
 
-OpenLeash is a desktop app that connects a language model to a project on your machine. Through OpenLeash's tools, the model can read files, make edits, run shell commands, search the web, and delegate to subagents. Output streams live, and anything that is not read-only asks for approval first.
+OpenLeash is a desktop app that lets a language model work on your code the way a developer would: it reads files, makes edits, runs shell commands, searches the web, and delegates to subagents. You watch it happen live and you stay in control.
 
-The core is written in Rust (Tauri 2) and the interface in React 19. You bring your own API key; supported providers are listed under [Highlights](#highlights).
+The core is written in Rust (Tauri 2) and the interface in React 19. Bring your own API key for Anthropic, OpenAI, Gemini, OpenRouter, Ollama, and much more.
 
-The agent executes model-authored commands, so the permission layer is security-critical. It is the most heavily tested part of the codebase. See the [security model](docs/security-model.md) for what it does and does not protect against.
+Because the agent executes model-authored commands, **the permission layer is a security feature, not a convenience**. It is the most heavily tested part of the codebase. See the [security model](docs/security-model.md) for exactly what it does and does not protect against.
 
 ## Highlights
 
-- **Tools.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, subagents and more. Each tool's description states when to use it and when not to.
-- **Edits.** Exact-string, unique-match edits. They fail if the agent has not read the file or if the file changed since.
-- **Permission gates.** Read-only commands run without asking. Everything else asks. Allow rules never match chained commands (`&&`, `;`, `|`, `$(...)`, backticks, redirects). Plan mode blocks edits until you approve.
-- **Parallel tasks.** Each task runs in its own **git worktree**, so concurrent agents do not collide. Review and commit per branch.
+- **Small, sharp toolset.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, subagents and more. Each tool says when to use it and when not to.
+- **Safe edits.** Exact-string, unique-match edits. They fail if the agent never read the file or if it changed since.
+- **Permission gates.** Read-only commands run freely. Everything else asks. Allow rules never match chained commands (`&&`, `;`, `|`, `$(...)`, backticks, redirects). Plan mode blocks edits until you approve.
+- **Parallel work.** Run many tasks at once, each in its own **git worktree**, so agents never collide. Review and commit per branch.
 - **Subagents.** Large searches run in a fresh, read-only context to keep the main one clean.
-- **Providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Gemini, OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, LM Studio, vLLM and custom endpoints.
-- **Controls.** A live todo list, mid-turn steering, `Esc` to pause or kill the whole process tree, and a budget cap.
-- **Goal mode.** `/goal <what done looks like>` keeps the agent working until it shows the goal is met.
-- **Extensions.** Skills (`SKILL.md`), MCP servers (stdio and HTTP), hooks, and project memory via `OPENLEASH.md` / `AGENTS.md` / `CLAUDE.md`.
+- **Many providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Gemini, OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, LM Studio, vLLM and custom endpoints.
+- **Stay in the loop.** A live todo list, steering mid-turn, `Esc` to pause or kill the whole process tree, and a budget cap.
+- **Goal mode.** `/goal <what done looks like>` keeps the agent going until it proves it is finished.
+- **Extensible.** Skills (`SKILL.md`), MCP servers (stdio and HTTP), hooks, and project memory via `OPENLEASH.md` / `AGENTS.md` / `CLAUDE.md`.
 - **Review view.** Per-file revert and commit, with or without git.
+- **Remote connectivity.** Drive the app from your phone or another browser (QR/code pairing, full parity), open another machine's OpenLeash over SSH, and work on WSL projects with commands running in the distro. See [docs/remote.md](docs/remote.md).
+- **Docker workspaces.** Next to local and worktree mode, run a task in a private copy of the project with commands in a container built from `.openleash_docker/`. The image rebuilds on change and idle containers stop automatically. See [docs/workspaces.md](docs/workspaces.md).
 - **No telemetry.** Requests go only to the providers and services you use.
 
 The full list is in [docs/features.md](docs/features.md).
 
-## Roadmap
-
-- Remote connectivity, targeted for 0.1.2
-- Agent sandboxes, targeted for 0.1.3
 
 ## Getting started
 
@@ -73,7 +74,7 @@ You can also set a key through the environment (`ANTHROPIC_API_KEY`, `OPENAI_API
 
 To make a production build, run `npm run tauri build`.
 
-## Shortcuts
+## Quick tour
 
 | Key | Action |
 |---|---|
@@ -88,7 +89,7 @@ Type `/` in the composer for slash commands (`/goal`, `/plan`, `/compact`, `/mod
 
 ## Security
 
-OpenLeash gives a model the tools to read and write files and execute shell commands on your machine. **Nothing sandboxes it.** Before pointing it at a repository you do not trust, note that:
+OpenLeash runs a model on your machine with the tools to read and write files and execute shell commands. **Nothing sandboxes it.** Before pointing it at a repository you do not trust, note that:
 
 - reads are not sandboxed, so the agent can read anything your account can;
 - a repo's `AGENTS.md` / `CLAUDE.md` is injected into the agent's prompt, so open untrusted repos in plan mode;

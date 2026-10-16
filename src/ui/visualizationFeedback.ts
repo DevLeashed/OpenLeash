@@ -1,5 +1,5 @@
 export interface VisualizationFeedbackDraft {
-  target?: { selector?: string; label?: string };
+  target?: { selector?: string; label?: string; x?: number; y?: number };
   state?: Record<string, unknown>;
 }
 
@@ -53,12 +53,20 @@ export function parseVisualizationFeedbackDraft(value: unknown): VisualizationFe
   if (new TextEncoder().encode(encoded).byteLength > MAX_VIZ_FEEDBACK_BYTES || !boundedDraftGraph(value)) return null;
   let target: VisualizationFeedbackDraft["target"];
   if (value.target !== undefined) {
-    if (!plainRecord(value.target) || Object.keys(value.target).some((key) => key !== "selector" && key !== "label")) return null;
+    if (!plainRecord(value.target) || Object.keys(value.target).some((key) => key !== "selector" && key !== "label" && key !== "x" && key !== "y")) return null;
     const selector = value.target.selector;
     const label = value.target.label;
     if (selector !== undefined && (typeof selector !== "string" || selector.length > 300)) return null;
     if (label !== undefined && (typeof label !== "string" || label.length > 300)) return null;
-    if (selector?.trim() || label?.trim()) target = { ...(selector?.trim() ? { selector: selector.trim() } : {}), ...(label?.trim() ? { label: label.trim() } : {}) };
+    // A click point is a percentage of the preview, so it stays meaningful at any
+    // frame size. Out-of-range or non-finite values are dropped rather than
+    // clamped: a pin the user cannot see would point at nothing.
+    const pct = (raw: unknown) => typeof raw === "number" && Number.isFinite(raw) && raw >= 0 && raw <= 100 ? raw : undefined;
+    const x = pct(value.target.x), y = pct(value.target.y);
+    const point = x !== undefined && y !== undefined ? { x, y } : {};
+    if (selector?.trim() || label?.trim() || "x" in point) {
+      target = { ...(selector?.trim() ? { selector: selector.trim() } : {}), ...(label?.trim() ? { label: label.trim() } : {}), ...point };
+    }
   }
   let state: Record<string, unknown> | undefined;
   if (value.state !== undefined) {

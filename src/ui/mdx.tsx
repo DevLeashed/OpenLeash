@@ -1,8 +1,8 @@
 /** Smarter markdown for agent replies: clickable file paths, numeric table
  *  columns, and automatic done/open progress bars. */
 import { memo, useSyncExternalStore } from "react";
-import ReactMarkdown from "react-markdown";
-import type { Components } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import type { Components, UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { invoke } from "@tauri-apps/api/core";
 import { flash, get } from "../store";
@@ -98,9 +98,12 @@ export function remarkOl() {
 
 // ───────────── components ─────────────
 
-export function copyText(t: string, what = "Copied") {
-  navigator.clipboard?.writeText(t).then(() => flash(what)).catch(() => flash("Couldn't copy"));
-}
+// Imported for this file's own code blocks and re-exported so existing
+// `from "./mdx"` imports keep working: the behaviour (including the fallback for
+// browsers without the async clipboard) lives in exactly one place. See
+// `clipboard.ts` for why the obvious optional-chain form did nothing on remote.
+import { copyText } from "./clipboard";
+export { copyText };
 
 /** Plain text of a rendered code block (for its copy button). */
 function codeOf(node: unknown): string {
@@ -164,6 +167,17 @@ function renderNodes(nodes: import("hast").RootContent[]): React.ReactNode {
   });
 }
 
+/**
+ * react-markdown's default blanks every URL with a scheme it doesn't know, which
+ * also ate a reply's `data:image/png` picture and its `C:\out\chart.png` path
+ * (`C:` reads as a scheme). An image's `src` is passed through untouched so
+ * `ReplyImage` can decide: it is the one place that sorts https / inline data /
+ * a confined local path from everything else, and it never puts the raw value
+ * anywhere but an `<img>`. Links keep the default sanitising.
+ */
+export const replyUrlTransform: UrlTransform = (url, key, node) =>
+  key === "src" && node.tagName === "img" ? url : defaultUrlTransform(url);
+
 export const mdComponents: Components = {
   table: ({ children }) => <ReplyTable>{children}</ReplyTable>,
   img: ({ src, alt, title }) => <ReplyImage key={src} src={typeof src === "string" ? src : ""} alt={alt ?? ""} title={title} />,
@@ -208,11 +222,20 @@ export const mdComponents: Components = {
 // react-markdown's identity checks, and a question card re-renders on every key.
 const INLINE_BLOCKS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "pre", "blockquote", "hr", "table", "thead", "tbody", "tr", "th", "td"];
 
+/// The remark stack every `ReactMarkdown` in the app uses, built once.
+///
+/// A plugin array built inline on each render is a new identity every time, and
+/// react-markdown answers by rebuilding its whole processor (`unified().use(...)`)
+/// for that render — so the cost is paid per render of every markdown surface,
+/// including the ones inside a streamed reply. Shared with `mdComponents` below
+/// so the two halves a `ReactMarkdown` needs are hoisted together.
+export const MD_PLUGINS = [remarkGfm, remarkOl];
+
 /** Markdown for a run of text that lives inside a sentence, a label or a title:
  *  block elements are unwrapped to their text, so nothing nests a paragraph and
  *  the `**bold**` an agent typed reads as bold rather than as asterisks. */
 export const MdInline = memo(({ text }: { text: string | null | undefined }) => (
-  <ReactMarkdown remarkPlugins={[remarkGfm, remarkOl]} components={mdComponents} disallowedElements={INLINE_BLOCKS} unwrapDisallowed>
+  <ReactMarkdown remarkPlugins={MD_PLUGINS} components={mdComponents} urlTransform={replyUrlTransform} disallowedElements={INLINE_BLOCKS} unwrapDisallowed>
     {text ?? ""}
   </ReactMarkdown>
 ));

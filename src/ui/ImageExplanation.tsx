@@ -1,10 +1,14 @@
 import { useState } from "react";
-import { ReplyImage } from "./ReplyImage";
+import { imageSource, ReplyImage, useImageUrl } from "./ReplyImage";
 import type { VisualizationFeedbackDraft } from "./visualizationFeedback";
 
 type Mark = { x: number; y: number; label: string };
 type ImageSpec = { title: string; src: string; after?: string; marks: Mark[] };
-const safeImage = (value: unknown): value is string => typeof value === "string" && value.length <= 200000 && (/^https:\/\//i.test(value) || /^data:image\/(png|jpeg|webp);base64,/i.test(value));
+/** https, an inline raster `data:` URL, or a path to an image on this machine,
+ *  which the backend reads (see `reply_image`). A path is what agents should
+ *  use: pasting a screenshot as base64 into the fence put hundreds of KB of
+ *  text into the reply for nothing. */
+const safeImage = (value: unknown): value is string => typeof value === "string" && value.length <= 200000 && imageSource(value).kind !== "blocked";
 export function parseImageSpec(source: string): ImageSpec | null {
   try {
     const data = JSON.parse(source);
@@ -18,17 +22,22 @@ export function parseImageSpec(source: string): ImageSpec | null {
     return { title: typeof data.title === "string" ? data.title.slice(0, 160) : "Image explanation", src: data.src, after: data.after, marks };
   } catch { return null; }
 }
-export function ImageExplanation({ source, onFeedbackDraft }: { source: string; onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void }) {
+/** `bare` drops the section's own frame so the image explorer can sit inside a
+ *  host frame (`ArtifictCanvas`) without a border in a border. */
+export function ImageExplanation({ source, onFeedbackDraft, bare = false }: { source: string; onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void; bare?: boolean }) {
   const spec = parseImageSpec(source);
+  const before = useImageUrl(spec?.src ?? "");
+  const after = useImageUrl(spec?.after ?? "");
   const [split, setSplit] = useState(50);
   const [region, setRegion] = useState({ x: 25, y: 25, width: 50, height: 50 });
   const [targeting, setTargeting] = useState(false);
   if (!spec) return <p role="status">Invalid image explanation. Expected a src, optional after image, and bounded percentage marks.</p>;
-  return <section aria-label={spec.title} style={{ border: "1px solid var(--line)", borderRadius: 10, padding: 12, margin: "12px 0" }}>
+  return <section className={`image-explanation${bare ? " bare" : ""}`} aria-label={spec.title} style={bare ? undefined : { border: "1px solid var(--line)", borderRadius: 10, padding: 12, margin: "12px 0" }}>
     <h3>{spec.title}</h3>
     <div style={{ position: "relative", overflow: "hidden" }}>
-      <img src={spec.src} alt={spec.after ? "Before" : spec.title} referrerPolicy="no-referrer" style={{ display: "block", width: "100%" }} />
-      {spec.after && <img src={spec.after} alt="After" referrerPolicy="no-referrer" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", clipPath: `inset(0 0 0 ${split}%)` }} />}
+      {(before.error || after.error) && <p role="status">Image unavailable: {before.error ?? after.error}</p>}
+      {before.url && <img src={before.url} alt={spec.after ? "Before" : spec.title} referrerPolicy="no-referrer" style={{ display: "block", width: "100%" }} />}
+      {spec.after && after.url && <img src={after.url} alt="After" referrerPolicy="no-referrer" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", clipPath: `inset(0 0 0 ${split}%)` }} />}
       {targeting && <span aria-hidden="true" style={{ position: "absolute", left: `${region.x}%`, top: `${region.y}%`, width: `${Math.min(region.width, 100 - region.x)}%`, height: `${Math.min(region.height, 100 - region.y)}%`, border: "2px solid var(--accent)", pointerEvents: "none" }} />}
       {spec.marks.map((mark, i) => <span key={i} aria-hidden="true" style={{ position: "absolute", left: `${mark.x}%`, top: `${mark.y}%`, background: "var(--accent)", color: "var(--bg)", borderRadius: "50%", padding: "2px 7px", transform: "translate(-50%,-50%)" }}>{i + 1}</span>)}
     </div>

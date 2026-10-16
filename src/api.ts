@@ -1,5 +1,6 @@
 // Typed IPC surface for the Rust harness (src-tauri/src/lib.rs).
 import { invoke } from "@tauri-apps/api/core";
+import type { ContainerState, DockerEnv, WorkspaceMode } from "./workspaces";
 
 export type BrowserPanelAction = { kind: "snapshot" | "back" | "refresh" } | { kind: "navigate"; url: string } | { kind: "click"; x: number; y: number } | { kind: "type"; text: string } | { kind: "key"; key: "Enter" | "Tab" } | { kind: "scroll"; delta_y: number };
 export interface BrowserPanelFrame { url: string; title: string; png: string; width: number; height: number; viewport_width: number; viewport_height: number }
@@ -17,18 +18,36 @@ export type Assist = "guide" | "default" | "necessary";
  *  unrestricted, or `[name, {fileRegex, description}]` where it is not (Roo
  *  Code's shape). Rust serializes the tuple form as an object. */
 export type ToolGroup = string | { name: string; file_regex?: string; description?: string };
-export interface AgentDef { id: string; name: string; description: string; prompt: string; model: string; tools: "all" | "read_only" | "no_shell"; color: string; builtin: boolean; source: string; inject_instructions?: boolean; effort?: number | null; groups?: ToolGroup[]; steps?: number }
+export interface AgentDef { id: string; name: string; description: string; prompt: string; model: string; tools: "all" | "read_only" | "no_shell"; color: string; builtin: boolean; source: string; inject_instructions?: boolean; effort?: number | null; groups?: ToolGroup[] }
 export interface SkillDef { name: string; description: string; source: string; path: string; enabled: boolean; files: number; disable_model_invocation?: boolean; user_invocable?: boolean }
 export interface Route { id: string; name: string; heads: string[]; all: boolean; steps: string[]; on_exhausted: "pause" | "fail" }
 export interface Window { label: string; used: number; resets_at: number }
+/** A ceiling the user put on one usage window: the harness stops using that
+ *  account once the window reaches `used` percent.
+ *
+ *  `until` 0 means the cap stands until it is lifted by hand; anything else is
+ *  the unix time a temporary cap lifts by itself. `holding` is the backend's own
+ *  answer to "is this cap what is keeping the account out of the pool right
+ *  now", computed from the predicate the router uses, so a row cannot draw a cap
+ *  as reached while the harness is still spending the account. */
+export interface UsageCap { window: string; used: number; until: number; holding: boolean }
 export interface AcctUsage { windows: Window[]; limited: boolean; plan: string; fetched: number; error: string }
 export interface AccountView {
   id: string; kind: string; label: string; email: string; priority: number; enabled: boolean; source: string; disabled_reason: string;
   usage: AcctUsage | null; cooldown_until: number; cooldown_reason: string; available: boolean; active: boolean; expires_at: number;
   /** Masked OpenCode workspace-key suffix; absent on older backends, empty for OAuth logins. */
   key_hint?: string;
+  /** Caps standing on this account, expired ones already left out by the backend. */
+  caps?: UsageCap[];
 }
-export interface Usage { input: number; output: number; cache_read: number; cache_write: number; cost: number; last_context: number }
+/** How the most recent prompt split by category, in tokens.
+ *
+ *  An estimate, and shown as one: a provider reports only a prompt *total*, so
+ *  the backend measures the request it built and rescales the parts onto that
+ *  total. Absent on a task that has not run a turn yet, and on any task saved
+ *  before this existed. */
+export interface ContextParts { system: number; instructions: number; skills: number; tools: number; attachments: number; history: number; summary: number }
+export interface Usage { input: number; output: number; cache_read: number; cache_write: number; cost: number; last_context: number; parts?: ContextParts }
 
 export interface TaskSummary {
   id: string; title: string;
@@ -38,20 +57,55 @@ export interface TaskSummary {
   status: "idle" | "running" | "waiting" | "done" | "failed" | "stopped";
   waiting_kind: "approval" | "question" | "wake" | null;
   step: string; project: string; cwd: string; branch: string; base_branch: string; worktree: boolean;
+  /** Present when this chat runs in a docker workspace (src/workspaces.ts). */
+  docker?: DockerEnv | null; container?: ContainerState | null;
   model: string; effort: number; perm: Perm; plan: boolean; ultra: boolean; ultra_wt: boolean; ultra_x: UltraX | null; subagents: boolean; goal: Goal | null;
-  assist: Assist; agents: string[]; pending: { model?: string; assist?: Assist; agents?: string[] }; paused: Pause | null; serving: string; route: string; unpaused: boolean; busy: number; archived: boolean; hidden: boolean; forked_from: string | null; pinned: boolean; order: number;
+  assist: Assist; agents: string[]; pending: { model?: string; assist?: Assist; agents?: string[] }; paused: Pause | null; serving: string; route: string; unpaused: boolean; busy: number;
+  /** The background commands alive in this chat *now*, so the UI can name what a
+   *  pause does not stop — see `Task::bg_now` in `src-tauri/src/agent/mod.rs`.
+   *
+   *  Read from the backend's live registry on every recount, never from
+   *  `bg_live`, which is the record saved as the app quits and therefore names
+   *  jobs the OS has already killed: a window that reloaded would list dead
+   *  servers as running. */
+  bg_now: Bg[];
+  archived: boolean; hidden: boolean; forked_from: string | null; pinned: boolean; artifict_open: boolean; order: number;
+  /** There is something in this chat the user has not looked at yet: the
+   *  sidebar's blue dot.
+   *
+   *  The backend keeps this, not the window that draws it. A remote browser is a
+   *  second client of the same app, and `remote/shim.js` reloads its page on
+   *  every reconnect — a page that only had the live `ol://attention` event to go
+   *  on painted every finished chat as if it had already been read. The backend
+   *  sets it where it publishes attention (`Harness::attention`, the same rule
+   *  `describe()` in `notify.ts` words into a toast) and clears it when a chat is
+   *  opened, so every client draws the same dot. A question or an approval that
+   *  is still pending stays marked until the backend ends the wait. */
+  unread: boolean;
   todos: Todo[]; subs: SubInfo[]; usage: Usage; context_window: number;
   created_at: string; updated_at: string;
   /** When the user last did something here (messaged, answered, paused,
    *  stopped, resumed). `updated_at` moves on every agent step, so the chat
    *  list sorts on this one instead. */
   touched_at: string;
+  /** Which build of this summary the backend made; higher is later state.
+   *
+   *  Every summary carries one — a live `task` event or a snapshot (`app_boot`'s
+   *  list, `task_open`, `tasks_list`). The store keeps the highest it has seen
+   *  per chat and refuses an older one, because a snapshot is built a moment
+   *  before the events it races: applying it anyway used to put a chat back to
+   *  "running" after it had finished, or back to "waiting" after the answer had
+   *  been given, with nothing left to publish the truth afterwards. See
+   *  `newerSummary` in store.ts. */
+  rev: number;
 }
 
 /** One entry of a `computer` tool call's `actions` list. */
 export interface ToolAction {
   [key: string]: unknown;
   type?: string; text?: string; keys?: string[]; x?: number; y?: number;
+  monitor?: number; width?: number; height?: number; button?: string;
+  scroll_x?: number; scroll_y?: number; ms?: number;
 }
 
 /** A tool call's parsed arguments. Free-form across every tool (path, pattern,
@@ -78,6 +132,9 @@ export interface ItemData {
   name?: string; input?: ToolInput; output?: string; status?: string; meta?: string;
   diff?: { k: "a" | "d" | "c" | "h"; t: string }[];
   images?: string[]; images_dropped?: number; exec?: boolean; bg_id?: string;
+  /** Staged temp copies of what the user attached: path, name and size. Lets an
+   *  edited message be resent with its attachments without re-reading files. */
+  attachments?: { path: string; name: string; size: number }[];
   resolved?: string; kind?: string; detail?: string; title?: string; feedback?: string;
   rec_wt?: boolean | null; suggest_wt?: boolean; reason?: string; git?: boolean; rec_why?: string;
   sub?: string; repeat?: boolean; rule?: string;
@@ -86,13 +143,17 @@ export interface ItemData {
   from?: string; question?: string; answer?: string; working?: boolean;
   path?: string; branch?: string; goal?: boolean; global?: boolean; replied?: string[];
   queued?: boolean; brief?: boolean; dismissed?: boolean; note?: string; sum?: string;
-  intro?: string; label?: string; artifact_card?: Record<string, unknown>; preview_draft?: string;
+  intro?: string; label?: string; artifict_card?: Record<string, unknown>; preview_draft?: string;
+  /** A plan-mode approval names the record the plan was filed as in the
+   *  project's artificts, so the card can send the user to what they will come
+   *  back to. Absent when the plan could not be filed (no project folder). */
+  plan_artifict?: { id?: string; version_id?: string; title?: string };
   questions?: import("./ui/Question").Q[]; notes?: string[]; answers?: unknown[];
 }
 
 export interface Item {
   id: string;
-  kind: "user" | "text" | "thinking" | "tool" | "approval" | "question" | "asklater" | "sub" | "notice" | "user_notice" | "artifact";
+  kind: "user" | "text" | "thinking" | "tool" | "approval" | "question" | "asklater" | "sub" | "notice" | "user_notice" | "artifict";
   text: string;
   data: ItemData;
   ts: string;
@@ -100,7 +161,7 @@ export interface Item {
 
 export interface Bg { id: string; cmd: string; started: string; last_line: string; running: boolean; exit: string | null }
 
-export type Perm = "disabled" | "allowlist" | "auto" | "turbo";
+export type Perm = "disabled" | "allowlist" | "auto" | "turbo" | "reviewer";
 /** Permission mode used when no choice has been recorded. */
 export const DEFAULT_PERM: Perm = "turbo";
 
@@ -114,7 +175,7 @@ export interface AccountTermsGate { title: string; lede: string; points: string[
 export interface AccountProviderInfo { display_name: string; short_name: string; login_file: string; login_command: string; paste_hint: string; setup_command: string; token_prefix: string; warning: string; terms_gate: AccountTermsGate | null; key_login: boolean }
 export interface ProviderPreset { name: string; url: string; kind: "openai" | "anthropic"; icon: string }
 export interface ProviderView { id: string; name: string; icon: string; mono: string; color: string; base_url: string; env: string; chip: string; kind: "openai" | "anthropic" | "codex"; custom: boolean; insist: boolean; connected: boolean; has_key: boolean; key_hint: string; key_hints: string[]; key_pool: boolean; base_url_override: string; enabled: boolean; local: boolean; account: AccountProviderInfo | null }
-export interface RemoteModel { id: string; name: string; context: number | null; output: number | null; input_price: number | null; output_price: number | null; modalities: string[] | null; reasoning_levels?: string[] | null; reasoning_param?: string | null; reasoning_parameter?: string | null; supported_reasoning_levels?: (string | { effort?: string })[] | null; supported_parameters?: string[] | null }
+export interface RemoteModel { id: string; name: string; context: number | null; output: number | null; input_price: number | null; output_price: number | null; modalities: string[] | null; reasoning_levels?: string[] | null; reasoning_param?: string | null; reasoning_parameter?: string | null; supported_reasoning_levels?: (string | { effort?: string })[] | null; supported_parameters?: string[] | null; guessed?: boolean }
 export interface AllowRule { pattern: string; project: string }
 /** `transport` is absent on servers saved before the HTTP transport existed —
  *  those are stdio, and `command` is empty on a URL server. */
@@ -142,25 +203,54 @@ export interface CustomCommand { name: string; description: string; prompt: stri
 
 export interface Settings {
   model: string; effort: number; perm: Perm; worktree: boolean; subagents: boolean;
+  /** Automatically rebuild Docker images when config changes; defaults on for old settings. */
+  docker_auto_rebuild?: boolean;
+  /** Workspace for new tasks; empty on older settings, which follow `worktree`. */
+  workspace?: WorkspaceMode | ""; docker_idle_minutes?: number;
   ui_size: string; ui_zoom: number; send_with: "enter" | "ctrl-enter"; theme?: "raycast" | "lavender" | "nord" | "dracula" | "gruvbox" | "tokyo" | "rosepine" | "catppuccin" | "solarized" | "everforest" | "monokai" | "ayu" | "ocean";
+  /** Let Enter send in a phone browser, with Shift Enter the newline. Off by
+   *  default: a phone's on-screen Return key cannot be trusted to report Shift,
+   *  so there Enter starts a new line and the send button sends. The desktop
+   *  window is unaffected and follows `send_with`. */
+  phone_enter_sends?: boolean;
   /** Light or dark, or follow the OS. Absent on settings saved before light mode. */
   mode?: "light" | "dark" | "system";
   routes: Route[]; agents: AgentDef[]; default_agents: string[]; assist: Assist; paused_all: boolean; paused_reason: string; close_to_tray: boolean; notify?: boolean; home_usage: string[]; model_colors: Record<string, string>;
+  /** Settings page the sidebar footer's shortcut button — the one beside the
+   *  usage bar — opens. A settings-tab id; Accounts on settings saved before
+   *  this existed, and an id this build has no page for falls back to it. */
+  sidebar_button_tab?: string;
   /** Cross-chat inbox for pending approvals and questions. Hidden by default. */
   needs_you?: boolean;
   /** Sidebar lists chats from every project folder, not just the current one. */
   all_projects: boolean;
-  show_thinking: boolean; inject_global_claude: boolean;
+  /** Show the optional GitHub pull-request screen beside Saved prompts. */
+  show_pull_requests?: boolean;
+  /** Order of the Saved prompts list: "newest", "folder" or "az". */
+  saved_sort?: string;
+  show_thinking: boolean;
+  /** Draw the estimated per-category split of the context window under the
+   *  meter. Off by default: the ring's used/limit pair is measured, the split
+   *  is an estimate rescaled to the provider's count. */
+  ctx_breakdown?: boolean;
+  inject_global_claude: boolean;
   /** Let the agent rename this chat as the work moves on. On by default. */
   agent_titles?: boolean;
+  /** OTLP/HTTP endpoint to send traces to. Empty (the default) means nothing is
+   *  exported at all — no client, no thread, no allocation. This is not
+   *  telemetry on by another name: the user names a collector *they* run, and
+   *  nothing is sent anywhere else. */
+  trace_endpoint?: string;
   /** Keep chats ordered automatically by attention and recent activity, even after a manual drag. On by default. */
   automatic_chat_reorder?: boolean;
+  /** Resume chats paused when provider accounts/keys were exhausted after one becomes available. On by default. */
+  automatic_resume?: boolean;
   /** Let the agent keep per-project notes across chats. Off by default. */
   memory?: boolean;
-  /** Idle window for "archive the chats I have not used in a while" (Settings →
-   *  Chats), in days. Nothing prunes on its own: this is only how long the
-   *  button's threshold sits before the user presses it. */
-  archive_after_days?: number;
+  /** Let an agent search the user's other chats, see what each is doing, and
+   *  send one of them a message. Off by default: this is the one capability
+   *  that reaches outside the chat the user opened. */
+  cross_chat?: boolean;
   /** State of the built-in `.env` read deny shown in Settings. */
   deny_env_files?: boolean;
   /** Hold back the long tail of MCP tool schemas in favor of `tool_search`. */
@@ -258,7 +348,7 @@ export interface TrustManifest {
 export interface PluginsStatus {
   has_token: boolean; can_login: boolean;
   github: { ok: boolean; source: string | null; login?: string; error?: string };
-  computer: { ok: boolean; error?: string; monitors: { name: string; w: number; h: number; primary: boolean }[] };
+  computer: { ok: boolean; error?: string; monitors: { name: string; w: number; h: number; primary: boolean; /** Whether the agent may move the cursor on this display: the primary one, unrotated. The others can be looked at but not clicked. */ driveable: boolean; rotation: number; x: number; y: number }[] };
   browser: { ok: boolean; error?: string; browser?: string };
 }
 
@@ -295,7 +385,12 @@ export interface RewindInfo { checkpoints: CheckpointInfo[]; in_worktree: boolea
 /** What a file restore did. `skipped` is the user's own work, left alone. */
 export interface RewindResult { restored: number; skipped: string[]; text: string }
 
-export interface NewTask { prompt: string; project: string; model: string; effort: number; perm: Perm; plan: boolean; worktree: boolean; base_branch: string; subagents: boolean; assist: Assist; agents: string[]; route: string; images?: string[]; ultra?: boolean; ultra_wt?: boolean; ultra_x?: UltraX | null }
+/** A WSL distro (`agent::projects::WslDistro`). `root` is `\\wsl.localhost\<name>`. */
+export interface WslDistro { name: string; root: string }
+/** What a clone would do (`agent::projects::ClonePlan`). `existing`: `dest` is already a checkout of this repo. */
+export interface ClonePlan { url: string; name: string; dest: string; existing: boolean }
+
+export interface NewTask { prompt: string; project: string; model: string; effort: number; perm: Perm; plan: boolean; worktree: boolean; workspace?: WorkspaceMode; base_branch: string; subagents: boolean; assist: Assist; agents: string[]; route: string; images?: string[]; image_names?: string[]; files?: string[]; ultra?: boolean; ultra_wt?: boolean; ultra_x?: UltraX | null }
 /** One layer of an ULTRATHREAD X ladder. */
 export interface UltraXLayer { model: string; effort: number | null; fanout: number }
 /** The ULTRATHREAD X ladder: a model / effort / fanout per layer below the orchestrator. */
@@ -309,7 +404,12 @@ export const defaultX = (): UltraX => ({ layers: Array.from({ length: X_MAX_LAYE
 /** X mode is a real mode only from two layers up; one layer is ultrathread with a worker model. */
 export const xOn = (x: UltraX | null | undefined): x is UltraX => !!x && x.layers.length > 1;
 export const xDepth = (x: UltraX) => Math.min(x.layers.length, X_MAX_LAYERS);
-export type TaskPatch = Partial<Pick<TaskSummary, "model" | "effort" | "perm" | "plan" | "ultra" | "ultra_wt" | "ultra_x" | "subagents" | "title" | "assist" | "agents" | "archived" | "pinned" | "order" | "route">> & { now?: boolean; apply_pending?: boolean; /** Hand the name back to the agent: clears the manual-rename lock. */ untitled?: boolean };
+export type TaskPatch = Partial<Pick<TaskSummary, "model" | "effort" | "perm" | "plan" | "ultra" | "ultra_wt" | "ultra_x" | "subagents" | "title" | "assist" | "agents" | "archived" | "pinned" | "artifict_open" | "order" | "route">> & { now?: boolean; apply_pending?: boolean; /** Hand the name back to the agent: clears the manual-rename lock. */ untitled?: boolean };
+
+/** What the user picked when resuming a stopped chat. `continue` retries what was
+ *  cut off; `summarise` reports where things stand and then carries on; `wrap`
+ *  reports and stops there. Mirrors the modes `task_resume` accepts in Rust. */
+export type ResumeMode = "continue" | "summarise" | "wrap";
 
 /** A file the user attached for the agent to read. The model gets the path,
  *  except for images, which ride along as real image blocks so it can see
@@ -324,6 +424,12 @@ export interface AppUpdateStatus {
   can_install: boolean;
 }
 
+/** One page of a chat's timeline, worst-newest first. `cursor` is the id of the
+ *  oldest item in `items`, the anchor for the next older page. */
+export interface TaskOpenPage { summary: TaskSummary; items: Item[]; bg: Bg[]; cursor: string | null; total: number }
+/** One older page. `cursor: null` means the history is exhausted. */
+export interface TaskHistoryPage { items: Item[]; cursor: string | null; total: number }
+
 export const api = {
   appUpdateStatus: () => invoke<AppUpdateStatus>("app_update_status"),
   appUpdateCheck: () => invoke<AppUpdateStatus>("app_update_check"),
@@ -332,11 +438,15 @@ export const api = {
   boot: () => invoke<Boot>("app_boot"),
   tasks: () => invoke<TaskSummary[]>("tasks_list"),
   task: (id: string) => invoke<{ summary: TaskSummary; items: Item[]; sub_items: Record<string, Item[]>; bg: Bg[] }>("task_get", { id }),
+  taskOpen: (id: string) => invoke<TaskOpenPage>("task_open", { id }),
+  taskHistory: (id: string, cursor: string | null, limit = 100) => invoke<TaskHistoryPage>("task_history", { id, cursor, limit }),
   /** A subagent's report, fetched when its panel opens: the live `task` event
    *  leaves reports out, because they are large and rarely change. */
   subReport: (id: string, sub: string) => invoke<string>("sub_report", { id, sub }),
+  /** One subagent's own transcript, read when its panel opens: `task_open` sends only the main timeline. */
+  subTranscript: (id: string, sub: string) => invoke<Item[]>("sub_transcript", { id, sub }),
   create: (req: NewTask) => invoke<TaskSummary>("task_create", { req }),
-  send: (id: string, text: string, later = false, images?: string[]) => invoke<void>("task_send", { id, text, later, images }),
+  send: (id: string, text: string, later = false, images?: string[], files?: string[], imageNames?: string[]) => invoke<void>("task_send", { id, text, later, images, files, imageNames }),
   interrupt: (id: string) => invoke<void>("task_interrupt", { id }),
   respond: (id: string, itemId: string, response: unknown) => invoke<void>("task_respond", { id, itemId, response }),
   /** Answer a question the agent raised without waiting (`ask_nonblocking`). The
@@ -358,19 +468,27 @@ export const api = {
   statsChat: (id: string) => invoke<[string, import("./ui/Stats").ChatStat] | null>("stats_chat", { id }),
   draftGet: (key: string) => invoke<string>("draft_get", { key }),
   draftSet: (key: string, text: string) => invoke<void>("draft_set", { key, text }),
-  /** Resolve picked/dropped absolute paths into attachments. */
-  filesAttach: (paths: string[]) => invoke<FileRef[]>("files_attach", { paths }),
+  /** Resolve picked/dropped absolute paths into attachments. `cwd` is the
+   *  chat's folder: for a remote (SSH) one, non-image files are refused. */
+  filesAttach: (paths: string[], cwd?: string) => invoke<FileRef[]>("files_attach", { paths, cwd: cwd ?? null }),
   /** Read an attached image into a data URL so the model can see it. */
   fileDataUrl: (path: string) => invoke<string>("file_data_url", { path }),
-  subSend: (id: string, subId: string, text: string) => invoke<void>("sub_send", { id, subId, text }),
+  remoteUpload: (id: string, filename: string, bytes: ArrayBuffer) => invoke<FileRef>("remote_stage_upload", { id, filename, bytes: Array.from(new Uint8Array(bytes)) }),
+  /** A picture an agent's reply points at, confined to the chat's folder (`reply_image`). */
+  replyImage: (cwd: string, path: string) => invoke<string>("reply_image", { cwd, path }),
+  subSend: (id: string, subId: string, text: string, images?: string[], imageNames?: string[]) => invoke<void>("sub_send", { id, subId, text, images, imageNames }),
   subModel: (id: string, subId: string, model: string) => invoke<void>("sub_set_model", { id, subId, model }),
+  subStop: (id: string, subId: string) => invoke<void>("sub_stop", { id, subId }),
   subEffort: (id: string, subId: string, effort: number | null) => invoke<void>("sub_set_effort", { id, subId, effort }),
   dismissPause: (id: string) => invoke<void>("task_dismiss_pause", { id }),
   pause: (id: string) => invoke<void>("task_pause", { id }),
   statusSummary: (id: string) => invoke<{ text: string; model: string; via?: string }>("task_status_summary", { id }),
   forcePause: (id: string) => invoke<void>("task_force_pause", { id }),
   forcePauseAll: () => invoke<void>("force_pause_all"),
-  resume: (id: string, message?: string, mode?: "continue" | "wrap") => invoke<void>("task_resume", { id, message: message || null, mode: mode ?? null }),
+  /** Resume a stopped chat. `mode` is what the user picked after a stop: keep going
+   *  (`continue`), report where things stand and then keep going (`summarise`), or
+   *  report and stop there (`wrap`). Omitting it is a plain resume. */
+  resume: (id: string, message?: string, mode?: ResumeMode) => invoke<void>("task_resume", { id, message: message || null, mode: mode ?? null }),
   broadcast: (id: string, text: string) => invoke<string>("task_broadcast", { id, text }),
   pauseAll: () => invoke<void>("pause_all"),
   resumeAll: (message?: string) => invoke<void>("resume_all", { message: message || null }),
@@ -386,6 +504,12 @@ export const api = {
   accountImportLocal: (kind: string, path?: string) => invoke<AccountView[]>("account_import_local", { kind, path: path || null }),
   accountUpdate: (id: string, patch: { label?: string; priority?: number; enabled?: boolean; move?: number }) => invoke<AccountView[]>("account_update", { id, patch }),
   accountRemove: (id: string) => invoke<AccountView[]>("account_remove", { id }),
+  /** Cap a usage window across accounts: each stops being used once that window
+   *  reaches `used` percent. `secs` 0 = until lifted by hand; the backend stamps
+   *  the deadline against its own clock, since a phone driving this backend is
+   *  not a clock this page can trust. */
+  accountCapSet: (ids: string[], window: string, used: number, secs: number) => invoke<AccountView[]>("account_cap_set", { ids, window, used, secs }),
+  accountCapClear: (ids: string[], window: string) => invoke<AccountView[]>("account_cap_clear", { ids, window }),
   accountsRefresh: () => invoke<AccountView[]>("accounts_refresh"),
   exportTask: (id: string, path: string) => invoke<void>("task_export", { id, path }),
   /** The ticked chats into one file. Its own command rather than a loop of
@@ -454,6 +578,7 @@ export const api = {
   modelRemove: (id: string) => invoke<ModelInfo[]>("model_remove", { id }),
   modelSetEnabled: (id: string, enabled: boolean) => invoke<ModelInfo[]>("model_set_enabled", { id, enabled }),
   providerModels: (id: string) => invoke<RemoteModel[]>("provider_models", { id }),
+  modelDetail: (prov: string, model: string) => invoke<Record<string, unknown>>("model_detail", { prov, model }),
   mcpStatus: () => invoke<McpStatus[]>("mcp_status"),
   mcpReconnect: () => invoke<void>("mcp_reconnect"),
   mcpOauthStart: (name: string, clientId?: string, scopes?: string[], redirectPort?: number) => invoke<{ flow_id: string; authorization_url: string }>("mcp_oauth_start", { name, clientId: clientId ?? null, scopes: scopes ?? null, redirectPort: redirectPort ?? null }),
@@ -469,15 +594,28 @@ export const api = {
    *  is the separate "and the subagent types too" opt-in: without it nothing a
    *  future spawn of an agent type would read is touched. */
   modelsSwap: (map: Record<string, string>, id?: string, effort?: Record<string, number>, spread?: boolean) => invoke<Settings>("models_swap", { id: id ?? null, map, effort: effort ?? null, spread: spread ?? false }),
+  githubPrs: (project: string, state: "open" | "closed" | "all" = "open") => invoke<{ repo: string; prs: { number: number; title: string; state: string; draft: boolean; html_url: string; user: string; head: string; base: string; updated_at: string }[] }>("github_list_prs", { project, state }),
   pluginsStatus: () => invoke<PluginsStatus>("plugins_status"),
   githubLoginStart: () => invoke<{ user_code: string; verification_uri: string; device_code: string; interval: number; expires_in: number }>("github_login_start"),
   githubLoginWait: (deviceCode: string, interval: number, expiresIn: number) => invoke<string>("github_login_wait", { deviceCode, interval, expiresIn }),
   githubLoginCancel: () => invoke<void>("github_login_cancel"),
   githubToken: (token: string) => invoke<void>("plugin_github_token", { token }),
   project: (path: string) => invoke<{ path: string; exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; docs: string[]; disabled_docs: string[]; trusted: boolean; decided: boolean }>("project_info", { path }),
+  /** Installed WSL distros (Windows only; empty elsewhere or without WSL). */
+  wslList: () => invoke<WslDistro[]>("wsl_list"),
+  /** Where the folder dialog should start inside a distro: its one user's home, else `/home`. */
+  wslStartDir: (distro: string) => invoke<string>("wsl_start_dir", { distro }),
+  /** What cloning `url` would do — the normalised URL and the folder — without doing it. */
+  clonePreview: (url: string) => invoke<ClonePlan>("clone_preview", { url }),
+  /** Clone into `~/openleash/<name>` (or reuse a checkout of the same repo there); resolves to its path. */
+  cloneRepo: (url: string) => invoke<string>("clone_repo", { url }),
   /** What a folder would inject, trusted or not — the trust dialog's evidence
    *  and the manifest panel's data. */
   trustManifest: (path: string) => invoke<TrustManifest>("trust_manifest", { path }),
+  /** Apply the saved trace endpoint to the running exporter and report what it
+   *  did. Takes no argument on purpose: a webview cannot point traces somewhere
+   *  the settings file does not already say. */
+  traceConfigure: () => invoke<{ enabled: boolean; endpoint: string; dropped: number; error: string | null }>("trace_configure"),
   /** Record a trust decision. `parent` trusts the folder and everything under
    *  it; `folder` is this directory alone. */
   trustSet: (path: string, kind: TrustKind, decision: TrustState) => invoke<Settings>("trust_set", { path, kind, decision }),
@@ -558,10 +696,15 @@ export function effortLabel(m: { reasoning_levels: string[]; reasoning_param: st
   return effortLevel(m, effort) ?? EFFORTS[clampEffort(steps, Math.round(effort))] ?? null;
 }
 /** The permission ladder, ascending autonomy. It includes the unset default,
- *  and unknown non-empty ids fail closed through permRung. */
+ *  and unknown non-empty ids fail closed through permRung.
+ *
+ *  `reviewer` is the one entry that is not a rung of its own: it behaves as
+ *  Allowlist only and adds a model in place of the user's click, so it sits
+ *  next to allowlist rather than above it. */
 export const PERMS: { id: Perm; name: string; color: string; desc: string }[] = [
   { id: "disabled", name: "Disabled", color: "#8b8f98", desc: "Read-only commands only. Edits and commands are refused, not asked about." },
   { id: "allowlist", name: "Allowlist only", color: "#33d6ff", desc: "Reads freely, runs allow-listed commands. Asks before anything else." },
+  { id: "reviewer", name: "Reviewer", color: "#b9a779", desc: "Same as Allowlist only, except a second model answers each prompt instead of you. A refusal is final for that call; an allow rule still overrides it." },
   { id: "auto", name: "Auto-edit", color: "#a78bfa", desc: "Edits files in its working directory. Asks before commands with side effects." },
   { id: "turbo", name: "Full Access", color: "#ff6363", desc: "Runs anything without asking. Best inside a worktree." },
 ];
@@ -577,13 +720,26 @@ export function permRung(id: string | undefined): Perm {
     case "turbo": return "turbo";
     case "disabled": return "disabled";
     case "allowlist": return "allowlist";
+    // Reviewer mode asks exactly what allowlist asks; a model answers instead
+    // of the user. Named explicitly so a later rung cannot silently swallow it.
+    case "reviewer": return "allowlist";
     default: return "allowlist";
   }
 }
 
+/** The ladder entry a stored id should be *shown* as.
+ *
+ * The same as [`permRung`] except that reviewer mode is its own entry rather
+ * than folding into Allowlist only: the difference between "you will be asked"
+ * and "a model will answer for you" is the whole point of the setting, and a
+ * label that hid it would misdescribe who is approving what. */
+export function permId(id: string | undefined): Perm {
+  return id === "reviewer" ? "reviewer" : permRung(id);
+}
+
 /** The display name of a rung, tolerant of legacy ids. */
 export function permLabel(id: string | undefined): string {
-  return PERMS.find((p) => p.id === permRung(id))?.name ?? "";
+  return PERMS.find((p) => p.id === permId(id))?.name ?? "";
 }
 
 /** A deny rule lives in the same `allow` array as an allow rule: it is just a
@@ -617,7 +773,15 @@ export const fmtK = (n: number) => {
 };
 export const fmt$ = (n: number) => "$" + (n < 10 ? n.toFixed(2) : n.toFixed(1));
 export const baseName = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
-export const normPath = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+/** A path key for comparisons. Local paths fold slashes and case (Windows).
+ *  A remote `ssh://<host>/<path>` URI only folds its scheme and host: the
+ *  path is POSIX and case-sensitive, and a backslash is a legal character
+ *  in it, so `/app/Readme` and `/app/README` must stay two files. */
+export const normPath = (p: string) => {
+  const m = /^ssh:\/\/([^/]*)(.*)$/i.exec(p);
+  if (m) return "ssh://" + (m[1] ?? "").toLowerCase() + ((m[2] ?? "").replace(/\/+$/, "") || "/");
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+};
 /** One line for a list row: runs of whitespace collapsed, trimmed to length. */
 export const oneLine = (s: string, n = 160) => (s.replace(/\s+/g, " ").trim().length > n ? s.replace(/\s+/g, " ").trim().slice(0, n).trimEnd() + "…" : s.replace(/\s+/g, " ").trim());
 
@@ -629,7 +793,7 @@ export function ago(iso: string) {
   return Math.round(s / 86400) + "d";
 }
 
-/** Built-in sub-agents that are always on: can't be deleted or toggled off. */
+/** Built-in subagents that are always on: can't be deleted or toggled off. */
 export const REQUIRED_AGENTS: string[] = ["explore", "general"];
 export const isRequiredAgent = (id: string) => REQUIRED_AGENTS.includes(id);
 /** Count selected custom agents that still have definitions. */

@@ -58,6 +58,7 @@ export function guess(id: string, kind: string): Guess {
 export function remoteReasoning(m: RemoteModel | Record<string, unknown>, provider = ""): { levels: string[]; param: string } {
   const metadata = m as Record<string, unknown>;
   const caps: unknown[] = Array.isArray(metadata.supported_parameters) ? metadata.supported_parameters : [];
+  const capsStr = caps.map((c) => typeof c === "string" ? c : (c && typeof c === "object" && "name" in c ? String(c.name) : ""));
   const reasoning = metadata.reasoning && typeof metadata.reasoning === "object" ? metadata.reasoning as Record<string, unknown> : {};
   const openRouterDeclared = Array.isArray(metadata.reasoning_effort) ? metadata.reasoning_effort as unknown[] : null;
   const isOpenRouter = provider === "openrouter" || metadata.provider === "openrouter";
@@ -86,9 +87,9 @@ export function remoteReasoning(m: RemoteModel | Record<string, unknown>, provid
     supportsBudget ? "reasoning.max_tokens" :
     Array.isArray(openRouterLevels) ? "reasoning.effort" :
     openRouterDeclared ? "reasoning_effort" :
-    isOpenRouter && caps.includes("reasoning") ? "reasoning.effort" :
-    caps.includes("reasoning_effort") ? "reasoning_effort" :
-    caps.includes("reasoning") ? "reasoning.effort" : "";
+    isOpenRouter && capsStr.includes("reasoning") ? "reasoning.effort" :
+    capsStr.includes("reasoning_effort") ? "reasoning_effort" :
+    capsStr.includes("reasoning") ? "reasoning.effort" : "";
   return { levels, param };
 }
 
@@ -109,6 +110,8 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
   const [remote, setRemote] = useState<RemoteModel[] | null>(null);
   const [remoteErr, setRemoteErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [detailGuessed, setDetailGuessed] = useState(false);
+  const [detailFetching, setDetailFetching] = useState(false);
   const up = (p: Partial<ModelInfo>) => setM((x) => ({ ...x, ...p }));
 
   // The accent lives in `settings.model_colors` keyed by the full id, not on the
@@ -142,6 +145,45 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
   useEffect(() => {
     api.providerModels(prov.id).then(setRemote).catch((e) => setRemoteErr(String(e)));
   }, [prov.id]);
+
+  // Auto-fetch individual model details when the model ID changes and smart
+  // config is on. This contacts the provider's API to get real metadata
+  // (context window, output tokens, reasoning levels) when the list endpoint
+  // doesn't include enough info.
+  useEffect(() => {
+    if (!smart || !m.id.trim() || edit) {
+      setDetailGuessed(false);
+      return;
+    }
+    const id = m.id.trim();
+    const t = setTimeout(async () => {
+      setDetailFetching(true);
+      try {
+        const d = await api.modelDetail(prov.id, id);
+        // Merge the detail response into the form
+        const r = { ...d, id } as RemoteModel;
+        const reasoning = remoteReasoning(d, prov.id);
+        up({
+          name: r.name || m.name,
+          context: r.context ?? undefined,
+          output: r.output ?? undefined,
+          input_price: r.input_price ?? undefined,
+          output_price: r.output_price ?? undefined,
+          input_types: r.modalities?.length ? r.modalities.filter((x): x is string => typeof x === "string").filter((x) => ["text", "image", "video", "pdf", "file"].includes(x)).map((x) => (x === "file" ? "pdf" : x)) : undefined,
+          reasoning_levels: reasoning.levels.length ? reasoning.levels : undefined,
+          reasoning_param: reasoning.param || undefined,
+        });
+        // If the detail response had no context/output, mark as guessed
+        setDetailGuessed(r.context == null && r.output == null);
+      } catch {
+        // Detail fetch failed — fall back to list data + heuristics
+        setDetailGuessed(true);
+      } finally {
+        setDetailFetching(false);
+      }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [m.id, smart, prov.id, edit]);
 
   const applySmart = (id: string) => {
     const g = guess(id, prov.kind);
@@ -210,6 +252,15 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
             <Switch label="Smart configuration" checked={smart} onChange={(on) => { setSmart(on); if (on && m.id.trim()) applySmart(m.id.trim()); }} />
           </div>
 
+          {detailGuessed && !detailFetching && (
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "10px 12px", borderRadius: 8, background: "rgba(245, 158, 11, .1)", border: "1px solid rgba(245, 158, 11, .25)" }}>
+              <span style={{ color: "#f59e0b", fontSize: 16, lineHeight: 1.2 }}>⚠</span>
+              <div style={{ fontSize: 12.5, color: "#fbbf24", lineHeight: 1.4 }}>
+                <strong>Estimated values.</strong> This provider's API did not return model metadata for <code>{m.id}</code>, so context window, output limit, and reasoning settings are guessed from the model name. Verify them before saving.
+              </div>
+            </div>
+          )}
+
           <div className="field">
             <label>Model ID {remote && <span style={{ color: "var(--hint)" }}>· {remote.length} available from {prov.name}</span>}{remoteErr && <Tooltip content={remoteErr}><span style={{ color: "var(--hint)" }}>· couldn't list models</span></Tooltip>}</label>
             <Input className="input mono" list="ol-remote-models" autoFocus={!edit} value={m.id} placeholder={prov.kind === "anthropic" ? "claude-sonnet-5" : "model-id"} onChange={(e) => onId(e.currentTarget.value)} />
@@ -219,12 +270,12 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
             <label>Display name <span style={{ color: "var(--dim)" }}>optional</span></label>
             <Input value={m.name} placeholder={m.id || "Shown in the model picker"} onChange={(e) => up({ name: e.currentTarget.value })} />
           </div>
-          <div style={{ display: "flex", gap: 12 }}>
-            <div className="field" style={{ flex: 1 }}>
+          <div className="fieldrow">
+            <div className="field">
               <label>Context window <Help t="Total tokens the model accepts. Drives the context meter and auto-compaction at 80%." /></label>
               <Input type="number" value={m.context || ""} onChange={(e) => up({ context: Number(e.currentTarget.value) })} />
             </div>
-            <div className="field" style={{ flex: 1 }}>
+            <div className="field">
               <label>Max output tokens <Help t="Upper bound for one response." /></label>
               <Input type="number" value={m.output || ""} onChange={(e) => up({ output: Number(e.currentTarget.value) })} />
             </div>
@@ -275,12 +326,12 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
                 <Dropdown value={m.reasoning_param} options={PARAMS.map((p) => ({ value: p.id, label: p.label }))} onChange={(v) => up({ reasoning_param: v })} search={false} style={{ width: "100%" }} />
                 <div style={{ fontSize: 11, color: "var(--dim)" }}>{param.hint}</div>
               </div>
-              <div style={{ display: "flex", gap: 12 }}>
-                <div className="field" style={{ flex: 1 }}>
+              <div className="fieldrow">
+                <div className="field">
                   <label>Input $ / 1M tokens</label>
                   <Input type="number" step="0.01" value={m.input_price} onChange={(e) => up({ input_price: Number(e.currentTarget.value) })} />
                 </div>
-                <div className="field" style={{ flex: 1 }}>
+                <div className="field">
                   <label>Output $ / 1M tokens</label>
                   <Input type="number" step="0.01" value={m.output_price} onChange={(e) => up({ output_price: Number(e.currentTarget.value) })} />
                 </div>
@@ -379,6 +430,11 @@ function ProviderCard({ p, onAddModel, onEdit, i }: { p: ProviderView; onAddMode
   const [key, setKey] = useState("");
   const [url, setUrl] = useState(p.base_url_override);
   const [newKey, setNewKey] = useState("");
+  // Which pooled key is being replaced, and the value typed for it. Replacing
+  // used to be a `window.prompt`, which paints browser chrome inside a native
+  // window and ignores the app's theme and keyboard model.
+  const [replacing, setReplacing] = useState<number | null>(null);
+  const [replaceVal, setReplaceVal] = useState("");
   const [confirmDel, setConfirmDel] = useState(false);
   const list = useMemo(() => models.filter((m) => m.provider === p.id), [models, p.id]);
   const saveKey = async () => {
@@ -403,6 +459,13 @@ function ProviderCard({ p, onAddModel, onEdit, i }: { p: ProviderView; onAddMode
   const replaceKey = async (idx: number, val: string) => {
     set({ providers: await api.providerKey(p.id, { op: "replace", index: idx, key: val }) });
     flash("Key updated");
+  };
+  const saveReplace = (idx: number) => {
+    const v = replaceVal.trim();
+    if (!v) return;
+    void replaceKey(idx, v)
+      .then(() => { setReplacing(null); setReplaceVal(""); })
+      .catch((e) => flash(String(e)));
   };
   const removeModel = async (m: ModelInfo) => {
     set({ models: await api.modelRemove(m.id) });
@@ -435,10 +498,11 @@ function ProviderCard({ p, onAddModel, onEdit, i }: { p: ProviderView; onAddMode
               {(p.key_hints ?? []).map((hint, idx) => (
                 <div key={idx} className="srowx" style={{ padding: "4px 6px", gap: 6 }}>
                   <div className="mono" style={{ fontSize: 10, color: "var(--dim)", minWidth: 80 }}>key {hint}</div>
-                  <Button variant="ghost" style={{ fontSize: 10, padding: "2px 6px" }} onClick={() => {
-                    const val = prompt(`Replace key ${idx + 1}`);
-                    if (val !== null && val.trim()) void replaceKey(idx, val.trim());
-                  }}>Replace</Button>
+                  {replacing === idx ? <>
+                    <Input className="input mono" autoFocus style={{ flex: 1, fontSize: 11 }} type="password" aria-label={`New value for key ${idx + 1}`} placeholder="New API key…" value={replaceVal} onChange={(e) => setReplaceVal(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter") saveReplace(idx); if (e.key === "Escape") setReplacing(null); }} />
+                    <Button disabled={!replaceVal.trim()} onClick={() => saveReplace(idx)}>Save</Button>
+                    <Button variant="ghost" onClick={() => setReplacing(null)}>Cancel</Button>
+                  </> : <Button variant="ghost" style={{ fontSize: 10, padding: "2px 6px" }} onClick={() => { setReplacing(idx); setReplaceVal(""); }}>Replace</Button>}
                   <IconButton label={`Remove key ${hint}`} style={{ width: 22, height: 22, color: "#ff8a8a" }} onClick={() => removeKey(idx)}>{I.close(11)}</IconButton>
                 </div>
               ))}

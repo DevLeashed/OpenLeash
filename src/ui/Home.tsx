@@ -1,15 +1,63 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { ago, api, baseName } from "../api";
-import { useEffect, useState } from "react";
-import { chatModel, flash, go, modelColor, openProject, set, useNow, useStore } from "../store";
+import { WorkspacePicker } from "./Workspaces";
+import { ProjectName } from "./ProjectName";
+import { ago, api, oneLine } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { chatModel, flash, go, isConnected, modelColor, openProject, set, useNow, useStore } from "../store";
 import { Composer, openMenu } from "./Composer";
-import { sortKey } from "./Chrome";
-import { I, StatusIcon, statusOf } from "./icons";
+import { bySortKey } from "./Chrome";
+import { I, StatusIcon, chatStatus, statusOf } from "./icons";
 import { globalPauseHolds, heldByGlobal, isPaused, pauseHeadline } from "./Paused";
-import { MorphText, Tooltip, Button, ChipButton, Input, Pressable, TextButton } from "./primitives";
+import { MorphText, Tooltip, Button, ChipButton, IconButton, Input, Pressable, TextButton } from "./primitives";
 
-export async function pickFolder() {
-  const dir = await open({ directory: true, multiple: false, title: "Open project folder" });
+/** Prompts for a chat that has nothing in it yet.
+ *
+ *  They fill the composer rather than sending: the first screen should offer a
+ *  starting point instead of an empty box, and the user should still get to
+ *  edit what they are about to run. */
+const STARTERS = [
+  { label: "Explain this repository", prompt: "Explain what this project is, how it is laid out, and how to build and test it." },
+  { label: "Find and fix a failing test", prompt: "Run the test suite and fix the first failure you find." },
+  { label: "Review my uncommitted changes", prompt: "Review my uncommitted changes and tell me what is wrong with them." },
+  { label: "Write project instructions", prompt: "/init" },
+];
+
+/** What has to be true before a first task can run.
+ *
+ *  Rendered only while something is missing, so it teaches once and then gets
+ *  out of the way. Its reason for existing: the recurring complaint against
+ *  tools in this field is discovering a missing prerequisite *halfway through a
+ *  task*, and the fix is to say it before one starts. */
+function FirstRun() {
+  const project = useStore((s) => s.settings?.project ?? "");
+  const info = useStore((s) => s.projectInfo);
+  const providers = useStore((s) => s.providers);
+  const modelReady = providers.some((p) => p.enabled && isConnected(p));
+  const steps = [
+    { id: "model", done: modelReady, label: "Connect a model provider", hint: "Add an API key, or sign in to a subscription", cta: "Open Models", run: () => go("settings", { settingsTab: "models" }) },
+    { id: "folder", done: !!project, label: "Open the project you want to work in", hint: "Agents work on real files, so they need a folder", cta: "Open folder", run: () => void pickFolder() },
+    // Only once there is a folder to decide about.
+    { id: "trust", done: !!info?.trusted, label: "Trust this folder", hint: "Until you decide, its instructions, skills, agents, hooks and MCP servers stay off", cta: "Decide", run: () => set({ trustPrompt: true }) },
+  ].filter((s) => s.id !== "trust" || !!project);
+  if (steps.every((s) => s.done)) return null;
+  return (
+    <div className="firstrun">
+      <div style={{ fontWeight: 600 }}>Before the first task</div>
+      {steps.map((s) => (
+        <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 34 }}>
+          <span aria-hidden="true" style={{ width: 12, color: s.done ? "var(--green)" : "var(--dim)" }}>{s.done ? "✓" : "•"}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ color: s.done ? "var(--mut3)" : "var(--fg)" }}>{s.label}{s.done && <span className="sr-only"> — done</span>}</div>
+            {!s.done && <div className="desc">{s.hint}</div>}
+          </div>
+          {!s.done && <Button variant="ghost" style={{ height: 24, flex: "none" }} onClick={s.run}>{s.cta}</Button>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export async function pickFolder() {  const dir = await open({ directory: true, multiple: false, title: "Open project folder" });
   if (typeof dir !== "string") return;
   await openProject(dir);
 }
@@ -23,8 +71,18 @@ export function Home() {
   const savedN = useStore((s) => s.settings?.saved_prompts?.length ?? 0);
   // "Recent" means the chats the user was last in, not the ones whose agents
   // happened to run most recently — same rule as the sidebar.
-  const recent = Object.values(tasks).filter((t) => t.project === project && !t.archived).sort((a, b) => sortKey(b) - sortKey(a)).slice(0, 5);
-  const wtOn = home.worktree && info?.git;
+  //
+  // Memoized, like the sidebar's copy of the same filter/sort and for the same
+  // reason: `tasks` changes on every task event from every chat, so this screen
+  // re-rendered — and re-sorted the whole chat list — each time a background
+  // agent reported a step, for a list that only changes when a chat is touched.
+  // The reorder setting is a subscription rather than something `sortKey` reads
+  // off the live store: inside a memo that would not be a dependency.
+  const automaticReorder = useStore((s) => s.settings?.automatic_chat_reorder !== false);
+  const recent = useMemo(
+    () => bySortKey(Object.values(tasks).filter((t) => t.project === project && !t.archived), automaticReorder).slice(0, 5),
+    [tasks, project, automaticReorder],
+  );
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
   const [msg, setMsg] = useState("");
   const [quiet, setQuiet] = useState(false);
@@ -34,12 +92,12 @@ export function Home() {
   // being rendered as a claim that the pause is already done.
   const [settlingPause, setSettlingPause] = useState(false);
   //
-  // It doubles as the button's own acknowledgement. `pause_all` does not flip the
-  // flag until it has walked every chat, reset `unpaused`, saved each to disk and
-  // recounted what was in flight — which is seconds on a machine with a few dozen
-  // chats, all of it after the IPC round trip. Until then the chip is still enabled
-  // and unchanged, so pressing it twice sends the whole sweep twice and the second
-  // press overwrites the first press's failure handling.
+  // It doubles as the button's own acknowledgement. The backend now puts the
+  // flag up first and walks the chats after it (see `pause_all_chats` in
+  // `src-tauri/src/lib.rs`), so what the chip covers is the IPC round trip rather
+  // than that walk — but it covers all of it: until the flag lands the chip is
+  // still enabled and unchanged, so pressing it twice would send the whole thing
+  // twice and the second press would overwrite the first press's failure handling.
   // How long the loading state has been showing. Off until a pause is pressed.
   const [floorPassed, setFloorPassed] = useState(false);
   // Whether the chip is mid-press. Separate from `settlingPause` because that one
@@ -48,17 +106,46 @@ export function Home() {
   // never made. Kept true until the flag is back, so the acknowledgement is the
   // whole round trip rather than one frame.
   const [pausing, setPausing] = useState(false);
-  const all = Object.values(tasks);
-  const live = all.filter((t) => t.status === "running" || t.status === "waiting").length;
-  const pausedN = all.filter((t) => t.paused).length;
-  // Paused but commands still finishing: the pause is in progress.
-  const draining = all.filter((t) => (t.paused || heldByGlobal(t, pausedAll)) && t.busy > 0).reduce((n, t) => n + t.busy, 0);
+  // One pass, memoized. Every one of these walks the whole chat list, and
+  // `tasks` changes on every task event from every chat, so the home screen paid
+  // four full scans plus a sort each time any agent reported a step.
+  const { live, pausedN, draining } = useMemo(() => {
+    const all = Object.values(tasks);
+    return {
+      live: all.filter((t) => t.status === "running" || t.status === "waiting").length,
+      pausedN: all.filter((t) => t.paused).length,
+      // Paused but commands still finishing: the pause is in progress.
+      draining: all.filter((t) => (t.paused || heldByGlobal(t, pausedAll)) && t.busy > 0).reduce((n, t) => n + t.busy, 0),
+    };
+  }, [tasks, pausedAll]);
+  const all = useMemo(() => Object.values(tasks), [tasks]);
   // The banner is about a pause that is holding something, so it is gated on that
   // and not on the flag: `paused_all` survives a quit and outlives the chats it
   // froze, and a flag that holds nothing announced "Everything is paused" over a
   // paused list reading "Nothing is frozen right now" — the user got that with
   // nothing paused, and believed it.
   const heldAll = globalPauseHolds(all, pausedAll);
+  // Every live background command, across every chat. A pause does not stop
+  // these — a dev server or a watcher is meant to outlive one, which is why the
+  // backend leaves them out of the `busy` count the headline is made of — so a
+  // banner saying "Everything is paused" has to name them, or it reports nothing
+  // running while a server is still up and rebuilding on every save.
+  //
+  // Read off the summaries rather than this window's own `bg` map: that map only
+  // covers the chats this window has seen an event for, and a job that exits on
+  // its own is not always re-emitted, so it can hold a dead one as `running`. The
+  // backend recounts on every start and exit and publishes, so this list is the
+  // same in every client.
+  // A summary the store already holds (or a test fixture) can predate the field,
+  // so a missing list has to read as nothing known rather than take the home
+  // screen down with it.
+  const liveJobs = useMemo(
+    () => all.flatMap((t) => (t.bg_now ?? []).filter((b) => b.running).map((b) => ({ task: t, job: b })))
+      // Oldest first: the server nobody remembers starting is the one worth
+      // seeing at the top of a list you are scanning on your way out.
+      .sort((a, b) => a.job.started.localeCompare(b.job.started)),
+    [all],
+  );
   // Whether any pause at all is showing, which is what the banner and its pill
   // are gated on. Same rule: an inert flag is not a pause.
   const anyPaused = heldAll || pausedN > 0;
@@ -96,8 +183,9 @@ export function Home() {
         <div style={{ flex: 1, minHeight: 40 }} />
         <div style={{ width: "100%", maxWidth: 660, display: "flex", flexDirection: "column", gap: 14 }}>
           <h1>
-            {project ? <>What should we build in <TextButton className="project-link" onClick={(e) => openMenu("folder", e)}>{baseName(project)}</TextButton>?</> : <><TextButton className="project-link" onClick={pickFolder}>Open a project</TextButton> to get started</>}
+            {project ? <>What should we build in <TextButton className="project-link" onClick={(e) => openMenu("folder", e)}><ProjectName path={project} /></TextButton>?</> : <><TextButton className="project-link" onClick={pickFolder}>Open a project</TextButton> to get started</>}
           </h1>
+          <FirstRun />
           {anyPaused && quiet && (
             <Tooltip content="Show the pause banner again"><Pressable className="pausepill" onClick={() => setQuiet(false)}>
               {I.pause(9)}<span>{settling ? "Pausing…" : heldAll ? "All paused" : `${pausedN} paused`}</span>
@@ -119,17 +207,33 @@ export function Home() {
                 {/* Opening the list also shrinks the banner to its small pill,
                     which carries List and Resume buttons of its own. */}
               </div>
+              {/* Last in the bar and full width, so the jobs read as part of the
+                  pause rather than as one more of its actions. */}
+              {liveJobs.length > 0 && (
+                <div className="pb-jobs">
+                  <div className="pb-jobs-h">
+                    <span style={{ fontWeight: 600 }}>Still running</span>
+                    <span>{liveJobs.length} background command{liveJobs.length === 1 ? "" : "s"} · not stopped by the pause</span>
+                  </div>
+                  {liveJobs.map(({ task, job }) => (
+                    <div key={`${task.id}/${job.id}`} className="pb-job" role="button" tabIndex={0} onClick={() => go("session", { task: task.id })}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go("session", { task: task.id }); } }}>
+                      <StatusIcon status="running" size={11} />
+                      <span className="mono pb-job-cmd" title={job.cmd}>{job.cmd}</span>
+                      <span className="pb-job-chat" title={task.title}>{oneLine(task.title, 28)}</span>
+                      <span className="pb-job-up" title={`Started ${new Date(job.started).toLocaleString()}`}>up {ago(job.started)}</span>
+                      <IconButton label={`Stop ${job.cmd}`} style={{ width: 20, height: 20 }} onClick={(e) => { e.stopPropagation(); void api.bgKill(task.id, job.id).catch((err) => flash(String(err))); }}><StatusIcon status="stopped" size={11} /></IconButton>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           <Composer mode="home" />
           <div style={{ display: "flex", alignItems: "center", gap: 2, padding: "0 6px", flexWrap: "wrap" }}>
-            <Tooltip content={info?.memory.length ? `Instructions loaded into every task: ${info.memory.join(", ")}` : undefined}><ChipButton onClick={(e) => (project ? openMenu("folder", e) : pickFolder())}>{I.folder()}{project ? baseName(project) : "Open folder…"}{!!info?.memory.length && <span className="membadge">{info.memory.length} doc{info.memory.length === 1 ? "" : "s"}</span>}</ChipButton></Tooltip>
-            {info?.git && (
-              <Tooltip content="Run in an isolated git worktree on its own branch"><ChipButton style={{ color: wtOn ? "var(--violet)" : undefined }} onClick={() => set((s) => ({ home: { ...s.home, worktree: !s.home.worktree } }))}>
-                {I.monitor()}{wtOn ? "New worktree" : "Local checkout"}
-              </ChipButton></Tooltip>
-            )}
-            {info?.git && <ChipButton className="mono" style={{ fontSize: 11.5 }} onClick={(e) => openMenu("branch", e)}>{I.branch()}{home.branch || info.branch}</ChipButton>}
+            <Tooltip content={info?.memory.length ? `Instructions loaded into every task: ${info.memory.join(", ")}` : undefined}><ChipButton onClick={(e) => (project ? openMenu("folder", e) : pickFolder())}>{I.folder()}{project ? <ProjectName path={project} /> : "Open folder…"}{!!info?.memory.length && <span className="membadge">{info.memory.length} doc{info.memory.length === 1 ? "" : "s"}</span>}</ChipButton></Tooltip>
+            {project && <WorkspacePicker project={project} git={!!info?.git} />}
+            {info?.git && <ChipButton className="mono home-branch" style={{ fontSize: 11.5 }} onClick={(e) => openMenu("branch", e)}>{I.branch()}<span className="home-branch-name">{home.branch || info.branch}</span></ChipButton>}
             <div style={{ flex: 1 }} />
             {!pausedAll && live > pausedN && (
               <Tooltip content={pausing ? "Pausing every agent…" : "Freeze every running agent (e.g. before shutting down)"}>
@@ -166,18 +270,34 @@ export function Home() {
               <span style={{ fontWeight: 500 }}>Jump back in</span>
             </div>
           )}
+          {!recent.length && (
+            <>
+              <div style={{ display: "flex", alignItems: "center", padding: savedN > 0 ? "10px 10px 6px" : "0 10px 6px", fontSize: 11, color: "var(--dim)" }}>
+                <span style={{ fontWeight: 500 }}>Try one of these</span>
+              </div>
+              {STARTERS.map((s) => (
+                <Pressable key={s.label} className="jrow" onClick={() => set({ draft: s.prompt })}>
+                  <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500, color: "#d4d4d8" }}>{s.label}</span>
+                  <span style={{ fontSize: 11, color: "var(--dim)" }}>Fill the box</span>
+                </Pressable>
+              ))}
+            </>
+          )}
           {recent.map((t) => {
             // `st` and the icon read the same question: is this chat frozen? They
             // used to answer it two ways, so under "Pause all" the row said
             // "Paused" while the icon beside it was still the live running one.
             const paused = isPaused(t, pausedAll);
-            const st = statusOf(t.status, paused);
+            // Same verdict the sidebar draws: a chat parked on a trigger is not
+            // waiting on the user, so it must not arrive here red either.
+            const shown = chatStatus(t);
+            const st = statusOf(shown, paused);
             return (
               <Pressable key={t.id} className="jrow" onClick={() => go("session", { task: t.id })}>
-                <StatusIcon status={paused ? "paused" : t.status} color={modelColor(chatModel(t))} />
+                <StatusIcon status={paused ? "paused" : shown} color={modelColor(chatModel(t))} />
                 <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500, color: "#d4d4d8" }}>{t.title}</span>
                 <span className="mono" style={{ fontSize: 11, color: "var(--dim)" }}>{t.branch}</span>
-                <MorphText className="task-state">{t.status === "done" || t.status === "idle" ? ago(t.updated_at) : st.text}</MorphText>
+                <MorphText className="task-state">{shown === "done" || shown === "idle" ? ago(t.updated_at) : st.text}</MorphText>
               </Pressable>
             );
           })}

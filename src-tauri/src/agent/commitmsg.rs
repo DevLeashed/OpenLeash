@@ -314,7 +314,9 @@ pub async fn complete(
         (task.model.clone(), task.route.clone())
     };
     let settings = h.settings.read().await.clone();
-    let model = choose_model(h, &settings, &task_model, &route_id)?;
+    let model = choose_model(h, &settings, &task_model, &route_id).ok_or_else(|| {
+        "no connected model is available for commit-message generation".to_string()
+    })?;
     let req = request(system_prompt, user, task_id);
     let (text, usage, target) = router::oneshot(
         h,
@@ -334,7 +336,7 @@ pub async fn complete(
 
     let cost = usage.cost(&providers::model_info(&target.model_id));
     let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-    record_spend(h, cost, tokens).await;
+    super::record_side_spend(h, cost, tokens).await;
     h.update_task(task_id, |task| {
         task.usage.input += usage.input;
         task.usage.output += usage.output;
@@ -372,19 +374,21 @@ fn route_error(error: router::RouteErr) -> String {
 
 /// Resolve a live task model, preferring any enabled cheaper model sibling
 /// that is actually connected. Provider fallbacks remain owned by the router.
-fn choose_model(
+///
+/// `None` means no model in the chain is connected. Shared with the permission
+/// reviewer, which wants exactly this shape — the cheapest thing the user has
+/// connected — so each caller names the failure in its own words rather than
+/// inheriting a message about commit messages.
+pub(crate) fn choose_model(
     h: &Arc<super::Harness>,
     settings: &super::store::Settings,
     task_model: &str,
     route_id: &str,
-) -> Result<String, String> {
+) -> Option<String> {
     let (chain, _) = router::steps(task_model, route_id);
     let base = chain
         .iter()
-        .find(|model| model_available(h, settings, model))
-        .ok_or_else(|| {
-            "no connected model is available for commit-message generation".to_string()
-        })?;
+        .find(|model| model_available(h, settings, model))?;
     let base_info = model_info(settings, base);
     let weak = providers::all_models()
         .into_iter()
@@ -405,7 +409,7 @@ fn choose_model(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| weak_model(b).cmp(&weak_model(a)))
         });
-    Ok(weak.map_or_else(|| task_model.to_string(), |model| model.id))
+    Some(weak.map_or_else(|| task_model.to_string(), |model| model.id))
 }
 
 fn model_info(settings: &super::store::Settings, id: &str) -> providers::ModelInfo {
@@ -504,24 +508,6 @@ fn cheaper_or_weaker(candidate: &providers::ModelInfo, base: &providers::ModelIn
     let base_price = base.input_price + base.output_price;
     candidate_price < base_price
         || (candidate_price <= base_price && weak_model(candidate) && !weak_model(base))
-}
-
-/// Keep commit-message spend in the same monthly budget ledger as agent turns.
-/// The router already recorded the detailed sample through `Stats::record`.
-async fn record_spend(h: &super::Harness, cost: f64, tokens: u64) {
-    let month = {
-        let mut settings = h.settings.write().await;
-        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
-        *settings.spend.entry(day).or_insert(0.0) += cost;
-        settings.tokens_month += tokens;
-        settings.month_spend()
-    };
-    h.save_settings_debounced().await;
-    let tokens = h.settings.read().await.tokens_month;
-    (h.bus)(
-        "ol://usage",
-        serde_json::json!({ "month": month, "tokens": tokens }),
-    );
 }
 
 /// The user turn: a bounded rendering of the change.

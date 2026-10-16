@@ -19,6 +19,8 @@ describe("visual and receipt upgrades", () => {
     for (const src of ["javascript:alert(1)", "file:///secret", "http://localhost/image", "data:text/html,hello"]) expect(parseImageSpec(JSON.stringify({ src }))).toBeNull();
     expect(parseImageSpec(JSON.stringify({ src: "https://example.org/a.png", marks: [{ x: 101, y: 0, label: "bad" }] }))).toBeNull();
     expect(parseImageSpec(JSON.stringify({ src: "https://example.org/a.png", marks: [{ x: 50, y: 10, label: "Head" }] }))?.marks).toHaveLength(1);
+    // Agents show their own screenshots by path rather than pasting base64.
+    for (const src of ["out/shot.png", "C:/Users/me/AppData/Local/Temp/shot.jpg", "/tmp/a.webp", "file:///C:/x/b.png"]) expect(parseImageSpec(JSON.stringify({ src }))?.src).toBe(src);
   });
   it("renders annotations and keyboard-adjustable before/after split without an iframe", () => {
     const source = JSON.stringify({ title: "Comparison", src: "https://example.org/a.png", after: "https://example.org/b.png", marks: [{ x: 10, y: 20, label: "Changed area" }] });

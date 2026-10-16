@@ -151,6 +151,11 @@ pub fn relevant(output: &str, edited: &[PathBuf]) -> Vec<String> {
 
 /// Run the checks for these edits. Some(reminder) when edited files have errors.
 pub async fn diagnose(cwd: &str, edited: &[PathBuf], cancel: &CancellationToken) -> Option<String> {
+    // The checks are planned from local project files and run locally; a
+    // remote (SSH) project has neither here, so it gets no automatic check.
+    if super::host::is_ssh(cwd) {
+        return None;
+    }
     let mut found: Vec<String> = vec![];
     for c in plan(cwd, edited) {
         let Ok(r) = shell::run(&c.cmd, &c.dir.to_string_lossy(), DIAG_TIMEOUT_MS, cancel).await
@@ -634,6 +639,12 @@ fn yes() -> bool {
 /// parsing (which a repo controls) and the trust resolution (which it must not)
 /// are visibly different steps.
 fn project_hooks_at(project: &str) -> Vec<Hook> {
+    // A remote (SSH) project's `.openleash/hooks.json` is on the remote host
+    // and is not read: project hooks are off for SSH projects (the user's
+    // own hooks still run, locally). Never let the URI reach a local path.
+    if super::host::is_ssh(project) {
+        return vec![];
+    }
     let Some(path) = project_hooks_path(project) else {
         return vec![];
     };
@@ -864,7 +875,19 @@ async fn fire(
             ("OL_TASK", task.to_string()),
         ];
         env.extend(extra.iter().map(|(k, v)| (*k, v.clone())));
-        match shell::run_env(&h.command, cwd, &env, HOOK_TIMEOUT_MS, cancel).await {
+        // Hooks are the user's own commands and always run on this machine.
+        // For a remote (SSH) project `OL_CWD`/`OL_PROJECT` carry its `ssh://`
+        // URI, and the hook starts in the user's home folder (a local
+        // process can't start "in" a remote directory).
+        let run_dir = if super::host::is_ssh(cwd) {
+            dirs::home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            cwd.to_string()
+        };
+        match shell::run_env(&h.command, &run_dir, &env, HOOK_TIMEOUT_MS, cancel).await {
             Ok(r) => {
                 // `r.output` is already `truncate_output`'d (30k, head+tail, whole
                 // copy spilled to disk). The request JSON is read from *that*, so

@@ -1,10 +1,10 @@
 //! Prompt rules that must reach *every* agent kind.
 //!
 //! The frozen prefix picks one of two rule blocks — `CORE` for the main agent,
-//! `SUB_CORE` for a sub-agent — so any working rule that matters to both lives
+//! `SUB_CORE` for a subagent — so any working rule that matters to both lives
 //! twice, in two blocks nothing keeps in sync. The rule that every command
 //! already starts in the agent's working directory is the one that bit: it was
-//! only in `CORE`, so sub-agents (which is where long-running background
+//! only in `CORE`, so subagents (which is where long-running background
 //! commands actually get written) were never told, and prefixed every command
 //! with `cd "<the directory the prompt had just shown them>"`.
 
@@ -50,6 +50,11 @@ fn main_prompt_explains_inline_visualization_behavior_and_safety() {
         "Source button is only for users who choose to inspect the code",
         "ordinary code fences are welcome",
         "Only a closed, exact `openleash-viz` fence in an assistant reply executes",
+        // A diagram the model writes without the fence is still drawn, so the
+        // rule has to name that case: it is the one difference from "raw HTML is
+        // inert", and an agent that does not know it will distrust the display.
+        "which is read as a diagram",
+        "block in your reply is read as that same inert diagram",
         "no network, external libraries/resources",
         "never put secrets or sensitive data",
     ] {
@@ -88,10 +93,31 @@ fn handoffs_preserve_verification_receipts_and_unresolved_failures() {
 }
 
 #[test]
+fn every_agent_kind_gets_guidance_to_recover_interrupted_subagents_without_duplicates() {
+    for (who, sys) in [
+        ("main", prompt::system(&env(), None, &[])),
+        ("subagent", prompt::system(&env(), Some(&sub()), &[])),
+    ] {
+        for rule in [
+            "does not necessarily lose delegated progress",
+            "old processes are gone",
+            "check current subagent status and existing reports",
+            "wait for workers that are still running",
+            "do not survive a full app restart",
+        ] {
+            assert!(
+                sys.contains(rule),
+                "the {who} prompt is missing interrupted-work guidance {rule:?}.\n---\n{sys}\n---"
+            );
+        }
+    }
+}
+
+#[test]
 fn every_agent_kind_is_told_commands_start_in_their_working_directory() {
     for (who, sys) in [
         ("main", prompt::system(&env(), None, &[])),
-        ("sub-agent", prompt::system(&env(), Some(&sub()), &[])),
+        ("subagent", prompt::system(&env(), Some(&sub()), &[])),
     ] {
         assert!(
             sys.contains("already starts in"),

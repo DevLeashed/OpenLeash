@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { DENY_PREFIX, isDenyRule, normPath, PERMS, type CustomCommand } from "../api";
-import { saveSettings, set, useStore } from "../store";
+import { flash, isNarrow, saveSettings, set, useStore } from "../store";
 import { ago } from "../api";
-import { ARCHIVE_AGES, ageLabel, archiveStale, archiveTask, DEFAULT_ARCHIVE_AGE, deleteArchivedTasks, deleteTask, exportTasks, importTasks, staleChats } from "./Chrome";
+import { archiveTask, deleteArchivedTasks, deleteTask, exportArchived, exportTasks, importTasks } from "./Chrome";
+import { copyText } from "./clipboard";
 import { AccountsTab, AgentsTab, RoutingTab } from "./Accounts";
 import { ModelsTab } from "./ModelManager";
 import { SkillsTab } from "./Skills";
@@ -11,10 +13,14 @@ import { AppVersion } from "./AppVersion";
 import { ConnectorsTab, PluginsTab } from "./Plugins";
 import { McpServers } from "./McpServers";
 import { ChecksTab } from "./Hooks";
+import { RemoteTab } from "./Remote";
+import { WorkspacesTab } from "./Workspaces";
+import { defaultMode } from "../workspaces";
 import { SLASH } from "./Composer";
 import { stepZoom, DEFAULT_ZOOM, ZOOMS } from "../store";
-import { Archive, Bot, Cable, ChartNoAxesColumn, KeyRound, ListChecks, Minus, Network, Palette, Plus, Puzzle, Settings, Sparkles, SlidersHorizontal, Trash2, UserRound, Terminal } from "lucide-react";
+import { Minus, Plus, Trash2 } from "lucide-react";
 import { Dropdown, Button, ChoiceRow, IconButton, Input, NavTab, Pressable, Segmented, Switch, MorphText } from "./primitives";
+import { HIDDEN_SETTINGS_TABS, SETTINGS_TABS, settingsTabDef } from "./settingsTabs";
 
 const THEMES = [
   { id: "raycast", name: "Default", accent: "#ff6363", swatch: ["#161618", "#28282b", "#ff6363", "#8b5cf6", "#33d6ff"] },
@@ -34,9 +40,23 @@ const THEMES = [
 
 function ThemeTab() {
   const cur = useStore((st) => st.settings?.theme ?? "raycast");
+  const mode = useStore((st) => st.settings?.mode ?? "dark");
   return (
     <>
-      <div className="settings-head"><div className="settings-head-main"><div className="settings-title">Theme</div><div className="settings-lead">Pick the accent palette for the whole app.</div></div></div>
+      <div className="settings-head"><div className="settings-head-main"><div className="settings-title">Theme</div><div className="settings-lead">Pick the accent palette for the whole app, and whether it is painted light or dark.</div></div></div>
+      <div className="settings-section-label">Light or dark</div>
+      <Segmented
+        label="Light or dark"
+        options={[
+          { value: "dark", label: "Dark", hint: "The default palette" },
+          { value: "light", label: "Light", hint: "Light surfaces. Floating panels and popovers stay dark." },
+          { value: "system", label: "System", hint: "Follow your OS setting, and keep following it when it changes" },
+        ]}
+        value={mode}
+        onChange={(v) => void saveSettings({ mode: v })}
+        style={{ width: 300 }}
+      />
+      <div className="settings-section-label">Accent palette</div>
       <div className="theme-grid">
         {THEMES.map((t) => (
           <Pressable key={t.id} className={"theme-card" + (cur === t.id ? " on" : "")} style={{ ["--card-accent" as string]: t.accent }} aria-pressed={cur === t.id} onClick={() => void saveSettings({ theme: t.id })}>
@@ -104,10 +124,126 @@ function ProjectDocs() {
   </>;
 }
 
+/**
+ * Import another coding tool's project rules into this app's own instruction
+ * file (`OPENLEASH.md`).
+ *
+ * Two steps on purpose. "Scan" is read-only (`import_scan`) and shows the user
+ * the count, a preview per source and what was skipped; nothing is written
+ * until they press "Import N items" (`import_apply`), which appends a labelled,
+ * deletable block per source and never overwrites the file. The backend
+ * (`importer.rs`) refuses an untrusted folder and refuses again on a re-run, so
+ * this button is not the only guard: it is the *ask*, and the gate is behind it.
+ *
+ * The wire types are declared here rather than in `../api` because this row
+ * owns its two commands; the command surface is `import_scan` / `import_apply`.
+ */
+type ImportItem = { id: string; tool: string; tool_id: string; kind: "rules" | "agent"; path: string; label: string; chars: number; meta: [string, string][]; preview: string; flagged: boolean; flag_reason: string; note: string };
+type ImportSkipped = { tool: string; path: string; reason: string };
+type ImportReport = { project: string; trusted: boolean; target: string; items: ImportItem[]; skipped: ImportSkipped[]; warnings: string[] };
+type ImportOutcome = { imported: number; skipped: number; target: string; tools: string[] };
+
+const baseName = (p: string) => p.split(/[\\/]/).pop() || p;
+const items = (n: number) => `${n} item${n === 1 ? "" : "s"}`;
+
+function ProjectImport() {
+  const s = useStore((st) => st.settings)!;
+  const project = s.project;
+  const [report, setReport] = useState<ImportReport | null>(null);
+  const [busy, setBusy] = useState(false);
+  // A scan belongs to the folder it was taken in: switching projects drops it
+  // rather than offering to file one repo's rules under another one's heading.
+  useEffect(() => { setReport(null); }, [project]);
+  if (!project) {
+    return <div className="settings-note">No project open. Pick a folder to import another tool's rules from.</div>;
+  }
+  const scan = () => {
+    setBusy(true);
+    invoke<ImportReport>("import_scan", { path: project })
+      .then((r) => { setReport(r); flash(r.items.length ? `${items(r.items.length)} to import from this project.` : "Nothing new to import."); })
+      .catch((e) => flash(String(e)))
+      .finally(() => setBusy(false));
+  };
+  // Confirm: append, then re-scan so the list shows what is left (nothing).
+  const run = () => {
+    setBusy(true);
+    invoke<ImportOutcome>("import_apply", { path: project })
+      .then((r) => { flash(r.imported ? `Imported ${items(r.imported)} into ${baseName(r.target)}` : "Nothing new to import."); })
+      .then(() => invoke<ImportReport>("import_scan", { path: project }))
+      .then(setReport)
+      .catch((e) => flash(String(e)))
+      .finally(() => setBusy(false));
+  };
+  const n = report?.items.length ?? 0;
+  return <>
+    <div className="settings-note">Bring another tool's project rules — Cursor (<span className="mono">.cursor/rules</span>, <span className="mono">.cursorrules</span>), Cline (<span className="mono">.clinerules</span>, <span className="mono">.cline/rules</span>), GitHub Copilot (<span className="mono">.github/copilot-instructions.md</span>, <span className="mono">.github/instructions</span>), Gemini CLI (<span className="mono">GEMINI.md</span>) and <span className="mono">.claude/agents</span> — into <span className="mono">OPENLEASH.md</span>. Scanning writes nothing. Importing appends a labelled block per source that you can find and delete, never overwrites your text, and never writes the same source twice.</div>
+    <div className="sgroup">
+      <div className="srowx" style={{ alignItems: "flex-start" }}>
+        <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Import another tool's rules</div><div className="desc">Reads this project folder only. Skips files that are empty, that you already have, or that are already in your instruction files.</div></div>
+        <Button disabled={busy} onClick={scan}><MorphText>{busy ? "Scanning…" : "Scan"}</MorphText></Button>
+      </div>
+    </div>
+    {report && <>
+      {!report.trusted && <div className="settings-note">This folder is <b>not trusted</b>, so OpenLeash will not import from it — a repository you have not looked at cannot write into the instructions your agents read. Answer the folder-trust prompt for this project first.</div>}
+      {report.warnings.map((w) => <div key={w} className="settings-note">{w}</div>)}
+      <div className="settings-section-label">Found {items(n)} to import</div>
+      {n > 0 && <div className="sgroup">
+        {report.items.map((it) => (
+          <div key={it.id} className="srowx" style={{ alignItems: "flex-start" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="mono" style={{ fontSize: 12 }}>{it.path}</div>
+              <div className="desc">{it.tool} · {it.kind === "agent" ? "subagent definition" : "rules"}{it.chars ? ` · ${it.chars} chars` : ""}{it.label && it.label !== baseName(it.path) ? ` · ${it.label}` : ""}{it.note ? ` · ${it.note}` : ""}</div>
+              {/* Imported either way, but never folded in silently: an override reads as text, and the flag rides with it into the file. */}
+              {it.flagged && <div className="desc" style={{ color: "#ff8a8a" }}>⚠ {it.flag_reason}. It is imported as text only — it cannot change an allow rule, a hook, a permission mode or a tool list.</div>}
+              <div className="desc mono" style={{ whiteSpace: "pre-wrap", maxHeight: 108, overflow: "hidden" }}>{it.preview}{it.chars > it.preview.length ? "…" : ""}</div>
+            </div>
+          </div>
+        ))}
+      </div>}
+      {report.skipped.length > 0 && <>
+        <div className="settings-section-label">Skipped {report.skipped.length}</div>
+        <div className="sgroup">
+          {report.skipped.map((sk) => (
+            <div key={`${sk.tool}:${sk.path}`} className="srowx">
+              <div style={{ flex: 1, minWidth: 0 }}><div className="mono" style={{ fontSize: 12 }}>{sk.path}</div><div className="desc">{sk.reason}</div></div>
+            </div>
+          ))}
+        </div>
+      </>}
+      <div className="sgroup">
+        <div className="srowx" style={{ alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 500 }}>{n ? `Append to ${baseName(report.target)}` : "Nothing to import"}</div>
+            <div className="desc">{n ? "A labelled block per source, added under a heading naming the tool and the source path so you can find and delete it. Your own text in the file is never overwritten." : "No Cursor, Cline, Copilot, Gemini or .claude/agents rules were found that you do not already have."}</div>
+          </div>
+          <Button variant="primary" disabled={busy || !report.trusted || !n} onClick={run}><MorphText>{busy ? "Importing…" : n ? `Import ${items(n)}` : "Import"}</MorphText></Button>
+        </div>
+      </div>
+    </>}
+  </>;
+}
+
 function General() {
   const s = useStore((st) => st.settings)!;
   const dataDir = useStore((st) => st.dataDir);
   const [copied, setCopied] = useState(false);
+  // Trace export. The endpoint is persisted like any other setting, but the
+  // exporter itself is process state, so applying it is a second, separate call
+  // — and it is the one that reports a refusal or a fact worth knowing.
+  const [endpoint, setEndpoint] = useState(s.trace_endpoint ?? "");
+  const [traceNote, setTraceNote] = useState("");
+  const [traceErr, setTraceErr] = useState(false);
+  const saveTrace = async () => {
+    if (!(await saveSettings({ trace_endpoint: endpoint.trim() }))) return;
+    try {
+      const st = await invoke<{ enabled: boolean; endpoint: string; error: string | null }>("trace_configure");
+      setTraceErr(!!st.error);
+      setTraceNote(st.error ?? (st.enabled ? `Sending spans to ${st.endpoint}` : "Trace export is off"));
+    } catch (e) {
+      setTraceErr(true);
+      setTraceNote(String(e));
+    }
+  };
   return (
     <>
       <div className="settings-head"><div className="settings-head-main settings-title">General</div></div>
@@ -121,16 +257,39 @@ function General() {
           </div></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Close to tray</div><div className="desc">Keep agents running after closing the window.</div></div>
           <Switch label="Close to tray" checked={s.close_to_tray !== false} onChange={(checked) => void saveSettings({ close_to_tray: checked })} /></div>
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Automatically resume when an account is available</div><div className="desc">Restart chats paused because all provider accounts or keys were out of usage, or because every account was held by a usage cap.</div></div>
+          <Switch label="Automatically resume when an account is available" checked={s.automatic_resume !== false} onChange={(checked) => void saveSettings({ automatic_resume: checked })} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Needs you inbox</div><div className="desc">Show pending approvals and questions from all chats in the sidebar.</div></div>
           <Switch label="Show Needs you inbox" checked={s.needs_you ?? false} onChange={(checked) => void saveSettings({ needs_you: checked })} /></div>
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Pull requests</div><div className="desc">Add a GitHub pull-request screen beside Saved prompts. Shows this project's PRs only. Off by default.</div></div>
+          <Switch label="Show Pull requests" checked={s.show_pull_requests ?? false} onChange={(checked) => void saveSettings({ show_pull_requests: checked })} /></div>
+        {/* The footer button sits beside the usage bar, which is about accounts, so
+            Accounts is what it has always opened and stays the default. Any page
+            is offered, including the ones the nav hides: see `settingsTabs.ts`. */}
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Sidebar shortcut button</div><div className="desc">The button beside the usage bar opens this settings page.</div></div>
+          <Dropdown placeholder="Settings page" value={settingsTabDef(s.sidebar_button_tab).id} options={SETTINGS_TABS.map((t) => ({ value: t.id, label: t.label, icon: <t.Icon size={13} strokeWidth={1.7} aria-hidden="true" /> }))} onChange={(v) => void saveSettings({ sidebar_button_tab: v })} style={{ width: 176, height: 28, padding: "0 8px", flex: "0 0 176px" }} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Notifications</div><div className="desc">When a chat finishes, fails or needs you. A desktop popup if the window is in the background, an in-app notice if you are looking at it.</div></div>
           <Switch label="Desktop notifications" checked={s.notify !== false} onChange={(checked) => void saveSettings({ notify: checked })} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Send message with</div></div>
           <Segmented label="Send message with" options={[{ value: "enter", label: "Enter" }, { value: "ctrl-enter", label: "Ctrl Enter" }]} value={s.send_with} onChange={(v) => void saveSettings({ send_with: v })} /></div>
+        {/* Off by default, and the default is the point: a phone's on-screen
+            Return key cannot be relied on to say whether Shift is held, so
+            Enter-sends there also sends the messages someone was breaking into
+            paragraphs. The desktop switch above cannot cover a phone — a touch
+            keyboard has no Ctrl — so this is a switch of its own. */}
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Enter sends on a phone</div><div className="desc">Off, Enter starts a new line in a phone browser and the send button sends. On, Enter sends and Shift Enter starts a new line. This window is unaffected.</div></div>
+          <Switch label="Enter sends on a phone" checked={s.phone_enter_sends === true} onChange={(checked) => void saveSettings({ phone_enter_sends: checked })} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show thinking</div><div className="desc">Show the model's internal reasoning blocks in chats.</div></div>
           <Switch label="Show thinking" checked={s.show_thinking ?? false} onChange={(checked) => void saveSettings({ show_thinking: checked })} /></div>
-        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>New tasks use a worktree</div><div className="desc">Separate branch and checkout per task.</div></div>
-          <Switch label="New tasks use a worktree" checked={s.worktree} onChange={(checked) => { void saveSettings({ worktree: checked }); set((st) => ({ home: { ...st.home, worktree: checked } })); }} /></div>
+        {/* Off by default, and the default is the point: the split is an estimate
+            rescaled to the provider's prompt count, so the measured ring and its
+            token pair are what everyone sees unless they ask for the rest. */}
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Context breakdown</div><div className="desc">Under the context meter, show the estimated split — system prompt, project instructions, skills and memory, tool schemas, attachments, conversation, summary. Off shows the ring and its token counts only.</div></div>
+          <Switch label="Context breakdown" checked={s.ctx_breakdown ?? false} onChange={(checked) => void saveSettings({ ctx_breakdown: checked })} /></div>
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Automatically rebuild Docker images</div><div className="desc">Changed Docker config rebuilds before next use. When disabled, OpenLeash uses an existing image; first builds and manual rebuilds still work.</div></div>
+          <Switch label="Automatically rebuild Docker images" checked={s.docker_auto_rebuild !== false} onChange={(checked) => void saveSettings({ docker_auto_rebuild: checked })} /></div>
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>New tasks use</div><div className="desc">The project folder, a separate git worktree per task, or a container (Settings → Workspaces).</div></div>
+          <Segmented label="New tasks use" value={defaultMode(s)} onChange={(v) => { void saveSettings({ workspace: v, worktree: v === "worktree" }); set((st) => ({ home: { ...st.home, worktree: v === "worktree", docker: v === "docker" } })); }} options={[{ value: "local", label: "Local" }, { value: "worktree", label: "Worktree" }, { value: "docker", label: "Docker" }]} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Assist mode for new chats</div><div className="desc">How often the agent asks for guidance.</div></div>
           <Segmented label="Assist mode for new chats" options={[{ value: "guide", label: "Guide" }, { value: "default", label: "Default" }, { value: "necessary", label: "Necessary" }]} value={s.assist} onChange={(v) => { void saveSettings({ assist: v }); set((st) => ({ home: { ...st.home, assist: v } })); }} /></div>
       </div>
@@ -138,7 +297,7 @@ function General() {
       <div className="sgroup">
         <div className="srowx">
           <div style={{ flex: 1, minWidth: 0 }}><div className="mono sel" style={{ fontSize: 12 }}>{dataDir}</div><div className="desc">Set OPENLEASH_HOME to move this folder.</div></div>
-          <Button onClick={() => { navigator.clipboard?.writeText(dataDir); setCopied(true); window.setTimeout(() => setCopied(false), 1200); }}><MorphText>{copied ? "Copied" : "Copy"}</MorphText></Button>
+          <Button onClick={() => copyText(dataDir, { onResult: (ok) => { if (!ok) return; setCopied(true); window.setTimeout(() => setCopied(false), 1200); } })}><MorphText>{copied ? "Copied" : "Copy"}</MorphText></Button>
         </div>
       </div>
       <div className="settings-section-label">Project instructions</div>
@@ -149,6 +308,8 @@ function General() {
       </div>
       <div className="settings-section-label">Project docs</div>
       <ProjectDocs />
+      <div className="settings-section-label">Import from another tool</div>
+      <ProjectImport />
       <div className="settings-section-label">Memory</div>
       <div className="sgroup">
         <div className="srowx" style={{ alignItems: "flex-start" }}>
@@ -156,6 +317,18 @@ function General() {
           <Switch label="Let the agent remember things" checked={s.memory ?? false} onChange={(checked) => void saveSettings({ memory: checked })} />
         </div>
       </div>
+      <div className="settings-section-label">Trace export</div>
+      <div className="sgroup">
+        <div className="srowx" style={{ alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 500 }}>Send spans to an OpenTelemetry collector</div>
+            <div className="desc">Off unless you name a collector you run. Each model request and tool call becomes one span carrying the tool name, model id, provider-reported token counts and a duration — never prompts, tool arguments, file contents or keys. Nothing is sent anywhere else, ever.</div>
+          </div>
+          <Input className="input mono" style={{ width: 250, flex: "none" }} aria-label="OTLP endpoint" value={endpoint} placeholder="http://localhost:4318/v1/traces" onChange={(e) => setEndpoint(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter") void saveTrace(); }} />
+          <Button style={{ flex: "none" }} disabled={endpoint.trim() === (s.trace_endpoint ?? "")} onClick={() => void saveTrace()}>Apply</Button>
+        </div>
+      </div>
+      {traceNote && <div className="settings-note" role={traceErr ? "alert" : undefined} style={traceErr ? { color: "#ff8a8a" } : undefined}>{traceNote}</div>}
       <AppVersion />
     </>
   );
@@ -181,7 +354,7 @@ function Perms() {
           </ChoiceRow>
         ))}
       </div>
-      <div className="settings-note">Read-only commands stay available. Plan mode requires approval for edits. A deny rule always wins over every allow rule and over every permission level, including Full Access. An allow rule never covers a chained command — one with a second command, a redirect or a substitution — so it still asks; a deny rule does reach into one.</div>
+      <div className="settings-note">Read-only commands stay available. Plan mode requires approval for edits. A deny rule always wins over every allow rule and over every permission level, including Full Access. An allow rule never covers a chained command — one with a second command, a redirect or a substitution — so it still asks; a deny rule does reach into one. In Reviewer mode a second model answers those prompts in your place and a refusal is final for that call, but a deny rule still decides before the reviewer is ever asked.</div>
       <div className="settings-section-label">Always-allowed commands</div>
       <div className="sgroup">
         {allows.map(({ a, i }) => (
@@ -210,9 +383,24 @@ function Perms() {
         </div>
       </div>
       <div className="settings-section-label">Secret files</div>
+      <div className="sgroup">
+        <div className="srowx" style={{ minHeight: 42 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 500 }}>Deny reading <span className="mono">.env</span> files</div>
+            <div className="desc"><span className="mono">*.env</span> and <span className="mono">*.env.*</span> are denied for <span className="mono">read_file</span>. <span className="mono">*.env.example</span> / <span className="mono">.sample</span> / <span className="mono">.template</span> / <span className="mono">.dist</span> stay readable.</div>
+          </div>
+          <Switch
+            label="Deny reading .env files"
+            hint="A deny that needs no rule. Reads are not sandboxed either way."
+            small
+            checked={s.deny_env_files !== false}
+            onChange={(v) => void saveSettings({ deny_env_files: v })}
+          />
+        </div>
+      </div>
       <div className="settings-note">{s.deny_env_files === false
-        ? <><span className="mono">.env</span> files are readable by <span className="mono">read_file</span> — the built-in deny on them is disabled.</>
-        : <><span className="mono">.env</span> files are denied for <span className="mono">read_file</span> by default (<span className="mono">*.env</span>, <span className="mono">*.env.*</span>; <span className="mono">*.env.example</span> / <span className="mono">.sample</span> / <span className="mono">.template</span> / <span className="mono">.dist</span> stay readable). To allow one, add an allow rule such as <span className="mono">read_file .env</span>.</>}
+        ? <>This is off, so <span className="mono">read_file</span> can read <span className="mono">.env</span> files. Turn it back on unless you have a reason.</>
+        : <>To let the agent read one specific file, add an allow rule such as <span className="mono">read_file .env</span>. Turning this off lifts the deny for every <span className="mono">.env</span> file in every project.</>}
       </div>
     </>
   );
@@ -225,17 +413,8 @@ function ChatsTab() {
   const [arm, setArm] = useState<string | null>(null);
   const [removeWorktree, setRemoveWorktree] = useState<string | null>(null);
   const [armAll, setArmAll] = useState(false);
-  const [armStale, setArmStale] = useState(false);
-  // An unset (or nonsensical) saved value falls back to the default rather than
-  // archiving everything on the next press: the sweep only ever runs from a
-  // button the user just clicked, so the window has to be what the row shows.
-  const current = useStore((st) => st.view === "session" || st.view === "diff" ? st.task : null);
-  const unread = useStore((st) => st.unread);
-  const archiveAfter = ARCHIVE_AGES.includes(s.archive_after_days as (typeof ARCHIVE_AGES)[number]) ? s.archive_after_days! : DEFAULT_ARCHIVE_AGE;
-  const ageOptions = ARCHIVE_AGES.map((d) => ({ value: String(d), label: ageLabel(d) }));
   const all = Object.values(tasks);
   const archived = all.filter((t) => t.archived).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-  const stale = staleChats(tasks, archiveAfter, Date.now(), unread, current, s.paused_all);
   return (
     <>
       <div className="settings-head"><div className="settings-head-main settings-title">Chats</div></div>
@@ -243,6 +422,13 @@ function ChatsTab() {
         <div className="srowx" style={{ alignItems: "flex-start" }}>
           <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Let the agent name chats</div><div className="desc">The agent names a chat once the job is clear, and renames it when the work moves on. Titles you set yourself are never renamed — use a chat's right-click menu to hand a name back.</div></div>
           <Switch label="Let the agent name chats" checked={s.agent_titles ?? true} onChange={(checked) => void saveSettings({ agent_titles: checked })} />
+        </div>
+      </div>
+      <div className="settings-section-label">Other chats</div>
+      <div className="sgroup">
+        <div className="srowx" style={{ alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Let agents see and message your other chats</div><div className="desc">Gives a chat's main agent <span className="mono">list_chats</span> (search your chats and see what each is doing) and <span className="mono">message_chat</span> (send one of them a message). Off by default: it reads conversations you did not open, and a message starts work in one of them. A chat that is paused or archived refuses, so nothing here can unpause a chat you froze, and each message still asks unless you always-allow it. Off applies to new chats immediately; a chat already running is told the rules changed.</div></div>
+          <Switch label="Let agents see and message your other chats" checked={s.cross_chat ?? false} onChange={(checked) => void saveSettings({ cross_chat: checked })} />
         </div>
       </div>
       <div className="sgroup">
@@ -260,18 +446,14 @@ function ChatsTab() {
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Automatic chat reorder</div><div className="desc">Sort by attention and recent activity, while keeping manually dragged chats in place until you return to them.</div></div>
           <Switch label="Automatic chat reorder" checked={s.automatic_chat_reorder !== false} onChange={(checked) => void saveSettings({ automatic_chat_reorder: checked })} /></div>
       </div>
-      <div className="settings-section-label">Archive by age</div>
-      <div className="sgroup">
-        <div className="srowx" style={{ alignItems: "flex-start" }}>
-          <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Archive chats you have not used in</div><div className="desc">Puts the sidebar's quiet tail away in one go, keeping them readable under <span className="mono">Archived</span> below — nothing is deleted. Measured from the last message you sent, not the last agent step, and a chat with a running or waiting agent is always left alone.</div></div>
-          <Dropdown value={String(archiveAfter)} options={ageOptions} onChange={(d) => void saveSettings({ archive_after_days: Number(d) })} search={false} style={{ width: 132, height: 26, flex: "0 0 132px" }} />
-        </div>
-        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Archive idle chats now</div><div className="desc">{stale.length ? `${stale.length} chat${stale.length === 1 ? "" : "s"} idle for over ${ageLabel(archiveAfter).toLowerCase()}` : "Every chat has been used recently"}</div></div>
-          {armStale
-            ? <Button variant="primary" style={{ height: 26, background: "#ff8a8a" }} onClick={() => { setArmStale(false); void archiveStale(archiveAfter); }}>Archive {stale.length} chat{stale.length === 1 ? "" : "s"}</Button>
-            : <Button variant="ghost" disabled={!stale.length} style={{ height: 26 }} onClick={() => setArmStale(true)}>Archive now…</Button>}</div>
-      </div>
       <div className="settings-section-label">Archived · {archived.length}</div>
+      <div className="sgroup">
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Export archived chats</div><div className="desc">{archived.length ? `${archived.length} archived chat${archived.length === 1 ? "" : "s"} · full history, JSON` : "Nothing archived"}</div></div>
+          {/* The label is what this export is *for*, not a generic "Export…" like
+              the active-chats row above: the archive is the only thing it can
+              reach, so naming the set beats repeating the verb. */}
+          <Button variant="ghost" disabled={!archived.length} style={{ height: 26 }} onClick={() => void exportArchived()}>Export archived</Button></div>
+      </div>
       {archived.length ? <div className="sgroup">
         {archived.map((t) => (
           <div key={t.id} className="srowx agentrow" style={{ minHeight: 42 }} onMouseLeave={() => { if (arm === t.id) setArm(null); if (removeWorktree === t.id) setRemoveWorktree(null); }}>
@@ -324,38 +506,29 @@ function CommandsTab() {
   </>;
 }
 
-const TABS = [
-  ["general", "General", Settings], ["theme", "Theme", Palette], ["models", "Models", SlidersHorizontal], ["accounts", "Accounts", UserRound],
-  ["routing", "Routing", Network], ["agents", "Subagents", Bot], ["skills", "Skills", Sparkles], ["commands", "Commands", Terminal], ["chats", "Chats", Archive],
-  ["perms", "Permissions", KeyRound], ["plugins", "Plugins", Puzzle], ["connectors", "Connectors", Cable], ["checks", "Checks & hooks", ListChecks],
-  ["mcp", "MCP servers", Cable], ["usage", "Stats", ChartNoAxesColumn],
-] as const;
-
-// Ids listed here keep their entry in TABS *and* their branch in the render
-// switch below; only the nav button is dropped. So a hidden tab stays reachable
-// from anywhere that sets settingsTab directly (the palette's "Routing and
-// fallbacks", the route menu's "Edit routes…"), the page keeps working for
-// anyone who already had it selected, and unhiding is deleting one string here
-// rather than rewiring every entry point back.
-// Filtered once at module load: TABS is a literal, so the icon component types
-// stay narrow, and `i` indexes the visible list only, keeping the staggered nav
-// animation gapless.
-const HIDDEN_TABS = ["routing"] as const;
-const VISIBLE_TABS = TABS.filter(([id]) => !HIDDEN_TABS.includes(id as (typeof HIDDEN_TABS)[number]));
+// Filtered once at module load, so `i` indexes the visible list only and the
+// staggered nav animation stays gapless. A page listed as hidden keeps its
+// branch in the render switch below and simply gets no nav button — the
+// "Sidebar shortcut button" choice in General still offers it. See
+// `settingsTabs.ts` for the list itself.
+const VISIBLE_TABS = SETTINGS_TABS.filter((t) => !HIDDEN_SETTINGS_TABS.includes(t.id));
 
 export function SettingsView() {
   const tab = useStore((s) => s.settingsTab);
   const ok = useStore((s) => !!s.settings);
+  // On a phone the nav is a strip that scrolls sideways (App.css), so a page
+  // opened from elsewhere (the titlebar's Remote chip) brings its tab into view.
+  useEffect(() => { if (isNarrow()) document.querySelector(".stabs .stab.on")?.scrollIntoView?.({ block: "nearest", inline: "nearest" }); }, [tab, ok]);
   if (!ok) return null;
   return (
-    <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+    <div className="settings-view">
       <div className="stabs">
         <div className="stabs-title">Settings</div>
-        <div role="tablist" aria-label="Settings pages" style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          {VISIBLE_TABS.map(([id, l, Icon], i) => <NavTab key={id} style={{ animationDelay: i * 25 + "ms" }} selected={tab === id} onClick={() => set({ settingsTab: id })}><Icon aria-hidden="true" size={14} strokeWidth={1.7} />{l}</NavTab>)}
+        <div role="tablist" aria-label="Settings pages" className="stabs-list">
+          {VISIBLE_TABS.map(({ id, label, Icon }, i) => <NavTab key={id} style={{ animationDelay: i * 25 + "ms" }} selected={tab === id} onClick={() => set({ settingsTab: id })}><Icon aria-hidden="true" size={14} strokeWidth={1.7} />{label}</NavTab>)}
         </div>
       </div>
-      <div style={{ flex: 1, overflow: "auto", padding: "24px 32px" }}>
+      <div className="settings-content">
         <div key={tab} className="settings-page" style={{ maxWidth: 680, display: "flex", flexDirection: "column", gap: 16 }}>
           {tab === "general" && <General />}
           {tab === "theme" && <ThemeTab />}
@@ -366,11 +539,13 @@ export function SettingsView() {
           {tab === "skills" && <SkillsTab />}
           {tab === "commands" && <CommandsTab />}
           {tab === "chats" && <ChatsTab />}
+          {tab === "workspaces" && <WorkspacesTab />}
           {tab === "perms" && <Perms />}
           {tab === "plugins" && <PluginsTab />}
           {tab === "connectors" && <ConnectorsTab />}
           {tab === "checks" && <ChecksTab />}
           {tab === "mcp" && <McpServers />}
+          {tab === "remote" && <RemoteTab />}
           {tab === "usage" && <StatsTab />}
         </div>
       </div>

@@ -3,23 +3,37 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { Check, FolderOpen } from "lucide-react";
+import { Check, MonitorUp } from "lucide-react";
 import { ago, api, baseName, normPath, TaskSummary } from "../api";
-import { back, chatModel, flash, forgetTask, forward, get, go, loadProject, modelColor, openProject, saveSettings, set, shownAccounts, shownProviders, type State, useNow, useStore, zoom } from "../store";
-import { netWindows } from "./Accounts";
-import { I, statusOf } from "./icons";
+import { back, chatModel, flash, forgetTask, forward, get, go, isNarrow, loadProject, modelColor, openProject, requestPause, saveSettings, set, shownAccounts, shownProviders, type State, useNow, useStore, zoom } from "../store";
+import { capsOf, netWindows } from "./Accounts";
+import { I, chatStatus, isParked, statusOf } from "./icons";
 import { openChatStats } from "./ChatStats";
+import { openTransfer } from "./SendToMachine";
 import { useRowDrag, type RowDrag } from "./drag";
 import { pickFolder } from "./Home";
+import { useOpenSources } from "./OpenProject";
+import { ProjectName } from "./ProjectName";
 import { isPaused, heldByGlobal } from "./Paused";
 import { ProviderIcon } from "./ProviderIcon";
 import { swarmState } from "./session/Swarm";
 import { NeedsYou } from "./NeedsYou";
+import { RemoteIndicator } from "./Remote";
+import { isRemoteClient } from "../remote";
 import { AnchoredPanel, Tooltip, IconButton, Input, MenuRow, MenuScrim, ctxPlace, menuLayer, Pressable, Switch, useAnchoredPanel, useEscapeClose, WindowButton, Kbd } from "./primitives";
+import { settingsTabDef, type SettingsTab } from "./settingsTabs";
 
 const win = () => getCurrentWindow();
 
-export const openAccountsSettings = () => go("settings", { settingsTab: "accounts" });
+/**
+ * Open the Settings page the sidebar footer's shortcut button points at.
+ *
+ * The button sits beside the usage bar, which is about accounts, so Accounts is
+ * the default it has always had — but Settings → General can aim it at any page.
+ * An id this build has no page for resolves to Accounts rather than opening a
+ * blank settings screen; see `settingsTabDef`.
+ */
+export const openSidebarShortcut = () => go("settings", { settingsTab: settingsTabDef(get().settings?.sidebar_button_tab).id });
 
 /** One entry in the project menu: the current folder first, then the remembered ones, no duplicates. */
 export function projectMenuEntries(current: string, remembered: string[]): string[] {
@@ -72,7 +86,7 @@ export function ProjectCtxMenu({ path, x, y, z, close }: { path: string; x: numb
       <div ref={ref} className="pop ctx" style={{ ...ctxPlace(x, y, 242, h, z), zIndex: 91, overflowY: "auto" }}>
         <div className="mmodel" aria-disabled="true">
           <span className="cico">{I.folder()}</span>
-          <span className="mm-name">{baseName(path)}</span>
+          <span className="mm-name"><ProjectName path={path} /></span>
         </div>
         <div className="msep" />
         <MenuRow onClick={() => { close(); void removeProject(path).catch((e) => flash(String(e))); }}>
@@ -113,6 +127,14 @@ function ProjectPicker() {
   // on every render; `projectMenuEntries` reads only these two inputs.
   const list = useMemo(() => projectMenuEntries(project, projects ?? []), [project, projects]);
   const [pos, setPos] = useState<{ left: number; top: number; width: number; maxHeight: number } | null>(null);
+  // Bumped when the window resizes while the popover is open. It is a dependency
+  // of the layout effect below, which is the thing that recomputes `pos`. There
+  // used to be a `resize` listener that called
+  // `window.dispatchEvent(new Event("resize"))` — re-dispatching the very event
+  // it was subscribed to. The dispatch is synchronous and re-entrant, so the
+  // first window resize recursed until the stack overflowed, and it could not
+  // move the popover anyway, because nothing in the effect read the window size.
+  const [resizeTick, setResizeTick] = useState(0);
 
   // The titlebar is draggable, so the popover can't be a child of the button.
   // Recompute on open and on resize, so a window shrink can't leave it off-screen.
@@ -128,12 +150,12 @@ function ProjectPicker() {
       width,
       maxHeight: maxH,
     });
-  }, [openMenuState, z, list.length]);
+  }, [openMenuState, z, list.length, resizeTick]);
   useEffect(() => {
     if (!openMenuState) return;
-    const remeasure = () => window.dispatchEvent(new Event("resize"));
-    window.addEventListener("resize", remeasure);
-    return () => window.removeEventListener("resize", remeasure);
+    const onResize = () => setResizeTick((n) => n + 1);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
   }, [openMenuState]);
   useEffect(() => { if (openMenuState) setHi(Math.max(0, list.indexOf(project))); }, [openMenuState, project, list]);
   useEffect(() => {
@@ -147,6 +169,7 @@ function ProjectPicker() {
   useEscapeClose(!!openMenuState, () => { if (ctx) setCtx(null); else setOpen(false); });
 
   const pick = (p: string) => { setOpen(false); if (p && p !== project) void openProject(p); };
+  const sources = useOpenSources(openMenuState);
   const openFolder = () => { setOpen(false); void pickFolder().catch((e) => flash(String(e))); };
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") { e.preventDefault(); setHi((h) => Math.min(h + 1, list.length - 1)); }
@@ -164,7 +187,7 @@ function ProjectPicker() {
           onClick={() => setOpen(!openMenuState)}
           onKeyDown={(e) => { if (!openMenuState && (e.key === "Enter" || e.key === "ArrowDown")) { e.preventDefault(); setOpen(true); } else onKey(e); }}>
           {I.folder()}
-          <span className="pv">{project ? baseName(project) : "No project"}</span>
+          <span className="pv">{project ? <ProjectName path={project} /> : "No project"}</span>
           {hint && <span className="ph">{hint}</span>}
           <span className="pc">{I.chev()}</span>
         </div>
@@ -183,7 +206,7 @@ function ProjectPicker() {
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setCtx({ p, x: e.clientX, y: e.clientY }); }}>
                   <span className="cico">{I.folder()}</span>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{baseName(p)}</div>
+                    <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}><ProjectName path={p} /></div>
                     <div style={{ fontSize: 11, color: "var(--mut3)", lineHeight: 1.4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p}</div>
                   </div>
                   <span style={{ width: 12, flex: "none", color: "var(--violet)", display: "flex" }}>{p === project ? <Check size={12} strokeWidth={2} /> : null}</span>
@@ -191,7 +214,9 @@ function ProjectPicker() {
               ))}
               {!list.length && <div style={{ padding: "2px 8px 6px", fontSize: 11.5, color: "var(--dim)" }}>No project yet</div>}
               <div className="msep" />
-              <MenuRow onClick={openFolder}><span className="cico"><FolderOpen size={13} /></span><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Open folder…</div><div style={{ fontSize: 11, color: "var(--mut3)" }}>Add another project · Ctrl O</div></div></MenuRow>
+              {sources.map((o) => (
+                <MenuRow key={o.id} onClick={() => { setOpen(false); o.run(); }}><span className="cico">{o.icon}</span><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>{o.label}</div><div style={{ fontSize: 11, color: "var(--mut3)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{o.hint}</div></div></MenuRow>
+              ))}
             </div>
           </div>,
         document.body,
@@ -228,7 +253,7 @@ function ChatProject() {
         {...(same ? {} : { role: "button", tabIndex: 0, onClick: () => void openProject(path),
           onKeyDown: (e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); void openProject(path); } } })}>
         {I.folder()}
-        <span className="cp-name">{baseName(path)}</span>
+        <span className="cp-name"><ProjectName path={path} /></span>
         {!same && <span className="cp-flag">here</span>}
       </div>
     </Tooltip>
@@ -252,7 +277,10 @@ export function Titlebar() {
         <Kbd>Ctrl K</Kbd>
       </Pressable>
       <div style={{ flex: 1 }} data-tauri-drag-region />
-      <div style={{ display: "flex", height: 40 }}>
+      <RemoteIndicator onOpen={() => go("settings", { settingsTab: "remote" })} />
+      {/* A remote browser has no window of its own to minimize or close, and
+          these would act on the desktop window out from under its user. */}
+      {!isRemoteClient() && <div style={{ display: "flex", height: 40 }}>
         <WindowButton label="Minimize" onClick={() => win().minimize()}><div style={{ width: 10, height: 1, background: "currentColor" }} /></WindowButton>
         <WindowButton label="Maximize or restore" onClick={() => win().toggleMaximize()}><div style={{ width: 9, height: 9, border: "1px solid currentColor", borderRadius: 1.5 }} /></WindowButton>
         <WindowButton label="Close window" close onClick={() => win().close()}>
@@ -261,7 +289,7 @@ export function Titlebar() {
             <div style={{ position: "absolute", left: 4.5, top: -1, width: 1, height: 12, background: "currentColor", transform: "rotate(-45deg)" }} />
           </div>
         </WindowButton>
-      </div>
+      </div>}
     </div>
   );
 }
@@ -281,7 +309,7 @@ export function chatPriority(t: TaskSummary, pausedAll = false): number {
   if (t.status === "waiting" && (t.waiting_kind === "question" || t.waiting_kind === "approval")) return 0;
   if (isPaused(t, pausedAll)) return 1;
   if (t.status === "running") return 2;
-  if (t.status === "done" || t.status === "stopped") return 3;
+  if (t.status === "done" || t.status === "failed" || t.status === "stopped") return 3;
   return 4;
 }
 
@@ -296,6 +324,26 @@ export function orderBetween(above: TaskSummary | undefined, below: TaskSummary 
   if (above) return sortKey(above, automatic) - 60_000;
   if (below) return sortKey(below, automatic) + 60_000;
   return Date.now();
+}
+
+/**
+ * Sort by a key computed once per chat, not once per comparison.
+ *
+ * `sortKey` parses up to two ISO timestamps, and a comparator that calls it pays
+ * that twice for every comparison — about `2·n·log n` parses where `2·n` would
+ * do, so ~1000 of them for an 80-chat list. The sidebar rebuilds and re-sorts
+ * this list on every task event from every chat, which is at its worst exactly
+ * when a lot of chats are running, so this is the difference between parsing 80
+ * dates per event and parsing a thousand.
+ *
+ * Stable the same way the plain `sort` was: ties keep their input order, so the
+ * ordered result is identical.
+ */
+export function bySortKey(list: TaskSummary[], automatic: boolean, dir: -1 | 1 = -1): TaskSummary[] {
+  return list
+    .map((t) => [sortKey(t, automatic), t] as const)
+    .sort((a, b) => dir * (a[0] - b[0]))
+    .map(([, t]) => t);
 }
 
 
@@ -327,10 +375,14 @@ export async function archiveTask(id: string, archived = true) {
   if (!(await patchTask(id, { archived }))) return;
   const s = get();
   if (archived && s.task === id && (s.view === "session" || s.view === "diff")) go("home");
+  // Archiving is reversible and used to offer no way back, which is most of why
+  // it read as destructive. The toast is the way back.
+  if (archived) flash("Chat archived", { label: "Undo", run: () => { void patchTask(id, { archived: false }); } });
 }
 
 export async function deleteTask(id: string, removeWorktree = false) {
   const task = get().tasks[id];
+  const workers = task?.subs?.filter((s) => s.cwd).length ?? 0;
   const result = await api.remove(id, removeWorktree).then(() => true).catch((e) => {
     flash(String(e));
     return false;
@@ -338,8 +390,10 @@ export async function deleteTask(id: string, removeWorktree = false) {
   if (!result) return false;
   set((s) => forgetTask(s, id));
   if (task && id === get().task && (get().view === "session" || get().view === "diff")) go("home");
-  if (removeWorktree) flash("Chat deleted · worktree removed · branch kept");
-  else if (task?.worktree) flash(`Chat deleted · worktree kept at ${task.cwd} (${task.branch})`);
+  const kept = !!task?.worktree || workers > 0;
+  if (removeWorktree) flash(kept ? "Chat deleted · worktrees removed · branches kept" : "Chat deleted");
+  else if (task?.worktree) flash(`Chat deleted · worktree kept at ${task.cwd} (${task.branch})${workers ? ` · ${workers} worker worktree${workers === 1 ? "" : "s"} kept` : ""}`);
+  else if (workers) flash(`Chat deleted · ${workers} worker worktree${workers === 1 ? "" : "s"} kept`);
   return true;
 }
 
@@ -366,7 +420,9 @@ export async function archivePicked(ids: string[]) {
   set({ picked: {}, selecting: false });
   if (n < 0) return;
   if (n && before && ids.includes(before) && (get().view === "session" || get().view === "diff")) go("home");
-  flash(n ? `Archived ${n} chat${n === 1 ? "" : "s"}` : "Those chats are already archived");
+  flash(n ? `Archived ${n} chat${n === 1 ? "" : "s"}` : "Those chats are already archived", n
+    ? { label: "Undo", run: () => { for (const id of ids) void patchTask(id, { archived: false }); } }
+    : undefined);
 }
 
 /** Pin or unpin every ticked chat in one write each, keeping the ticks: pinning
@@ -376,80 +432,66 @@ async function pinPicked(ids: string[], pinned: boolean) {
   await Promise.all(ids.map((id) => patchTask(id, { pinned })));
 }
 
-/** Delete every archived chat at once. Their worktrees are kept on disk. */
+/** Delete every archived chat at once. Their worktrees are kept on disk.
+ *
+ *  One call rather than a loop of deletes: the backend re-derives the archived
+ *  set itself (`delete_archived` in `lib.rs`), so a client list that went stale
+ *  cannot leave a chat behind or delete one that was just unarchived, and it
+ *  preserves worktrees the same way this used to. `api.deleteArchived` used to
+ *  have no caller at all, with this loop reimplementing it. */
 export async function deleteArchivedTasks() {
   const before = get();
   const ids = Object.values(before.tasks).filter((task) => task.archived).map((task) => task.id);
-  const keptWorktrees = ids.filter((id) => !!before.tasks[id]?.worktree).length;
-  const deleted: string[] = [];
-  for (const id of ids) {
-    const success = await api.remove(id, false).then(() => true).catch((e) => {
-      flash(String(e));
-      return false;
-    });
-    if (success) deleted.push(id);
+  // Nothing to do, and no reason to ask the backend: this is the one case where
+  // the client's own list is the whole answer.
+  if (!ids.length) {
+    flash("No archived chats");
+    return;
   }
-  if (deleted.length) set((s) => {
+  // Both kinds count: a chat's own worktree, and the worker worktrees an
+  // ultrathread run left behind. The count is what the toast promises was kept.
+  const keptWorktrees = ids.reduce((n, id) => {
+    const t = before.tasks[id];
+    return n + (t?.worktree ? 1 : 0) + (t?.subs?.filter((s) => s.cwd).length ?? 0);
+  }, 0);
+  let removed: number;
+  try {
+    removed = await api.deleteArchived();
+  } catch (e) {
+    flash(String(e));
+    return;
+  }
+  // Forget locally whatever we believed was archived: those are exactly the rows
+  // whose files the backend just removed.
+  set((s) => {
     let next = s;
-    for (const id of deleted) next = { ...next, ...forgetTask(next, id) } as State;
+    for (const id of ids) next = { ...next, ...forgetTask(next, id) } as State;
     return next === s ? {} : (next as unknown as Partial<State>);
   });
-  if (before.task && deleted.includes(before.task) && (before.view === "session" || before.view === "diff")) go("home");
-  const n = deleted.length;
+  if (before.task && ids.includes(before.task) && (before.view === "session" || before.view === "diff")) go("home");
   flash(
-    n
-      ? `Deleted ${n} archived chat${n === 1 ? "" : "s"}${keptWorktrees ? ` · kept ${keptWorktrees} worktree${keptWorktrees === 1 ? "" : "s"} on disk` : ""}`
-      : ids.length ? "Archived chats could not be deleted" : "No archived chats",
+    removed
+      ? `Deleted ${removed} archived chat${removed === 1 ? "" : "s"}${keptWorktrees ? ` · kept ${keptWorktrees} worktree${keptWorktrees === 1 ? "" : "s"} on disk` : ""}`
+      : "Archived chats could not be deleted",
   );
 }
 
-/** How long a chat has to sit untouched before a sweep will put it away. */
-export const ARCHIVE_AGES = [7, 14, 30, 90, 180] as const;
-
-/** Two weeks, the window a sweep opens at: long enough that a chat you return
- *  to after a fortnight is still in the sidebar, short enough that the list does
- *  not become an archive of everything you have ever opened. */
-export const DEFAULT_ARCHIVE_AGE = 14;
 export const SIDEBAR_CHAT_LIMIT = 100;
 
-export const ageLabel = (days: number) => (days >= 365 ? `${Math.round(days / 365)} years` : days >= 30 ? (days % 30 ? `${days} days` : `${days / 30} month${days / 30 === 1 ? "" : "s"}`) : `${days} day${days === 1 ? "" : "s"}`);
-
-/// Chats a sweep is allowed to put away: the live ones, and the ones the user
-/// last *did* something in.
-///
-/// Archived chats are already out of the way, and a running or waiting one has
-/// a live agent in it — `tasks_archive` deliberately hides a chat rather than
-/// cancelling it, so sweeping one away would leave work running somewhere the
-/// user cannot see. Age comes off `touched_at`, the field the sidebar sorts on:
-/// `updated_at` moves on every agent step, so a chat working through a hundred
-/// tool calls looks brand new to it and would never age out.
-///
-/// Exported for tests.
-export function staleChats(tasks: Record<string, TaskSummary>, days: number, now = Date.now(), unread: Record<string, boolean> = {}, current: string | null = null, pausedAll = false): TaskSummary[] {
-  const cutoff = now - days * 86_400_000;
-  return Object.values(tasks).filter((t) => !t.archived && !t.pinned && t.id !== current && !unread[t.id]
-    && !isPaused(t, pausedAll) && !["running", "waiting"].includes(t.status)
-    && Date.parse(t.touched_at || t.updated_at) < cutoff);
-}
-
 /** Oldest eligible chats beyond the sidebar cap, preserving pinned, active, paused, unread and current chats. */
-export function excessSidebarChats(tasks: Record<string, TaskSummary>, limit = SIDEBAR_CHAT_LIMIT, unread: Record<string, boolean> = {}, current: string | null = null, pausedAll = false): TaskSummary[] {
+export function excessSidebarChats(tasks: Record<string, TaskSummary>, limit = SIDEBAR_CHAT_LIMIT, current: string | null = null, pausedAll = false): TaskSummary[] {
   const unarchived = Object.values(tasks).filter((t) => !t.archived);
   const excess = Math.max(0, unarchived.length - limit);
   if (!excess) return [];
-  const eligible = unarchived.filter((t) => !t.pinned && t.id !== current && !unread[t.id]
-    && !isPaused(t, pausedAll) && !["running", "waiting"].includes(t.status))
-    .sort((a, b) => sortKey(a) - sortKey(b));
-  return eligible.slice(0, excess);
-}
-
-/** Put every chat idle for longer than `days` away. Reports through `flash`. */
-export async function archiveStale(days: number) {
-  const state = get();
-  const current = state.view === "session" || state.view === "diff" ? state.task : null;
-  const ids = staleChats(state.tasks, days, Date.now(), state.unread, current, state.settings?.paused_all ?? false).map((t) => t.id);
-  if (!ids.length) return flash("No chats idle that long");
-  return archivePicked(ids);
+  const eligible = unarchived.filter((t) => !t.pinned && t.id !== current && !t.unread
+    && !isPaused(t, pausedAll) && !["running", "waiting"].includes(t.status));
+  // Oldest first, keyed once per chat: this runs from an effect on every task
+  // event while the sidebar is mounted, and it only ever returns the oldest
+  // `excess` — so the cheap length check above already covers the common case.
+  // The flag is read explicitly because `bySortKey` takes it as an argument
+  // where the old call let `sortKey` read its own default.
+  const automatic = get().settings?.automatic_chat_reorder !== false;
+  return bySortKey(eligible, automatic, 1).slice(0, excess);
 }
 
 export async function archiveExcessSidebarChats(ids: string[]) {
@@ -458,6 +500,12 @@ export async function archiveExcessSidebarChats(ids: string[]) {
     const n = await api.archiveTasks(ids);
     if (!n) return;
     set((s) => ({ tasks: Object.fromEntries(Object.entries(s.tasks).map(([id, task]) => [id, ids.includes(id) ? { ...task, archived: true, pinned: false } : task])) }));
+    // Deliberately silent. Announcing the sweep put a banner and an "Undo" in
+    // front of every launch that trimmed the list, for a tidy-up nobody asked
+    // for; the chats it puts away are still in the sidebar's Archived list,
+    // which is where they are looked for. The failure path below still speaks,
+    // because a sweep that did *not* happen is the user's news and a successful
+    // one is not.
   } catch (e) {
     flash(String(e));
   }
@@ -478,6 +526,27 @@ export async function exportTasks(ids: string[] | "all") {
     if (ids === "all") flash(`Exported ${await api.exportAll(path, false)} chats`);
     else if (ids.length > 1) flash(`Exported ${await api.exportTasks(ids, path)} chats`);
     else { await api.exportTask(one!, path); flash("Chat exported"); }
+  } catch (e) {
+    flash(String(e));
+  }
+}
+
+/** Write every archived chat to one file, whatever its title or status.
+ *
+ *  The one export that starts from the archive rather than the list: archived
+ *  chats are hidden from the sidebar by design, so the usual "export these"
+ *  paths cannot reach them, and this is the button under the list that is
+ *  literally a list of them. Goes through `tasks_export` like the selection
+ *  export — one file of full chat bodies, not the summaries the settings page
+ *  shows — and takes the ids off the store fresh, so a chat restored a moment
+ *  ago is not swept into a backup nobody asked to include it. */
+export async function exportArchived() {
+  const ids = Object.values(get().tasks).filter((t) => t.archived).map((t) => t.id);
+  const path = await save({ defaultPath: `openleash-archive-${new Date().toISOString().slice(0, 10)}.json`, filters: [{ name: "OpenLeash chats", extensions: ["json"] }] }).catch((e) => { flash(String(e)); return null; });
+  if (!path) return;
+  try {
+    const n = await api.exportTasks(ids, path);
+    flash(n ? `Exported ${n} archived chat${n === 1 ? "" : "s"}` : "Nothing archived");
   } catch (e) {
     flash(String(e));
   }
@@ -575,15 +644,26 @@ const Row = memo(function Row({ t, active, onCtx, drag }: { t: TaskSummary; acti
   // tick re-rendering the whole sidebar.
   useNow();
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
-  const unread = useStore((s) => s.unread[t.id]);
+  // The blue dot is the backend's mark on the summary (`TaskSummary.unread`), not
+  // this window's: it survives a reload, and the phone's browser sees the same
+  // one. The chat that is on screen right now is the exception — you are looking
+  // at it, so its dot does not shout. Read off the row's own `t` rather than a
+  // subscription: the summary is the prop this row re-renders for.
+  const onScreen = useStore((s) => (s.view === "session" || s.view === "diff") && s.task === t.id);
+  const unread = !!t.unread && !onScreen;
   const renaming = useStore((s) => s.renaming === t.id);
   const picked = useStore((s) => !!s.picked[t.id]);
   const selecting = useStore((s) => s.selecting);
   const project = useStore((s) => s.settings?.project ?? "");
   const [arm, setArm] = useState(false);
   const [title, setTitle] = useState(t.title);
-  const st = statusOf(t.status, isPaused(t, pausedAll));
-  const live = (t.status === "running" || t.status === "waiting") && st.text !== "Paused";
+  // A chat parked by `wait_for_event` is waiting on a trigger, not on you, so it
+  // is drawn by its own quiet status: the red "Needs you" and the attention
+  // pulse belong to the waits only the user can end. See `chatStatus`.
+  const parked = isParked(t);
+  const shown = chatStatus(t);
+  const st = statusOf(shown, isPaused(t, pausedAll));
+  const live = (shown === "running" || shown === "waiting") && st.text !== "Paused";
   // A chat from another folder is listed (while "show all" is on, or because it
   // is the one being read) but belongs to somewhere else: it steps back a shade
   // and a notch, so this folder's own chats are the ones that read as solid.
@@ -605,13 +685,18 @@ const Row = memo(function Row({ t, active, onCtx, drag }: { t: TaskSummary; acti
   // dot itself belongs to the model, and a settled swarm falls back to the same
   // status colour any other row gets.
   const swarm = t.ultra ? swarmState(t, heldByGlobal(t, pausedAll)) : null;
-  // The dot and the active rail take one colour from here, so they can never
-  // disagree: unread is the loudest, then the chat's own status colour. A
-  // blocking question or approval is the exception: its red waiting colour is
-  // the attention marker, and unread blue would hide the fact that it needs an
-  // answer until the backend ends the wait.
-  const needsAnswer = dot === "var(--st-wait)" && (t.waiting_kind === "question" || t.waiting_kind === "approval");
-  const dotColor = unread && !needsAnswer ? "var(--st-unread)" : dot;
+  // The status dot reports what the chat is doing; unread is a separate mark,
+  // never a replacement colour. Otherwise an unread run or wait looks done until
+  // opening it hides the unread mark and reveals its actual status.
+  const blockingWait = t.waiting_kind === "question" || t.waiting_kind === "approval";
+  const needsAnswer = blockingWait || (t.status === "waiting" && !parked);
+  const isPausedState = st.text === "Paused";
+  // A finished chat has no status to hide behind, so its unread state is the
+  // full dot itself, in the unread colour, glowing as it did before. Running and
+  // waiting chats keep their status colour and get the corner speck instead.
+  const doneUnread = unread && shown === "done" && !isPausedState;
+  const showUnreadMark = unread && !needsAnswer && !isPausedState && !doneUnread;
+  const dotColor = isPausedState ? dot : needsAnswer ? statusOf("waiting", false).dot : doneUnread ? "var(--st-unread)" : dot;
   // The newest title, for the rename effect: it must seed the box when `renaming`
   // turns on, but must NOT re-seed on every title change while the user types.
   const titleRef = useRef(t.title);
@@ -635,8 +720,9 @@ const Row = memo(function Row({ t, active, onCtx, drag }: { t: TaskSummary; acti
       onMouseLeave={() => setArm(false)}
     >
       {selecting && <span className="pickbox" aria-hidden="true">{picked && I.close(9)}</span>}
-      <span style={{ width: 12, flex: "none", display: "grid", placeItems: "center" }}>
-        <span className={"dot" + (live ? " pulse" : "")} style={{ background: dotColor, boxShadow: live || unread ? `0 0 7px ${dotColor}` : undefined }} />
+      <span style={{ width: 12, flex: "none", display: "grid", placeItems: "center", position: "relative" }}>
+        <span className={"dot" + (live ? " pulse" : "")} style={{ background: dotColor, boxShadow: live || doneUnread ? `0 0 7px ${dotColor}` : undefined }} />
+        {showUnreadMark && <span className="unread-mark" title="Unread" aria-label="Unread chat" />}
       </span>
       {renaming ? (
         <Input className="input rename" autoFocus value={title} onClick={(e) => e.stopPropagation()} onChange={(e) => setTitle(e.currentTarget.value)} onBlur={commit}
@@ -644,13 +730,13 @@ const Row = memo(function Row({ t, active, onCtx, drag }: { t: TaskSummary; acti
       ) : (
         <span className="t" style={{ color: titleColor }}>{t.title}</span>
       )}
-      {t.status === "waiting" && !arm && (
-        <span className="badge">
-          {/* A parked chat ("sleep until X") is not waiting *on you*, so an
-              "Answer"/"Approve" badge would be a lie — it wakes itself. */}
-          {t.waiting_kind === "question" ? "Answer" : t.waiting_kind === "wake" ? "Waiting" : "Approve"}
+      {needsAnswer || parked ? (
+        <span className={"badge" + (parked ? " quiet" : "")}>
+          {/* A parked chat waits on a trigger, not on you; only an explicit
+              question or approval gets an actionable label. */}
+          {t.waiting_kind === "question" ? "Answer" : t.waiting_kind === "approval" ? "Approve" : "Waiting"}
         </span>
-      )}
+      ) : null}
       {!renaming && (arm ? (
         <Pressable className="confirm" onClick={(e) => { e.stopPropagation(); void archiveTask(t.id); }}>Archive</Pressable>
       ) : (
@@ -678,6 +764,35 @@ function CtxMenu({ ctx, close }: { ctx: NonNullable<Ctx>; close: () => void }) {
   const x = Math.min(ctx.x, window.innerWidth - 220);
   const y = Math.min(ctx.y, window.innerHeight - 290);
   const run = (f: () => unknown) => () => { close(); void f(); };
+  // Ultrathread worker worktrees are this chat's too, so the delete choice has
+  // to cover them: a worktree-per-worker run keeps its own checkout in each
+  // top-level worker, and the chat's own `worktree` flag is false when the chat
+  // itself runs in the project folder. Without them here the toggle never
+  // appeared and every worker worktree was left on disk with no way to say
+  // otherwise from this menu.
+  const workerWts = (t.subs ?? []).filter((s) => s.cwd);
+  // What the second click removes, named one piece at a time, because the same
+  // flag drives all of it: the chat's own checkout, every worker's checkout, and
+  // — for a docker chat — the workspace on disk (`purge_task`). A docker chat
+  // can hold worker worktrees too (each is a worktree of its clone), so leaving
+  // the workspace out of the text would delete something the user was never told
+  // about.
+  const several = workerWts.length > 0;
+  const bits = [
+    t.worktree ? `uncommitted files in ${t.cwd}` : null,
+    several ? `${workerWts.length} worker worktree${workerWts.length === 1 ? "" : "s"}` : null,
+    t.docker ? "its workspace on disk" : null,
+  ].filter((s): s is string => !!s);
+  // What Delete says before and after the second click. A chat with no worktree
+  // of any kind used to read "Delete chat; keep worktree", promising to keep
+  // something it never had.
+  const keepWhat = [t.worktree || several ? "worktrees" : null, t.docker ? "workspace" : null].filter(Boolean).join(" and ");
+  const keepLabel = keepWhat ? `Delete chat; keep ${keepWhat}` : "Delete chat";
+  const delLabel = removeWorktree
+    ? t.worktree || several
+      ? "Delete chat + worktrees"
+      : "Delete chat + workspace"
+    : keepLabel;
   // Entering select mode from here also ticks the chat you right-clicked. The
   // mode alone left you in a list with boxes on it and nothing chosen, which is
   // the same as not having selected anything — the menu was the one place the
@@ -693,13 +808,14 @@ function CtxMenu({ ctx, close }: { ctx: NonNullable<Ctx>; close: () => void }) {
     ...(t.titled ? [{ icon: I.edit(12), label: "Let the agent name it", run: run(() => patchTask(t.id, { untitled: true })) }] : []),
     { icon: I.copy(12), label: "Duplicate", run: run(() => api.duplicate(t.id).then((d) => set((s) => ({ tasks: { ...s.tasks, [d.id]: d } }))).catch((e) => flash(String(e)))) },
     { icon: I.download(12), label: "Export…", run: run(() => exportTasks([t.id])) },
+    { icon: <MonitorUp size={12} strokeWidth={1.7} aria-hidden="true" />, label: "Send to another machine…", run: run(() => openTransfer(t.id)) },
     // Above Archive and Delete, and below Export: it reads the chat rather than
     // changing it, so it belongs with the other "look at this" rows rather than
     // with the ones that alter the sidebar.
     { icon: I.chart(12), label: "Stats…", run: run(() => openChatStats(t.id)) },
     ...((t.status === "running" || t.status === "waiting") ? [t.paused
       ? { icon: I.play(10), label: "Resume", run: run(() => api.resume(t.id).catch((e) => flash(String(e)))) }
-      : { icon: I.pause(10), label: "Pause", run: run(() => api.pause(t.id).catch((e) => flash(String(e)))) }] : []),
+      : { icon: I.pause(10), label: "Pause", run: run(() => requestPause(t.id)?.catch((e) => flash(String(e)))) }] : []),
     { icon: I.archive(12), label: "Archive", run: run(() => archiveTask(t.id)) },
   ];
   return (
@@ -718,12 +834,12 @@ function CtxMenu({ ctx, close }: { ctx: NonNullable<Ctx>; close: () => void }) {
             else run(() => deleteTask(t.id, removeWorktree))();
           }}>
           <span className="cico">{I.trash(12)}</span>
-          <span style={{ flex: 1 }}>{delArm ? (removeWorktree ? "Delete chat + worktree" : "Delete chat; keep worktree") : "Delete…"}</span>
+          <span style={{ flex: 1 }}>{delArm ? delLabel : "Delete…"}</span>
         </MenuRow>
-        {delArm && t.worktree && (
+        {delArm && bits.length > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 9px", color: "var(--mut3)", fontSize: 11 }}>
-            <Switch label="Also permanently remove the worktree and its uncommitted files" checked={removeWorktree} small onChange={setRemoveWorktree} />
-            <span>Also remove uncommitted files in {t.cwd}; branch {t.branch} will remain.</span>
+            <Switch label="Also permanently remove these and any uncommitted files in them" checked={removeWorktree} small onChange={setRemoveWorktree} />
+            <span>Also remove {bits.join(" and ")}{t.worktree || several ? "; branches remain" : ""}.</span>
           </div>
         )}
       </div>
@@ -802,6 +918,12 @@ function SelectionBar() {
   );
 }
 
+/** The page's own glyph, at the size the other footer buttons draw at. */
+function ShortcutIcon({ tab }: { tab: SettingsTab }) {
+  const { Icon } = tab;
+  return <Icon size={14} strokeWidth={1.7} aria-hidden="true" />;
+}
+
 /** Three dots, drawn rather than imported: the header wants the glyph without a
  *  label in a 10px slot, and the whole bar is not worth an icon dependency. */
 const MoreIcon = () => (
@@ -824,15 +946,27 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   // The header's "Chats · N picked" suffix, counted the way the selection bar
   // counts: over chats that still exist and are not archived, so a tick on a
   // chat that has since been archived doesn't promise an action on it.
-  const selectedN = useStore((s) => Object.values(s.tasks).filter((t) => s.picked[t.id] && !t.archived).length);
+  //
+  // Guarded on `selecting`, the only condition under which the value is read.
+  // This selector returns a primitive, so it never triggers a re-render either
+  // way — but it walks every chat, and unguarded it did that on every store
+  // write while the sidebar was mounted, for a number nothing was reading.
+  const selectedN = useStore((s) => s.selecting
+    ? Object.values(s.tasks).filter((t) => s.picked[t.id] && !t.archived).length
+    : 0);
   const project = useStore((s) => s.settings?.project ?? "");
   const savedN = useStore((s) => s.settings?.saved_prompts?.length ?? 0);
+  const showPullRequests = useStore((s) => s.settings?.show_pull_requests ?? false);
   const showNeedsYou = useStore((s) => s.settings?.needs_you ?? false);
   // Saved in settings, so closing or reopening the sidebar keeps the choice.
   const allProjects = useStore((s) => s.settings?.all_projects ?? false);
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
+  // The footer shortcut button follows Settings → General. Subscribed rather
+  // than read through `get()`: the label, the glyph and the lit state all come
+  // off the page it points at, so changing the choice has to repaint the footer.
+  const shortcut = settingsTabDef(useStore((s) => s.settings?.sidebar_button_tab));
+  const settingsTab = useStore((s) => s.settingsTab);
   const automaticReorder = useStore((s) => s.settings?.automatic_chat_reorder !== false);
-  const unread = useStore((s) => s.unread);
   const currentTask = useStore((s) => (s.view === "session" || s.view === "diff") ? s.task : null);
   // Only the selected project's chats (plus whichever chat is open), unless "show all".
   // Memoized: this filtered and sorted the whole list on every render of the
@@ -840,9 +974,17 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   const { hiddenN, visible, pinned, rest } = useMemo(() => {
     const unarchived = Object.values(tasks).filter((t) => !t.archived);
     const inProject = (t: TaskSummary) => chatInProject(t, project, allProjects, cur);
-    const visible = unarchived.filter(inProject).sort((a, b) => sortKey(b, automaticReorder) - sortKey(a, automaticReorder));
+    const visible = bySortKey(unarchived.filter(inProject), automaticReorder);
     const pinned = visible.filter((t) => t.pinned);
-    const rest = visible.filter((t) => !t.pinned).sort((a, b) => compareChats(a, b, pausedAll, automaticReorder));
+    // Attention first, then this group's own order. Decorate-sort-undecorate for
+    // the same reason as `bySortKey`: `compareChats` reads two sort keys per
+    // comparison, so calling it from the comparator cost ~n·log n of them.
+    // Lower priority wins; within a priority, the newer key wins.
+    const rest = visible
+      .filter((t) => !t.pinned)
+      .map((t) => [chatPriority(t, pausedAll), -sortKey(t, automaticReorder), t] as const)
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1])
+      .map(([, , t]) => t);
     return {
       hiddenN: unarchived.filter((t) => !inProject(t)).length,
       visible,
@@ -857,11 +999,14 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   const archiveInFlight = useRef(false);
   useEffect(() => {
     if (archiveInFlight.current) return;
-    const excess = excessSidebarChats(sidebarTasks, SIDEBAR_CHAT_LIMIT, unread, currentTask, pausedAll);
+    // The sweep reads the chats' own `unread` marks (`excessSidebarChats`), so a
+    // chat waiting to be looked at is never swept away; `sidebarTasks` covers the
+    // dependency, because a changed mark arrives as a changed summary.
+    const excess = excessSidebarChats(sidebarTasks, SIDEBAR_CHAT_LIMIT, currentTask, pausedAll);
     if (!excess.length) return;
     archiveInFlight.current = true;
     void archiveExcessSidebarChats(excess.map((task) => task.id)).finally(() => { archiveInFlight.current = false; });
-  }, [sidebarTasks, unread, currentTask, pausedAll]);
+  }, [sidebarTasks, currentTask, pausedAll]);
 
   // Memoized, and so is every row's `onCtx`. These were rebuilt on each render,
   // so they were new props on all 80 chat rows every time the sidebar rendered
@@ -884,12 +1029,26 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   const drag: DragApi = useMemo(() => ({ dragging: hook.dragging, over: hook.over, press: hook.press, click: hook.click }), [hook.dragging, hook.over, hook.press, hook.click]);
   // One handler per chat, kept in a ref-keyed cache: a new arrow per row was a
   // new prop on every row, so the list re-rendered whole on any change.
+  //
+  // The handler must NOT close over the `t` it was created with. The cache makes
+  // the *first* render's summary permanent for that id, so a menu built from a
+  // captured copy offered stale actions off a stale status: a chat that started
+  // running after the first right-click had no Pause row, one that had finished
+  // still did, and Delete read `worktree` from whenever the row first appeared.
+  // So it reads the live summary through `get()` at click time, which is the
+  // identity the cache exists for without the frozen data. A chat that has since
+  // gone is not worth a menu, so the click is dropped.
   const ctxHandlers = useRef(new Map<string, (e: React.MouseEvent) => void>());
   const onCtx = (t: TaskSummary) => {
     let fn = ctxHandlers.current.get(t.id);
     if (!fn) {
-      fn = (e: React.MouseEvent) => { e.preventDefault(); setCtx({ t, x: e.clientX, y: e.clientY }); };
-      ctxHandlers.current.set(t.id, fn);
+      const id = t.id;
+      fn = (e: React.MouseEvent) => {
+        e.preventDefault();
+        const live = get().tasks[id];
+        if (live) setCtx({ t: live, x: e.clientX, y: e.clientY });
+      };
+      ctxHandlers.current.set(id, fn);
     }
     return fn;
   };
@@ -908,6 +1067,9 @@ function SidebarBody({ peek }: { peek?: boolean }) {
             {I.bookmark()}<span className="t">Saved prompts</span><span className="tm">{savedN}</span>
           </Pressable>
         )}
+        {showPullRequests && <Pressable className={"srow" + (view === "pulls" ? " on" : "")} style={{ color: "var(--mut)" }} onClick={() => go("pulls")}>
+          {I.branch()}<span className="t">Pull requests</span>
+        </Pressable>}
       </div>
       {/* Both sections live inside this one element, so a row dragged out of
           "Chats" and into the pinned block still hit-tests against the same
@@ -948,7 +1110,7 @@ function SidebarBody({ peek }: { peek?: boolean }) {
         <div style={{ flex: 1, minWidth: 0, position: "relative", display: "flex", alignItems: "center", padding: "0 7px" }}>
           <UsageBar />
         </div>
-        <IconButton label="Accounts" className={view === "settings" && get().settingsTab === "accounts" ? "on" : ""} onClick={openAccountsSettings}>{I.key(14)}</IconButton>
+        <IconButton label={shortcut.label} className={view === "settings" && settingsTab === shortcut.id ? "on" : ""} onClick={openSidebarShortcut}><ShortcutIcon tab={shortcut} /></IconButton>
         <IconButton label="Settings · Ctrl ," className={view === "settings" ? "on" : ""} onClick={() => go("settings")}>{I.gear()}</IconButton>
       </div>
       {ctx && <CtxMenu ctx={ctx} close={() => setCtx(null)} />}
@@ -957,16 +1119,31 @@ function SidebarBody({ peek }: { peek?: boolean }) {
 }
 
 export function Sidebar() {
-  const open = useStore((s) => s.sidebar);
+  // While a chat is on its Artificts surface the rail is forced collapsed rather
+  // than genuinely closed: the user's own preference is left alone in the store,
+  // so it comes back the moment that chat's surface closes, and the closed state
+  // is already the one that keeps the left-edge peek available.
+  const sidebarOpen = useStore((s) => s.sidebar);
+  const artifictMode = useStore((s) => (s.task ? s.tasks[s.task]?.artifict_open ?? false : false));
+  const open = sidebarOpen && !artifictMode;
   const [peek, setPeek] = useState(false);
   const timer = useRef<number | undefined>(undefined);
   const hold = (on: boolean, delay: number) => { clearTimeout(timer.current); timer.current = window.setTimeout(() => setPeek(on), delay); };
   useEffect(() => { if (open) setPeek(false); }, [open]);
+  // On a phone the sidebar is a drawer over the content (App.css), so picking a
+  // chat or a screen from it closes it — otherwise every tap leaves the user
+  // looking at the list they just chose from instead of what they chose.
+  const view = useStore((s) => s.view);
+  const task = useStore((s) => s.task);
+  useEffect(() => { if (isNarrow() && get().sidebar) set({ sidebar: false }); }, [view, task]);
   return (
     <>
-      <aside className="sidebar" style={{ width: open ? 246 : 0 }}>
+      <aside className={"sidebar" + (open ? " open" : "")} style={{ width: open ? 246 : 0 }}>
         <div style={{ opacity: open ? 1 : 0, height: "100%", transition: "opacity .18s ease" }}>{open && <SidebarBody />}</div>
       </aside>
+      {/* Only shown on a phone, where the open sidebar covers the content: a tap
+          beside the drawer closes it. */}
+      {open && <div className="sidebar-scrim" aria-hidden="true" onClick={() => set({ sidebar: false })} />}
       {!open && (
         <>
           {/* Hover the left edge to peek at the sidebar without opening it. */}
@@ -995,18 +1172,23 @@ function UsageBar() {
     const list = accts.filter((a) => a.kind === p.id);
     const w = netWindows(list)[0];
     const avail = list.filter((a) => a.available).length;
-    return { p, left: avail ? Math.max(0, 100 - (w?.used ?? 0)) : 0, avail, n: list.length, label: w?.label ?? "" };
+    // Caps are the user's own doing, so the footer says so where it is visible
+    // from every screen: a segment whose accounts are all held by caps is drawn
+    // amber, the way the lines in Settings → Accounts are, and one that is only
+    // partly capped says how many in its tooltip.
+    const capped = list.filter((a) => capsOf(a).some((c) => c.holding)).length;
+    return { p, left: avail ? Math.max(0, 100 - (w?.used ?? 0)) : 0, avail, n: list.length, label: w?.label ?? "", capped };
   });
   const toggle = (k: string) => saveSettings({ home_usage: shown.includes(k) ? shown.filter((x) => x !== k) : [...shown, k] });
   return (
     <>
-      <Tooltip content={segs.length ? segs.map((s) => `${s.p.account!.short_name}: ${Math.round(s.left)}% left${s.label ? ` (${s.label})` : ""} · ${s.avail}/${s.n} accounts`).join(" · ") + " · click to choose" : accts.length ? "No accounts in this bar · click to choose" : "No subscription accounts"}><Pressable className="sbar" aria-label="Usage in this bar" aria-disabled={!accts.length} onClick={(e) => { if (accts.length) { e.stopPropagation(); setMenu(!menu); } }}>
+      <Tooltip content={segs.length ? segs.map((s) => `${s.p.account!.short_name}: ${Math.round(s.left)}% left${s.label ? ` (${s.label})` : ""} · ${s.avail}/${s.n} accounts${s.capped ? ` · ${s.capped} held by a cap` : ""}`).join(" · ") + " · click to choose" : accts.length ? "No accounts in this bar · click to choose" : "No subscription accounts"}><Pressable className="sbar" aria-label="Usage in this bar" aria-disabled={!accts.length} onClick={(e) => { if (accts.length) { e.stopPropagation(); setMenu(!menu); } }}>
         {/* Empty renders nothing rather than a "No usage to show" line: the bar
             is a footer affordance, and a dead label there reads as an error.
             The click target stays because it is also the only way back into the
             picker when every account has been toggled off. */}
         {segs.map((s) => (
-          <div key={s.p.id} className="useg" style={{ flex: 1 }}><div style={{ width: s.left + "%", background: USAGE_COLOR[s.p.id] ?? "#33d6ff" }} /></div>
+          <div key={s.p.id} className={"useg" + (s.capped > 0 && s.capped === s.n ? " capped" : "")} style={{ flex: 1 }}><div style={{ width: s.left + "%", background: USAGE_COLOR[s.p.id] ?? "#33d6ff" }} /></div>
         ))}
       </Pressable></Tooltip>
       {menu && (

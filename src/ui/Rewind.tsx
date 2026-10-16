@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, CheckpointInfo, RewindInfo, RewindResult } from "../api";
-import { flash, persistDraft, set } from "../store";
+import { flash, newerSummary, persistDraft, set } from "../store";
 import { Button, ChoiceRow, IconButton, Kbd, Loader, Modal, Pressable, Tooltip } from "./primitives";
 import { I } from "./icons";
 import { CircleAlert, GitFork } from "lucide-react";
@@ -115,7 +115,11 @@ export function Rewind({ taskId, itemId, onClose }: { taskId: string; itemId?: s
       const back = effMode !== "files" ? r.text : null;
       set((s) => ({
         items: { ...s.items, [taskId]: t.items },
-        tasks: { ...s.tasks, [taskId]: t.summary },
+        // Folded in, not assigned: the rewind published its own summary, and a
+        // `task` event for this chat can have landed while `task_get` was in
+        // flight. Writing this read over that one would freeze the chat on the
+        // state it was in a moment ago. See `newerSummary`.
+        tasks: { ...s.tasks, [taskId]: newerSummary(s.tasks[taskId], t.summary) },
         ...(back !== null ? { sessionDrafts: { ...s.sessionDrafts, [taskId]: back } } : {}),
       }));
       if (back !== null) persistDraft(taskId, back);
@@ -317,7 +321,7 @@ export function Rewind({ taskId, itemId, onClose }: { taskId: string; itemId?: s
                 {help && (
                   <ul style={{ margin: "2px 0 4px", paddingLeft: 18, fontSize: 11.5, color: "var(--hint)", lineHeight: 1.6, display: "flex", flexDirection: "column", gap: 3 }}>
                     <li>Files changed by a command — <code className="mono">rm</code>, <code className="mono">mv</code>, <code className="mono">cp</code>, a build script — are not tracked. Only file edits and writes are.</li>
-                    <li>Edits made by sub-agents are not restored.</li>
+                    <li>Edits made by subagents are not restored.</li>
                     <li>Changes made outside OpenLeash while this task was running are not restored.</li>
                     <li>Messages queued mid-turn are not part of any checkpoint.</li>
                     {info?.in_worktree && <li>This chat runs in a worktree, so restoring files only affects that worktree. Your main checkout is left alone.</li>}

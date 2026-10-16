@@ -68,9 +68,16 @@ fn system_prompt(c: &PluginsCfg) -> String {
 
 /// Every tool name the model is offered: the core list, then the plugin
 /// schemas appended to it, which is the order the frozen prefix serves them in.
+/// The plugin half is policy-filtered exactly as the runner filters it when it
+/// builds a subagent's list.
 fn offered(c: &PluginsCfg, sub: Option<&str>) -> Vec<String> {
+    let policy = sub.unwrap_or("all");
     let mut v = tools::schemas(sub, c);
-    v.extend(super::plugins::schemas(c));
+    v.extend(
+        super::plugins::schemas(c)
+            .into_iter()
+            .filter(|t| super::plugins::offered_to_sub(policy, t["name"].as_str().unwrap_or(""))),
+    );
     v.iter()
         .map(|t| t["name"].as_str().unwrap_or("").to_string())
         .collect()
@@ -189,7 +196,7 @@ fn the_no_fake_input_rule_survives_every_configuration() {
 /// `exec_screenshot` refuses it when the computer plugin is off. It must
 /// therefore be *absent* from the tool list, not merely gated at run time —
 /// offering a tool whose only outcome is an error wastes a turn and reads to
-/// the model as a broken harness. Checked for every sub-agent policy, since the
+/// the model as a broken harness. Checked for every subagent policy, since the
 /// gate is on the schema list and not on the agent kind.
 #[test]
 fn screenshot_is_in_the_tool_list_only_with_the_computer_plugin() {
@@ -204,6 +211,30 @@ fn screenshot_is_in_the_tool_list_only_with_the_computer_plugin() {
             );
         }
     }
+}
+
+/// The same rule as `screenshot_is_in_the_tool_list_only_with_the_computer_plugin`,
+/// for a policy rather than for a disabled plugin: a read-only subagent may only
+/// take screenshots, so it must be left with the core `screenshot` tool and not
+/// with `computer`, whose every non-observe batch `exec_computer` refuses.
+#[test]
+fn a_read_only_sub_is_offered_screenshots_but_not_the_computer_tool() {
+    let c = cfg(false, true, false);
+    for sub in [None, Some("all"), Some("no_shell")] {
+        assert!(
+            offered(&c, sub).iter().any(|n| n == "computer"),
+            "{sub:?} may drive the screen, so it is offered `computer`"
+        );
+    }
+    let ro = offered(&c, Some("read_only"));
+    assert!(
+        !ro.iter().any(|n| n == "computer"),
+        "a read_only sub can only screenshot, so `computer` is a tool that can only fail: {ro:?}"
+    );
+    assert!(
+        ro.iter().any(|n| n == "screenshot"),
+        "the read-only way to look at the screen is the core tool: {ro:?}"
+    );
 }
 
 /// Plan mode used to name the disabled tools by hand ("the github / computer /
@@ -235,16 +266,16 @@ fn the_screen_section_is_byte_stable_for_a_fixed_config() {
     assert_eq!(prompt::screen_section(&off), prompt::screen_section(&off));
 }
 
-/// A sub-agent builds its tool list from the parent's *frozen* plugin snapshot,
+/// A subagent builds its tool list from the parent's *frozen* plugin snapshot,
 /// not from live settings. `prefix_plugins` is the seam: the hot prefix wins, and
 /// a cold task falls back to settings. Both paths have to name the live tools,
-/// because the sub-agent shares the parent's prompt world.
+/// because the subagent shares the parent's prompt world.
 #[test]
 fn a_sub_agent_tool_list_follows_the_parents_frozen_prefix() {
     let with_computer = cfg(false, true, false);
     let without = cfg(false, false, false);
 
-    // The frozen path: whatever the snapshot says is what a sub-agent gets,
+    // The frozen path: whatever the snapshot says is what a subagent gets,
     // even where live settings would say otherwise. Asserted through the schema
     // builder because `prefix_plugins` needs a Harness, and the builder is the
     // only thing that consumes its result.
@@ -258,7 +289,7 @@ fn a_sub_agent_tool_list_follows_the_parents_frozen_prefix() {
     // A `Default` snapshot is what a cold task carries in `Task.plugins`, which is
     // exactly why `prefix_plugins` falls back to live settings instead of
     // trusting it: read literally it means "every plugin off", and a first
-    // sub-agent would inherit that and conclude computer use was switched off.
+    // subagent would inherit that and conclude computer use was switched off.
     let cold = PluginsCfg::default();
     assert!(
         !cold.computer.enabled && !cold.browser.enabled,

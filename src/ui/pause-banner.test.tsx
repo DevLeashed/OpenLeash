@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 // The pause banner must never claim a pause is settled while it is still landing.
 //
-// "Pause all" flips the global flag optimistically, and the per-chat in-flight
-// command counts arrive a beat later. In that gap the counts read zero, so the
-// banner used to fall through to the flat "Everything is paused" — which reads
-// as *nothing is happening, quit the app*. The user reported exactly that: a
-// pause banner that made them think the app had hung.
+// "Pause all" puts the global flag up first, and the per-chat in-flight command
+// counts land a beat later — the flag is the freeze, the counts are bookkeeping
+// (see `pause_all_chats` in `src-tauri/src/lib.rs`). In that gap the counts read
+// zero, so the banner used to fall through to the flat "Everything is paused" —
+// which reads as *nothing is happening, quit the app*. The user reported exactly
+// that: a pause banner that made them think the app had hung.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
 

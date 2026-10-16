@@ -1,11 +1,15 @@
-# On-demand downloads with updater signing (requires Tauri signing secrets). Never creates tags or releases.
+# On-demand downloads; optional Windows installer bundles. Never creates tags or releases.
 name: Build downloads
 
 on:
   workflow_dispatch:
     inputs:
+      build_installers:
+        description: Also build installer bundles (Windows NSIS)
+        type: boolean
+        default: false
       release_tag:
-        description: Release tag for updater URLs (blank = package version, no v)
+        description: Release tag validated against the package version (blank = that version, no v)
         type: string
         default: ''
 
@@ -24,6 +28,8 @@ jobs:
           - label: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
+            # DMG only: macOS has no installer bundle, so this leg is never
+            # built by the installer step (see scripts/release_assets.py).
             bundles: app,dmg
           - label: windows-x64
             os: windows-2022
@@ -54,7 +60,7 @@ jobs:
       BUILD_TARGET: ${{ matrix.target }}
       BUILD_LABEL: ${{ matrix.label }}
       BUILD_BUNDLES: ${{ matrix.bundles }}
-      BUILD_UPDATER: 'true'
+      BUILD_INSTALLERS: ${{ inputs.build_installers }}
       RELEASE_TAG: ${{ inputs.release_tag }}
 
     steps:
@@ -111,10 +117,12 @@ jobs:
           key: downloads-${{ matrix.target }}
 
       - name: Validate release identity
-        run: python -B -c 'import json, os, sys; sys.path.insert(0, "scripts"); from updater_assets import release_identity; release_identity(json.load(open("package.json"))["version"], os.environ["RELEASE_TAG"])'
+        run: python -B -c 'import json, os, sys; sys.path.insert(0, "scripts"); from release_assets import release_identity; release_identity(json.load(open("package.json"))["version"], os.environ["RELEASE_TAG"])'
 
-      - name: Build unsigned downloads
-        if: ${{ matrix.label == 'linux-arm64' }}
+      - name: Build downloads
+        # macOS and Linux ARM64 build here even when installers are requested:
+        # neither has an installer bundle to add, and both bundle on their own.
+        if: ${{ !inputs.build_installers || matrix.label == 'linux-arm64' || matrix.label == 'macos-arm64' }}
         # The first -- is npm's separator; the second forwards --locked to Cargo.
         # Tauri also runs beforeBuildCommand (TypeScript + production Vite build).
         run: |
@@ -124,36 +132,23 @@ jobs:
             npm run tauri -- build --ci --no-sign --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" -- --locked
           fi
 
-      - name: Build updater-signed downloads
-        if: matrix.label != 'linux-arm64'
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        # --no-sign skips updater signatures too, so MUST NOT be used here.
-        # Updater signing is distinct from Authenticode / Apple notarization.
+      - name: Build installer downloads
+        if: inputs.build_installers && matrix.label != 'linux-arm64' && matrix.label != 'macos-arm64'
+        # The Windows legs otherwise produce the portable executable alone, so
+        # this step only adds the NSIS installer. Nothing is signed: this
+        # workflow uploads no updater signature or manifest.
         run: |
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo 'Set TAURI_SIGNING_PRIVATE_KEY in repository Actions secrets before running this workflow.' >&2
-            exit 1
-          fi
           bundles="$BUILD_BUNDLES"
           if [ "$bundles" = none ]; then bundles=nsis; fi
-          npm run tauri -- build --ci --target "$BUILD_TARGET" \
-            --config "$GITHUB_WORKSPACE/src-tauri/tauri.updater.conf.json" \
+          npm run tauri -- build --ci --no-sign --target "$BUILD_TARGET" \
             --bundles "$bundles" -- --locked
 
       - name: Test download staging
-        run: |
-          python -B scripts/test-stage-downloads.py
-          python -B scripts/test-updater.py
+        run: python -B scripts/test-stage-downloads.py
 
       - name: Stage release-named downloads
         id: downloads
-        run: |
-          python scripts/stage-downloads.py
-          if [ "$BUILD_UPDATER" = true ]; then
-            python -B -c 'import json, os; from scripts.updater_assets import release_identity; version=json.load(open("package.json"))["version"]; tag=release_identity(version, os.environ.get("RELEASE_TAG", "")); print("Validated updater release tag:", tag)'
-          fi
+        run: python scripts/stage-downloads.py
 
       # Each artifact ZIP contains exactly one file at its root.
       - name: Upload primary download
@@ -166,7 +161,7 @@ jobs:
           compression-level: 0
           retention-days: 14
 
-      - name: Upload secondary download or updater installer
+      - name: Upload secondary download or installer
         if: steps.downloads.outputs.file_2 != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -175,59 +170,4 @@ jobs:
           if-no-files-found: error
           overwrite: true
           compression-level: 0
-          retention-days: 14
-
-      - name: Upload updater signature or fragment
-        if: steps.downloads.outputs.file_3 != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ steps.downloads.outputs.file_3 }}
-          path: downloads/${{ steps.downloads.outputs.file_3 }}
-          if-no-files-found: error
-          overwrite: true
-          compression-level: 0
-          retention-days: 14
-
-      - name: Upload updater metadata fragment
-        if: steps.downloads.outputs.file_4 != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ${{ steps.downloads.outputs.file_4 }}
-          path: downloads/${{ steps.downloads.outputs.file_4 }}
-          if-no-files-found: error
-          overwrite: true
-          compression-level: 0
-          retention-days: 14
-
-  updater-manifest:
-    name: Assemble updater manifest (no publishing)
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - name: Download single-file artifacts
-        # gh extracts into separate named directories; no ZIPs are nested in latest.json.
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-        run: gh run download "$RUN_ID" --dir extracted
-      - name: Assemble static latest.json
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          version=$(python -c 'import json; print(json.load(open("package.json"))["version"])')
-          python -B scripts/assemble-updater.py extracted --version "$version" --release-tag "$RELEASE_TAG"
-      - name: Upload single-file updater manifest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: latest.json
-          path: latest.json
-          if-no-files-found: error
-          overwrite: true
           retention-days: 14

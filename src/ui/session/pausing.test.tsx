@@ -3,12 +3,13 @@
 // Two bugs with one shape: the UI said "paused" about work that was still running,
 // and said nothing at all about a button the user had just pressed.
 //
-// 1. The Pause all chip. `pause_all` walks every chat, resets `unpaused`, saves each
-//    to disk and recounts in flight commands before it flips the flag — seconds on a
-//    machine with a few dozen chats, all of it after the IPC round trip. Nothing
-//    local moved for any of it, so the chip sat there unchanged and fully enabled:
-//    pressing it twice ran the whole sweep twice, and the press that did land gave
-//    no sign it had been heard.
+// 1. The Pause all chip. The backend puts the global flag up first — that flag *is*
+//    the freeze, so every agent starts parking the moment it lands — and walks the
+//    chats after it, resetting `unpaused`, saving each to disk and recounting the
+//    commands in flight (see `pause_all_chats`). The flag is what the UI hears back
+//    over IPC, and until it lands nothing local has moved, so the chip sat there
+//    unchanged and fully enabled: pressing it twice ran the whole thing twice, and
+//    the press that did land gave no sign it had been heard.
 //
 // 2. The tool row's glyph. A pause blocks at `wait_unpaused` at the *top* of the
 //    bash handler, so a command that already started runs to completion whatever

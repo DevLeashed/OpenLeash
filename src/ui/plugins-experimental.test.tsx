@@ -44,8 +44,21 @@ const store = (plugins: Plugins | undefined, tab = "plugins") =>
 const status = {
   has_token: false, can_login: false,
   github: { ok: false, source: null, error: "No token found" },
-  computer: { ok: true, monitors: [{ name: "", w: 2560, h: 1440, primary: true }] },
+  computer: { ok: true, monitors: [{ name: "", w: 2560, h: 1440, primary: true, driveable: true, rotation: 0, x: 0, y: 0 }] },
   browser: { ok: true, browser: "Chrome" },
+} as unknown as PluginsStatus;
+
+/** The same, on a machine whose second display can be looked at but not clicked:
+ *  input only ever reaches the primary, so the card has to say so. */
+const twoDisplays = {
+  ...status,
+  computer: {
+    ok: true,
+    monitors: [
+      { name: "Built-in", w: 2560, h: 1440, primary: true, driveable: true, rotation: 0, x: 0, y: 0 },
+      { name: "DELL U2720Q", w: 3840, h: 2160, primary: false, driveable: false, rotation: 0, x: -3840, y: 0 },
+    ],
+  },
 } as unknown as PluginsStatus;
 
 beforeEach(() => vi.spyOn(api, "pluginsStatus").mockResolvedValue(status));
@@ -127,6 +140,22 @@ describe("compact details and connectors", () => {
     expect(screen.getByText(/Browser available/)).toBeTruthy();
     expect(document.body.textContent).not.toContain("Driving");
     expect(screen.queryByText("GitHub")).toBeNull();
+  });
+
+  it("says which monitors can be looked at and which can be clicked", async () => {
+    // Only the primary display takes input, so the card must not imply the whole
+    // desktop is available: a second monitor is for looking, not clicking.
+    vi.spyOn(api, "pluginsStatus").mockResolvedValue(twoDisplays);
+    store(allOff);
+    render(<PluginsTab />);
+    expect(await screen.findByText(/1 more can be looked at, not clicked/)).toBeTruthy();
+    expect(screen.getByText(/2560×1440/)).toBeTruthy();
+    // One display: nothing to explain away.
+    cleanup();
+    vi.spyOn(api, "pluginsStatus").mockResolvedValue(status);
+    render(<PluginsTab />);
+    await screen.findByText(/Screen available/);
+    expect(document.body.textContent).not.toContain("more can be looked at");
   });
 
   it("moves GitHub to Connectors with an off switch and collapsed authentication", () => {

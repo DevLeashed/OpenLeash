@@ -3,12 +3,16 @@ import { createPortal } from "react-dom";
 import { chord } from "../keys";
 import { api, ASSISTS, baseName, clampEffort, EFFORTS, effortLabel, effortSteps, isRequiredAgent, ModelInfo, PERMS, TaskSummary, withRequiredAgents, xOn } from "../api";
 import { matchesTaskQuery, taskSearchDetail } from "./task-search";
-import { chatModel, defaultRoute, flash, get, go, isConnected, modelColor, modelInfo, openProject, openTask, saveSettings, set, shownProviders, stepZoom, subModel, useStore, DEFAULT_ZOOM, ZOOMS } from "../store";
+import { chatModel, defaultRoute, flash, get, go, isConnected, modelColor, modelInfo, openProject, openTask, requestPause, saveSettings, set, shownProviders, stepZoom, subModel, useStore, DEFAULT_ZOOM, ZOOMS } from "../store";
 import { afterChange, openUltraXEditor, setOpts, togglePlan, toggleUltra, toggleUltraWt, ULTRA_X_SHOWN } from "./Composer";
-import { messageable, chatProjectIsCurrent, MassScope, massTargets, pickAll, projectMenuEntries, ProjectCtxMenu, sortKey, togglePick } from "./Chrome";
+import { messageable, chatProjectIsCurrent, MassScope, massTargets, pickAll, projectMenuEntries, ProjectCtxMenu, sortKey, togglePick, archiveTask } from "./Chrome";
 import { pickFolder } from "./Home";
-import { I, StatusIcon } from "./icons";
+import { openClone, openFromWsl, openOverSsh, OpenProjectDialogs, useOpenSources } from "./OpenProject";
+import { useProjectLabel, useSshHosts } from "./ProjectName";
+import { isSsh, projectLabel } from "../sshPath";
+import { I, StatusIcon, chatStatus } from "./icons";
 import { ChatStatsPanel } from "./ChatStats";
+import { openTransfer, SendToMachine } from "./SendToMachine";
 import { ModelSwap, openSwap } from "./ModelSwap";
 import { Notices } from "./Notices";
 import { isPaused } from "./Paused";
@@ -16,7 +20,9 @@ import { UltraXEditor } from "./UltraX";
 import { TrustDialog } from "./Trust";
 import { ProviderIcon } from "./ProviderIcon";
 import { AnchoredPanel, ColorPicker, Button, Loader, Modal, TextArea, TextButton, Tooltip, IconButton, Input, MenuRow, MenuScrim, Segmented, Switch, Kbd, useAnchoredPanel } from "./primitives";
-import { ArrowLeftRight, BrainCircuit, Check, CircleDollarSign, Copy, FolderOpen, GitCompare, GitFork, History, Layers, MessagesSquare, Network, PanelLeft, PanelRight, Route, ScrollText, ServerCog, Shield, Sparkles, Star, UserRoundCog, ZoomIn, ZoomOut } from "lucide-react";
+import { ArrowLeftRight, BrainCircuit, Check, Copy, FolderGit2, FolderOpen, GitCompare, GitFork, History, Keyboard, Layers, MessagesSquare, MonitorUp, Network, PanelLeft, PanelRight, Route, ScrollText, Server, ServerCog, Shield, Sparkles, SquareTerminal, Star, UserRoundCog, ZoomIn, ZoomOut } from "lucide-react";
+import { SETTINGS_TABS } from "./settingsTabs";
+import { ShortcutSheet } from "./Shortcuts";
 
 const li = (C: typeof History, size = 14) => <C aria-hidden="true" size={size} strokeWidth={1.7} />;
 
@@ -51,6 +57,8 @@ function SmallMenu({ z }: { z: number }) {
   const home = useStore((s) => s.home);
   const task = useStore((s) => (s.view !== "home" && s.task ? s.tasks[s.task] : null));
   const close = () => set({ menu: null });
+  const sources = useOpenSources(menu === "folder");
+  const label = useProjectLabel(menu === "folder" ? settings?.projects : undefined);
   // Read from the subscriptions above, not through get(): these two mirror
   // currentOpts(), and were re-rendered by an unlabelled `useStore(s => s.home)`
   // rather than by the value actually being used.
@@ -60,6 +68,7 @@ function SmallMenu({ z }: { z: number }) {
   let rows: Row[] = [];
   if (menu === "plus") rows = [
     ...(task ? [{ icon: li(GitFork), label: "Fork this chat…", desc: "Branch off a new chat from here — the whole conversation, or just its context", run: () => openFork(task.id) }] : []),
+    ...(task ? [{ icon: li(MonitorUp), label: "Send to another machine…", desc: "Copy or move this chat to OpenLeash on another computer over SSH", run: () => openTransfer(task.id) }] : []),
     { icon: li(ArrowLeftRight), label: task ? "Swap Models…" : "Swap All Models…", k: "/models", run: openSwap },
     // Home only, and only because it needs nothing to point at: it works from
     // the roster of working chats, so there is no "the chat this was opened for"
@@ -72,7 +81,7 @@ function SmallMenu({ z }: { z: number }) {
     ...(ULTRA_X_SHOWN ? [{ icon: li(Layers), label: "Ultrathread X…", desc: "A ladder of subagent layers, each with its own model, effort and fanout", k: "/ultrax", toggle: xOn(o.ultra_x), run: () => { close(); openUltraXEditor(); } }] : []),
     ...(task ? [task.paused
       ? { icon: I.play(12), label: "Resume this task", run: () => { close(); api.resume(task.id).catch((e) => flash(String(e))); } }
-      : { icon: I.pause(12), label: "Pause this task", desc: "Freezes the agent and all its subagents", run: () => { close(); api.pause(task.id).catch((e) => flash(String(e))); } }] : []),
+      : { icon: I.pause(12), label: "Pause this task", desc: "Freezes the agent and all its subagents", run: () => { close(); requestPause(task.id)?.catch((e) => flash(String(e))); } }] : []),
     { sep: true },
     { icon: li(ServerCog), label: "MCP servers", k: `${settings?.mcp.filter((m) => m.enabled).length ?? 0} on`, run: () => go("settings", { settingsTab: "mcp" }) },
   ];
@@ -91,7 +100,7 @@ function SmallMenu({ z }: { z: number }) {
   }
   if (menu === "assist") rows = [
     { head: "Assist mode" },
-    ...ASSISTS.map((a) => ({ label: a.name, desc: a.desc, check: a.id === (task?.pending.assist ?? o.assist), run: (e: React.MouseEvent) => { close(); void setOpts({ assist: a.id, now: e.shiftKey }); afterChange("Assist mode: " + a.name, e.shiftKey); } })),
+    ...ASSISTS.map((a) => ({ label: a.name, desc: a.desc, check: a.id === (task?.pending.assist ?? o.assist), run: (e: React.MouseEvent) => { close(); void setOpts({ assist: a.id, now: e.altKey }); afterChange("Assist mode: " + a.name, e.altKey); } })),
   ];
   if (menu === "agents") {
     const cur = withRequiredAgents(task?.pending.agents ?? o.agents);
@@ -102,7 +111,7 @@ function SmallMenu({ z }: { z: number }) {
         return;
       }
       const next = withRequiredAgents(cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
-      void setOpts({ agents: next, now: e.shiftKey });
+      void setOpts({ agents: next, now: e.altKey });
       if (!task) void saveSettings({ default_agents: next });
     };
     rows = [
@@ -119,9 +128,9 @@ function SmallMenu({ z }: { z: number }) {
   if (menu === "branch") rows = [{ head: "Base branch" }, ...(info?.branches ?? []).slice(0, 12).map((b) => ({ label: b, mono: true, k: b === info?.branch ? "current" : "", check: b === (home.branch || info?.branch), run: () => { set((s) => ({ home: { ...s.home, branch: b }, menu: null })); } }))];
   if (menu === "folder") rows = [
     { head: "Projects" },
-    ...(settings?.projects ?? []).slice(0, 8).map((p) => ({ label: baseName(p), desc: p, check: p === settings?.project, ctx: (x: number, y: number) => set({ menu: null, projCtx: { p, x, y } }), run: async () => { close(); await openProject(p); } })),
+    ...(settings?.projects ?? []).slice(0, 8).map((p) => ({ icon: isSsh(p) ? <Server size={12} strokeWidth={1.8} aria-label="SSH" /> : undefined, label: label(p), desc: p, check: p === settings?.project, ctx: (x: number, y: number) => set({ menu: null, projCtx: { p, x, y } }), run: async () => { close(); await openProject(p); } })),
     { sep: true },
-    { label: "Open folder…", run: () => { close(); pickFolder(); } },
+    ...sources.map((o) => ({ icon: o.icon, label: o.label, desc: o.hint, run: () => { close(); o.run(); } })),
   ];
   if (!menu || menu === "model" || !rows.length) return null;
   const W = { plus: 280, perm: 290, branch: 250, folder: 300, assist: 300, agents: 330, route: 340 }[menu] ?? 260;
@@ -173,7 +182,7 @@ function ModelPicker({ z }: { z: number }) {
   const o = task
     ? { plan: task.plan, ultra: !!task.ultra, ultra_wt: !!task.ultra_wt, ultra_x: task.ultra_x ?? null, perm: task.perm, model: task.model, effort: task.effort, assist: task.assist, agents: task.agents }
     : home;
-  // What a sub-agent is really on, resolved the way the backend resolves it — its
+  // What a subagent is really on, resolved the way the backend resolves it — its
   // own model, else the ladder layer for its depth, else the chat's. Reading
   // `subFor.model` here showed a blank row for every agent that just follows the
   // chat, and never showed a queued swap.
@@ -258,7 +267,7 @@ function ModelPicker({ z }: { z: number }) {
   };
   const pick = (id: string, now: boolean) => {
     if (subFor && task) {
-      // Sub-agents only switch mid-flight: next request.
+      // Subagents only switch mid-flight: next request.
       api.subModel(task.id, subFor.id, id).catch((e) => flash(String(e)));
     } else {
       void setOpts({ model: id, now, route: defaultRoute(id) });
@@ -294,7 +303,7 @@ function ModelPicker({ z }: { z: number }) {
         onKeyDown={(e) => {
           if (e.key === "ArrowDown") { e.preventDefault(); setHi(Math.min(hi + 1, list.length - 1)); }
           else if (e.key === "ArrowUp") { e.preventDefault(); setHi(Math.max(hi - 1, 0)); }
-          else if (e.key === "Enter") { e.preventDefault(); const m = list[hi]; m && pick(m.id, e.shiftKey); }
+          else if (e.key === "Enter") { e.preventDefault(); const m = list[hi]; m && pick(m.id, !e.shiftKey); }
           else if (e.key === "ArrowLeft" && !q) { e.preventDefault(); const n = stepBy(1); if (n !== undefined) setEffort(n); }
           else if (e.key === "ArrowRight" && !q) { e.preventDefault(); const n = stepBy(-1); if (n !== undefined) setEffort(n); }
         }}>
@@ -324,7 +333,7 @@ function ModelPicker({ z }: { z: number }) {
             </div>
             <div ref={listRef} style={{ flex: 1, overflowY: "auto", padding: "2px 6px 6px" }}>
               {shownList.map((m, i) => (
-                <div key={m.id + i} className={"mrow" + (i === hi ? " hi" : "")} style={{ height: 30, animationDelay: Math.min(i, 14) * 5 + "ms" }} onMouseMove={() => setHi(i)} onClick={(e) => pick(m.id, e.shiftKey)}>
+                <div key={m.id + i} className={"mrow" + (i === hi ? " hi" : "")} style={{ height: 30, animationDelay: Math.min(i, 14) * 5 + "ms" }} onMouseMove={() => setHi(i)} onClick={(e) => pick(m.id, !e.shiftKey)}>
                   {m.provider !== "route" && <ColorDot id={m.id} />}
                   <span style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>{m.name}</span>
                   <span style={{ fontSize: 11, color: "var(--dim)", whiteSpace: "nowrap" }}>{m.provider === "route" ? (settings?.routes.find((r) => "route/" + r.id === m.id)?.steps.length ?? 0) + " steps" : m.provider}</span>
@@ -409,8 +418,11 @@ function Palette() {
   const view = useStore((s) => s.view);
   const task = useStore((s) => s.task);
   const home = useStore((s) => s.home);
+  const wsl = useStore((s) => s.wsl);
+  const sshHosts = useSshHosts(pal ? settings?.projects : undefined);
   const [q, setQ] = useState("");
   const [i, setI] = useState(0);
+  const [shortcuts, setShortcuts] = useState(false);
   const inp = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (!pal) return;
@@ -430,6 +442,7 @@ function Palette() {
     // Mirrors currentOpts(): in a chat the running task's options, on the home
     // screen the new-chat ones. Subscribed above, not read through get().
     const o = { plan: home.plan, ultra: home.ultra, ultra_wt: home.ultra_wt, ultra_x: home.ultra_x };
+    const cur = task ? tasks[task] : undefined;
     const base: Cmd[] = [
       { g: "Action", icon: I.newTask(), label: "New task", k: "Ctrl N", run: () => go("home") },
       { g: "Action", icon: li(ArrowLeftRight), label: view === "session" ? "Swap Models" : "Swap All Models", k: "/models", run: openSwap },
@@ -441,14 +454,29 @@ function Palette() {
       { g: "Action", icon: li(PanelRight), label: "Toggle details panel", k: "Ctrl J", run: () => set((s) => ({ details: !s.details })) },
       { g: "Action", icon: li(PanelLeft), label: "Toggle sidebar", k: "Ctrl B", run: () => set((s) => ({ sidebar: !s.sidebar })) },
       { g: "Action", icon: li(GitCompare), label: "Review changes", run: () => task && go("diff") },
+      // Chat lifecycle for the chat that is open. These lived only in the
+      // sidebar's right-click menu, so they were unreachable from the keyboard.
+      // Delete is deliberately not here: its armed two-step confirm lives in that
+      // menu, and a second unguarded path to it would be worse than missing.
+      ...(cur ? [
+        { g: "Chat", icon: I.pin(12), label: cur.pinned ? "Unpin this chat" : "Pin this chat", run: () => { void api.update(cur.id, { pinned: !cur.pinned }); } },
+        { g: "Chat", icon: I.edit(12), label: "Rename this chat", run: () => set({ renaming: cur.id, sidebar: true }) },
+        { g: "Chat", icon: I.copy(12), label: "Duplicate this chat", run: () => { void api.duplicate(cur.id).then((d) => set((s) => ({ tasks: { ...s.tasks, [d.id]: d } }))).catch((e) => flash(String(e))); } },
+        { g: "Chat", icon: I.archive(12), label: "Archive this chat", run: () => { void archiveTask(cur.id); } },
+      ] : []),
       { g: "Action", icon: li(FolderOpen), label: "Open project folder…", k: "Ctrl O", run: pickFolder },
-      ...projectMenuEntries(settings?.project ?? "", settings?.projects ?? []).slice(1, 6).map((p) => ({ g: "Project", icon: I.folder(), label: baseName(p), run: () => { void openProject(p); } })),
+      { g: "Action", icon: li(FolderGit2), label: "Clone repository…", run: openClone },
+      { g: "Action", icon: li(Server), label: "Open project over SSH…", run: openOverSsh },
+      ...(wsl.length ? [{ g: "Action", icon: li(SquareTerminal), label: "Open project from WSL…", run: openFromWsl }] : []),
+      ...projectMenuEntries(settings?.project ?? "", settings?.projects ?? []).slice(1, 6).map((p) => ({ g: "Project", icon: isSsh(p) ? li(Server) : I.folder(), label: projectLabel(p, sshHosts), run: () => { void openProject(p); } })),
       { g: "Go to", icon: I.bookmark(), label: "Saved prompts", run: () => go("saved") },
       { g: "Go to", icon: I.pause(13), label: "Paused chats", run: () => go("paused") },
       { g: "Go to", icon: I.gear(), label: "Settings", k: "Ctrl ,", run: () => go("settings") },
-      { g: "Go to", icon: li(ServerCog), label: "MCP servers", run: () => go("settings", { settingsTab: "mcp" }) },
-      { g: "Go to", icon: li(Sparkles), label: "Skills", run: () => go("settings", { settingsTab: "skills" }) },
-      { g: "Go to", icon: li(CircleDollarSign), label: "Usage and budget", run: () => go("settings", { settingsTab: "usage" }) },
+      // Generated from the one list the Settings nav reads, so a page added there
+      // is reachable here without a second list to keep in step. This replaces six
+      // hand-written rows that covered a third of the tabs.
+      ...SETTINGS_TABS.map((tab) => ({ g: "Go to", icon: li(tab.Icon), label: tab.label, run: () => go("settings", { settingsTab: tab.id }) })),
+      { g: "Go to", icon: li(Keyboard), label: "Keyboard shortcuts", run: () => { set({ pal: false }); setShortcuts(true); } },
       { g: "View", icon: li(ZoomIn), label: "Zoom in", k: "Ctrl +", run: () => stepZoom(1) },
       { g: "View", icon: li(ZoomOut), label: "Zoom out", k: "Ctrl −", run: () => stepZoom(-1) },
       ...ZOOMS.map((n) => ({ g: "View", icon: "%", label: `Interface zoom ${n}%${n === DEFAULT_ZOOM ? " (default)" : ""}`, k: n === DEFAULT_ZOOM ? "Ctrl 0" : undefined, run: () => saveSettings({ ui_zoom: n }) })),
@@ -477,17 +505,18 @@ function Palette() {
     // the palette drew it with the live blue spinner — a frozen chat that looked
     // like it was still working, in the one list the user reaches for to jump to it.
     const pausedAll = !!settings?.paused_all;
-    const chatCmds = (t: TaskSummary) => ({ g: "Task", icon: <StatusIcon status={isPaused(t, pausedAll) ? "paused" : t.status} color={modelColor(chatModel(t))} />, label: t.title, detail: taskSearchDetail(t), run: () => go("session", { task: t.id }) });
+    const chatCmds = (t: TaskSummary) => ({ g: "Task", icon: <StatusIcon status={isPaused(t, pausedAll) ? "paused" : chatStatus(t)} color={modelColor(chatModel(t))} />, label: t.title, detail: taskSearchDetail(t), run: () => go("session", { task: t.id }) });
     return ql
       ? [...base.filter((c) => keep(c.g, c.label)),
          ...models.filter((m) => keep("Model", "Switch to " + m.name)).map(modelCmds),
          ...chats.filter((t) => matchesTaskQuery(t, ql)).map(chatCmds)].slice(0, 9)
       : [...base, ...models.slice(0, room).map(modelCmds), ...chats.slice(0, room).map(chatCmds)].slice(0, 9);
-  }, [q, pal, settings, task, home, view, modelRows, tasks]);
-  if (!pal) return null;
+  }, [q, pal, settings, task, home, view, modelRows, tasks, wsl, sshHosts]);
+  if (!pal && !shortcuts) return null;
   const run = (c: Cmd) => { set({ pal: false }); c.run(); };
   return (
     <>
+      {pal && <>
       <MenuScrim style={{ zIndex: 50 }} onClick={() => set({ pal: false })} />
       <div className="palette" onKeyDown={(e) => {
         const n = cmds.length || 1;
@@ -516,6 +545,8 @@ function Palette() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14, height: 32, padding: "0 14px", borderTop: "1px solid rgba(255,255,255,0.07)", fontSize: 11, color: "var(--dim)" }}><span>Up/Down to navigate</span><span>Enter to run</span></div>
       </div>
+      </>}
+      {shortcuts && <ShortcutSheet onClose={() => setShortcuts(false)} />}
     </>
   );
 }
@@ -729,6 +760,7 @@ function ProjCtxMenu({ z }: { z: number }) {  const ctx = useStore((s) => s.proj
 
 export function Overlays({ z }: { z: number }) {
   const toast = useStore((s) => s.toast);
+  const toastAction = useStore((s) => s.toastAction);
   return (
     <>
       <SmallMenu z={z} />
@@ -739,9 +771,11 @@ export function Overlays({ z }: { z: number }) {
       <UltraXEditor />
       <MassMessage />
       <ForkChat />
+      <SendToMachine />
       <ChatStatsPanel />
       <TrustDialog />
-      {toast && createPortal(<div className="toast" role="status">{toast}</div>, document.body)}
+      <OpenProjectDialogs />
+      {toast && createPortal(<div className="toast" role="status"><span>{toast}</span>{toastAction && <button type="button" className="toast-act" onClick={() => { const a = toastAction; set({ toast: null, toastAction: null }); a.run(); }}>{toastAction.label}</button>}</div>, document.body)}
       <Notices />
     </>
   );

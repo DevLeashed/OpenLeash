@@ -20,19 +20,28 @@ it("offers a direct control to clear the current goal", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Remove current goal" }));
   expect(send).toHaveBeenCalledWith(task.id, "/goal clear");
 });
-it("only offers the same-task browser when its plugin is enabled", () => {
+it("hosts the plugin's browser as a view of the Artificts surface, not a panel of its own", () => {
   (globalThis as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver = class { observe() {} disconnect() {} unobserve() {} } as unknown as typeof ResizeObserver;
   vi.spyOn(api, "review").mockResolvedValue({ git: false, files: [] });
   const task = { id: "browser-chat", title: "Chat", status: "stopped", model: "test/model", project: "D:/dummy", subs: [], pending: {}, todos: [], cost: 0, tokens: {}, usage: { cost: 0, last_context: 0, cache_read: 0 }, context_window: 200000 } as unknown as TaskSummary;
   const settings = { plugins: { browser: { enabled: false } } } as unknown as Settings;
   set({ task: task.id, tasks: { [task.id]: task }, items: { [task.id]: [] }, settings, details: false, find: false });
   render(<Session />);
+  // No separate header control: the browser lives behind the workspace now.
+  expect(screen.queryByRole("button", { name: "Browser" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Artificts" }));
   expect(screen.queryByRole("button", { name: "Browser" })).toBeNull();
   cleanup();
+  // The chat remembers it was left on its artificts surface — that is saved with
+  // the chat — so the second render opens straight into it, and the browser view
+  // is simply what the plugin adds to that surface.
   set({ settings: { ...settings, plugins: { ...settings.plugins, browser: { enabled: true, width: 1280, height: 800 } } } });
-  render(<Session />);
+  const { container } = render(<Session />);
+  const workspace = container.querySelector(".collaboration-workspace")!;
+  expect(workspace).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Browser" }));
-  expect(screen.getByText("Browser for browser-chat")).toBeTruthy();
+  // The view renders inside the workspace pane, so it shares the surface's frame.
+  expect(workspace.contains(screen.getByText("Browser for browser-chat"))).toBe(true);
   fireEvent.click(screen.getByText("Close test browser"));
   expect(screen.queryByText("Browser for browser-chat")).toBeNull();
 });

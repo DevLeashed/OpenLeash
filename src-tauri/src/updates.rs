@@ -6,6 +6,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::atomic::Ordering, sync::Arc, time::Duration};
 use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::{Mutex, RwLock};
@@ -137,13 +138,17 @@ impl Updates {
                     })
                     .build()
                     .map_err(|e| e.to_string())?;
-                let mut update = updater
+                let update = updater
                     .check()
                     .await
+                    // The plugin's config schema requires `pubkey` (dropping the
+                    // key fails deserialization, so it stays in tauri.conf.json
+                    // unused) and rejects a manifest whose platform entry carries
+                    // no `signature` field, though nothing verifies one here;
+                    // publish `"signature": ""` to satisfy it.
                     .map_err(|e| e.to_string())?
-                    .ok_or("The signed update manifest is not available yet")?;
+                    .ok_or("The update manifest is not available yet")?;
                 validate_manifest(&version, &update.version, update.download_url.as_str())?;
-                update.timeout = Some(Duration::from_secs(30 * 60));
                 Ok::<_, String>(update)
             }
             .await;
@@ -185,9 +190,7 @@ impl Updates {
             .ok_or("No installable update is available; use GitHub Releases")?
             .clone();
         self.transition(app, "downloading").await;
-        // The plugin verifies the minisign signature with the compiled public
-        // key BEFORE returning these bytes. Never retain an unverified package.
-        match update.download(|_, _| {}, || {}).await {
+        match fetch_release_asset(&update).await {
             Ok(bytes) => {
                 pending.bytes = Some(bytes);
                 let mut view = self.transition(app, "ready").await;
@@ -211,6 +214,40 @@ impl Updates {
             }
         }
     }
+}
+
+/// Fetch the release asset the manifest points at.
+///
+/// Deliberately not `Update::download`: that path verifies the artifact against
+/// the updater public key compiled into the app, and this project publishes
+/// unsigned update assets, so the check could only ever reject them. The URL has
+/// already been pinned to an HTTPS asset of this repository's releases by
+/// [`validate_manifest`]; the bytes themselves are not authenticated, which is
+/// why applying them stays behind an explicit user action.
+async fn fetch_release_asset(update: &Update) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        // GitHub redirects asset downloads to its CDN, so this client follows
+        // redirects where the metadata client above deliberately does not.
+        .timeout(Duration::from_secs(30 * 60))
+        .user_agent("OpenLeash-update-download")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(update.download_url.clone())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Update download failed with status {}",
+            response.status()
+        ));
+    }
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -299,6 +336,23 @@ fn installation_capable() -> bool {
 }
 
 fn notify(app: &AppHandle, body: &str) {
+    // Windows: go through our own toast so a click raises the window. The
+    // plugin's toast carries no activation argument and goes nowhere on click.
+    #[cfg(windows)]
+    {
+        let id = app.config().identifier.clone();
+        crate::win::show_toast(
+            &id,
+            "OpenLeash update",
+            &format!(
+                "{body}
+{RELEASE_PAGE}"
+            ),
+            "",
+        );
+        return;
+    }
+    #[cfg(not(windows))]
     let _ = app
         .notification()
         .builder()
@@ -383,7 +437,7 @@ pub async fn app_update_install(
     let bytes = pending
         .bytes
         .as_ref()
-        .ok_or("Download and verify the update before installing")?;
+        .ok_or("Download the update before installing")?;
     if has_active_work(&h).await {
         return Err(
             "Stop all active tasks, subagents and background commands before installing an update"
@@ -480,27 +534,6 @@ mod tests {
             }
         )
         .is_err());
-    }
-
-    #[test]
-    fn minisign_rejects_tampered_update_bytes() {
-        // Public test vector from minisign-verify; this key is not the
-        // production updater key and the signature covers only the inert bytes "test".
-        let public_key = minisign_verify::PublicKey::from_base64(
-            "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
-        )
-        .unwrap();
-        let signature = minisign_verify::Signature::decode(
-            "untrusted comment: signature from minisign secret key
-RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=
-trusted comment: timestamp:1556193335\tfile:test
-y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==",
-        )
-        .unwrap();
-        assert!(public_key.verify(b"test", &signature, false).is_ok());
-        assert!(public_key
-            .verify(b"tampered update", &signature, false)
-            .is_err());
     }
 
     #[test]

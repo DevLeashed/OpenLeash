@@ -73,6 +73,16 @@ impl Default for TrustDecision {
 /// `canonicalize`d: the folder may not exist yet when a decision is recorded,
 /// and following a symlink would silently move a decision onto its target.
 pub fn norm_path(p: &str) -> String {
+    // A remote-SSH folder keeps its host and its case: trust for
+    // `/home/me/app` on one host must not cover another host, a local
+    // folder, or `/home/me/App` (POSIX paths are case-sensitive). An
+    // unparseable `ssh://` string normalizes to something no folder matches.
+    if super::host::is_ssh(p.trim()) {
+        return match super::host::parse_ssh(p.trim()) {
+            Some(sp) => sp.uri(),
+            None => "ssh://invalid".into(),
+        };
+    }
     let mut out = String::with_capacity(p.len());
     let mut prev = false;
     for c in p.trim().chars() {
@@ -98,6 +108,16 @@ pub fn norm_path(p: &str) -> String {
 
 /// The next directory up, or `None` at the top. `c:/a/b` -> `c:/a` -> `c:`.
 fn parent_of(p: &str) -> Option<String> {
+    if super::host::is_ssh(p) {
+        let sp = super::host::parse_ssh(p)?;
+        if sp.path == "/" {
+            return None;
+        }
+        return Some(super::host::ssh_uri(
+            &sp.host,
+            &super::host::parent(&sp.path),
+        ));
+    }
     let i = p.rfind('/')?;
     if i == 0 {
         // A leading `/` is the filesystem root, which has no parent.
@@ -114,7 +134,11 @@ pub fn parent_dir(path: &str) -> Option<String> {
     let p = norm_path(path);
     let up = parent_of(&p)?;
     // A bare drive (`c:`) or filesystem root is not a folder to trust.
-    if up.ends_with(':') || up.is_empty() || up == "/" {
+    if up.ends_with(':')
+        || up.is_empty()
+        || up == "/"
+        || super::host::parse_ssh(&up).is_some_and(|sp| sp.path == "/")
+    {
         return None;
     }
     Some(up)
@@ -188,7 +212,7 @@ pub fn clear(decisions: &mut Vec<TrustDecision>, path: &str) {
 
 // ───────────────────── process-global view ─────────────────────
 //
-// `prompt::system` builds a sub-agent's prompt from a `prompt::Env` that carries
+// `prompt::system` builds a subagent's prompt from a `prompt::Env` that carries
 // no settings, and `runner.rs` (which owns that call) is not ours to change, so
 // the trust decision the *prompt* needs cannot be threaded through as an
 // argument. It is kept here as one process-global table instead, written
@@ -380,6 +404,9 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
 /// so this is what the trust manifest shows, and the one function any future
 /// project-hook wiring must go through so the trust gate is never skipped.
 pub fn project_hooks(root: &str) -> Vec<Hook> {
+    if super::host::is_ssh(root) {
+        return vec![];
+    }
     let Some(v) = read_json(&Path::new(root).join(".openleash").join("hooks.json")) else {
         return vec![];
     };
@@ -402,6 +429,9 @@ pub fn hooks_for(s: &store::Settings, root: &str) -> Vec<Hook> {
 }
 
 fn scan_hooks(root: &str, m: &mut Manifest) {
+    if super::host::is_ssh(root) {
+        return;
+    }
     for h in project_hooks(root) {
         m.hooks.push(ManifestHook {
             event: h.event,
@@ -431,6 +461,9 @@ fn scan_hooks(root: &str, m: &mut Manifest) {
 }
 
 fn scan_mcp(root: &str, m: &mut Manifest) {
+    if super::host::is_ssh(root) {
+        return;
+    }
     for file in [".mcp.json", ".openleash/mcp.json"] {
         let Some(v) = read_json(&Path::new(root).join(file)) else {
             continue;
@@ -489,6 +522,9 @@ const DANGEROUS_KEYS: &[&str] = &[
 ];
 
 fn scan_overrides(root: &str, m: &mut Manifest) {
+    if super::host::is_ssh(root) {
+        return;
+    }
     for file in [".claude/settings.json", ".openleash/settings.json"] {
         let Some(v) = read_json(&Path::new(root).join(file)) else {
             continue;
@@ -536,11 +572,35 @@ pub fn manifest(s: &store::Settings, root: &str) -> Manifest {
         ..Default::default()
     };
 
-    for f in MEMORY_FILES {
-        let p = Path::new(root).join(f);
-        if let Ok(text) = std::fs::read_to_string(&p) {
-            let disabled = disabled_docs.iter().any(|d| d == f);
-            push_file(&mut m.instructions, &p, f, false, disabled, &text);
+    if super::host::is_ssh(root) {
+        // Read from the remote host; the rest of a remote project's items
+        // (skills, agents, hooks, MCP) are not loaded for SSH projects.
+        for (f, text) in prompt::remote_project_files(root, &[]) {
+            let disabled = disabled_docs.contains(&f);
+            let chars = text.chars().count();
+            m.instructions.push(ManifestFile {
+                name: f.clone(),
+                path: format!("{}/{f}", root.trim_end_matches('/')),
+                bytes: text.len() as u64,
+                chars,
+                truncated: chars > 40_000,
+                pointer_only: f == "CLAUDE.md" && prompt::is_agents_pointer_only(&text),
+                disabled,
+                global: false,
+                preview: text.chars().take(PREVIEW_CHARS).collect(),
+            });
+        }
+        m.warnings.push(Warning {
+            level: "info".into(),
+            text: "This is a remote (SSH) project: only its instruction files are used. Its skills, agents, hooks and MCP servers are not loaded.".into(),
+        });
+    } else {
+        for f in MEMORY_FILES {
+            let p = Path::new(root).join(f);
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                let disabled = disabled_docs.iter().any(|d| d == f);
+                push_file(&mut m.instructions, &p, f, false, disabled, &text);
+            }
         }
     }
     if let Some(home) = dirs::home_dir() {
@@ -572,7 +632,7 @@ pub fn manifest(s: &store::Settings, root: &str) -> Manifest {
         }
     }
 
-    if !root.is_empty() && Path::new(root).is_dir() {
+    if !root.is_empty() && !super::host::is_ssh(root) && Path::new(root).is_dir() {
         for sk in store::read_project_skills(root)
             .into_iter()
             .take(MANIFEST_CAP)

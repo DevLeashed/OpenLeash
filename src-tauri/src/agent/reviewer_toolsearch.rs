@@ -261,7 +261,7 @@ async fn a_searched_tool_stays_loaded_for_the_rest_of_the_conversation() {
         "re-loading the same tools must not grow the list"
     );
 
-    // The per-agent key keeps a sub-agent's loaded set off the main agent's.
+    // The per-agent key keeps a subagent's loaded set off the main agent's.
     assert!(toolindex::loaded(&rt, "sub-1").await.is_empty());
 
     // Compaction drops the prefix; the loaded set goes with it.

@@ -13,7 +13,7 @@
 //    reason is worth stating because it cost the obvious fix its life: an
 //    *unpackaged* Win32 app gets no in-process activation for its own toasts.
 //    The shell resolves a toast back to an owning app via the AppUserModelID,
-//    finds the COM activator named by `ToastActivatorCLSID`, and calls it *out of
+//    finds the COM activator named by `CustomActivator`, and calls it *out of
 //    process*. `tauri-plugin-notification` attaches no such handler and drops the
 //    `NotificationHandle` that owns notify-rust's activation channel, so a click
 //    has nowhere to go at all.
@@ -146,7 +146,7 @@ mod imp {
     use super::TASK_ARG;
 
     /// The activator CLSID for this app. A fixed constant rather than a
-    /// generated one: the shell reads `ToastActivatorCLSID` out of the registry
+    /// generated one: the shell reads `CustomActivator` out of the registry
     /// on every click, so it has to be the same value every launch, and it has
     /// to be ours alone — a colliding CLSID would activate whatever else
     /// registered it.
@@ -302,8 +302,8 @@ mod imp {
                 // registers the live class object under — the two drifting apart
                 // is a toast that is delivered but cannot be clicked.
                 let clsid = guid_str(ACTIVATOR_CLSID);
-                if let Err(e) = set_str(hkey, "ToastActivatorCLSID", &clsid) {
-                    eprintln!("[openleash] toast: no ToastActivatorCLSID for {app_id}: {e}");
+                if let Err(e) = set_str(hkey, "CustomActivator", &clsid) {
+                    eprintln!("[openleash] toast: no CustomActivator for {app_id}: {e}");
                 }
                 Ok(())
             });
@@ -444,29 +444,24 @@ mod imp {
             riid: *const GUID,
             ppv: *mut *mut c_void,
         ) -> windows::core::Result<()> {
-            // Only the activation callback is ours to hand out. Answering for
-            // anything else would be claiming an interface this object does not
-            // implement, which is how a caller ends up calling through a
-            // vtable slot that was never filled in.
-            if riid.is_null()
-                || ppv.is_null()
-                || unsafe { *riid } != <IToastNotificationActivationCallback as Interface>::IID
-            {
+            // The shell does not ask for the callback interface directly: COM's
+            // out-of-process activation asks the class factory for `IUnknown` and
+            // queries from there. A factory that insisted on the callback IID
+            // answered `E_NOINTERFACE` to that, so the shell never got an
+            // activator and a click went nowhere. `query` answers for `IUnknown`
+            // and the callback and refuses everything else, which is still the
+            // guard against claiming an interface this object does not have.
+            if riid.is_null() || ppv.is_null() {
                 return Err(E_NOINTERFACE.into());
             }
             // A fresh activator per activation: the shell may hold it for the
             // lifetime of a process it launched, and the sink is the only thing
             // it carries.
-            let obj: IToastNotificationActivationCallback = Activator {
+            let obj: IUnknown = Activator {
                 on_click: Arc::clone(&self.on_click),
             }
             .into();
-            // Hand the shell a reference it owns and will Release. `obj` is
-            // dropped here without releasing because the count was taken for the
-            // caller, not for us.
-            unsafe { *ppv = windows::core::Interface::as_raw(&obj) };
-            std::mem::forget(obj);
-            Ok(())
+            unsafe { obj.query(riid, ppv).ok() }
         }
 
         fn LockServer(&self, _flock: BOOL) -> windows::core::Result<()> {
@@ -487,6 +482,16 @@ mod imp {
     pub fn install_activator(
         on_click: Arc<dyn Fn(Option<String>) + Send + Sync>,
     ) -> Result<(), String> {
+        install_activator_as(&ACTIVATOR_CLSID, on_click)
+    }
+
+    /// `install_activator` for an arbitrary CLSID, so a test can register its
+    /// own class object without colliding with a copy of the app that is
+    /// already running and owns the real one.
+    pub(super) fn install_activator_as(
+        clsid: &GUID,
+        on_click: Arc<dyn Fn(Option<String>) + Send + Sync>,
+    ) -> Result<(), String> {
         // COM has to be up on this thread before anything is registered against
         // it. MTA: the shell calls us on its own thread and all we do is hand a
         // string to a closure — no interface pointer is marshalled.
@@ -501,14 +506,9 @@ mod imp {
         }
         let factory: IClassFactory = Factory { on_click }.into();
         unsafe {
-            CoRegisterClassObject(
-                &ACTIVATOR_CLSID,
-                &factory,
-                CLSCTX_LOCAL_SERVER,
-                REGCLS_MULTIPLEUSE,
-            )
-            .map(|_| ())
-            .map_err(|e| format!("CoRegisterClassObject: {e}"))
+            CoRegisterClassObject(clsid, &factory, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE)
+                .map(|_| ())
+                .map_err(|e| format!("CoRegisterClassObject: {e}"))
         }
     }
 }
@@ -707,7 +707,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_activator_class_is_registered_under_the_clsid_the_shell_will_ask_for() {
-        // `ToastActivatorCLSID` in the AUMID key and the class object registered
+        // `CustomActivator` in the AUMID key and the class object registered
         // with COM have to be the same GUID. They are written by different calls
         // at startup, and if they ever drift the result is a toast that appears
         // and cannot be clicked — with no error anywhere to notice it by.
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn the_activator_clsid_is_stable_and_not_zero() {
-        // The shell resolves `ToastActivatorCLSID` out of the registry on every
+        // The shell resolves `CustomActivator` out of the registry on every
         // click, so a value that changed per launch would be a dead end — and an
         // all-zero CLSID would be one the shell refuses outright.
         #[cfg(windows)]
@@ -850,5 +850,44 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert!(!ACTIVATOR_CLSID.is_empty());
+    }
+
+    /// The shell activates us through COM's out-of-process path, which asks the
+    /// class factory for `IUnknown` and queries from there. A factory that only
+    /// answered for the callback IID returned `E_NOINTERFACE` to that, so clicks
+    /// never reached `Activate`. Drives the real class object through
+    /// `CoCreateInstance` with both IIDs and then calls `Activate`.
+    #[cfg(windows)]
+    #[test]
+    fn class_object_answers_unknown_and_delivers_the_click() {
+        use super::imp::{install_activator_as, IToastNotificationActivationCallback};
+        use std::sync::{Arc, Mutex};
+        use windows::core::{IUnknown, Interface, PCWSTR};
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_LOCAL_SERVER};
+
+        let got: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let sink = {
+            let got = Arc::clone(&got);
+            Arc::new(move |t: Option<String>| got.lock().unwrap().push(t))
+        };
+        // Not `ACTIVATOR_CLSID`: a running copy of the app has that one.
+        let clsid = windows::core::GUID::from_u128(0x0b6f2f1c_5d7a_4c3e_9a41_7d2e8c1f5a03);
+        install_activator_as(&clsid, sink).expect("register class object");
+
+        let unk: IUnknown = unsafe { CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER) }
+            .expect("IUnknown must be answered");
+        let cb: IToastNotificationActivationCallback = unk.cast().expect("callback interface");
+        let arg = wide("task:0123456789ab").unwrap();
+        let hr = unsafe {
+            (Interface::vtable(&cb).Activate)(
+                cb.as_raw(),
+                PCWSTR::null(),
+                PCWSTR(arg.as_ptr()),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(hr.is_ok());
+        assert_eq!(*got.lock().unwrap(), vec![Some("0123456789ab".to_string())]);
     }
 }

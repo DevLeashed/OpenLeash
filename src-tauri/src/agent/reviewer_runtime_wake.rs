@@ -471,11 +471,11 @@ async fn a_stop_clears_a_park() {
 
 // ───────────────────────── per-agent cost attribution (end to end) ─────────────────────────
 
-/// A real sub-agent's spend lands in its own `by_agent` row, not the main
+/// A real subagent's spend lands in its own `by_agent` row, not the main
 /// agent's. The stats *unit* is covered in `stats.rs`; this drives the actual
 /// turn loop so the plumbing — which `usage_id` the router records each request
 /// under — is what is under test. A well-tested `Stats::record` with the router
-/// still passing `"main"` for a sub-agent is exactly the bug that hides spend.
+/// still passing `"main"` for a subagent is exactly the bug that hides spend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sub_agents_spend_is_a_row_of_its_own() {
     let _g = router::ROUTES_LOCK
@@ -492,7 +492,7 @@ async fn a_sub_agents_spend_is_a_row_of_its_own() {
     t.status = "idle".into();
     let (h, _) = harness(s, vec![t]);
 
-    // Main asks a sub-agent, the sub-agent answers, the main reports back.
+    // Main asks a subagent, the subagent answers, the main reports back.
     m.push(openai_call(
         "task",
         json!({"description": "look it up", "prompt": "Where is X?", "subagent_type": "explore"}),
@@ -519,11 +519,11 @@ async fn a_sub_agents_spend_is_a_row_of_its_own() {
         .keys()
         .find(|k| k.starts_with("sub:"))
         .unwrap_or_else(|| {
-            panic!("a sub-agent must have its own row, not be folded into main: {by:?}")
+            panic!("a subagent must have its own row, not be folded into main: {by:?}")
         });
     assert!(
         by[sub_key].requests >= 1,
-        "the sub-agent's request is recorded"
+        "the subagent's request is recorded"
     );
     // The two rows are genuinely different slices: main and the sub both made
     // requests, and neither total swallowed the other.
@@ -549,7 +549,7 @@ fn a_system_oneshot_is_its_own_agent_row() {
     assert_eq!(agent_kind_for_test("compactor", None), "compactor");
     assert_eq!(agent_kind_for_test("keepalive", None), "keepalive");
     assert_eq!(agent_kind_for_test("summary", None), "summary");
-    // A sub-agent keeps its *role* here (the dimension is per type), which is
+    // A subagent keeps its *role* here (the dimension is per type), which is
     // how `by_agent`'s per-*instance* `sub:<id>` and this per-type key differ.
     assert_eq!(
         agent_kind_for_test("sub:abc123", Some("explore")),

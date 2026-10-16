@@ -11,7 +11,7 @@
 //! - selection: highest priority first; among equals, stay on the account
 //!   that is already warm so the provider's prompt cache keeps hitting
 
-use super::store::{self, Account};
+use super::store::{self, Account, UsageCap};
 use super::Harness;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -116,6 +116,25 @@ pub struct AccountView {
     pub available: bool,
     pub active: bool,
     pub expires_at: i64,
+    /// The usage caps standing on this account, expired ones left out.
+    pub caps: Vec<CapView>,
+}
+
+/// A cap as the settings page draws it.
+#[derive(Serialize, Clone)]
+pub struct CapView {
+    pub window: String,
+    /// Percent of the window used at which the harness stops using the account.
+    pub used: f64,
+    /// Unix seconds the cap lifts on its own; 0 = until the user removes it.
+    pub until: i64,
+    /// This cap is what is keeping the account out of the pool right now.
+    ///
+    /// Computed from the same predicate the router applies, so a row that draws
+    /// a cap as reached is a row the router is genuinely skipping — two
+    /// independent answers to "is this account being used" is how a settings
+    /// page starts lying about what the harness is doing.
+    pub holding: bool,
 }
 
 impl AccountRt {
@@ -126,6 +145,24 @@ impl AccountRt {
             .iter()
             .map(|a| {
                 let s = st.get(&a.id).cloned().unwrap_or_default();
+                // Built before the struct literal because `s.usage` is moved out
+                // of `s` below, and the caps read the state it still holds.
+                //
+                // A temporary cap that has run out can never hold anything
+                // again, so it is not a cap the page should offer to remove —
+                // it is litter in the settings file until the next cap on this
+                // window replaces it.
+                let caps: Vec<CapView> = a
+                    .caps
+                    .iter()
+                    .filter(|c| c.until == 0 || c.until > now())
+                    .map(|c| CapView {
+                        window: c.window.clone(),
+                        used: c.used,
+                        until: c.until,
+                        holding: cap_holding(c, &s),
+                    })
+                    .collect();
                 AccountView {
                     id: a.id.clone(),
                     kind: a.kind.clone(),
@@ -148,6 +185,7 @@ impl AccountRt {
                     cooldown_until: s.cooldown_until,
                     cooldown_reason: s.cooldown_reason,
                     expires_at: a.expires_at,
+                    caps,
                 }
             })
             .collect()
@@ -158,20 +196,71 @@ impl AccountRt {
         usable_with(a, &st.get(&a.id).cloned().unwrap_or_default())
     }
 
+    /// Free-named models may have a separate allowance from the account's paid
+    /// usage windows, so let them try an account benched only for usage limits.
+    /// Explicit account disables and credential failures still apply.
+    pub fn usable_for_model(&self, a: &Account, model: &str) -> bool {
+        if !model.to_ascii_lowercase().contains("free") {
+            return self.usable(a);
+        }
+        let st = self.state.lock().unwrap();
+        let state = st.get(&a.id).cloned().unwrap_or_default();
+        let usage_limited = state.cooldown_reason == LIVE_LIMIT
+            || state.cooldown_reason == "Usage limit reached"
+            || state.cooldown_reason == "Rate limited";
+        let mut eligible = state.clone();
+        let mut model_account = a.clone();
+        // A free model is allowed to use the account even when its paid-usage
+        // cap or provider-reported usage window is exhausted.
+        model_account.caps.clear();
+        if usage_limited {
+            eligible.cooldown_until = 0;
+            eligible.cooldown_reason.clear();
+            eligible.usage = None;
+        }
+        usable_with(&model_account, &eligible)
+    }
+
     /// Earliest moment any of these accounts frees up (for "resumes at …").
+    ///
+    /// A cap is a blocker like any other, and it lifts two ways: a temporary one
+    /// when its own clock runs out, a permanent one when the window it caps
+    /// rolls over and the account starts that window under the cap again. A
+    /// permanent cap whose window reports no reset time therefore frees up at no
+    /// known moment and contributes nothing here, rather than a made-up time:
+    /// the chat stays parked until the user lifts the cap, which is what they
+    /// asked for by setting it.
     pub fn next_free(&self, accts: &[Account]) -> i64 {
+        let t = now();
         let st = self.state.lock().unwrap();
         accts
             .iter()
             .filter_map(|a| {
                 let s = st.get(&a.id)?;
-                let mut t = s.cooldown_until;
+                let mut at = s.cooldown_until;
                 if let Some(u) = &s.usage {
                     for w in u.windows.iter().filter(|w| w.used >= 99.5) {
-                        t = t.max(w.resets_at);
+                        at = at.max(w.resets_at);
                     }
                 }
-                (t > now()).then_some(t)
+                if let Some(c) = holding_cap(a, s) {
+                    let reset = s
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.windows.iter().find(|w| w.label == c.window))
+                        .map(|w| w.resets_at)
+                        .unwrap_or(0);
+                    let lift = match (c.until > t, reset > t) {
+                        (true, true) => c.until.min(reset),
+                        (true, false) => c.until,
+                        (false, true) => reset,
+                        (false, false) => 0,
+                    };
+                    if lift > 0 {
+                        at = at.max(lift);
+                    }
+                }
+                (at > t).then_some(at)
             })
             .min()
             .unwrap_or(0)
@@ -397,6 +486,7 @@ fn usable_with(a: &Account, s: &AcctState) -> bool {
     a.enabled
         && a.disabled_reason.is_empty()
         && s.cooldown_until <= now()
+        && holding_cap(a, s).is_none()
         && !s.usage.as_ref().is_some_and(|u| {
             u.limited
                 && u.windows
@@ -404,6 +494,28 @@ fn usable_with(a: &Account, s: &AcctState) -> bool {
                     .filter(|w| w.used >= 99.5)
                     .any(|w| w.resets_at == 0 || w.resets_at > now())
         })
+}
+
+/// Is this cap keeping the account out of the pool right now?
+///
+/// It holds when it is still live and the window it names has reached it. The
+/// window is found by label, not by position, so a provider that stops reporting
+/// a window leaves its cap armed and inert instead of applying it to whichever
+/// window took its place.
+fn cap_holding(c: &UsageCap, s: &AcctState) -> bool {
+    if c.until > 0 && c.until <= now() {
+        return false;
+    }
+    s.usage.as_ref().is_some_and(|u| {
+        u.windows
+            .iter()
+            .any(|w| w.label == c.window && w.used >= c.used)
+    })
+}
+
+/// The cap holding this account out of the pool, if one is.
+fn holding_cap<'a>(a: &'a Account, s: &AcctState) -> Option<&'a UsageCap> {
+    a.caps.iter().find(|c| cap_holding(c, s))
 }
 
 fn window_label(secs: i64) -> String {
@@ -1382,5 +1494,184 @@ mod tests {
             assert_eq!(go_url("usage"), "https://opencode.ai/zen/go/v1/usage");
             assert_eq!(go_url("models"), "https://opencode.ai/zen/go/v1/models");
         }
+    }
+
+    // ── caps ──────────────────────────────────────────────────────────────
+    //
+    // A cap is the user telling the harness to stop short of spending a window.
+    // It is not a cooldown, and these tests are as much about what it is *not*:
+    // it has to survive the things that clear a cooldown, it has to leave the
+    // windows beside it alone, and a temporary one has to be able to run out.
+
+    /// One enabled account carrying one cap.
+    fn capped(id: &str, window: &str, used: f64, until: i64) -> Account {
+        Account {
+            id: id.into(),
+            kind: "codex".into(),
+            label: id.into(),
+            enabled: true,
+            caps: vec![UsageCap {
+                window: window.into(),
+                used,
+                until,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// What a usage read leaves behind: `(window, percent used, resets at)`.
+    fn usage_of(windows: &[(&str, f64, i64)]) -> AcctUsage {
+        AcctUsage {
+            windows: windows
+                .iter()
+                .map(|(label, used, resets_at)| Window {
+                    label: (*label).into(),
+                    used: *used,
+                    resets_at: *resets_at,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn read(windows: &[(&str, f64, i64)]) -> AcctState {
+        AcctState {
+            usage: Some(usage_of(windows)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn free_named_model_retries_usage_limited_account_but_respects_other_blocks() {
+        let rt = AccountRt::default();
+        let a = Account {
+            id: "only".into(),
+            kind: "codex".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        rt.set_usage(
+            "only",
+            AcctUsage {
+                limited: true,
+                windows: vec![Window {
+                    label: "Week".into(),
+                    used: 100.0,
+                    resets_at: now() + 3600,
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(!rt.usable_for_model(&a, "codex/model"));
+        assert!(rt.usable_for_model(&a, "codex/model-free"));
+        assert!(rt.usable_for_model(&a, "codex/FREE-tier"));
+
+        let capped = Account {
+            caps: vec![UsageCap {
+                window: "Week".into(),
+                used: 50.0,
+                until: 0,
+            }],
+            ..a.clone()
+        };
+        rt.set_usage("only", usage_of(&[("Week", 80.0, 0)]));
+        assert!(rt.usable_for_model(&capped, "codex/model-free"));
+        let disabled = Account {
+            enabled: false,
+            ..a
+        };
+        assert!(!rt.usable_for_model(&disabled, "codex/model-free"));
+    }
+
+    #[test]
+    fn free_named_model_bypasses_caps_without_usage_state() {
+        let rt = AccountRt::default();
+        let capped = capped("only", "Week", 50.0, 0);
+        rt.set_usage("only", usage_of(&[("Week", 80.0, 0)]));
+        assert!(!rt.usable_for_model(&capped, "codex/model"));
+        assert!(rt.usable_for_model(&capped, "codex/model-free"));
+    }
+
+    #[test]
+    fn a_cap_stops_the_account_at_the_line_the_user_drew() {
+        let a = capped("only", "5h", 50.0, 0);
+        assert!(
+            usable_with(&a, &read(&[("5h", 49.9, 0)])),
+            "under the cap the account is the router's as usual"
+        );
+        assert!(!usable_with(&a, &read(&[("5h", 50.0, 0)])), "at the cap");
+        assert!(!usable_with(&a, &read(&[("5h", 90.0, 0)])), "past the cap");
+        // A cap on one window says nothing about the windows beside it.
+        assert!(usable_with(
+            &a,
+            &read(&[("5h", 20.0, 0), ("Week", 96.0, 0)])
+        ));
+        // A cap for a window the provider has not reported yet is armed, not
+        // spent: there is no reading to compare it against.
+        assert!(usable_with(
+            &capped("only", "Month", 50.0, 0),
+            &read(&[("5h", 90.0, 0)])
+        ));
+        assert!(usable_with(&a, &AcctState::default()));
+    }
+
+    #[test]
+    fn a_temporary_cap_lifts_by_itself_and_an_expired_one_holds_nothing() {
+        let t = now();
+        let live = capped("only", "5h", 50.0, t + 600);
+        assert!(!usable_with(&live, &read(&[("5h", 90.0, 0)])));
+        let spent = capped("only", "5h", 50.0, t - 1);
+        assert!(
+            usable_with(&spent, &read(&[("5h", 90.0, 0)])),
+            "a temporary cap is not a bench: nothing has to clear it by hand"
+        );
+    }
+
+    /// The badge on the row and the router's own answer are the same answer.
+    #[test]
+    fn the_row_draws_the_cap_the_router_is_acting_on() {
+        let rt = AccountRt::default();
+        let a = capped("only", "5h", 50.0, 0);
+        rt.set_usage("only", usage_of(&[("5h", 80.0, 0)]));
+        let v = rt.views(&[a.clone()]);
+        assert!(!v[0].available, "reached: the router is skipping it");
+        assert_eq!(v[0].caps.len(), 1);
+        assert!(v[0].caps[0].holding, "the row has to say why it is skipped");
+
+        rt.set_usage("only", usage_of(&[("5h", 10.0, 0)]));
+        let v = rt.views(&[a]);
+        assert!(v[0].available);
+        assert_eq!(v[0].caps.len(), 1, "an armed cap is still shown");
+        assert!(!v[0].caps[0].holding);
+
+        // A temporary cap whose time is up can never hold anything again, so it
+        // is not a cap the page offers to remove.
+        let past = capped("only", "5h", 50.0, now() - 1);
+        rt.set_usage("only", usage_of(&[("5h", 80.0, 0)]));
+        let v = rt.views(&[past]);
+        assert!(v[0].available);
+        assert!(v[0].caps.is_empty());
+    }
+
+    #[test]
+    fn a_capped_account_says_when_it_comes_back() {
+        let rt = AccountRt::default();
+        let t = now();
+        let reset = t + 7200;
+        let perm = capped("only", "Week", 50.0, 0);
+        rt.set_usage("only", usage_of(&[("Week", 70.0, reset)]));
+        assert_eq!(
+            rt.next_free(&[perm.clone()]),
+            reset,
+            "a permanent cap lifts when the window rolls over under it"
+        );
+        // A temporary cap that lifts before the reset is the earlier moment.
+        let temp = capped("only", "Week", 50.0, t + 600);
+        assert_eq!(rt.next_free(&[temp]), t + 600);
+        // A permanent cap on a window that reports no reset has no moment it
+        // frees up on, so nothing here promises one: the chat stays parked until
+        // the user lifts the cap, which is what setting it meant.
+        rt.set_usage("only", usage_of(&[("Week", 70.0, 0)]));
+        assert_eq!(rt.next_free(&[perm]), 0);
     }
 }

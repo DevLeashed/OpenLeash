@@ -66,6 +66,29 @@ describe("Full Access permission mode", () => {
     expect(invoke).toHaveBeenCalledWith("settings_update", { patch: { custom_commands: [{ name: "review-pr", description: "Review pull request", prompt: "Review {{args}}" }] } });
   });
 
+  // The footer button beside the usage bar can be aimed at any settings page.
+  // Accounts is what it has always opened, so that is what an install with
+  // nothing recorded must still show.
+  it("aims the sidebar shortcut button at any settings page", async () => {
+    set({ settingsTab: "general", settings: settings("auto") as Settings });
+    render(<SettingsView />);
+    const picker = screen.getByRole("combobox", { name: "Settings page" });
+    expect(picker.querySelector(".ddv")?.textContent).toBe("Accounts");
+
+    fireEvent.click(picker);
+    // Every page, including the ones the nav hides: a hidden page stays reachable.
+    expect(screen.getByRole("listbox").textContent).toContain("Routing");
+    fireEvent.click([...document.querySelectorAll<HTMLElement>('[role="option"]')].find((option) => option.textContent?.includes("Permissions"))!);
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("settings_update", { patch: { sidebar_button_tab: "perms" } }));
+  });
+
+  it("shows Accounts for a stored page this build does not have", () => {
+    set({ settingsTab: "general", settings: { ...settings("auto"), sidebar_button_tab: "gone" } as Settings });
+    render(<SettingsView />);
+    expect(screen.getByRole("combobox", { name: "Settings page" }).querySelector(".ddv")?.textContent).toBe("Accounts");
+  });
+
   it("uses Full Access when no new-chat mode has been recorded", () => {
     expect(DEFAULT_PERM).toBe("turbo");
     expect(permLabel(undefined)).toBe("Full Access");

@@ -123,14 +123,31 @@ export function McpServers({ custom = false }: { custom?: boolean }) {
           <Switch label={`${m.enabled ? "Disable" : "Enable"} ${m.name}`} checked={m.enabled} onChange={(enabled) => setCfg({ enabled })} />
           <IconButton label={`Remove ${m.name}`} style={{ width: 24, height: 24 }} onClick={() => save(s.mcp.filter((_, j) => j !== i))}><Trash2 size={12} /></IconButton>
         </div>
-        {expanded && <McpAutoApprove cfg={m} status={st} onChange={(next, removed) => {
-          const mcp = s.mcp.map((x, j) => j === i ? { ...x, auto_approve: next } : x);
-          // Backend sync only adds grants: retract the exact allow rule in the same save.
-          if (removed) void saveSettings({ mcp, allow: s.allow.filter((r) => r.pattern !== `mcp__${m.name}__${removed} *`) });
-          else void save(mcp);
-        }} />}
+        {expanded && <>
+          <div className="srowx" style={{ paddingLeft: 22 }}>
+            <div style={{ flex: 1 }}>Always declare its tools<div className="desc">On keeps every tool from this server in the request. Off defers them to <span className="mono">tool_search</span> instead — fewer tokens per request, at the cost of a search per call.</div></div>
+            <Switch label={`Always declare ${m.name}'s tools`} small checked={m.defer !== false} onChange={(v) => setCfg({ defer: v })} />
+          </div>
+          <McpAutoApprove cfg={m} status={st} onChange={(next, removed) => {
+            const mcp = s.mcp.map((x, j) => j === i ? { ...x, auto_approve: next } : x);
+            // Backend sync only adds grants: retract the exact allow rule in the same save.
+            if (removed) void saveSettings({ mcp, allow: s.allow.filter((r) => r.pattern !== `mcp__${m.name}__${removed} *`) });
+            else void save(mcp);
+          }} />
+        </>}
       </Fragment>;
     })}</div> : <div className="empty">{custom ? "No custom plugins yet." : "No MCP servers yet."}</div>}
+    {/* Tool-schema deferral. One place for the decision, because it is the same
+        decision at three scopes: globally, for plugins, and per server above.
+        Not in the Plugins tab's copy of this view — two sets of controls for one
+        setting is worse than making the user visit the tab that owns it. */}
+    {!custom && <>
+    <div className="settings-section-label">Tool schemas</div>
+    <div className="sgroup">
+      <div className="srowx"><div style={{ flex: 1 }}>Defer the long tail to <span className="mono">tool_search</span><div className="desc">Holds back MCP tool schemas until the agent searches for one, instead of declaring every tool on every request. Off declares everything, always.</div></div><Switch label="Defer the long tail to tool_search" checked={s.tool_search !== false} onChange={(v) => void saveSettings({ tool_search: v })} /></div>
+      <div className="srowx"><div style={{ flex: 1 }}>Also defer plugin tools<div className="desc">Applies the same rule to plugin tools (GitHub, browser, computer), not only MCP servers.</div></div><Switch label="Also defer plugin tools" checked={s.defer_plugins === true} onChange={(v) => void saveSettings({ defer_plugins: v })} /></div>
+    </div>
+    </>}
     <div className="settings-note">Tools ask permission unless Full access, a pre-approved tool, or an allow rule applies. A URL server is reached over the streamable-HTTP transport; a command server runs as a local process.</div>
     {adding && <AddMcpDialog existing={s.mcp} onClose={() => setAdding(false)} />}
   </>;

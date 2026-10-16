@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpRight, CircleAlert, CircleQuestionMark, Hand, type LucideIcon } from "lucide-react";
 import { ago, api, oneLine, type Item, type TaskSummary } from "../api";
 import { get, go, useNow, useStore } from "../store";
@@ -57,7 +57,12 @@ function focusPending(taskId: string, kind: "approval" | "question", itemId?: st
 /** Cross-chat inbox for the existing, blocking decisions. It never answers for the user. */
 export function NeedsYou() {
   const tasks = useStore((state) => state.tasks);
-  const waiting = Object.values(tasks).filter(needsYou); // Filtering is stable: keep the existing chat/API order.
+  // Memoized, and it matters most when a lot of chats are working: this banner is
+  // mounted for the whole session, `tasks` changes identity on every summary
+  // event from every chat, and both passes below walk the entire chat list. With
+  // a dozen chats running that was two full scans of every chat several times a
+  // second, for a list that only changes when a chat starts or stops waiting.
+  const waiting = useMemo(() => Object.values(tasks).filter(needsYou), [tasks]); // Filtering is stable: keep the existing chat/API order.
   const waitingKey = waiting.map((task) => `${task.id}:${task.waiting_kind}`).join("|");
   const [open, setOpen] = useState(false);
   const [previews, setPreviews] = useState<Record<string, PendingPreview>>({});

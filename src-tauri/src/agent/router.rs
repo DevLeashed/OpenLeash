@@ -8,7 +8,7 @@
 //! Each target is retried per its failure class (transient noise gets
 //! backoff, "insist" providers get dozens of tries, exhausted accounts are
 //! skipped until their reset). When the whole chain is out, the task
-//! **pauses** — main agent and every sub-agent — and the request resumes
+//! **pauses** — main agent and every subagent — and the request resumes
 //! exactly where it was once the user (or an account reset) unpauses it.
 //! The model never hears about any of this.
 
@@ -128,7 +128,7 @@ impl std::fmt::Debug for RouteErr {
     }
 }
 
-/// Who is asking: the main agent or one sub-agent of a task.
+/// Who is asking: the main agent or one subagent of a task.
 pub struct Who<'a> {
     pub task_id: &'a str,
     pub sub: Option<&'a str>,
@@ -250,7 +250,7 @@ async fn live(h: &Arc<Harness>, who: &Who<'_>, model: &str) -> (String, String) 
     let m = if who.side {
         model.to_string()
     } else {
-        // A sub-agent's own entry, for the model somebody chose for it and for the
+        // A subagent's own entry, for the model somebody chose for it and for the
         // depth its X layer is picked by. The main agent has neither.
         let sub = who.sub.and_then(|s| t.subs.iter().find(|x| x.id == s));
         super::resolve_model(&t, sub, sub.map(|s| s.depth).unwrap_or(0), model)
@@ -273,7 +273,7 @@ fn targets(h: &Harness, s: &Settings, step: &str) -> Vec<Target> {
     if providers::is_pool(prov) {
         let pool: Vec<Target> = accounts::pool(h, &s.accounts, prov)
             .into_iter()
-            .filter(|a| h.accts.usable(a))
+            .filter(|a| h.accts.usable_for_model(a, step))
             .map(|a| Target {
                 account: Some(a),
                 ..base.clone()
@@ -325,7 +325,7 @@ async fn live_effort(h: &Arc<Harness>, who: &Who<'_>, fallback: usize) -> usize 
         return fallback;
     };
     let t = t.lock().await;
-    // A sub-agent's own override wins over the chat's, matching the loop.
+    // A subagent's own override wins over the chat's, matching the loop.
     match who.sub {
         Some(sid) => t
             .subs
@@ -408,6 +408,11 @@ pub async fn request(
         let settings = h.settings.read().await.clone();
         let mut last_err = String::from("no provider configured");
         let mut failed: Vec<String> = vec![];
+        // Whether anything in this pass failed in a way waiting could fix. A
+        // pass where every target rejected the request itself (400/404/422) has
+        // nothing to wait for: pausing as "exhausted" and resuming just sends
+        // the same rejected payload again, forever.
+        let mut retryable = false;
 
         for step in &chain {
             let prov = step.split('/').next().unwrap_or("");
@@ -419,6 +424,7 @@ pub async fn request(
                 } else {
                     format!("no {prov} accounts connected")
                 };
+                retryable = true;
                 failed.push(step.clone());
                 continue;
             }
@@ -512,6 +518,17 @@ pub async fn request(
                                 who.usage_id,
                                 &sample,
                             );
+                            // Opt-in trace export. A no-op unless the user has
+                            // named a collector: it reads one atomic and returns.
+                            // Provider-reported counts only, never estimated.
+                            crate::trace::model_request(&crate::trace::ModelRequest {
+                                provider: &t.prov,
+                                model: &t.model,
+                                input_tokens: Some(u.input),
+                                output_tokens: Some(u.output),
+                                duration: started.elapsed(),
+                                error: false,
+                            });
                             let label = t.label();
                             // The user swapped this agent's model while it was waiting
                             // (out of usage, paused): say so, unless the chain fell
@@ -545,6 +562,17 @@ pub async fn request(
                             .or_else(|| t.api_key.as_ref().map(|k| providers::key_hint(k)));
                         h.stats
                             .error(who.task_id, &t.model_id, stats_label_owned.as_deref());
+                        // The failing half of the same span: no counts (the
+                        // provider reported none) but the duration and the fact
+                        // that it failed, which is the interesting part.
+                        crate::trace::model_request(&crate::trace::ModelRequest {
+                            provider: &t.prov,
+                            model: &t.model,
+                            input_tokens: None,
+                            output_tokens: None,
+                            duration: started.elapsed(),
+                            error: true,
+                        });
                         h.stats.event_in(who.task_id, "retries");
                     }
                     if emitted {
@@ -563,6 +591,7 @@ pub async fn request(
                         }
                         Fail::TooLong(m) => return Err(RouteErr::TooLong(m)),
                         Fail::Auth(m) => {
+                            retryable = true;
                             last_err = m;
                             if let Some(a) = &t.account {
                                 if !refreshed {
@@ -578,6 +607,7 @@ pub async fn request(
                             break;
                         }
                         Fail::Exhausted { msg, until, hard } => {
+                            retryable = true;
                             last_err = msg.clone();
                             if let Some(a) = &t.account {
                                 let until = if until > now() {
@@ -644,9 +674,27 @@ pub async fn request(
                                 return Err(RouteErr::Cancelled);
                             }
                         }
+                        // The provider rejected this exact request: resending it
+                        // gets the same answer (a malformed history 400'd three
+                        // times in a row before this). Another target in the
+                        // chain may still take it, so move on, not give up.
+                        // An `insist` gateway is the exception by design: those
+                        // say 4xx for "no channel free right now".
+                        Fail::Bad(m) if !insist && rejects_request(&m) => {
+                            last_err = m;
+                            break;
+                        }
                         Fail::Transient(m) | Fail::Bad(m) => {
+                            retryable = true;
+                            // The gateway's "endpoint is unavailable" blip gets
+                            // fifteen tries before the chain is declared out.
+                            // Everything else keeps its old ladder: noise gets
+                            // six tries, a 4xx the provider might still accept
+                            // gets three.
                             let bad = m.starts_with("HTTP 4");
-                            let max = if insist {
+                            let max = if providers::looks_endpoint_unavailable(&m) {
+                                15
+                            } else if insist {
                                 40
                             } else if bad {
                                 3
@@ -672,7 +720,7 @@ pub async fn request(
             }
         }
 
-        if on_out == "fail" {
+        if on_out == "fail" || (!retryable && !failed.is_empty()) {
             return Err(RouteErr::Fatal(last_err));
         }
         let pool_accts: Vec<_> = settings
@@ -719,7 +767,7 @@ pub async fn request(
     }
 }
 
-/// The app-wide `agents` key: "main", a sub-agent's type (explore, general, …),
+/// The app-wide `agents` key: "main", a subagent's type (explore, general, …),
 /// or a system label for a one-shot that belongs to no agent at all.
 ///
 /// The `usage_id` is read for the system case and not derived from `sub`, because
@@ -745,6 +793,15 @@ async fn agent_kind(h: &Harness, who: &Who<'_>) -> String {
     }
 }
 
+/// A failure that is about the request itself, so the same payload fails the
+/// same way every time. `classify` gives these codes `Bad`; other `Bad` codes
+/// (an odd status from a gateway) keep their few retries.
+fn rejects_request(msg: &str) -> bool {
+    ["HTTP 400", "HTTP 404", "HTTP 422"]
+        .iter()
+        .any(|p| msg.starts_with(p))
+}
+
 fn label_of(t: &Target) -> String {
     t.label()
 }
@@ -753,7 +810,7 @@ fn label_of(t: &Target) -> String {
 /// the naming rule `agent_kind` applies, exposed so it can be tested without
 /// standing up a task.
 ///
-/// `sub` is the sub-agent's *role* (what the caller resolved from the task), not
+/// `sub` is the subagent's *role* (what the caller resolved from the task), not
 /// its id: the dimension is per agent type, unlike the per-chat `by_agent` split
 /// which is per agent instance.
 pub fn agent_kind_for_test(usage_id: &str, sub_role: Option<&str>) -> String {

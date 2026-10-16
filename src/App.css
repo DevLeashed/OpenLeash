@@ -153,6 +153,12 @@
   --ultra: #a78bfa; --ultra2: #d3c2ff; --ultra-rgb: 167,139,250;
   --st-run: #a78bfa; --st-wait: #e98585; --st-idle: #6d6d75; --st-done: #888891; --st-stop: #888891; --st-fail: #e98585; --st-pause: #b9a779; --st-unread: #c4b5fd;
   --cyan: #a78bfa; --cyan2: #c4b5fd; --red: #e98585; --red2: #f0a0a0; --violet: #a78bfa; --green: #92aa99; --green2: #afc3b4;
+  /* The app's own faces, declared here rather than inline on `body` so the host
+     can hand them to documents it renders on the agent's behalf (isolated HTML
+     previews, SVG image documents). Those documents carry no CSS of the app's,
+     so one that names no family falls back to the user agent's default — a
+     serif — which is exactly how a generated artifict used to arrive. */
+  --font-sans: "Geist", system-ui, "Segoe UI", sans-serif;
   --mono: "Geist Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
   --ease: cubic-bezier(.32,.72,0,1); --spring: cubic-bezier(.34,1.56,.64,1); --out: cubic-bezier(.22,1,.36,1);
   /* Syntax highlighting. Defined here rather than left to a highlight.js
@@ -355,7 +361,7 @@
 }
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
-body { color: var(--fg); font-family: "Geist", system-ui, "Segoe UI", sans-serif; font-size: 12.5px; letter-spacing: -0.005em; -webkit-font-smoothing: antialiased; user-select: none; }
+body { color: var(--fg); font-family: var(--font-sans); font-size: 12.5px; letter-spacing: -0.005em; -webkit-font-smoothing: antialiased; user-select: none; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent2); }
 textarea, input { user-select: text; }
@@ -403,6 +409,7 @@ textarea::placeholder, input::placeholder { color: var(--hint); opacity: 1; }
 .ico:active { transform: scale(.94); }
 .ico.on { background: var(--hover); color: var(--fg); }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+.unread-mark { position: absolute; width: 4px; height: 4px; right: 0; top: -1px; border-radius: 50%; background: var(--st-unread); box-shadow: 0 0 5px var(--st-unread); }
 .pulse { animation: olPulse 1.3s ease-in-out infinite; }
 /* Key hints: a flat hairline chip, deliberately not a 3D key. The old version
    had a gradient face, a border and a drop shadow, which made every shortcut
@@ -504,6 +511,10 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .srow .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .srow .tm { font-size: 10.5px; color: var(--dim); font-variant-numeric: tabular-nums; }
 .badge { font-size: 10px; font-weight: 600; color: #ff7b7b; background: rgba(255,99,99,0.12); padding: 1px 5px; border-radius: 4px; }
+/* The same chip for a wait the user cannot lift: a chat parked on a trigger
+   (`wait_for_event`) is marked, but red is reserved for the questions and
+   approvals that are actually holding a chat still. */
+.badge.quiet { color: var(--mut2); background: var(--ov-90); }
 .shead { display: flex; align-items: center; justify-content: space-between; padding: 8px 9px 4px; font-size: 11px; font-weight: 500; color: var(--dim); }
 /* project filter: pinned above the footer, so it stays put while the list scrolls */
 .projfilter { flex: none; display: flex; align-items: center; gap: 9px; height: 26px; margin: 0 6px 2px 0; padding: 0 9px; border-radius: 7px; font-size: 11px; color: var(--mut3); transition: background .2s ease, color .2s ease; cursor: default; }
@@ -555,13 +566,21 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .home h1 { text-align: center; font-size: 24px; font-weight: 600; letter-spacing: -0.03em; padding-bottom: 14px; margin: 0; }
 .home h1 .project-link { text-decoration: underline dotted var(--ov-350); text-underline-offset: 5px; transition: color .15s; }
 .home h1 .project-link:hover { color: var(--accent); }
+/* A long branch name ellipsizes instead of running the row off a phone screen. */
+.home-branch { min-width: 0; max-width: 100%; }
+.home-branch > svg { flex: none; }
+.home-branch-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .bglogo { position: absolute; left: 50%; top: 50%; width: min(460px, 68%); transform: translate(-50%, -50%); pointer-events: none; z-index: 0; animation: olFade .55s ease both; }
 .jrow { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 9px; transition: background .2s; }
 .jrow:hover { background: var(--ov-40); }
 
 /* session */
 .shdr { flex: none; display: flex; align-items: center; gap: 10px; height: 44px; padding: 0 8px 0 16px; border-bottom: 1px solid var(--ov-50); animation: olFade .22s ease both; }
-.shdr-title { flex: 1; min-width: 0; }
+/* The title sizes to its text (and ellipsizes when crowded) so the branch, goal
+   and container chips sit right after it; the spacer takes the free space.
+   With `flex: 1` here too, the title and spacer split the row and the chips
+   floated halfway across the header, away from the name they describe. */
+.shdr-title { flex: 0 1 auto; min-width: 0; }
 .shdr-spacer { flex: 1; min-width: 0; }
 .shdr-control { flex: none; }
 .shdr-optional { flex: none; }
@@ -590,26 +609,38 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .savedrow:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .savedglyph { flex: none; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; background: rgba(var(--accent-rgb), 0.09); color: var(--accent); }
 .savedtext { font-size: 13.5; line-height: 1.4; color: var(--fg3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.savedmeta { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--dim); }
 .saved-model { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 190px; }
 .savedtag { flex: none; font-size: 10.5px; padding: 2px 7px; border-radius: 6px; background: var(--ov-60); color: var(--mut3); white-space: nowrap; }
+/* A prompt parked for another folder is listed, and still one click from the
+   composer, but steps back a shade — so this folder's own prompts are the ones
+   that read as solid. The fading is on the row's children, not the row: the
+   `olRowIn` entry animation fills `opacity` and would override it. The folder tag
+   stays at full strength: it is the reason the row looks like this. */
+.savedrow.elsewhere .savedglyph { opacity: .5; }
+.savedrow.elsewhere .savedtext { color: var(--mut3); }
+.savedrow.elsewhere .savedmeta { opacity: .72; }
 .saveddel { flex: none; width: 24px; height: 24px; border-radius: 6px; display: grid; place-items: center; color: var(--mut3); opacity: 0; transition: opacity .15s, background .15s, color .15s; }
 .savedrow:hover .saveddel, .saveddel.armed { opacity: 1; }
 .saveddel:hover { background: rgba(255,99,99,0.12); color: #ff8a8a; }
 .saveddel.armed { width: auto; padding: 0 9px; font: inherit; font-size: 11.5px; font-weight: 500; background: rgba(255,99,99,0.14); color: #ff8a8a; }
 .saveddel.armed:hover { background: rgba(255,99,99,0.26); }
+/* The sort control sits under the list, not in the header above it: while "show
+   all chats" is off there is nothing from another folder to order, and the
+   control is not rendered at all. */
+.savedsort { display: flex; align-items: center; gap: 10px; padding: 2px 2px 0; }
+.savedsort-label { font-size: 11px; color: var(--dim); }
 /* --cfloat-h: live height of the floating composer (+ pause bar), so nothing hides under it. */
 .timeline { position: absolute; inset: 0; overflow: auto; padding: 24px 24px calc(var(--cfloat-h, 146px) + 24px); }
 .timeline-in { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
 /* Long transcripts: rows scrolled out of view skip layout and paint entirely.
-   The `auto` entry animation is also dropped for them, since a blur filter on
-   thousands of rows is what pins the compositor on a big chat. */
-.timeline-in > .it { content-visibility: auto; contain-intrinsic-size: auto 72px; }
+   Rows still animate in, but with `olRowIn` (opacity + translate) rather than
+   `.it`'s `olIn`: a blur filter on thousands of rows is what pins the
+   compositor on a big chat, while a plain fade-and-rise stays cheap. */
+.timeline-in > .it { content-visibility: auto; contain-intrinsic-size: auto 72px; animation-name: olRowIn; }
 /* A fixed expanded preview must escape row paint/layout containment without
    moving its live iframe to a portal (which would reset interactive state). */
 .timeline-in > .it:has(.viz-expanded-viewer), .it:has(.viz-expanded-viewer) { content-visibility: visible; contain: none; animation: none; }
-@media (prefers-reduced-motion: no-preference) {
-  .timeline-in > .it { animation: none; }
-}
 
 /* Find-in-chat. Sits top-right over the transcript, above the sticky composer,
    so it never covers the lines it is about to scroll to. */
@@ -760,6 +791,11 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .cmdbox { font-family: var(--mono); font-size: 12px; padding: 8px 10px; border-radius: 8px; background: var(--ov-300); color: var(--fg); white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; user-select: text; }
 .resolved { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--mut3); padding: 2px; }
 .working { display: flex; align-items: center; gap: 9px; padding: 4px 2px; }
+/* The Esc hint is read once and then competes with the step text on every turn
+   after. Hidden at every width, desktop included: the keyboard-hint rules far
+   below sit inside a `max-width: 640px` block, so a normal desktop window never
+   matched them and kept showing the hint. A rule here is not scoped to a width. */
+.working-keyhint { display: none; }
 .shimmer { background: linear-gradient(90deg, var(--dim) 0%, var(--dim) 35%, var(--fg) 50%, var(--dim) 65%, var(--dim) 100%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: olShimmer 1.7s linear infinite; }
 .cfloat { position: absolute; left: 0; right: 0; bottom: 0; padding: 28px 24px 12px; background: linear-gradient(180deg, var(--panel-glass-clear) 0%, var(--panel-glass) 45%); pointer-events: none; }
 .cfloat > * { pointer-events: auto; max-width: 800px; margin: 0 auto; }
@@ -896,6 +932,15 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .ctx-swatch.used { background: var(--violet); }
 .ctx-swatch.remaining { background: var(--ov-70); }
 .ctx-limit { color: var(--dim); font-size: 10px; }
+/* The category split of the last request. Spans both columns of the grid above,
+   because it belongs to the whole measure rather than to either half. */
+.ctx-breakdown { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.ctx-breakdown-row { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto; align-items: center; gap: 6px; font-size: 10.5px; color: var(--mut2); font-variant-numeric: tabular-nums; }
+.ctx-breakdown-row b { color: var(--fg); font-weight: 500; }
+.ctx-breakdown-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-breakdown-bar { grid-column: 2 / -1; height: 3px; border-radius: 2px; background: var(--ov-70); overflow: hidden; }
+.ctx-breakdown-bar i { display: block; height: 100%; border-radius: 2px; }
+.ctx-note { color: var(--dim); font-size: 10px; }
 /* diff */
 /* Wrap review controls rather than shrinking labels into each other at higher
    UI zoom. Only filenames and the branch truncate; actions keep their width. */
@@ -952,9 +997,14 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .srowx { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 8px 14px; }
 .srowx + .srowx { border-top: 1px solid var(--ov-50); }
 .srowx .desc { font-size: 11.5px; color: var(--hint); margin-top: 2px; text-align: left; }
-.seg { position: relative; display: flex; width: 210px; padding: 2px; border-radius: 8px; background: var(--ov-300); border: 1px solid var(--ov-50); flex: none; }
+/* The track owns the height and the options stretch to it. With a fixed 24px
+   option, a caller that set a shorter track (the home picker's 26px) left the
+   labels overflowing downwards while the knob stayed inside the padding, so the
+   text sat 2px below the knob's centre. `max-width: 100%` lets a fixed-width
+   track give way on a phone instead of pushing its row off the screen. */
+.seg { position: relative; display: flex; align-items: stretch; width: 210px; max-width: 100%; height: 30px; padding: 2px; border-radius: 8px; background: var(--ov-300); border: 1px solid var(--ov-50); flex: none; }
 .seg > .knob { position: absolute; top: 2px; bottom: 2px; left: 2px; border-radius: 6px; background: var(--knob); box-shadow: inset 0 1px 0 rgba(0,0,0,0.08), 0 1px 4px rgba(0,0,0,0.3); transition: transform .22s var(--ease), width .18s var(--ease); }
-.seg > .o { position: relative; flex: 1; height: 24px; display: grid; place-items: center; padding: 0 8px; border: 0; background: transparent; font: inherit; font-weight: 500; color: var(--mut3); transition: color .25s; white-space: nowrap; cursor: default; }
+.seg > .o { position: relative; flex: 1 1 0; min-width: 0; height: auto; display: grid; place-items: center; padding: 0 8px; border: 0; background: transparent; font: inherit; font-weight: 500; line-height: 1; color: var(--mut3); transition: color .25s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default; }
 .seg > .o.on { color: var(--fg); }
 .seg.quiet { background: transparent; border-color: transparent; }
 .seg.quiet > .knob { background: var(--ov-90); }
@@ -968,7 +1018,25 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .mhead { padding: 5px 8px 3px; font-size: 11px; font-weight: 500; color: var(--hint); }
 .palette { position: fixed; z-index: 51; left: 50%; top: 12vh; transform: translateX(-50%); width: min(580px, calc(100vw - 40px)); border-radius: 16px; overflow: hidden; background: var(--panel-glass); backdrop-filter: blur(40px) saturate(180%); border: 1px solid var(--ov-90); box-shadow: inset 0 1px 0 rgba(0,0,0,0.08), 0 36px 90px rgba(0,0,0,0.6); animation: olPal .18s var(--ease) both; }
 .toast { position: fixed; z-index: 980; left: 50%; bottom: 24px; transform: translateX(-50%); display: flex; align-items: center; gap: 9px; height: 34px; padding: 0 14px; border-radius: 12px; background: var(--panel-glass); backdrop-filter: blur(24px); border: 1px solid var(--ov-90); box-shadow: 0 14px 36px rgba(0,0,0,0.5); font-weight: 500; white-space: nowrap; animation: olToast .4s var(--spring) both; }
+/* The toast's one action, when it has one. Inherits the toast's type so it sits
+   in the sentence rather than beside it, and takes the accent so it reads as
+   something to press rather than as more of the message. */
+.toast-act { font: inherit; font-weight: 600; color: var(--accent2); background: none; border: 0; padding: 0 2px; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.toast-act:hover { color: var(--accent); }
+/* The preflight on the new-task screen. A card rather than a row, because it is
+   the one thing on that screen asking for a decision. */
+.firstrun { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--ov-20); }
+/* Seconds since the last sign of progress, beside the step line. Muted until it
+   matters: it is there to answer "is this stuck?", not to be watched. */
+.waiting-for { font-size: 11px; color: var(--mut3); font-variant-numeric: tabular-nums; }
 .empty { padding: 4px 2px; text-align: left; color: var(--hint); }
+/* Visible to a screen reader only. A live region has to be in the DOM to be
+   announced, but this one reports state the transcript already shows, so it
+   must not take up space or paint. */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+/* A chat that could not be opened. Replaces the whole transcript, so it is a
+   centred full-view state rather than the inline `.empty` row above. */
+.chat-open-failed { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 48px 24px; text-align: center; color: var(--hint); }
 
 /* in-app attention notices: the focused-window counterpart to the OS toast */
 /* Sits below the 40px titlebar, which owns the window controls in that corner. */
@@ -986,11 +1054,17 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .notice .nx { flex: none; width: 18px; height: 18px; margin-top: 1px; padding: 0; border: 0; border-radius: 5px; background: transparent; font: inherit; font-size: 15px; line-height: 1; color: var(--dim); transition: background .15s, color .15s; }
 .notice .nx:hover { background: var(--hover); color: var(--fg2); }
 @keyframes olNotice { from { opacity: 0; transform: translateX(14px) scale(.97); } to { opacity: 1; transform: none; } }
+.notice.notice-exiting, .agent-notice.notice-exiting { pointer-events: none; animation: olNoticeOut .18s var(--ease) both; }
+@keyframes olNoticeOut { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateX(14px) scale(.97); } }
 
 .provider-icon { display: inline-block; flex: none; color: var(--mut2); }
 .provider-icon svg { display: block; width: 100%; height: 100%; }
 .on .provider-icon, .rail.on .provider-icon { color: var(--fg2); }
 .tooltip { position: fixed; z-index: 1000; max-width: min(280px, calc(100vw - 16px)); padding: 5px 8px; border-radius: 7px; background: var(--panel-glass); border: 1px solid var(--line2); box-shadow: 0 8px 24px rgba(0,0,0,.3); color: var(--fg2); font-size: 11px; line-height: 1.35; text-align: center; white-space: normal; pointer-events: none; animation: olFade .12s ease both; }
+/* The full text of a clipped line (a path, a command): starts where the line
+   starts and wraps at path separators rather than mid-word where it must. */
+.tooltip.start { text-align: left; }
+.tooltip.full { max-width: min(640px, calc(100vw - 16px)); overflow-wrap: anywhere; }
 
 /* questions */
 .qchip { height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 5px; background: rgba(var(--accent-rgb), 0.12); color: var(--accent2); font-size: 11px; font-weight: 600; }
@@ -999,7 +1073,7 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
    `.qtext` is also the queued-message row's one-line clip, so the nowrap and the
    ellipsis have to be undone here: a question is read, not scanned, and a long
    one used to be cut off mid-sentence with no sign it continued. */
-.card-q .qtext, .card-q .qtitle, .card-q .qintro { animation: none; word-break: break-word; white-space: normal; overflow: visible; }
+.card-q .qtext, .card-q .qtitle, .card-q .qintro { word-break: break-word; white-space: normal; overflow: visible; }
 .card-q .qtext { margin: 0; }
 .card-q .qtitle + .qintro { margin-top: 3px; }
 .card-q .qtext + .qtext { margin-top: 3px; }
@@ -1033,11 +1107,13 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .modal-scrim { position: fixed; inset: 0; z-index: 900; background: rgba(8,8,10,0.58); animation: olFade .14s ease both; display: grid; place-items: center; padding: 24px; }
 .modal { width: min(560px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; border-radius: 16px; background: #1e1e21; border: 1px solid var(--ov-90); box-shadow: inset 0 1px 0 rgba(0,0,0,0.06), 0 20px 56px rgba(0,0,0,0.28); animation: olPop .16s var(--ease) both; }
 .modal-needs-you { width: min(440px, 100%); height: min(620px, calc(100vh - 48px)); }
-.modal .sgroup, .modal .gstep { animation: none; }
 .modal .mh { display: flex; align-items: center; gap: 10px; padding: 16px 18px 10px; font-size: 15px; font-weight: 600; }
 .modal .mb { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 18px 16px; display: flex; flex-direction: column; gap: 14px; }
 /* Scroll the body instead of compressing form rows and clipping their controls. */
 .modal > :not(.mb), .modal .mb > * { flex-shrink: 0; }
+/* A two-column field pair is the one row allowed to give way: it wraps on a
+   narrow dialog so neither column is clipped off the edge (see the 640px block). */
+.modal .mb > .fieldrow { flex-shrink: 1; }
 .modal .mf { display: flex; align-items: center; gap: 8px; padding: 12px 18px 16px; border-top: 1px solid var(--ov-60); }
 /* investigate: the views sit in a strip under the title, and each view brings
    its own actions, so the dialog has no footer of its own. */
@@ -1051,6 +1127,11 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
    the generic :focus-visible rule would otherwise draw one on every dialog open. */
 .modal:focus, .modal:focus-visible { outline: none; }
 .field { display: flex; flex-direction: column; gap: 6px; }
+/* Two fields side by side (context window / max output, prices). They stack on a
+   narrow dialog: a row that cannot fit both columns clips the second one off the
+   edge, and the modal body scrolls vertically only. */
+.fieldrow { display: flex; gap: 12px; }
+.fieldrow > .field { flex: 1 1 0; min-width: 0; }
 .field > label { font-size: 12px; color: var(--mut); display: flex; align-items: center; gap: 6px; }
 .field .input { height: 34px; }
 .help { width: 14px; height: 14px; border-radius: 50%; border: 1px solid #5c5c64; color: var(--mut3); font-size: 9px; display: grid; place-items: center; cursor: help; }
@@ -1087,14 +1168,40 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .bar3 > div { transition: width .45s var(--ease), background .2s; }
 
 /* pause */
-.pausebar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; padding: 9px 10px 9px 12px; border-radius: 12px; border: 1px solid rgba(251,191,36,0.3); background: linear-gradient(90deg, rgba(251,191,36,0.10), rgba(251,191,36,0.04)); backdrop-filter: blur(20px); animation: olIn .24s var(--out) both; }
-.pausebar.big { margin: 0; background: linear-gradient(90deg, var(--pause-a), var(--pause-b)); backdrop-filter: none; }
+.pausebar { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 8px; padding: 12px 14px; border-radius: 12px; border: 1px solid rgba(251,191,36,0.3); background: linear-gradient(90deg, rgba(251,191,36,0.10), rgba(251,191,36,0.04)); backdrop-filter: blur(20px); animation: olIn .24s var(--out) both; }
+.pausebar.big { margin: 0; background: linear-gradient(90deg, var(--pause-a), var(--pause-b)); backdrop-filter: none; flex-wrap: wrap; }
 .pausebar.big .input { background: #151412; }
+/* The commands a pause leaves running, listed under the banner's own row. A dev
+   server or a watcher keeps running while the agents are frozen, so a bar
+   claiming everything is paused has to name them — with the command, the chat it
+   belongs to, and how long it has been up. Full width because this is a section
+   of the banner rather than one more action in the column beside it. */
+.pb-jobs { flex: 1 1 100%; min-width: 0; margin-top: 4px; padding-top: 8px; border-top: 1px solid rgba(251,191,36,0.18); max-height: 200px; overflow: auto; display: flex; flex-direction: column; gap: 1px; }
+.pb-jobs-h { display: flex; align-items: baseline; gap: 8px; padding: 0 2px 4px; font-size: 11px; color: #b8a36a; }
+.pb-jobs-h span:first-child { font-size: 11.5px; color: #fde68a; }
+.pb-job { display: flex; align-items: center; gap: 8px; min-height: 26px; padding: 0 4px 0 6px; border-radius: 7px; font-size: 11.5px; cursor: pointer; transition: background .15s; }
+.pb-job:hover { background: rgba(251,191,36,0.10); }
+.pb-job-cmd { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e4e4e7; }
+.pb-job-chat { max-width: 34%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #c9b37a; }
+.pb-job-up { flex: none; color: #b8a36a; font-variant-numeric: tabular-nums; }
 .cfloat > .pausebar { background: linear-gradient(90deg, var(--pause-a), var(--pause-b)); }
-.pz { width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; background: rgba(251,191,36,0.16); color: #fbbf24; flex: none; animation: olBreath 2.2s ease-in-out infinite; }
+.pb-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.pb-title { font-weight: 600; font-size: 13.5px; color: #fde68a; display: flex; align-items: baseline; gap: 8px; }
+.pb-ago { font-weight: 400; font-size: 11px; color: #b8a36a; }
+.pb-reason { font-size: 12px; line-height: 1.5; color: #b8a36a; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+.pb-reason.open { display: block; white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+.pb-links { display: flex; gap: 12px; font-size: 11px; color: #b8a36a; }
+.pb-links span { cursor: pointer; }
+.pb-links span:first-child { color: #fde68a; }
+.pb-recovery { font-size: 11.5px; color: #b8a36a; }
+.pb-recovery summary { cursor: pointer; width: fit-content; padding: 2px 8px; border-radius: 999px; background: rgba(251,191,36,0.08); }
+.pb-recovery[open] summary { margin-bottom: 6px; }
+.pb-recovery > div { padding-left: 8px; line-height: 1.5; }
+.pb-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.pz { width: 28px; height: 28px; margin-top: 1px; border-radius: 8px; display: grid; place-items: center; background: rgba(251,191,36,0.16); color: #fbbf24; flex: none; animation: olBreath 2.2s ease-in-out infinite; }
 .cfloat > .pausebar { max-width: 800px; margin: 0 auto 8px; }
 
-/* sub-agents */
+/* subagents */
 .subpill { border-color: var(--ov-80); background-color: var(--ov-25); transition: background-color .2s; }
 .subpill:hover { background-color: var(--ov-55); }
 .subpill.live { background-image: linear-gradient(90deg, transparent 0%, rgba(var(--accent-rgb), 0.08) 50%, transparent 100%); background-size: 200% 100%; animation: olSheen 2.6s linear infinite; }
@@ -1180,8 +1287,18 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .route-add-fallback { width: min(230px, 100%); }
 .route-targets .dd, .route-add-fallback .dd { height: 26px; font-size: 12px; }
 .zoom { display: flex; align-items: center; gap: 4px; }
-.minibar { flex: none; width: 56px; height: 3px; border-radius: 3px; background: var(--ov-80); overflow: hidden; display: inline-block; }
+.minibar { flex: none; position: relative; width: 56px; height: 3px; border-radius: 3px; background: var(--ov-80); overflow: hidden; display: inline-block; }
 .minibar > span { display: block; height: 100%; border-radius: 3px; transition: width .4s var(--ease); }
+/* A cap on a usage line. The marker is a floor the fill is not allowed to
+   shrink past, and it goes amber with the rest of the line once the cap is
+   reached — the same colour the app uses for work that is being held back,
+   rather than the red it uses for something that went wrong. */
+.capmark { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--st-pause); }
+.capmark.held { width: 3px; margin-left: -1.5px; }
+.capbadge { flex: none; font-size: 10px; line-height: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--st-pause); padding: 0 4px; border-radius: 5px; border: 1px solid color-mix(in srgb, var(--st-pause) 40%, transparent); background: color-mix(in srgb, var(--st-pause) 12%, transparent); }
+.capbadge.held { font-weight: 600; background: color-mix(in srgb, var(--st-pause) 22%, transparent); }
+.capnote { flex: none; font-size: 10.5px; white-space: nowrap; color: var(--st-pause); }
+.capslider { width: 100%; accent-color: var(--st-pause); }
 .ico.rail { transition: background .2s, transform .25s var(--spring); }
 .ico.rail.on { background: var(--ov-100); transform: scale(1.04); }
 
@@ -1400,6 +1517,10 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .ubarmulti { display: flex; gap: 2px; width: 90px; height: 5px; }
 .useg { height: 100%; border-radius: 3px; background: var(--ov-80); overflow: hidden; }
 .useg > div { height: 100%; border-radius: 3px; transition: width .45s var(--ease); }
+/* Every account in this segment is held by a cap the user set: the footer bar is
+   the one usage reading that is on screen from every part of the app, so it says
+   so in the same amber the account lines use. */
+.useg.capped { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--st-pause) 60%, transparent); }
 @keyframes olGrowX { from { transform: scaleX(0); } to { transform: none; } }
 .umenu { position: absolute; right: 0; bottom: calc(100% + 6px); width: 230px; }
 
@@ -1461,6 +1582,10 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .stable tbody tr:hover { background: var(--ov-30); }
 .stable tbody tr.on { background: rgba(167,139,250,0.09); }
 .stable .muted { color: var(--dim); }
+/* The failure rate on a model row, reddened once it is high enough to act on.
+   `warn` is already taken by the ranked lists (`.bright.warn`), so this is its
+   own class rather than a reuse that would silently do nothing here. */
+.stable .rate-warn { color: #ff8a8a; }
 .cgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 8px; }
 .brow { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(60px, 1fr) auto; align-items: center; gap: 10px; min-height: 28px; animation: olRowIn .35s var(--out) both; }
 .brow .bl { min-width: 0; display: flex; flex-direction: column; }
@@ -1619,6 +1744,13 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .composer textarea.dropping { background: rgba(var(--accent-rgb), 0.06); }
 /* attach: a paperclip that opens the file dialog, and the whole box is a drop target */
 .attachbtn { display: inline-flex; }
+/* The files a sent message carried. Same visual language as the composer's own
+   chips, but read-only: this is a record of what went out, not a pending pick. */
+.ubattach { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 6px; }
+.ubatchip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; padding: 4px 8px; border-radius: 8px; background: var(--ov-40); border: 1px solid var(--ov-80); }
+.ubatchip .ubatico { display: flex; flex: none; color: var(--mut2); }
+.ubatchip .ubatname { font-size: 11.5px; color: var(--fg3); max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ubatchip .ubatsize { font-size: 10.5px; color: var(--mut3); flex: none; font-variant-numeric: tabular-nums; }
 /* files the agent reads by path: a chip, not a thumbnail */
 .filerow { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 12px 0; }
 .filechip { position: relative; display: inline-flex; align-items: center; gap: 7px; max-width: 260px; padding: 5px 8px; border-radius: 8px; background: var(--ov-50); border: 1px solid var(--ov-90); animation: olPop .2s var(--spring) both; }
@@ -1718,6 +1850,9 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .shdr.ultra.failed::after { background: var(--st-fail); animation: none; opacity: .7; }
 .shdr.ultra.paused::after { background: var(--st-pause); animation: none; opacity: .7; }
 .shdr.ultra.waiting::after { background: var(--st-wait); animation: none; opacity: .7; }
+/* Parked on a trigger: settled and quiet. The red above is for a wait the user
+   can end, and it would shout for hours over one that wakes itself. */
+.shdr.ultra.parked::after { background: var(--st-idle); animation: none; opacity: .55; }
 /* Keep the live subagent count in Details → Subagents; retain this chip markup so it can be restored easily. */
 .shdr .swarmchip { display: none; }
 .swarmchip.btn { height: 26px; gap: 6px; padding: 0 8px; font-size: 11.5px; color: var(--mut); }
@@ -1794,3 +1929,460 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .ultrabadge.stopped { color: var(--mut3); background: var(--ov-40); }
 .ultrabadge.paused { color: #e0cd9b; background: rgba(185,167,121,0.14); }
 .ultrabadge.waiting { color: var(--red2); background: rgba(233,133,133,0.12); }
+.ultrabadge.parked { color: var(--mut2); background: var(--ov-60); }
+
+/* Remote control: titlebar chip showing remote devices are connected (desktop)
+   or that this window is a remote one (browser). */
+.remote-chip { display: inline-flex; align-items: center; gap: 5px; height: 24px; margin: 0 6px; padding: 0 8px; border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--fg); border-radius: 999px; font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; -webkit-app-region: no-drag; }
+.remote-chip:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+.remote-live { color: var(--accent); font-weight: 500; }
+.picker-row:hover { background: var(--hover); }
+.container-chip { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 2px 0 8px; border-radius: 999px; background: var(--ov-50); color: var(--mut); font-size: 11.5px; white-space: nowrap; }
+.container-chip .ico, .container-chip button { width: 20px; height: 20px; }
+.linkish { all: unset; cursor: pointer; }
+.linkish:hover { text-decoration: underline; }
+.linkish:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+/* ───────── settings shell ───────── */
+.settings-view { flex: 1; min-height: 0; display: flex; }
+.stabs-list { display: flex; flex-direction: column; gap: 2px; }
+.settings-content { flex: 1; overflow: auto; padding: 24px 32px; }
+
+/* The sidebar's drawer scrim only exists on a phone (below). */
+.sidebar-scrim { display: none; }
+
+/* ───────── phones and remote browsers ─────────
+   The same UI is served to a phone by remote control (src-tauri/src/remote/).
+   Three layers, so a desktop window at normal widths is untouched:
+   - `:root.remote`: things only a browser has (safe areas, pull-to-refresh).
+   - `(pointer: coarse)` / `(hover: none)`: a finger, not a mouse — bigger
+     targets, and nothing that only appears on hover.
+   - `(max-width: 640px)`: phone-width layout. Keep in step with `isNarrow()`
+     in store.ts. Positions use % rather than vw where the element sits inside
+     the zoomed app root: vw is scaled by `zoom`, % of the viewport is not. */
+
+/* Notches and the home indicator: index.html asks for `viewport-fit=cover`, so
+   the app pads itself out of them. */
+:root.remote { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
+/* A pull past the top of the transcript must not reload the page under the user. */
+:root.remote, :root.remote body { overscroll-behavior: none; }
+:root.remote .app { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+:root.remote .toast { bottom: calc(24px + env(safe-area-inset-bottom)); }
+
+@media (pointer: coarse) {
+  /* iOS zooms the whole page into any field set below 16px when it takes focus,
+     and doesn't zoom back out. */
+  input, textarea, select { font-size: 16px !important; }
+  /* A phone renders the remote UI at 100% rather than the desktop's zoom
+     (store.ts `zoomFactor`); body copy steps up to make up the difference. */
+  :root.remote body { font-size: 13.5px; }
+  .srow .rename { height: 32px; }
+  .ico { width: 36px; height: 36px; }
+  .titlebar { height: 48px; }
+  .titlebar .ico.corner::before { left: -8px; top: -6px; width: 44px; height: 48px; }
+  .projbtn, .search { height: 34px; }
+  .remote-chip { height: 32px; }
+  .srow { height: 40px; }
+  .projfilter { height: 36px; }
+  .mrow { min-height: 40px; }
+  .stab { height: 36px; }
+  .btn { height: 34px; }
+  .cbtn { height: 34px; }
+  .chip { height: 32px; }
+  .send { width: 34px; height: 34px; }
+  /* The box beside a subagent sizes its own button — a 24px dot in the rail was
+     a desktop decision, and as a two-class rule it beat the line above. On a
+     phone that left the one control that can send there (Enter is a newline)
+     half the size of every other send button. */
+  .subinput .send { width: 34px; height: 34px; }
+  .dd { height: 38px; }
+  .input { height: 38px; }
+  .seg { height: 36px; }
+  .jrow { height: 44px; }
+  .tool .hd { height: 38px; }
+  .opt { padding: 11px 12px; }
+  .chipbox { height: 38px; }
+  .qico { width: 32px; height: 32px; }
+  .notice .nx { width: 32px; height: 32px; margin: -6px -6px 0 0; }
+  .notice .ncta { height: 32px; }
+  .lightbox-x, .lightbox-nav { width: 44px; height: 44px; }
+  /* A switch keeps its look; the finger gets a bigger target around it. */
+  .toggle { position: relative; }
+  .toggle::after { content: ""; position: absolute; inset: -10px -6px; }
+  /* Key hints describe a keyboard the device doesn't have. */
+  .kbd { display: none; }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  /* Hover-only affordances. Several are opacity 0 rather than absent, so a tap
+     on the empty spot would fire a control nobody could see. */
+  .codewrap .copybtn, .qico, .attach .attach-x, .filechip .attach-x, .anrow .an-x, .saveddel, .favstar, .urow .msgacts, .urow .rw, .shead .shint { opacity: 1; }
+  .srow.task .rowact { display: grid; width: 30px; height: 30px; color: var(--dim); }
+  .srow.task .tm, .srow.task .pin { display: none; }
+  /* Edge-hover peeking and hover tooltips have no hover to start from; a tap
+     would leave a tooltip stuck over whatever was tapped. */
+  .peekzone, .peekpanel { display: none; }
+  .tooltip { display: none; }
+}
+
+@media (max-width: 640px) {
+  /* chrome: the window's own controls never show in a browser (Chrome.tsx);
+     Forward and the open chat's folder give their room to the project picker. */
+  .titlebar { padding-left: 6px; padding-right: 6px; gap: 0; }
+  .titlebar [aria-label="Forward"], .titlebar .chatproj { display: none; }
+  .projbtn { flex: 0 1 auto; min-width: 0; max-width: none; margin-left: 4px; }
+  .projbtn .ph { display: none; }
+  .search { width: auto; flex: none; padding: 0 9px; gap: 0; margin-left: auto; }
+  /* No window to drag in a browser: the spacers give way and search sits at
+     the right with the remote chip, rather than floating mid-bar. */
+  .titlebar > div[data-tauri-drag-region] { display: none; }
+  .search > :not(svg) { display: none; }
+  .remote-chip { margin: 0 0 0 6px; }
+  .remote-chip > span { display: none; }
+
+  /* The panel fills the screen: no gutter, no card edge. */
+  .body { padding: 0; }
+  .main { border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; }
+
+  /* sidebar: a drawer over the content rather than a column beside it. The
+     inline width animates the desktop column; here the drawer slides instead. */
+  .sidebar { position: fixed; z-index: 45; top: 0; bottom: 0; left: 0; width: min(300px, 86%) !important; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) env(safe-area-inset-left); background: var(--side); border-right: 1px solid var(--line2); box-shadow: 0 0 40px rgba(0,0,0,0.5); transform: translateX(calc(-100% - 40px)); transition: transform .28s var(--ease); }
+  .sidebar.open { transform: none; }
+  .sidebar .sidebar-in { width: 100%; padding: 8px 0 4px 8px; }
+  .sidebar-scrim { display: block; position: fixed; inset: 0; z-index: 44; background: rgba(8,8,10,0.55); animation: olFade .18s ease both; }
+
+  /* home */
+  .home { padding: 0 14px; }
+  .home h1 { font-size: 21px; padding-bottom: 8px; }
+  .jrow .mono { display: none; }
+
+  /* composer: the model gets its own line under the text, then the options and
+     send. A wrapping row rather than a grid: on the narrowest phones a busy bar
+     (pause + stop + options) wraps its right half to a third line instead of
+     drawing one control over another. */
+  .composer .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; padding: 4px 6px 6px; }
+  .composer .bar > .bc { order: -1; flex: 1 0 100%; justify-content: flex-start; }
+  .composer .bar > .bl { flex: 0 1 auto; }
+  .composer .bar > .br { flex: 0 0 auto; margin-left: auto; }
+  .composer .bar .cbtn { padding: 0 7px; }
+  .composer .bar .ico { width: 32px; }
+  .composer .bar .mbtn { max-width: 100%; min-width: 0; }
+  .composer .bar .routechip { min-width: 0; }
+  .send.pausebtn { margin-right: 2px; }
+  .composer textarea { padding: 12px 12px 4px; }
+  .composer.float textarea { padding: 10px 12px 2px; }
+  /* Keyboard hints describe a keyboard these devices don't have, on any remote
+     client rather than only a phone: a tablet or laptop browser has no Esc key
+     either. The picker's path/list lines are room this width cannot spare. */
+  :root.remote .question-keyhint, :root.remote .al-keyhint { display: none; }
+  .remote-picker-mobile .mh > .desc, .remote-picker-mobile .mf > .desc { display: none; }
+  .remote-picker-mobile .picker-row { min-height: 44px; }
+  .remote-picker-mobile [role="listbox"] { min-height: 0 !important; }
+
+  /* session */
+  .shdr .shdr-control { padding: 0 8px; gap: 5px; }
+  /* Chat and Artificts are a two-way switch: a phone shows only the way out of
+     the current view, which gives the title the room the pair took. */
+  .shdr .shdr-control[aria-pressed="true"] { display: none; }
+  .shdr .shdr-title { font-size: 13px !important; }
+  .timeline { padding: 14px 12px calc(var(--cfloat-h, 146px) + 16px); }
+  .cfloat { padding: 20px 8px 8px; }
+  .ubub, .ucol { max-width: 88%; }
+  .md table { display: block; max-width: 100%; overflow-x: auto; }
+  .findbar { left: 8px; right: 8px; min-width: 0; max-width: none; top: 8px; }
+  .session-pane { min-width: 0 !important; }
+  /* Details floats over the transcript, under the chat header that toggles it,
+     instead of squeezing a phone-width column. */
+  .details { position: absolute; z-index: 8; right: 0; top: 44px; bottom: 0; max-width: 100% !important; box-shadow: -12px 0 40px rgba(0,0,0,0.45); }
+  .details-in.wide { width: 100%; }
+
+  /* settings: the nav becomes a strip above the page. */
+  .settings-view { flex-direction: column; }
+  .stabs { width: auto; padding: 8px 8px 6px; border-right: 0; border-bottom: 1px solid var(--ov-50); overflow-x: auto; scrollbar-width: none; }
+  .stabs::-webkit-scrollbar { display: none; }
+  .stabs-title { display: none; }
+  .stabs-list { flex-direction: row; gap: 4px; }
+  .stab { width: auto; flex: none; white-space: nowrap; }
+  .stab::before { display: none; }
+  .settings-content { padding: 16px 12px 28px; }
+  /* A row's text keeps a readable width; a wide control (a segmented track, a
+     button) drops under it instead of squeezing it to a word per line. */
+  .srowx { flex-wrap: wrap; padding: 10px 12px; row-gap: 8px; }
+  .srowx > div:first-child:not(:only-child) { flex: 1 1 180px !important; min-width: 0; }
+  .settings-head { flex-wrap: wrap; }
+
+  /* popovers: full width, wherever their anchor put them vertically. */
+  .pop:not(.ctx):not(.umenu), .statuspop { left: 8px !important; right: 8px !important; width: auto !important; max-width: none !important; }
+  .palette { top: 8%; width: calc(100% - 20px); }
+  /* The model list's context/price line is hover detail; on a phone it pushed
+     the model name down to "Claud…". */
+  .pop .mrow > .meta { display: none; }
+  .modal-scrim { padding: 10px; }
+  .modal { max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); }
+  .modal .mh { padding: 14px 14px 8px; }
+  .modal .mb { padding: 4px 14px 14px; }
+  .modal .mf { padding: 10px 14px 14px; flex-wrap: wrap; }
+  /* A phone cannot fit two labelled inputs side by side: the pair stacks so both
+     keep their full width instead of the second running off the dialog edge. */
+  .fieldrow { flex-direction: column; gap: 14px; }
+  .toast { max-width: calc(100% - 24px); height: auto; min-height: 34px; padding: 8px 14px; white-space: normal; text-align: center; }
+  .notices { left: 8px; right: 8px; width: auto; top: calc(52px + env(safe-area-inset-top)); }
+  .notepill.editing { width: min(360px, calc(100% - 16px)); }
+  .lightbox { padding: 52px 8px; }
+}
+
+/* ── Artifict surfaces ────────────────────────────────────────────────────────
+   One visual language for everything the host previews: a rounded frame with a
+   compact bar. The isolated HTML runtime wears the same frame through
+   `.viz-frame`, so an artifict looks like itself whatever kind it is. */
+.viz-frame, .artifict-canvas {
+  display: flex; flex-direction: column; min-width: 0; margin: 12px 0;
+  border: 1px solid var(--line); border-radius: 14px; background: var(--bg); overflow: hidden;
+}
+.artifict-canvas-bar {
+  flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  padding: 7px 8px 7px 10px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.artifict-canvas-spacer { flex: 1; min-width: 0; }
+.artifict-badge {
+  flex: none; display: inline-flex; align-items: center; height: 19px; padding: 0 7px; border-radius: 6px;
+  background: rgba(var(--accent-rgb), 0.13); color: var(--accent2);
+  font-family: var(--mono); font-size: 10px; font-weight: 650; letter-spacing: .08em; line-height: 1;
+}
+.artifict-action { height: 26px; padding: 0 8px; border-radius: 7px; font-size: 11.5px; }
+/* The body is the canvas: padded for documents, edge to edge for a diagram. */
+.artifict-canvas-body { min-width: 0; padding: 14px; }
+.artifict-canvas-body.scroll { max-height: min(72vh, 720px); overflow: auto; }
+.artifict-canvas-body.bleed {
+  padding: 0; background-color: var(--raise);
+  background-image: linear-gradient(45deg, var(--ov-40) 25%, transparent 25%, transparent 75%, var(--ov-40) 75%),
+    linear-gradient(45deg, var(--ov-40) 25%, transparent 25%, transparent 75%, var(--ov-40) 75%);
+  background-size: 22px 22px; background-position: 0 0, 11px 11px;
+}
+/* A document, at document scale: `.md`'s sizing is tuned for a reply in a
+   transcript and reads like a comment once it is inside a canvas. */
+.artifict-prose { max-width: 74ch; margin: 0 auto; font-size: 13px; line-height: 1.7; }
+.artifict-text { max-width: 74ch; margin: 0 auto; white-space: pre-wrap; word-break: break-word; color: var(--fg2); font-size: 13px; line-height: 1.7; }
+.artifict-prose > :first-child { margin-top: 0; }
+.artifict-prose > :last-child { margin-bottom: 0; }
+.artifict-prose h1 { margin: 1.1em 0 .45em; font-size: 17px; letter-spacing: -.012em; color: var(--fg); }
+.artifict-prose h2 { margin: 1.1em 0 .4em; font-size: 15px; letter-spacing: -.01em; color: var(--fg); }
+.artifict-prose h3 { margin: 1em 0 .35em; font-size: 13.5px; color: var(--fg); }
+.artifict-prose h4, .artifict-prose h5, .artifict-prose h6 { margin: 1em 0 .3em; font-size: 12.5px; color: var(--fg2); }
+.artifict-prose p { margin: 0 0 .85em; }
+.artifict-prose ul, .artifict-prose ol { margin: .3em 0 .85em; padding-left: 1.5em; }
+.artifict-prose li { margin: .25em 0; }
+.artifict-prose li::marker { color: var(--mut3); }
+.artifict-prose hr { margin: 1.4em 0; border: 0; border-top: 1px solid var(--line); }
+.artifict-prose a { color: var(--accent2); text-decoration: underline; text-underline-offset: 2px; }
+.artifict-prose img { max-width: 100%; border-radius: 8px; }
+.artifict-prose pre { padding: 12px 14px; border-radius: 10px; }
+.artifict-prose pre code { font-size: 11.5px; }
+.artifict-prose th, .artifict-prose td { padding: 6px 10px; }
+.artifict-prose thead th { background: var(--ov-40); }
+.artifict-prose blockquote { padding-left: 12px; }
+.artifict-code { margin: 0; max-width: 100%; white-space: pre; font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: var(--fg3); }
+.artifict-svg { display: block; width: 100%; max-height: min(70vh, 620px); object-fit: contain; padding: 12px; }
+.artifict-image { display: flex; justify-content: center; }
+.artifict-image > * { max-width: 100%; }
+.artifict-image img { max-height: min(70vh, 600px); object-fit: contain; }
+.artifict-source {
+  flex: none; margin: 0; padding: 10px 12px; border-top: 1px solid var(--line); background: var(--panel);
+  max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+}
+
+/* The collaboration record: a document, not a wall of browser-default tags. */
+.artifict-record { max-width: 74ch; margin: 0 auto; }
+.artifict-record h3 { margin: 0 0 4px; font-size: 14.5px; }
+.artifict-record h4 { margin: 14px 0 4px; font-size: 11px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--mut2); }
+.artifict-record p { margin: 0 0 8px; font-size: 12.5px; line-height: 1.6; color: var(--fg2); }
+.artifict-record ul { margin: 4px 0 10px; padding-left: 18px; }
+.artifict-record li { margin: 3px 0; font-size: 12px; line-height: 1.55; color: var(--fg2); }
+.artifict-record label { display: inline-flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--mut2); }
+.artifict-record code { font-family: var(--mono); font-size: 11.5px; background: var(--ov-60); padding: 1px 5px; border-radius: 5px; color: #e9e9ee; }
+.artifict-record pre { margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--ov-300); overflow: auto; white-space: pre-wrap; font-family: var(--mono); font-size: 11.5px; }
+.artifict-record details { margin: 6px 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 9px; font-size: 12px; }
+.artifict-record summary { cursor: pointer; font-size: 12px; }
+.artifict-target {
+  font: inherit; font-size: 11.5px; color: var(--accent2); cursor: pointer;
+  background: rgba(var(--accent-rgb), 0.1); border: 1px solid rgba(var(--accent-rgb), 0.22);
+  border-radius: 7px; padding: 2px 8px;
+}
+.artifict-target:hover { background: rgba(var(--accent-rgb), 0.18); }
+.artifict-target:disabled { opacity: .5; cursor: default; }
+.image-explanation.bare > h3 { margin: 0 0 8px; font-size: 13px; }
+.image-explanation ol { padding-left: 18px; font-size: 12px; }
+.image-explanation > label { display: block; margin-top: 8px; font-size: 11.5px; color: var(--mut2); }
+
+/* An inline card is a name row above its own frame, never a box in a box. */
+.artifict-inline { margin: 12px 0; }
+.artifict-inline .viz-frame, .artifict-inline .artifict-canvas { margin: 0; }
+.artifict-inline-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 6px; }
+.artifict-inline-title { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.artifict-inline-meta { color: var(--mut3); font-size: 10.5px; font-weight: 600; letter-spacing: .04em; }
+
+/* The work-in-progress strip, shared by the record surface and the inline card:
+   one line above the content it describes, in the warning tint the app already
+   uses for things that are stated rather than verified. */
+.artifict-wip { display: flex; align-items: flex-start; gap: 7px; margin: 0 0 8px; padding: 7px 10px; border: 1px solid color-mix(in srgb, var(--st-pause) 34%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--st-pause) 10%, transparent); color: var(--fg2); font-size: 11.5px; line-height: 1.5; }
+.artifict-wip svg { flex: none; margin-top: 1px; color: var(--st-pause); }
+.artifict-wip b { color: var(--st-pause); font-weight: 650; }
+
+/* The record surface is one column — the record, then its comments and the
+   request that goes with them. The conversation is the chat beside it, so
+   there is no second pane here to mirror it into. */
+.artifict-main, .artifict-gallery { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 10px; }
+.artifict-main .artifict-canvas, .artifict-main .viz-frame { margin: 0; }
+/* Comments and the request are one panel: what you pinned, then what you send. */
+.artifict-request { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.artifict-status { display: flex; flex-direction: column; gap: 8px; margin-bottom: 2px; }
+
+@media (max-width: 900px) {
+  .artifict-main, .artifict-gallery { padding: 10px 8px; }
+  .artifict-canvas-body.scroll { max-height: none; overflow: visible; }
+}
+@media (max-width: 600px) {
+  .artifict-canvas-bar { padding: 6px 8px; }
+  .artifict-canvas-body { padding: 10px; }
+  .artifict-canvas-body.bleed { padding: 0; }
+  .artifict-inline-bar { gap: 6px; }
+}
+/* Touch targets: the bar buttons follow the rest of the coarse-pointer chrome. */
+@media (pointer: coarse) {
+  .artifict-action { height: 32px; padding: 0 10px; }
+}
+
+/* The set of records, as a gallery: a wall of miniatures you scan, the way a
+   design workspace shows a project's artifacts. */
+.artifict-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(178px, 1fr)); gap: 12px; margin-top: 10px; }
+.artifict-card { position: relative; display: flex; flex-direction: column; gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: 14px; background: transparent; transition: border-color .15s, background .15s, transform .15s, box-shadow .15s; }
+.artifict-card:hover { border-color: var(--ov-140); background: var(--ov-30); transform: translateY(-1px); box-shadow: 0 10px 24px rgba(0, 0, 0, .18); }
+.artifict-card[aria-current="true"] { border-color: var(--accent); background: var(--raise); }
+/* A live miniature is an isolated frame, so the card's own target is a
+   transparent button laid over everything rather than a wrapping button. */
+.artifict-card-open { position: absolute; inset: 0; z-index: 2; border: 0; border-radius: 14px; background: transparent; cursor: pointer; }
+.artifict-card-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.artifict-card-open:disabled { cursor: default; }
+/* 16/10 like a canvas, with the artifact itself drawn inside it at a desktop
+   size and scaled down, so the card is the thing and not a screenshot of it. */
+.artifict-card-frame { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 10; overflow: hidden; border-radius: 10px; background: var(--raise); container-type: size; }
+.artifict-card-kind { position: absolute; z-index: 1; top: 6px; left: 6px; padding: 3px 6px; border-radius: 5px; background: var(--panel-glass); color: var(--mut2); font-family: var(--mono); font-size: 9px; font-weight: 650; letter-spacing: .07em; line-height: 1; backdrop-filter: blur(8px); }
+.artifict-thumb-media { max-width: 100%; max-height: 100%; object-fit: contain; }
+.artifict-thumb-frame { position: absolute; top: 50%; left: 50%; width: 1440px; height: 900px; border: 0; background: var(--bg); pointer-events: none; transform: translate(-50%, -50%) scale(.1); }
+/* Chromium's container units let the miniature fill whatever size the card ends
+   up; the fixed scale above is the fallback for an engine without them. */
+@supports (container-type: size) {
+  .artifict-thumb-frame { transform: translate(-50%, -50%) scale(min(calc(100cqw / 1440px), calc(100cqh / 900px))); }
+}
+.artifict-doc-text { padding: 10px; align-self: stretch; overflow: hidden; color: var(--mut2); font-size: 10.5px; line-height: 1.5; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6; }
+.artifict-row-title { font-size: 12.5px; font-weight: 600; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifict-row-kind { padding: 4px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--mut2); font-family: var(--mono); font-size: 9.5px; font-weight: 650; letter-spacing: .07em; line-height: 1; }
+.artifict-row-meta { color: var(--mut3); font-size: 11px; line-height: 1.45; }
+
+/* Empty states: something to look at, and a sentence about what to do. */
+.artifict-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 28px 10px; text-align: center; color: var(--mut3); }
+.artifict-empty svg { opacity: .45; }
+.artifict-empty p { margin: 0; }
+.artifict-blank { padding: 34px 18px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; background: var(--ov-20); color: var(--mut3); font-size: 12.5px; line-height: 1.6; }
+
+/* The workspace's own views. The strip only exists when there is more than one
+   view, so a build without the browser plugin looks exactly as it did. */
+.workspace-tabs { flex: none; display: flex; gap: 4px; padding: 8px 10px 0; }
+.workspace-tabs .btn { height: 26px; padding: 0 10px; font-size: 11.5px; }
+/* The embedded browser: the pane is its frame, so the whole view scrolls inside
+   one column instead of arriving as a dialog over the chat. */
+.browser-panel { flex: 1; min-height: 0; overflow: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.browser-panel .desc { margin: 0; }
+.browser-panel img { border: 1px solid var(--line); border-radius: 10px; }
+@media (pointer: coarse) { .workspace-tabs .btn { height: 32px; } }
+
+/* The reader's chrome: a document toolbar, a version strip, and the discussion,
+   reading like the surfaces the rest of the app uses rather than filled boxes. */
+.artifict-workspace-bar { background: var(--ov-20); }
+.artifict-version-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--ov-25); }
+.artifict-selection { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.artifict-comments { margin: 10px 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.artifict-comments > div:first-child { padding-bottom: 4px; }
+@media (max-width: 600px) {
+  .artifict-version-bar, .artifict-comments { padding: 8px; }
+}
+
+/* The viewer's bar: the artifact or its source on the left, the size it is being
+   looked at on the right. A device width frames the body on the stage instead of
+   narrowing the frame, so the artifact keeps its own page width. */
+.artifict-tabs { display: flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: var(--ov-40); }
+.artifict-tab { height: 22px !important; padding: 0 10px !important; border: 0 !important; border-radius: 999px !important; font-size: 11px !important; }
+.artifict-tabs .artifict-tab.primary { box-shadow: none; }
+.artifict-viewport { height: 24px; padding: 0 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--raise); color: var(--fg); font: inherit; font-size: 11px; }
+.artifict-canvas-stage { min-width: 0; }
+.artifict-canvas-stage[data-viewport="tablet"], .artifict-canvas-stage[data-viewport="phone"] { padding: 14px; background: var(--raise); }
+.artifict-canvas-stage[data-viewport="tablet"] .artifict-canvas-body,
+.artifict-canvas-stage[data-viewport="phone"] .artifict-canvas-body { margin: 0 auto; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.artifict-canvas-stage[data-viewport="tablet"] .artifict-canvas-body { max-width: 820px; }
+.artifict-canvas-stage[data-viewport="phone"] .artifict-canvas-body { max-width: 390px; }
+.artifict-canvas-stage[data-viewport="phone"] .artifict-canvas-body.bleed { border-radius: 12px; overflow: hidden; }
+@media (max-width: 600px) {
+  .artifict-canvas-stage[data-viewport="tablet"], .artifict-canvas-stage[data-viewport="phone"] { padding: 8px; }
+}
+
+/* The live miniature: one card at a time, so there is no host wrapper — the
+   scaled frame sits directly in the card's 16/10 box and measures against it. */
+
+/* Extra motion: surfaces that used to appear, or change state, with a hard cut.
+   Everything here is an entry animation (it plays once when the element mounts)
+   or a transition between states, so none of it re-runs on a streamed token or
+   an unrelated re-render. The global `prefers-reduced-motion: reduce` rule still
+   flattens all of it. */
+@keyframes olChipIn { from { opacity: 0; transform: scale(.7); } to { opacity: 1; transform: none; } }
+
+/* Panels and overlays. */
+.findbar { animation: olDrop .18s var(--out) both; transform-origin: top right; }
+.findbar-hit { animation: olFade .16s ease both; }
+.todo-panel { animation: olPop .2s var(--out) both; }
+.lightbox-foot { animation: olFade .3s ease .08s both; }
+
+/* Task plan rows rise in, and each status icon is a different element per status,
+   so this pop plays exactly when a step starts or finishes. */
+.todo-panel-list .todo-panel-item { animation: olRowIn .22s var(--out) both; transition: color .25s ease; }
+.todo-panel-list .todo-panel-item:nth-child(2) { animation-delay: 25ms; }
+.todo-panel-list .todo-panel-item:nth-child(3) { animation-delay: 50ms; }
+.todo-panel-list .todo-panel-item:nth-child(4) { animation-delay: 75ms; }
+.todo-panel-list .todo-panel-item:nth-child(n+5) { animation-delay: 100ms; }
+.todo-panel-status > *, .todo-chip-mark > * { animation: olChipIn .3s var(--spring) both; }
+
+/* Notes, briefs and callouts. */
+.brief, .snote, .ultrarec, .termsgate, .needs-you-note, .reply-image-error,
+.artifict-version-bar, .artifict-selection, .artifict-comments, .artifict-blank { animation: olRowIn .26s var(--out) both; }
+.reply-image-loading { animation: olBreath 1.6s ease-in-out infinite; }
+
+/* Needs-you list: rows rise in a short stagger; the icon answers hover. */
+.needs-you-item { animation: olRowIn .24s var(--out) both; }
+.needs-you-item:nth-child(2) { animation-delay: 30ms; }
+.needs-you-item:nth-child(3) { animation-delay: 60ms; }
+.needs-you-item:nth-child(4) { animation-delay: 90ms; }
+.needs-you-item:nth-child(n+5) { animation-delay: 120ms; }
+.needs-you-row-icon { transition: transform .25s var(--spring), background .2s, color .2s; }
+.needs-you-item:hover .needs-you-row-icon, .needs-you-item:focus-within .needs-you-row-icon { transform: scale(1.08); }
+
+/* Chips and badges pop in, then ease between states (done, failed, held...)
+   instead of snapping colour. */
+.badge, .capbadge, .needs-you-count, .tkids, .branchtag, .savedtag, .goaltag, .ultrabadge,
+.container-chip, .artifict-badge, .ubatchip, .lvl, .ultraspark, .unread-mark { animation: olChipIn .24s var(--spring) both; }
+.badge, .capbadge, .needs-you-count, .tkids, .goaltag, .ultrabadge, .artifict-badge { transition: background .2s, color .2s, border-color .2s; }
+.dot { transition: background-color .25s, box-shadow .25s; }
+
+/* Small hover responses. */
+.savedglyph { transition: transform .3s var(--spring), background .2s; }
+.savedrow:hover .savedglyph { transform: scale(1.08) rotate(-4deg); }
+.help { transition: color .15s, border-color .15s, transform .25s var(--spring); }
+.help:hover { color: var(--fg); border-color: var(--mut2); transform: scale(1.12); }
+.lvl .lvl-remove { transition: color .15s, background .15s; }
+.artifict-target { transition: background .15s, opacity .15s; }
+.artifict-viewport { transition: border-color .15s, background .15s; }
+.artifict-viewport:hover { border-color: var(--ov-140); }
+.theme-swatch > span { transition: flex .35s var(--ease); }
+.theme-card:hover .theme-swatch > span:first-child { flex: 1.6; }
+
+/* Context breakdown bars grow from the left and ease when their share changes. */
+.ctx-breakdown-bar i { transform-origin: left; animation: olGrowX .45s var(--out) both; transition: width .4s var(--ease); }

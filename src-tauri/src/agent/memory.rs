@@ -117,6 +117,11 @@ pub fn dir_for(project: &str) -> PathBuf {
 }
 
 fn repo_root(project: &str) -> Option<String> {
+    // A remote (SSH) project's memory is keyed by its URI (host + path) and
+    // kept here, locally; never run a local git "in" the URI.
+    if super::host::is_ssh(project) {
+        return None;
+    }
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(project)

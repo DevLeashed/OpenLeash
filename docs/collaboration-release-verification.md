@@ -5,12 +5,12 @@ This records checks run locally against the shared D:/openleash working tree. It
 ## Implemented
 
 - Optional chat/workspace collaboration with narrow-window stacked layout.
-- Searchable artifact overview, unresolved feedback counts, safe inert SVG/embedded-image thumbnails and author-reported stages.
+- Searchable artifict overview, unresolved feedback counts, safe inert SVG/embedded-image thumbnails and author-reported stages.
 - Exact-version feedback and implementation/architecture/visual-investigation request staging, with explicit send and unchanged tool permissions.
 - Bounded JSON collaboration records: component/dependency discussion targets, relative source refs, implementation/evidence entries and limitations.
 - Keyboard-accessible percentage screenshot-region proposal, marker discussion and before/after comparisons preserving original images.
-- Selected-text targeting restricted to the artifact preview; all-version response history.
-- User and agent guide: `docs/artifact-collaboration.md`.
+- Selected-text targeting restricted to the artifict preview; all-version response history.
+- User and agent guide: `docs/artifict-collaboration.md`.
 
 ## Checks actually run
 
@@ -37,9 +37,9 @@ Commits after `2ebd3ee` changed archiving of paused chats (`src-tauri/src/lib.rs
 ## Required desktop smoke before release
 
 - Open the new build using isolated/dummy settings and project data, not real credentials.
-- Create a collaboration JSON artifact; explore a component and dependency, review the private proposal, explicitly send, revise/respond and compare exact versions.
+- Create a collaboration JSON artifict; explore a component and dependency, review the private proposal, explicitly send, revise/respond and compare exact versions.
 - Select a screenshot region, verify its overlay/percentage coordinates, send it and confirm the agent receives only reviewed fields.
-- Check chat/composer remains usable alongside artifacts at 900/1200/large widths and with details pane open.
+- Check chat/composer remains usable alongside artificts at 900/1200/large widths and with details pane open.
 - Verify image failure/retry, diagram/lightbox keyboard focus, preview size changes and theme readability.
 - Exercise fresh install and upgrade on intended platforms; verify updater signatures/installers separately.
 

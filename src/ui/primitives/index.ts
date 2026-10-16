@@ -1,4 +1,5 @@
 export * from "./ColorPicker";
+export * from "./Confirm";
 export * from "./Controls";
 export * from "./Dropdown";
 export * from "./escape";

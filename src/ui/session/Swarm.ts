@@ -17,7 +17,7 @@ export function swarmCounts(subs: SubInfo[]): SwarmCounts {
   return c;
 }
 
-export type SwarmState = "live" | "done" | "failed" | "paused" | "stopped" | "waiting";
+export type SwarmState = "live" | "done" | "failed" | "paused" | "stopped" | "waiting" | "parked";
 
 /**
  * The swarm's state, worst-news-first: a failure anywhere outranks a clean
@@ -34,10 +34,14 @@ export type SwarmState = "live" | "done" | "failed" | "paused" | "stopped" | "wa
  * `heldByGlobal(task, pausedAll)`, the same predicate the rest of the app uses,
  * so one rule decides both.
  */
-export function swarmState(task: Pick<TaskSummary, "paused" | "status" | "subs">, heldByGlobal = false): SwarmState {
+export function swarmState(task: Pick<TaskSummary, "paused" | "status" | "subs" | "waiting_kind">, heldByGlobal = false): SwarmState {
   if (task.paused || heldByGlobal) return "paused";
   const c = swarmCounts(task.subs);
-  if (task.status === "waiting") return "waiting";
+  // `waiting` is two waits, not one: on the user, and on a trigger the chat will
+  // wake itself from (`wait_for_event`). Only the first is news — the red that
+  // says a chat is being held still — so a parked one gets its own quiet state,
+  // the same distinction `chatStatus` draws for the dot and the header icon.
+  if (task.status === "waiting") return task.waiting_kind === "wake" ? "parked" : "waiting";
   if (c.running > 0) return "live";
   if (c.failed > 0) return "failed";
   // Agents that were all stopped read as stopped, not a clean finish.

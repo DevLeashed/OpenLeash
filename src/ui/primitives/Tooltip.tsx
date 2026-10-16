@@ -2,15 +2,21 @@ import { cloneElement, isValidElement, ReactElement, ReactNode, useCallback, use
 import { createPortal } from "react-dom";
 
 type Side = "top" | "bottom" | "left" | "right";
+/** `start` lines a top/bottom tip up with the anchor's left edge, so a tip that
+ *  spells out a clipped line starts exactly where that line starts. */
+type Align = "center" | "start";
 type Rect = Pick<DOMRect, "top" | "right" | "bottom" | "left" | "width" | "height">;
 type Size = { width: number; height: number };
 type Position = { left: number; top: number };
 
 const GAP = 8;
 const EDGE = 8;
+/** `.tooltip`'s left padding plus its border: a `start` tip moves left by this
+ *  much so its first character sits over the anchor's first character. */
+const START_INSET = 9;
 let activeTooltip: { owner: symbol; close: () => void } | null = null;
 
-export function tooltipPosition(anchor: Rect, tip: Size, side: Side, viewport: Size): Position {
+export function tooltipPosition(anchor: Rect, tip: Size, side: Side, viewport: Size, align: Align = "center"): Position {
   const space = {
     top: anchor.top - EDGE,
     bottom: viewport.height - anchor.bottom - EDGE,
@@ -23,6 +29,7 @@ export function tooltipPosition(anchor: Rect, tip: Size, side: Side, viewport: S
   const clamp = (value: number, max: number) => Math.max(EDGE, Math.min(value, Math.max(EDGE, max - EDGE)));
   const left = actual === "left" ? anchor.left - tip.width - GAP
     : actual === "right" ? anchor.right + GAP
+    : align === "start" ? anchor.left - START_INSET
     : anchor.left + (anchor.width - tip.width) / 2;
   const top = actual === "top" ? anchor.top - tip.height - GAP
     : actual === "bottom" ? anchor.bottom + GAP
@@ -30,10 +37,23 @@ export function tooltipPosition(anchor: Rect, tip: Size, side: Side, viewport: S
   return { left: clamp(left, viewport.width - tip.width), top: clamp(top, viewport.height - tip.height) };
 }
 
-export function Tooltip({ content, children, side = "top", delay = 200 }: { content?: ReactNode; children: ReactElement; side?: Side; delay?: number }) {
+/** Whether an element's text is cut off by its own `overflow: hidden`. */
+export const isTruncated = (el: HTMLElement) => el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1;
+
+/**
+ * `truncated`: only show when the anchor's own text is clipped. A tip that just
+ * repeats a line the user can already read in full is noise, and over a list it
+ * covers the neighbouring row for nothing. Implies `align="start"` and left-aligned
+ * text, so the full value reads as a continuation of the clipped one.
+ */
+export function Tooltip({ content, children, side = "top", delay = 200, truncated = false, align }: { content?: ReactNode; children: ReactElement; side?: Side; delay?: number; truncated?: boolean; align?: Align }) {
+  const placement: Align = align ?? (truncated ? "start" : "center");
   const [target, setTarget] = useState<HTMLElement | null>(null);
   const [visible, setVisible] = useState(false);
   const [position, setPosition] = useState<Position | null>(null);
+  // A clipped line's tip is set in the line's own face, so a mono path reads as
+  // the same path rather than a reflowed one in another font.
+  const [font, setFont] = useState<string | undefined>(undefined);
   const tooltip = useRef<HTMLDivElement>(null);
   const timer = useRef<number | undefined>(undefined);
   const owner = useRef(Symbol("tooltip"));
@@ -53,7 +73,7 @@ export function Tooltip({ content, children, side = "top", delay = 200 }: { cont
       const rect = target.getBoundingClientRect();
       if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth) { close(); return; }
       const box = tooltip.current?.getBoundingClientRect();
-      if (box) setPosition(tooltipPosition(rect, box, side, { width: window.innerWidth, height: window.innerHeight }));
+      if (box) setPosition(tooltipPosition(rect, box, side, { width: window.innerWidth, height: window.innerHeight }, placement));
     };
     update();
     window.addEventListener("scroll", update, true);
@@ -66,12 +86,14 @@ export function Tooltip({ content, children, side = "top", delay = 200 }: { cont
       window.removeEventListener("resize", update);
       observer.disconnect();
     };
-  }, [visible, target, side, content, close]);
+  }, [visible, target, side, content, close, placement]);
 
   if (!content || !isValidElement(children)) return children;
 
   const open = (el: HTMLElement) => {
     clearTimeout(timer.current);
+    if (truncated && !isTruncated(el)) return;
+    if (truncated) setFont(getComputedStyle(el).fontFamily || undefined);
     if (activeTooltip?.owner !== owner.current) activeTooltip?.close();
     activeTooltip = { owner: owner.current, close };
     setTarget(el);
@@ -88,7 +110,7 @@ export function Tooltip({ content, children, side = "top", delay = 200 }: { cont
   } as never);
 
   return <>{child}{visible && target && createPortal(
-    <div ref={tooltip} className="tooltip" role="tooltip" style={{ left: position?.left ?? 0, top: position?.top ?? 0, visibility: position ? "visible" : "hidden" }}>{content}</div>,
+    <div ref={tooltip} className={"tooltip" + (placement === "start" ? " start" : "") + (truncated ? " full" : "")} role="tooltip" style={{ left: position?.left ?? 0, top: position?.top ?? 0, visibility: position ? "visible" : "hidden", fontFamily: truncated ? font : undefined }}>{content}</div>,
     document.body,
   )}</>;
 }

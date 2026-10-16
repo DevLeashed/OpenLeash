@@ -10,7 +10,7 @@ import type { AccountView, Item, ProviderView, Settings, SubInfo, TaskSummary } 
 import type { Note } from "./store";
 import { until, countOptionalAgents, defaultX, emptyXLayer, xDepth, xOn, X_DEFAULT_RUNNING, X_DEFAULT_TOTAL, X_MAX_LAYERS, fmtK } from "./api";
 import { netWindows } from "./ui/Accounts";
-import { bufferDelta, clickedChat, DEFAULT_ZOOM, evictTranscripts, flushDeltas, forgetTask, get, inFrontNow, modelInfo, set, stepZoom, subscribe, zoom } from "./store";
+import { bufferDelta, clickedChat, DEFAULT_ZOOM, evictTranscripts, flushDeltas, forgetTask, get, inFrontNow, modelInfo, requestPause, set, stepZoom, subscribe, zoom } from "./store";
 import { ProviderIcon } from "./ui/ProviderIcon";
 import { Button, ChoiceChip, ChoiceRow, Input, Kbd, MenuRow, NavTab, Segmented, Switch, TextArea } from "./ui/primitives";
 import { todoProgress, TodoPanel } from "./ui/session/TodoPanel";
@@ -266,6 +266,12 @@ describe("chat list order", () => {
     const done = { id: "done", status: "done", order: 0, touched_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" } as unknown as TaskSummary;
     expect([done, stopped].sort(compareChats).map((chat) => chat.id)).toEqual(["stopped", "done"]);
   });
+  it("keeps an errored chat in its recency position among finished chats", () => {
+    const failed = { id: "failed", status: "failed", order: 0, touched_at: "2026-09-03T00:00:00Z", updated_at: "2026-09-03T00:00:00Z" } as unknown as TaskSummary;
+    const done = { id: "done", status: "done", order: 0, touched_at: "2026-09-02T00:00:00Z", updated_at: "2026-09-02T00:00:00Z" } as unknown as TaskSummary;
+    const stopped = { id: "stopped", status: "stopped", order: 0, touched_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" } as unknown as TaskSummary;
+    expect([stopped, done, failed].sort(compareChats).map((chat) => chat.id)).toEqual(["failed", "done", "stopped"]);
+  });
   it("sorts by recency inside each priority group", () => {
     const older = { id: "older", status: "done", order: 0, touched_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" } as unknown as TaskSummary;
     const newer = { ...older, id: "newer", touched_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" };
@@ -447,7 +453,7 @@ describe("ultrathread X visibility", () => {
 import { swarmCounts, swarmGlow, swarmState } from "./ui/session/Swarm";
 describe("ultrathread badge", () => {
   const s = (status: string) => ({ status }) as unknown as SubInfo;
-  const t = (o: Partial<Pick<TaskSummary, "status" | "paused" | "subs">>): Pick<TaskSummary, "status" | "paused" | "subs"> => ({ status: "idle", paused: null, subs: [], ...o });
+  const t = (o: Partial<Pick<TaskSummary, "status" | "paused" | "subs" | "waiting_kind">>): Pick<TaskSummary, "status" | "paused" | "subs" | "waiting_kind"> => ({ status: "idle", paused: null, subs: [], waiting_kind: null, ...o });
   it("counts each agent state so the badge can show progress", () => {
     expect(swarmCounts([s("running"), s("running"), s("done"), s("failed"), s("stopped")] as SubInfo[]))
       .toEqual({ running: 2, done: 1, failed: 1, stopped: 1 });
@@ -471,13 +477,17 @@ describe("ultrathread badge", () => {
     // Paused and waiting beat whatever the agents were doing.
     expect(swarmState(t({ status: "running", paused: { reason: "manual", kind: "manual", since: "" }, subs: [s("running")] }))).toBe("paused");
     expect(swarmState(t({ status: "waiting", subs: [s("running")] }))).toBe("waiting");
+    // A wait on a trigger is not a wait on the user: the underline and the badge
+    // go quiet instead of taking the red the state above uses.
+    expect(swarmState(t({ status: "waiting", waiting_kind: "wake", subs: [s("running")] }))).toBe("parked");
+    expect(swarmGlow(swarmState(t({ status: "waiting", waiting_kind: "wake" })))).toBe(false);
     // A stopped chat that ran agents reads as stopped, not done.
     expect(swarmState(t({ status: "stopped", subs: [s("stopped")] }))).toBe("stopped");
   });
 });
 
 import { FeedRows, UserMsg } from "./ui/Session";
-import { InlineArtifactCard } from "./ui/InlineArtifactCard";
+import { InlineArtifictCard } from "./ui/InlineArtifictCard";
 describe("transcript feed", () => {
   const task = { id: "t1", model: "m", cwd: "D:/p", subs: [] } as unknown as TaskSummary;
   it("merges finished subagents into the action group instead of their own Done line", () => {
@@ -495,7 +505,7 @@ describe("transcript feed", () => {
     // One chain: the finished subagent and both commands share it, and the settled
     // subagent reads as a count on the same line rather than a separate Done fold.
     expect(html).not.toContain("Done");
-    expect(html).toContain("Ran a command, started a command, 1 sub-agent finished");
+    expect(html).toContain("Ran a command, started a command, 1 subagent finished");
     expect((html.match(/class="toolgroup"/g) ?? [])).toHaveLength(1);
     // Nothing hides behind the header that isn't the point of it, and the work
     // that is still in flight stays visible rather than being folded away.
@@ -512,37 +522,37 @@ describe("transcript feed", () => {
     expect(both).toContain("Ran 2 commands");
   });
 
-  it("renders a running artifact tool as an inline building placeholder without leaking partial JSON", () => {
-    const item = { id: "preview-1", kind: "tool", text: "", data: { name: "artifact_preview", status: "running", preview_draft: '{"content":"<script>partial</script>"}' } } as unknown as Item;
-    const html = renderToStaticMarkup(createElement(InlineArtifactCard, { item }));
+  it("renders a running artifict tool as an inline building placeholder without leaking partial JSON", () => {
+    const item = { id: "preview-1", kind: "tool", text: "", data: { name: "artifict_preview", status: "running", preview_draft: '{"content":"<script>partial</script>"}' } } as unknown as Item;
+    const html = renderToStaticMarkup(createElement(InlineArtifictCard, { item }));
     expect(html).toContain("Building a visual…");
     expect(html).not.toContain("partial");
     expect(html).not.toContain("toolgroup");
   });
 
-  it("renders a successful one-off artifact inline without a project-save link", () => {
-    const item = { id: "preview-2", kind: "tool", text: "", data: { name: "artifact_preview", status: "ok", input: { title: "Trend chart", kind: "html", content: "<h1>Trend</h1>" }, artifact_card: { title: "Trend chart", kind: "html", persistence: "session" } } } as unknown as Item;
-    const html = renderToStaticMarkup(createElement(InlineArtifactCard, { item }));
+  it("renders a successful one-off artifict inline without a project-save link", () => {
+    const item = { id: "preview-2", kind: "tool", text: "", data: { name: "artifict_preview", status: "ok", input: { title: "Trend chart", kind: "html", content: "<h1>Trend</h1>" }, artifict_card: { title: "Trend chart", kind: "html", persistence: "session" } } } as unknown as Item;
+    const html = renderToStaticMarkup(createElement(InlineArtifictCard, { item }));
     expect(html).toContain("One-off · in this chat");
     expect(html).toContain("Trend chart");
     expect(html).not.toContain("toolgroup");
-    expect(html).not.toContain("Open in Artifacts");
+    expect(html).not.toContain("Open in Artificts");
   });
 
-  it("renders a saved artifact inline and wires exact-version navigation", () => {
-    const item = { id: "saved-1", kind: "tool", text: "", data: { name: "artifact_create", status: "ok", input: { title: "Feedback flow", kind: "markdown", content: "# Flow" }, artifact_card: { title: "Feedback flow", kind: "markdown", persistence: "project", artifact_id: "artifact-1", version_id: "version-2" } } } as unknown as Item;
-    const onOpenArtifact = vi.fn();
-    const html = renderToStaticMarkup(createElement(InlineArtifactCard, { item, onOpenArtifact }));
+  it("renders a saved artifict inline and wires exact-version navigation", () => {
+    const item = { id: "saved-1", kind: "tool", text: "", data: { name: "artifict_create", status: "ok", input: { title: "Feedback flow", kind: "markdown", content: "# Flow" }, artifict_card: { title: "Feedback flow", kind: "markdown", persistence: "project", artifict_id: "artifict-1", version_id: "version-2" } } } as unknown as Item;
+    const onOpenArtifict = vi.fn();
+    const html = renderToStaticMarkup(createElement(InlineArtifictCard, { item, onOpenArtifict }));
     expect(html).toContain("Saved to project · version version-");
-    expect(html).toContain("Open in Artifacts");
+    expect(html).toContain("Open in Artificts");
     expect(html).not.toContain("toolgroup");
   });
 
-  it("keeps successful artifact cards standalone when sharing a completed-turn fold", () => {
-    const item: Item = { id: "saved-turn", kind: "tool", text: "", ts: "2026-10-01T00:00:00Z", data: { name: "artifact_create", status: "ok", input: { title: "Diagram", kind: "markdown", content: "# Diagram" }, artifact_card: { title: "Diagram", kind: "markdown", persistence: "project", artifact_id: "art", version_id: "v1" } } };
+  it("keeps successful artifict cards standalone when sharing a completed-turn fold", () => {
+    const item: Item = { id: "saved-turn", kind: "tool", text: "", ts: "2026-10-01T00:00:00Z", data: { name: "artifict_create", status: "ok", input: { title: "Diagram", kind: "markdown", content: "# Diagram" }, artifict_card: { title: "Diagram", kind: "markdown", persistence: "project", artifict_id: "art", version_id: "v1" } } };
     const user: Item = { id: "user", kind: "user", text: "Make a diagram", ts: "2026-10-01T00:00:00Z", data: {} };
     const html = renderToStaticMarkup(createElement(FeedRows, { items: [user, item], task, showThinking: false }));
-    expect(html).toContain("Artifact: Diagram");
+    expect(html).toContain("Artifict: Diagram");
     expect(html).toContain("Saved to project");
     expect(html).not.toContain("toolgroup");
   });
@@ -557,7 +567,7 @@ describe("transcript feed", () => {
     expect(off).not.toContain("weighing the two parsers");
 
     // And the setting is the only thing that lets it through, so a user who
-    // asks for it gets it in both the main feed and a sub-agent's transcript.
+    // asks for it gets it in both the main feed and a subagent's transcript.
     const on = renderToStaticMarkup(createElement(FeedRows, { items, task, showThinking: true }));
     expect(on).toContain("weighing the two parsers");
   });
@@ -596,22 +606,22 @@ describe("transcript feed", () => {
     // its own status, so this must fold with nothing but the item in hand.
     const html = renderToStaticMarkup(createElement(FeedRows, { items: [sub], task, showThinking: false }));
     expect(html).not.toContain("Done");
-    expect(html).toContain("1 sub-agent finished");
+    expect(html).toContain("1 subagent finished");
   });
 
   it("counts a failed subagent as a failure on the chain, and a live one is not folded", () => {
     const task = { id: "t1", model: "m", cwd: "D:/p", subs: [] } as unknown as TaskSummary;
     const sub = (id: string, status: string) => ({ id, kind: "sub", text: `swept ${id}`, data: { status, name: "explore", sub_id: id } }) as unknown as Item;
     const read = (id: string) => ({ id, kind: "tool", text: "", data: { name: "read_file", status: "ok", input: { path: `${id}.ts` } } }) as unknown as Item;
-    // A sub-agent that ended badly is the receipt this line most needs to keep:
+    // A subagent that ended badly is the receipt this line most needs to keep:
     // previously it was a separate Done line that said "did not finish", and
     // merging it into the chain must not drop that.
     const bad = renderToStaticMarkup(createElement(FeedRows, { items: [read("a"), sub("s1", "failed")], task, showThinking: false }));
     expect(bad).not.toContain("Done");
     expect(bad).toContain("Read a");
-    expect(bad).toContain("1 sub-agent finished");
+    expect(bad).toContain("1 subagent finished");
     expect(bad).toContain("1 failed");
-    // A still-running sub-agent keeps its own pill row rather than folding away.
+    // A still-running subagent keeps its own pill row rather than folding away.
     const live = renderToStaticMarkup(createElement(FeedRows, { items: [read("a"), sub("s2", "running")], task, showThinking: false }));
     expect(live).toContain("Read a");
     expect(live).toContain("swept s2");
@@ -667,6 +677,23 @@ describe("transcript feed", () => {
     expect(pending).toContain('class="toolgroup"');
     expect(pending).not.toContain("waiting for an answer");
     expect(pending).not.toContain("does the kernel support it?");
+  });
+
+  it("tells a message sent to another chat apart from one received", () => {
+    const mine = { id: "c1", kind: "notice", text: "Message to Payroll import: the schema moved to v3", data: { level: "msg", from: "This chat", to: "Payroll import", chat_id: "other" }, ts: "2026-09-01T00:00:00Z" } as unknown as Item;
+    const sent = renderToStaticMarkup(createElement(FeedRows, { items: [mine], task, showThinking: false }));
+    // The sender's own copy counts as *sent*. Without the `to` check it read as
+    // "Got a message", which is the opposite of what happened.
+    expect(sent).toContain("Sent a message to another chat");
+    expect(sent).not.toContain("Got a message");
+    // It stays quiet chatter rather than becoming a row of its own.
+    expect(sent).toContain('class="toolgroup"');
+
+    // The other chat's transcript says where it came from instead.
+    const theirs = { ...mine, id: "c2", text: "Message from This chat: the schema moved to v3", data: { level: "msg", from: "This chat", chat_id: "t1" } } as unknown as Item;
+    const got = renderToStaticMarkup(createElement(FeedRows, { items: [theirs], task, showThinking: false }));
+    expect(got).toContain("Got a message from This chat");
+    expect(got).not.toContain("Sent a message to another chat");
   });
 });
 
@@ -969,7 +996,7 @@ describe("question notes and saved forms", () => {
   });
 });
 
-import { deleteArchivedTasks } from "./ui/Chrome";
+import { deleteArchivedTasks, deleteTask } from "./ui/Chrome";
 describe("delete all archived chats", () => {
   // `flash` sets its timer through `window`, so the store needs one here.
   beforeEach(() => {
@@ -977,25 +1004,84 @@ describe("delete all archived chats", () => {
     set({ settings: {} as unknown as Settings, view: "home", task: null });
   });
   const t = (id: string, archived: boolean) => ({ id, archived }) as unknown as TaskSummary;
-  const reply = () => (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => null);
+  // The bulk delete goes through the backend's own command now, which re-derives
+  // the archived set and reports how many it actually removed.
+  const reply = () => (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => (cmd === "tasks_delete_archived" ? 2 : null));
 
   it("drops archived chats and the open view, keeps the active ones", async () => {
     reply();
     set({ tasks: { a: t("a", true), b: t("b", false), c: t("c", true) }, task: "c", view: "session" as const });
     await deleteArchivedTasks();
-    expect(invoke).toHaveBeenCalledWith("task_delete", { id: "a", removeWorktree: false });
-    expect(invoke).toHaveBeenCalledWith("task_delete", { id: "c", removeWorktree: false });
+    expect(invoke).toHaveBeenCalledWith("tasks_delete_archived");
     expect(Object.keys(get().tasks)).toEqual(["b"]);
     expect([get().task, get().view]).toEqual([null, "home"]);
     expect(get().toast).toBe("Deleted 2 archived chats");
   });
+  // A worker worktree belongs to a chat too, so what a bulk delete promises it
+  // kept has to count them. Counting only `task.worktree` said "kept 1 worktree"
+  // over the two a worktree-per-worker chat had just left on disk.
+  it("counts a chat's worker worktrees in what it kept on disk", async () => {
+    reply();
+    const a = { ...t("a", true), worktree: true } as unknown as TaskSummary;
+    const b = {
+      ...t("b", true),
+      subs: [{ id: "s1", cwd: "C:/wt/1" }, { id: "s2", cwd: "C:/wt/2" }],
+    } as unknown as TaskSummary;
+    set({ tasks: { a, b }, task: null, view: "home" });
+    await deleteArchivedTasks();
+    expect(get().toast).toBe("Deleted 2 archived chats · kept 3 worktrees on disk");
+  });
+  // Deleting a chat with its files takes its workers' checkouts as well as its
+  // own, and the toast names them: a chat that runs in the project folder has no
+  // `worktree` of its own, so before this it looked like nothing had gone.
+  it("removes a chat's worker worktrees with it and says so", async () => {
+    reply();
+    const x = { ...t("x", false), subs: [{ id: "s1", cwd: "C:/wt/1" }] } as unknown as TaskSummary;
+    set({ tasks: { x }, task: null, view: "home" });
+    await deleteTask("x", true);
+    expect(invoke).toHaveBeenCalledWith("task_delete", { id: "x", removeWorktree: true });
+    expect(get().toast).toBe("Chat deleted · worktrees removed · branches kept");
+  });
+
   it("keeps the active chat when nothing is archived", async () => {
     reply();
     set({ tasks: { b: t("b", false) }, task: "b", view: "session" as const });
+    // Nothing archived locally is the one case the client answers on its own, so
+    // assert no IPC at all rather than no *particular* IPC — `invoke` is one spy
+    // shared by this file and carries the earlier tests' calls.
+    const before = (invoke as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
     await deleteArchivedTasks();
+    expect((invoke as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
     expect(Object.keys(get().tasks)).toEqual(["b"]);
     expect([get().task, get().view]).toEqual(["b", "session"]);
     expect(get().toast).toBe("No archived chats");
+  });
+});
+
+describe("pause requests", () => {
+  it("shares one pending pause IPC request per chat and allows retry after it settles", async () => {
+    let finish!: () => void;
+    const ipc = invoke as unknown as ReturnType<typeof vi.fn>;
+    const previous = ipc.getMockImplementation();
+    ipc.mockClear();
+    ipc.mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+
+    try {
+      const first = requestPause("chat-a");
+      if (!first) throw new Error("the initial pause request should start");
+      expect(requestPause("chat-a"), "a repeated click before the task summary arrives is ignored").toBeNull();
+      expect(ipc).toHaveBeenCalledTimes(1);
+
+      finish();
+      await first;
+      const retry = requestPause("chat-a");
+      if (!retry) throw new Error("a settled request should allow a retry");
+      expect(ipc).toHaveBeenCalledTimes(2);
+      finish();
+      await retry;
+    } finally {
+      ipc.mockImplementation(previous!);
+    }
   });
 });
 
@@ -1023,6 +1109,28 @@ describe("streamed deltas", () => {
     flushDeltas();
     expect(get().items.t1!.map((x) => x.text)).toEqual(["one!", "two"]);
     expect(get().items.nope).toBeUndefined();
+  });
+
+  // The field report: a reply whose tail repeated verbatim from a chunk
+  // boundary on. A buffered chunk belongs *after* the text the item had when it
+  // was buffered; if that text has since been replaced by the backend's own
+  // copy — the finished item re-emitted at the end of a turn, or a transcript
+  // read — the copy already contains the chunk, and appending it prints the
+  // text twice. On a phone this is the normal case, not a race: rAF does not
+  // run while a document is hidden, so a whole reply waits in the buffer.
+  it("drops a chunk whose item was rewritten before the flush", () => {
+    bufferDelta("t1", null, "a", " + two!");
+    set({ items: { t1: [item("a", "one + two!"), item("b", "two")] } });
+    flushDeltas();
+    expect(get().items.t1!.map((x) => x.text)).toEqual(["one + two!", "two"]);
+  });
+
+  it("drops a rewritten subagent item's chunk too", () => {
+    set({ subItems: { t1: { s1: [item("c", "step ")] } } });
+    bufferDelta("t1", "s1", "c", "one");
+    set({ subItems: { t1: { s1: [item("c", "step one")] } } });
+    flushDeltas();
+    expect(get().subItems.t1!.s1![0]!.text).toBe("step one");
   });
 });
 
@@ -1111,6 +1219,41 @@ describe("stats model filter", () => {
     const r = pick(c(9), { a: c(2, 1), b: c(3, 2) }, ["a", "b", "missing"]);
     expect([r.requests, r.input, r.reasoning]).toEqual([5, 50, 3]);
     expect(pick(c(9), undefined, ["a"]).requests).toBe(0);
+  });
+});
+
+import { failureRate, sum } from "./ui/Stats";
+describe("failure rate", () => {
+  const c = (requests: number, errors: number) => ({ requests, input: 0, output: 0, cache_read: 0, cache_write: 0, errors, total_ms: 0, ttft_ms: 0, ttft_n: 0, cost: 0, last_used: "" });
+  it("divides errors by attempts, not by requests", () => {
+    // A failed attempt never increments `requests` (the backend records it as an
+    // error and nothing else), so `errors / requests` would read 300% here and
+    // disagree with the "3 failed attempts" printed beside it.
+    expect(failureRate(c(1, 3))).toBeCloseTo(0.75);
+    expect(failureRate(c(0, 0))).toBe(0);
+    expect(failureRate(c(4, 0))).toBe(0);
+  });
+
+  it("re-derives per-model rows for an aggregate, which the backend never scored", () => {
+    // `sum` builds a range total out of buckets; nothing wrote a `failure_rate`
+    // for that combination, and an old stats file has none on any row at all.
+    // Deriving from the counts is what keeps the tile right in both cases.
+    const tot = sum([c(1, 3), c(3, 0)]);
+    expect([tot.requests, tot.errors]).toEqual([4, 3]);
+    expect(failureRate(tot)).toBeCloseTo(3 / 7);
+  });
+
+  it("puts a per-model fail rate column in both model tables", () => {
+    // The ask was per *model*, and a headline tile cannot answer "which model is
+    // failing me". Read the sources rather than render: these tables sit behind a
+    // polled fetch and a modal, and the column existing in both is the thing that
+    // keeps the stats screen and the chat panel from disagreeing.
+    for (const p of ["src/ui/Stats.tsx", "src/ui/ChatStats.tsx"]) {
+      const src = readFileSync(p, "utf8");
+      expect(src).toContain("<th>Fail rate</th>");
+      // And it has to be the attempts-based derive, not a bare `errors` print.
+      expect(src).toContain("failureRate(c)");
+    }
   });
 });
 
@@ -1453,11 +1596,11 @@ describe("archiving a selection of chats", () => {
   });
 });
 
-// The age sweep (Settings → Chats) is a bulk archive, so most of what matters
-// is which chats it is allowed to reach — it can put away a chat the user never
-// ticked, and it must not hide work that is still running.
-import { SIDEBAR_CHAT_LIMIT, archiveExcessSidebarChats, archiveStale, excessSidebarChats, staleChats } from "./ui/Chrome";
-describe("archiving the chats that have gone idle", () => {
+// The sidebar cap is a bulk archive, so most of what matters is which chats it
+// is allowed to reach — it can put away a chat the user never ticked, and it
+// must not hide work that is still running.
+import { SIDEBAR_CHAT_LIMIT, archiveExcessSidebarChats, excessSidebarChats } from "./ui/Chrome";
+describe("archiving the chats past the sidebar cap", () => {
   const DAY = 86_400_000;
   const NOW = Date.parse("2026-10-04T12:00:00Z");
   const idleFor = (ms: number) => new Date(NOW - ms).toISOString();
@@ -1465,64 +1608,15 @@ describe("archiving the chats that have gone idle", () => {
     ({ id, title: id, archived: false, status: "done", pinned: false, order: 0, touched_at: idleFor(30 * DAY), updated_at: idleFor(30 * DAY), ...over }) as unknown as TaskSummary;
   const list = (...t: TaskSummary[]) => Object.fromEntries(t.map((x) => [x.id, x]));
 
-  it("takes the chats past the window and leaves the rest", () => {
-    const tasks = list(
-      chat("old"),
-      chat("ancient", { touched_at: idleFor(400 * DAY) }),
-      chat("recent", { touched_at: idleFor(13 * DAY) }),
-      chat("brand-new", { touched_at: idleFor(0) }),
-    );
-    expect(staleChats(tasks, 14, NOW).map((t) => t.id)).toEqual(["old", "ancient"]);
-  });
-
-  // The window is measured off `touched_at`, not `updated_at`: every agent step
-  // moves `updated_at`, so a background chat working through a hundred tool
-  // calls looks brand new to it and would never age out.
-  it("ages a chat by when the user last did something, not by the last agent step", () => {
-    const tasks = list(chat("busy-quietly", { touched_at: idleFor(90 * DAY), updated_at: new Date(NOW).toISOString() }));
-    expect(staleChats(tasks, 14, NOW).map((t) => t.id)).toEqual(["busy-quietly"]);
-  });
-
-  // `tasks_archive` hides a chat rather than cancelling it, so archiving a live
-  // one would leave an agent running somewhere the user cannot see it.
-  it("never reaches a chat with a running or waiting agent", () => {
-    const tasks = list(chat("running", { status: "running" }), chat("waiting", { status: "waiting" }), chat("done"));
-    expect(staleChats(tasks, 14, NOW).map((t) => t.id)).toEqual(["done"]);
-  });
-
-  it("never reaches pinned, paused, unread or current chats, even when idle", () => {
-    const tasks = list(
-      chat("pinned", { pinned: true }),
-      chat("paused", { paused: { kind: "manual" } as never }),
-      chat("unread"),
-      chat("current"),
-      chat("safe"),
-    );
-    expect(staleChats(tasks, 14, NOW, { unread: true }, "current").map((t) => t.id)).toEqual(["safe"]);
-  });
-
-  it("leaves already-archived chats alone", () => {
-    expect(staleChats(list(chat("gone", { archived: true })), 14, NOW)).toEqual([]);
-  });
-
-  // A chat saved before `touched_at` existed has an empty one on the wire. It
-  // must fall back to `updated_at` rather than parsing "" as 1970, which would
-  // sweep the oldest chats on the strength of a field that was never written.
-  it("ages a chat with no touched_at off its updated_at, not off nothing", () => {
-    expect(staleChats(list(chat("legacy", { touched_at: "", updated_at: idleFor(30 * DAY) })), 14, NOW).map((t) => t.id)).toEqual(["legacy"]);
-    expect(staleChats(list(chat("legacy-old", { touched_at: "", updated_at: idleFor(400 * DAY) })), 14, NOW).map((t) => t.id)).toEqual(["legacy-old"]);
-    expect(staleChats(list(chat("legacy-new", { touched_at: "", updated_at: idleFor(DAY) })), 14, NOW)).toEqual([]);
-  });
-
   it("archives the oldest eligible chats needed to get back under 100", () => {
     const tasks = list(
       ...Array.from({ length: SIDEBAR_CHAT_LIMIT - 3 }, (_, i) => chat(`old-${i}`, { touched_at: idleFor((SIDEBAR_CHAT_LIMIT - i) * DAY) })),
       chat("newest", { touched_at: idleFor(0) }),
       chat("pinned", { pinned: true, touched_at: idleFor(500 * DAY) }),
       chat("running", { status: "running", touched_at: idleFor(500 * DAY) }),
-      chat("unread", { touched_at: idleFor(500 * DAY) }),
+      chat("unread", { touched_at: idleFor(500 * DAY), unread: true }),
     );
-    const excess = excessSidebarChats(tasks, SIDEBAR_CHAT_LIMIT, { unread: true });
+    const excess = excessSidebarChats(tasks, SIDEBAR_CHAT_LIMIT);
     expect(excess).toHaveLength(1);
     expect(excess[0]?.id).toBe("old-0");
   });
@@ -1531,15 +1625,9 @@ describe("archiving the chats that have gone idle", () => {
     const tasks = list(...Array.from({ length: SIDEBAR_CHAT_LIMIT + 1 }, (_, i) => chat(`live-${i}`, { status: "running" })));
     expect(excessSidebarChats(tasks, SIDEBAR_CHAT_LIMIT)).toEqual([]);
   });
-
-  it("honours whatever window the user chose", () => {
-    const tasks = list(chat("a", { touched_at: idleFor(20 * DAY) }));
-    expect(staleChats(tasks, 30, NOW)).toEqual([]);
-    expect(staleChats(tasks, 7, NOW).map((t) => t.id)).toEqual(["a"]);
-  });
 });
 
-describe("archiving idle chats: what it sends", () => {
+describe("archiving the sidebar's overflow: what it sends", () => {
   beforeEach(() => {
     (globalThis as { window?: unknown }).window ??= { setTimeout: (f: () => void, ms: number) => setTimeout(f, ms) };
     set({ settings: {} as unknown as Settings, view: "home", task: null, selecting: false, picked: {} });
@@ -1547,26 +1635,6 @@ describe("archiving idle chats: what it sends", () => {
   });
   const t = (id: string, over: Partial<TaskSummary> = {}) => ({ id, title: id, archived: false, status: "done", pinned: false, order: 0, touched_at: "", updated_at: "", ...over }) as unknown as TaskSummary;
   const reply = (n: number) => (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => (cmd === "tasks_archive" ? n : null));
-  const idle = new Date(Date.now() - 90 * 86_400_000).toISOString();
-
-  it("archives the idle chats in one call and leaves the selection alone", async () => {
-    reply(2);
-    set({ tasks: { a: t("a", { touched_at: idle }), b: t("b", { touched_at: idle }), fresh: t("fresh", { touched_at: new Date().toISOString() }) } });
-    await archiveStale(14);
-    expect(invoke).toHaveBeenCalledWith("tasks_archive", { ids: ["a", "b"] });
-    expect(get().toast).toBe("Archived 2 chats");
-    // This is not a selection: the user never ticked anything, so a sweep must
-    // not clear ticks on chats they did choose for something else.
-    expect([get().picked, get().selecting]).toEqual([{}, false]);
-  });
-
-  it("archives only still-eligible idle chats, with their unread and pin status", async () => {
-    reply(1);
-    const idle = new Date(Date.now() - 90 * 86_400_000).toISOString();
-    set({ tasks: { safe: t("safe", { touched_at: idle }), pinned: t("pinned", { touched_at: idle, pinned: true }), unread: t("unread", { touched_at: idle }), paused: t("paused", { touched_at: idle, paused: { kind: "manual" } as never }), running: t("running", { touched_at: idle, status: "running" }), current: t("current", { touched_at: idle }) }, unread: { unread: true }, task: "current", view: "session" as const });
-    await archiveStale(14);
-    expect(invoke).toHaveBeenCalledWith("tasks_archive", { ids: ["safe"] });
-  });
 
   it("archives excess chats without leaving selection mode or changing the current view", async () => {
     reply(1);
@@ -1577,20 +1645,26 @@ describe("archiving idle chats: what it sends", () => {
     expect([get().task, get().view]).toEqual(["current", "session"]);
   });
 
-  it("says so when there is nothing idle that long, and writes nothing", async () => {
+  // Deliberate: the sweep is the app tidying up, not something the user did, so
+  // it says nothing. It used to flash "Archived N chats to keep the sidebar
+  // short" with an Undo, which interrupted a launch over a tidy-up nobody asked
+  // for. A failure still has to speak, so the silence is asserted here rather
+  // than left to the length of that comment.
+  it("sweeps without raising a toast", async () => {
     reply(1);
-    set({ tasks: { fresh: t("fresh", { touched_at: new Date().toISOString() }) } });
-    await archiveStale(14);
-    expect(invoke).not.toHaveBeenCalled();
-    expect(get().toast).toBe("No chats idle that long");
+    set({ tasks: { old: t("old") }, toast: null, toastAction: null });
+    await archiveExcessSidebarChats(["old"]);
+    expect(get().tasks.old?.archived).toBe(true);
+    expect([get().toast, get().toastAction]).toEqual([null, null]);
   });
 
-  it("reports the failure rather than claiming the chats were archived", async () => {
-    (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async () => {
-      throw new Error("disk is full");
+  it("still reports a sweep that failed", async () => {
+    (invoke as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
+      if (cmd === "tasks_archive") throw new Error("disk is full");
+      return null;
     });
-    set({ tasks: { a: t("a", { touched_at: idle }) } });
-    await archiveStale(14);
+    set({ tasks: { old: t("old") }, toast: null, toastAction: null });
+    await archiveExcessSidebarChats(["old"]);
     expect(get().toast).toMatch(/disk is full/);
   });
 });
@@ -1953,7 +2027,7 @@ describe("transcripts held in memory", () => {
     set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, subItems: { a: { s1: [item("4")] }, b: { s2: [item("5")] } }, bg: { a: [], b: [] } });
     const patch = evictTranscripts(get(), "b");
     expect(Object.keys(patch.items ?? {})).toEqual(["b"]);
-    // A's sub-agent transcript goes with the chat it belonged to: a swarm whose
+    // A's subagent transcript goes with the chat it belonged to: a swarm whose
     // drawer was never opened is the largest thing the store can be holding.
     expect(Object.keys(patch.subItems ?? {})).toEqual(["b"]);
     expect(Object.keys(patch.bg ?? {})).toEqual(["b"]);
@@ -1998,5 +2072,43 @@ describe("transcripts held in memory", () => {
     set({ notes: { gone: [{ chat: "gone", quote: "a".repeat(6000) } as unknown as Note], kept: [] }, tasks: {} });
     const patch = forgetTask(get(), "gone");
     expect(Object.keys(patch.notes ?? {})).toEqual(["kept"]);
+  });
+});
+
+describe("the Esc hint is hidden on the desktop too", () => {
+  // The rule first went into the keyboard-hint group inside `@media
+  // (max-width: 640px)`, so a normal desktop window never matched it and the
+  // line stayed on screen — the change looked applied in the stylesheet while
+  // doing nothing in the app. Pin the nesting, not just the declaration.
+  //
+  // Read the file rather than `import css from "./App.css?raw"`: this Vitest
+  // setup has no `test.css` handling, so that import is an empty string and any
+  // assertion against it passes vacuously.
+  const src = readFileSync("src/App.css", "utf8");
+  const depthAt = (needle: string) => {
+    let depth = 0;
+    for (const line of src.split("\n")) {
+      if (line.includes(needle)) return depth;
+      for (const ch of line) {
+        if (ch === "{") depth++;
+        else if (ch === "}") depth--;
+      }
+    }
+    return null;
+  };
+
+  it("declares the rule outside every media query", () => {
+    expect(depthAt(".working-keyhint { display: none; }"), "top level, no @media wrapper").toBe(0);
+  });
+
+  it("hides the working-row hint that Session.tsx renders", () => {
+    expect(src).toMatch(/\.working-keyhint\s*\{\s*display:\s*none/);
+  });
+
+  it("leaves the remote-only hints scoped to a remote client", () => {
+    // Those two describe Esc to a browser that has no Esc key; they must keep
+    // `:root.remote`, and must not be the thing that hides the working hint.
+    expect(src).toMatch(/:root\.remote[^{]*\.question-keyhint/);
+    expect(src).toMatch(/:root\.remote[^{]*\.al-keyhint/);
   });
 });

@@ -51,6 +51,40 @@ class StageDownloadsTests(unittest.TestCase):
                     module.stage_downloads(release, stage, "macos-arm64", "0.1.1")
                 self.assertFalse(stage.exists())
 
+    def test_installers_are_staged_only_when_requested(self):
+        # build_installers adds the Windows NSIS installer and nothing else: no
+        # signature and no updater fragment may reach the downloads, even when
+        # the build tree still holds them.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "release"
+            (release / "bundle/nsis").mkdir(parents=True)
+            (release / "openleash.exe").write_bytes(b"dummy build")
+            installer = release / "bundle/nsis/OpenLeash-setup.exe"
+            installer.write_bytes(b"dummy build")
+            installer.with_name(installer.name + ".sig").write_text("dummy signature")
+            stage = root / "downloads"
+            names = module.stage_downloads(release, stage, "windows-x64", "0.1.0", True)
+            self.assertEqual(names, ["OpenLeash_0.1.0_win_x64.exe", "OpenLeash_0.1.0_win_x64_setup.exe"])
+            self.assertEqual(sorted(path.name for path in stage.iterdir()), sorted(names))
+
+    def test_macos_stages_only_the_dmg(self):
+        # macOS has no installer bundle and no updater artifact, so requesting
+        # installers adds nothing and a leftover tarball/signature is ignored.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "release"
+            (release / "bundle/dmg").mkdir(parents=True)
+            (release / "bundle/dmg/OpenLeash.dmg").write_bytes(b"dummy build")
+            (release / "bundle/macos").mkdir(parents=True)
+            tarball = release / "bundle/macos/OpenLeash.app.tar.gz"
+            tarball.write_bytes(b"dummy build")
+            tarball.with_name(tarball.name + ".sig").write_text("dummy signature")
+            stage = root / "downloads"
+            names = module.stage_downloads(release, stage, "macos-arm64", "0.1.0", True)
+            self.assertEqual(names, ["OpenLeash_0.1.0_macos_aarch64.dmg"])
+            self.assertEqual(sorted(path.name for path in stage.iterdir()), sorted(names))
+
     def test_current_version_is_used(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

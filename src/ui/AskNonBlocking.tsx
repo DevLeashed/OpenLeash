@@ -280,7 +280,7 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
         {/* Count first, keys second: what you have done with the form is the
             thing worth reading, and the shortcuts are a footnote on that. */}
         <span className="al-hint">{footHint}</span>
-        {keysHint && <span className="al-hint dim">{keysHint}</span>}
+        {keysHint && <span className="al-hint dim al-keyhint">{keysHint}</span>}
         <div style={{ flex: 1 }} />
         <Tooltip content="The agent decides this itself and you won't be asked again">
           <Button variant="ghost" className="qbtn" disabled={sent} onClick={() => answer(ans, true)}>

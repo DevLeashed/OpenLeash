@@ -29,6 +29,7 @@ export const I = {
   rewind: () => icon(RotateCcw, 12),
   agents: (w = 13) => icon(Bot, w),
   pause: (w = 12) => icon(Pause, w),
+  stop: (w = 12) => icon(Square, w),
   play: (w = 12) => icon(Play, w),
   key: (w = 13) => icon(KeyRound, w),
   pin: (w = 12) => icon(Pin, w),
@@ -69,6 +70,8 @@ export const I = {
 export const ST: Record<string, { dot: string; text: string }> = {
   running: { dot: "var(--st-run)", text: "Running" },
   waiting: { dot: "var(--st-wait)", text: "Needs you" },
+  /** A wait on a trigger (`wait_for_event`), not on the user. See `chatStatus`. */
+  parked: { dot: "var(--st-idle)", text: "Waiting" },
   idle: { dot: "var(--st-idle)", text: "Idle" },
   done: { dot: "var(--st-done)", text: "Done" },
   stopped: { dot: "var(--st-stop)", text: "Stopped" },
@@ -86,6 +89,25 @@ export const ST: Record<string, { dot: string; text: string }> = {
 const IDLE = { dot: "var(--st-idle)", text: "Idle" };
 const PAUSED = { dot: "var(--st-pause)", text: "Paused" };
 export const statusOf = (status: string, paused: boolean) => (paused ? PAUSED : ST[status] ?? IDLE);
+
+/** True for a chat parked on an external trigger (`wait_for_event`). The backend
+ *  reports it as `status: "waiting"` with `waiting_kind: "wake"` — the same shape
+ *  a chat waiting on the user has — so every surface that colours or labels a
+ *  chat has to tell the two apart. */
+export const isParked = (t: { status: string; waiting_kind?: string | null }) =>
+  t.status === "waiting" && t.waiting_kind === "wake";
+
+/** The status a chat is drawn by, everywhere a chat summary is shown.
+ *
+ *  A chat parked by `wait_for_event` is waiting on a timer, a CI run or a PR.
+ *  That is nobody's problem: nothing is running, and the background watcher wakes
+ *  it on its own. Read as the raw `waiting` status it wore the red "Needs you" of
+ *  a blocking question — a red dot pulsing next to a chat that had nothing to
+ *  answer and no way for the user to lift the wait. `parked` is its own status:
+ *  quiet and still, still labelled "Waiting", as the sidebar's badge already
+ *  said in words. */
+export const chatStatus = (t: { status: string; waiting_kind?: string | null }) =>
+  isParked(t) ? "parked" : t.status;
 
 /**
  * The glyph for work that is not moving because the chat is frozen: a solid

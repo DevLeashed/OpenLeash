@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // async open rejects after the assertions have already run.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string) => {
+    if (cmd === "task_open") return { summary: { id: "a", title: "A" }, items: [], bg: [], cursor: null, total: 0 };
     if (cmd === "task_get") return { summary: { id: "a", title: "A" }, items: [], bg: [], subs: [] };
     return null;
   }),
@@ -14,12 +15,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { back, forward, get, go, set } from "./store";
+import { invoke } from "@tauri-apps/api/core";
 
 // Back/Forward as a pair. The Forward button shipped as a dead <span>, so the
 // only thing that had ever been exercised was `hist` growing and shrinking;
 // these are the invariants that make the arrow worth having at all.
 describe("back and forward", () => {
   beforeEach(() => {
+    vi.mocked(invoke).mockClear();
     set({ hist: [], fwd: [], view: "home", task: null });
   });
 
@@ -57,9 +60,11 @@ describe("back and forward", () => {
     expect(get().task).toBe("b");
     back();
     expect(get().task).toBe("a");
+    expect(invoke).toHaveBeenCalledWith("task_open", { id: "a" });
 
     forward();
     expect(get().task).toBe("b");
+    expect(invoke).toHaveBeenCalledWith("task_open", { id: "b" });
     forward();
     expect(get().view).toBe("settings");
     expect(get().fwd, "nothing left ahead").toHaveLength(0);

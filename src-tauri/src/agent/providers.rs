@@ -437,9 +437,13 @@ pub fn parse_codex_models(v: &Value) -> Vec<ModelInfo> {
 
 /// Parse OpenCode Go's `/zen/go/v1/models` into subscription model infos.
 ///
-/// The payload is the plain OpenAI list shape — `{"data": [{"id": …}]}` — with
-/// no context window, no reasoning levels and no price: everything the app
-/// needs to send a working request has to be filled in here. Two things matter:
+/// The payload is the plain OpenAI list shape — `{"data": [{"id": …}]}` — usually
+/// with no context window, no reasoning levels and no price: everything the app
+/// needs to send a working request has to be filled in here. However, when the
+/// response DOES include metadata (context_length, max_output_tokens, etc.), we
+/// extract it so the smart config gets real values instead of guesses.
+///
+/// Two things matter:
 ///
 /// - the name is tidied from the id, because Go returns `kimi-k3`, not `Kimi K3`;
 /// - the wire protocol is decided per model, exactly as the live path does it
@@ -454,7 +458,11 @@ pub fn parse_go_models(v: &Value) -> Vec<ModelInfo> {
             if id.is_empty() {
                 return None;
             }
-            let name = go_model_name(&id);
+            let name = x["display_name"]
+                .as_str()
+                .or(x["name"].as_str())
+                .map(String::from)
+                .unwrap_or_else(|| go_model_name(&id));
             let mut mi = m(
                 "opencode-go",
                 &id,
@@ -465,6 +473,31 @@ pub fn parse_go_models(v: &Value) -> Vec<ModelInfo> {
                 0.0,
                 true,
             );
+            // Extract context window from API response when available
+            if let Some(ctx) = x["context_length"]
+                .as_u64()
+                .or(x["context_window"].as_u64())
+                .or(x["max_input_tokens"].as_u64())
+            {
+                mi.context = ctx;
+            }
+            // Extract max output tokens from API response when available
+            if let Some(out) = x["max_output_tokens"].as_u64().or(x["max_tokens"].as_u64()) {
+                mi.output = out;
+            }
+            // Extract reasoning levels from API response when available
+            if let Some(levels) = x["supported_reasoning_levels"]
+                .as_array()
+                .or(x["reasoning_levels"].as_array())
+            {
+                let extracted: Vec<String> = levels
+                    .iter()
+                    .filter_map(|l| l["effort"].as_str().or(l.as_str()).map(String::from))
+                    .collect();
+                if !extracted.is_empty() {
+                    mi.reasoning_levels = extracted;
+                }
+            }
             // Go bills the subscription, not the token, so the price fields stay 0
             // (as Zen's do) and `model_info` reports it free — the spend screen is
             // fed by the account's own usage windows instead.
@@ -533,10 +566,17 @@ fn go_context(id: &str) -> u64 {
         272_000
     } else if m.starts_with("glm") || m.starts_with("mimo") || m.starts_with("muse") {
         200_000
+    } else if m.starts_with("longcat") {
+        // LongCat models (Meituan) have 1M context
+        1_000_000
+    } else if m.starts_with("deepseek") {
+        128_000
+    } else if m.starts_with("minimax") {
+        200_000
     } else {
-        // DeepSeek, MiniMax, LongCat, Hy and anything new: the smallest of the
-        // plausible windows. Guessing high is the dangerous direction — it lets
-        // a conversation grow past what the model accepts before compaction.
+        // Hy and anything new: the smallest of the plausible windows. Guessing
+        // high is the dangerous direction — it lets a conversation grow past
+        // what the model accepts before compaction.
         128_000
     }
 }
@@ -1449,6 +1489,15 @@ fn looks_quota(s: &str) -> bool {
     .any(|k| l.contains(k))
 }
 
+/// The gateway saying its own upstream endpoint is down. It wraps this in
+/// whatever status it likes (a 429 or a 4xx), so it is matched by message, not
+/// by code. This is the one failure worth a few extra resends instead of
+/// cooling the account and pausing the whole chain.
+pub(crate) fn looks_endpoint_unavailable(s: &str) -> bool {
+    let l = s.to_lowercase();
+    l.contains("endpoint is unavailable") || l.contains("endpoint unavailable")
+}
+
 /// Seconds until reset from the usual places a 429 hides them.
 fn reset_at(headers: &reqwest::header::HeaderMap, body: &Value) -> i64 {
     let h = |k: &str| {
@@ -1518,6 +1567,10 @@ pub fn classify(status: u16, body: &str, headers: &reqwest::header::HeaderMap) -
         if detail.is_empty() { kind } else { &detail }
     );
     match status {
+        // A gateway that wraps "upstream is down" in a 429 is not rate limiting
+        // this account: cooling it and moving on strands the whole chain until
+        // the retry-after. Retry the same target instead.
+        429 if looks_endpoint_unavailable(&detail) => Transient(msg),
         429 => Exhausted {
             until: reset_at(headers, &v),
             hard: looks_quota(&detail) || looks_quota(kind),
@@ -1541,6 +1594,9 @@ pub fn classify(status: u16, body: &str, headers: &reqwest::header::HeaderMap) -
         }
         413 => TooLong(msg),
         400 | 404 | 422 if looks_too_long(&detail) => TooLong(msg),
+        // The same blip as the 429 above, wrapped in a 4xx: keep it off
+        // `rejects_request` so it is retried instead of failed fast.
+        400 | 404 | 422 if looks_endpoint_unavailable(&detail) => Transient(msg),
         400 | 404 | 422 => Bad(msg),
         s if s >= 500 || s == 408 || s == 409 => Transient(msg),
         _ => Bad(msg),
@@ -1991,10 +2047,10 @@ async fn anthropic(
             }
             "message_stop" => done = true,
             "error" => {
-                let msg = ev["error"]["message"]
-                    .as_str()
-                    .unwrap_or("stream error")
-                    .to_string();
+                // Scrubbed like `classify` does for HTTP bodies: a gateway that
+                // reflects the request can put the key in a stream error too,
+                // and this text is shown and saved into the task.
+                let msg = scrub_secrets(ev["error"]["message"].as_str().unwrap_or("stream error"));
                 return Err(match ev["error"]["type"].as_str().unwrap_or("") {
                     "rate_limit_error" => Exhausted {
                         hard: looks_quota(&msg),
@@ -2259,7 +2315,7 @@ async fn codex(
                 } else {
                     &ev
                 };
-                let msg = e["message"].as_str().unwrap_or("codex error").to_string();
+                let msg = scrub_secrets(e["message"].as_str().unwrap_or("codex error"));
                 let code = e["code"].as_str().or(e["type"].as_str()).unwrap_or("");
                 return Err(
                     if code.contains("usage_limit")
@@ -2319,7 +2375,37 @@ async fn codex(
     })
 }
 
-fn to_openai_messages(system: &str, msgs: &[Message]) -> Vec<Value> {
+/// Does this target's thinking mode enforce a `reasoning_content` round-trip on
+/// every replayed assistant turn?
+///
+/// DeepSeek is the one that documents it: with `tools` in the request — which
+/// an agent sends on every call — each prior assistant turn's chain of thought
+/// must be echoed back, and a turn that arrives without one is a hard 400
+/// ("The `reasoning_content` in the thinking mode must be passed back to the
+/// API"). Nothing else in the catalog rejects the field, and sending it to a
+/// provider that doesn't expect it risks the opposite failure, so this stays a
+/// deliberate allow-list rather than "every OpenAI-shaped endpoint".
+///
+/// Matched on the provider *and* the wire model name, because the model name is
+/// what the upstream gateway routes on: the same broken replay reaches DeepSeek
+/// through a gateway whose own id says nothing about it. OpenCode Zen/Go list
+/// `deepseek-v4.1-flash` among many other vendors' models, and a custom endpoint
+/// can point at api.deepseek.com under any name the user likes.
+fn needs_reasoning_replay(prov: &str, model: &str) -> bool {
+    let named = |s: &str| s.to_ascii_lowercase().contains("deepseek");
+    named(prov) || named(model)
+}
+
+/// History → Chat Completions.
+///
+/// `reasoning_model` is the wire model to round-trip `reasoning_content` for,
+/// or `None` when the target does not want it (see `needs_reasoning_replay`).
+/// It is a model rather than a flag because the field is per-message and
+/// per-model: reasoning another model produced is not replayed to this one, the
+/// same rule `anthropic_messages` applies to foreign thinking blocks, since a
+/// chain of thought carries no meaning across models and signing/verification
+/// only ever covers the model that wrote it.
+fn to_openai_messages(system: &str, msgs: &[Message], reasoning_model: Option<&str>) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for m in msgs {
         if m.role == "assistant" {
@@ -2337,35 +2423,55 @@ fn to_openai_messages(system: &str, msgs: &[Message]) -> Vec<Value> {
                 .map(|b| json!({"id": b["id"], "type": "function", "function": {"name": b["name"], "arguments": b["input"].to_string()}}))
                 .collect();
             let mut msg = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) }});
+            if let Some(model) = reasoning_model {
+                // Present on *every* assistant turn, and never omitted or null.
+                // The provider checks each message, so a turn with nothing to
+                // contribute — one that predates a mid-chat switch onto this
+                // model, say — still has to carry the field. An empty string is
+                // what DeepSeek's own docs and the clients that fixed this
+                // (opencode #24104/#24250) settled on for exactly that case:
+                // it satisfies the check without attributing reasoning the
+                // model never produced.
+                let thinking = if m.model == model {
+                    m.content
+                        .iter()
+                        .filter(|b| b["type"] == "thinking")
+                        .filter_map(|b| b["thinking"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                } else {
+                    String::new()
+                };
+                msg["reasoning_content"] = json!(thinking);
+            }
             if !calls.is_empty() {
                 msg["tool_calls"] = json!(calls);
+            } else if text.is_empty() {
+                // Nothing this API can carry (a thinking-only turn, e.g. one
+                // that spent its whole output budget reasoning). `content: null`
+                // without `tool_calls` is a 400 here, so the turn is left out.
+                // Dropping it cannot break the round-trip above: a turn nobody
+                // sent is not a turn the provider can find missing a field.
+                continue;
             }
             out.push(msg);
         } else {
             let mut texts = vec![];
             let mut parts = vec![];
+            // Images from tool results. A `tool` message may only hold text,
+            // so these ride in a user message after the results (which have to
+            // directly follow the assistant's calls).
+            let mut shots = vec![];
             for b in &m.content {
                 match b["type"].as_str() {
                     Some("tool_result") => {
-                        let images = tool_result_images(b);
-                        if images.is_empty() {
-                            out.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": tool_result_text(b)}));
-                        } else {
-                            // Chat-completions tool messages accept array content:
-                            // text + image_url parts in the same message.
-                            let mut parts = vec![];
-                            let txt = tool_result_text(b);
-                            if !txt.is_empty() {
-                                parts.push(json!({"type": "text", "text": txt}));
-                            }
-                            for (mt, data) in images {
-                                parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mt};base64,{data}")}}));
-                            }
-                            out.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": parts}));
+                        out.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": tool_result_text(b)}));
+                        for (mt, data) in tool_result_images(b) {
+                            shots.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mt};base64,{data}")}}));
                         }
                     }
                     Some("text") => texts.push(b["text"].as_str().unwrap_or("").to_string()),
-                    // Images the user pasted (or a sub-agent was handed) live
+                    // Images the user pasted (or a subagent was handed) live
                     // directly on a user turn. Without this they were dropped
                     // silently here, so the model only ever saw the caption.
                     Some("image") => {
@@ -2378,6 +2484,12 @@ fn to_openai_messages(system: &str, msgs: &[Message]) -> Vec<Value> {
             }
             if !texts.is_empty() {
                 parts.insert(0, json!({"type": "text", "text": texts.join("\n\n")}));
+            }
+            if !shots.is_empty() {
+                parts.push(
+                    json!({"type": "text", "text": "(Images returned by the tool calls above.)"}),
+                );
+                parts.extend(shots);
             }
             if !parts.is_empty() {
                 // A user turn carrying only images (no caption) still has to
@@ -2532,7 +2644,11 @@ async fn openai_compat(
     let mut body = json!({
         "model": t.model,
         "stream": true,
-        "messages": to_openai_messages(&req.system, &req.messages),
+        "messages": to_openai_messages(
+            &req.system,
+            &req.messages,
+            needs_reasoning_replay(prov, &t.model).then_some(t.model.as_str()),
+        ),
     });
     if !local {
         body["stream_options"] = json!({"include_usage": true});
@@ -2590,6 +2706,14 @@ async fn openai_compat(
     let resp = send(rb.json(&body), cancel, hdrs).await?;
 
     let mut text = String::new();
+    // DeepSeek's thinking mode requires each assistant turn's chain of thought
+    // to be sent back on every later request *that carries `tools`* — which an
+    // agent's every request does. Dropping it is a hard 400, not a quality
+    // loss, and it is what made a mid-chat switch onto a DeepSeek model fail:
+    // the turns before the switch carry no reasoning at all, so the replay has
+    // to be able to supply one. Accumulated here and folded into the turn
+    // below, because that turn is what the replayed history is built from.
+    let mut reasoning = String::new();
     // index -> (id, name, args)
     let mut calls: Vec<(String, String, String)> = vec![];
     let mut usage = TurnUsage::default();
@@ -2605,10 +2729,12 @@ async fn openai_compat(
         };
         any = true;
         if let Some(e) = ev.get("error").filter(|e| !e.is_null()) {
-            let msg = e["message"]
-                .as_str()
-                .map(String::from)
-                .unwrap_or_else(|| e.to_string());
+            let msg = scrub_secrets(
+                &e["message"]
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| e.to_string()),
+            );
             return Err(if looks_too_long(&msg) {
                 TooLong(msg)
             } else if looks_quota(&msg) {
@@ -2643,6 +2769,7 @@ async fn openai_compat(
         let d = &ch["delta"];
         for k in ["reasoning_content", "reasoning"] {
             if let Some(s) = d[k].as_str() {
+                reasoning.push_str(s);
                 on(StreamEvent::Thinking(s.into()));
             }
         }
@@ -2688,6 +2815,14 @@ async fn openai_compat(
     require_stream_finish(&finish)?;
 
     let mut content = vec![];
+    // The reasoning rides *inside* the turn's content as its own block, ahead
+    // of the text: every backend's shaper then decides for itself whether it
+    // survives the trip back. Anthropic already drops foreign thinking blocks
+    // this way (`anthropic_messages`), and Chat Completions reads it back out
+    // as `reasoning_content` in `to_openai_messages`.
+    if !reasoning.is_empty() {
+        content.push(json!({"type": "thinking", "thinking": reasoning}));
+    }
     if !text.is_empty() {
         content.push(json!({"type": "text", "text": text}));
     }
@@ -2743,11 +2878,27 @@ pub fn budget_tokens(level: &str) -> u64 {
 }
 
 fn remote_model(m: &Value, provider: &str) -> Option<Value> {
+    let context = m["context_length"]
+        .as_u64()
+        .or(m["max_input_tokens"].as_u64())
+        .or(m["context_window"].as_u64())
+        .or(m
+            .pointer("/top_provider/context_length")
+            .and_then(|x| x.as_u64()));
+    let output = m["max_tokens"]
+        .as_u64()
+        .or(m["max_output_tokens"].as_u64())
+        .or(m
+            .pointer("/top_provider/max_completion_tokens")
+            .and_then(|x| x.as_u64()));
+    // `guessed` is true when the API did not provide context or output —
+    // the smart config will fall back to heuristics and should warn the user.
+    let guessed = context.is_none() && output.is_none();
     Some(json!({
         "id": m["id"].as_str().or(m["name"].as_str()).filter(|s| !s.is_empty())?,
         "name": m["display_name"].as_str().or(m["name"].as_str()).unwrap_or(""),
-        "context": m["context_length"].as_u64().or(m["max_input_tokens"].as_u64()).or(m.pointer("/top_provider/context_length").and_then(|x| x.as_u64())),
-        "output": m["max_tokens"].as_u64().or(m.pointer("/top_provider/max_completion_tokens").and_then(|x| x.as_u64())),
+        "context": context,
+        "output": output,
         "input_price": m.pointer("/pricing/prompt").and_then(|x| x.as_str()).and_then(|x| x.parse::<f64>().ok()).map(|x| x * 1e6),
         "output_price": m.pointer("/pricing/completion").and_then(|x| x.as_str()).and_then(|x| x.parse::<f64>().ok()).map(|x| x * 1e6),
         "modalities": m.pointer("/architecture/input_modalities").cloned(),
@@ -2757,7 +2908,71 @@ fn remote_model(m: &Value, provider: &str) -> Option<Value> {
         "reasoning_effort": m.get("reasoning_effort"),
         "provider": provider,
         "supported_parameters": m.get("supported_parameters"),
+        "guessed": guessed,
     }))
+}
+
+/// Fetch details for a single model from the provider's API.
+///
+/// Some providers (OpenAI, OpenCode Go) return only model IDs from their list
+/// endpoint. This tries `GET /models/{id}` and `GET /v1/models/{id}` to get
+/// per-model metadata. Returns the raw JSON response, or an error string.
+pub async fn model_detail(
+    http: &reqwest::Client,
+    settings: &Settings,
+    prov: &str,
+    model: &str,
+) -> Result<Value, String> {
+    let key = api_key(settings, prov);
+    let base = base_url(settings, prov);
+    if base.is_empty() {
+        return Err("This provider has no base URL.".into());
+    }
+    let anth = kind(settings, prov) == "anthropic";
+    // Try both `/models/{id}` and `/v1/models/{id}` — providers differ.
+    let urls = if anth {
+        vec![format!("{base}/v1/models/{model}")]
+    } else {
+        vec![
+            format!("{base}/models/{model}"),
+            format!("{base}/v1/models/{model}"),
+        ]
+    };
+    let mut last_err = String::new();
+    for url in urls {
+        let mut rb = http.get(&url).timeout(std::time::Duration::from_secs(15));
+        if anth {
+            rb = rb
+                .header("x-api-key", &key)
+                .header("anthropic-version", "2023-06-01");
+        } else if !key.is_empty() {
+            rb = rb.bearer_auth(&key);
+        }
+        match rb.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(v) = resp.json::<Value>().await {
+                    return Ok(v);
+                }
+            }
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                last_err = resp
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/error/message")
+                            .and_then(|m| m.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or_else(|| format!("HTTP {status}"));
+            }
+            Err(e) => {
+                last_err = format!("request failed: {e}");
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// List model ids a provider serves (`GET /models`), for the add-model picker.
@@ -2898,6 +3113,57 @@ mod wire_tests {
         assert_eq!(wire(&s, "opencode-go", "qwen3.7-plus"), "anthropic");
         assert_eq!(wire(&s, "opencode-go", "grok-4.7"), "responses");
         assert_eq!(wire(&s, "opencode-go", "kimi-k3"), "openai");
+    }
+
+    /// LongCat models have 1M context, not the 128K fallback.
+    #[test]
+    fn go_context_longcat_has_full_window() {
+        assert_eq!(go_context("longcat-2.5-preview"), 1_000_000);
+        assert_eq!(go_context("longcat-2.0"), 1_000_000);
+        assert_eq!(go_context("longcat-flash"), 1_000_000);
+    }
+
+    /// `parse_go_models` extracts context, output, and reasoning from the API
+    /// response when available, instead of always falling back to guesses.
+    #[test]
+    fn parse_go_models_extracts_metadata_when_present() {
+        // When Go returns rich metadata, use it
+        let list = json!({"data": [{"id": "longcat-2.5-preview", "context_length": 1000000, "max_output_tokens": 128000, "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]}]});
+        let models = parse_go_models(&list);
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.context, 1_000_000, "context from API");
+        assert_eq!(m.output, 128_000, "output from API");
+        assert_eq!(
+            m.reasoning_levels,
+            vec!["low", "high"],
+            "reasoning from API"
+        );
+    }
+
+    /// When Go returns only IDs (the usual case), fall back to family heuristics.
+    #[test]
+    fn parse_go_models_falls_back_to_heuristics() {
+        let list = json!({"data": [{"id": "longcat-2.5-preview"}]});
+        let models = parse_go_models(&list);
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.context, 1_000_000, "LongCat heuristic");
+        assert_eq!(m.output, 32_000, "default output");
+    }
+
+    /// `remote_model` flags models whose context/output are not in the API response.
+    #[test]
+    fn remote_model_flags_guessed_models() {
+        // No context/output in response → guessed
+        let v = json!({"id": "gpt-5", "object": "model"});
+        let rm = remote_model(&v, "openai").unwrap();
+        assert_eq!(rm["guessed"], json!(true), "should be flagged as guessed");
+
+        // Has context and output → not guessed
+        let v = json!({"id": "gpt-5", "context_length": 400000, "max_tokens": 128000});
+        let rm = remote_model(&v, "openai").unwrap();
+        assert_eq!(rm["guessed"], json!(false), "has real values");
     }
 
     /// The three account kinds differ in one way that decides which host a
@@ -3129,6 +3395,68 @@ mod tests {
             .any(|event| matches!(event, StreamEvent::Text(text) if text == "partial")));
     }
 
+    /// A stream `error` event is user-visible and persisted, exactly like an
+    /// HTTP error body, so it gets the same secret scrubbing.
+    #[tokio::test]
+    async fn anthropic_stream_error_is_scrubbed() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad header Authorization: Bearer sk-ant-dummy0123456789abcdef\"}}\n\n";
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let mut settings = Settings::default();
+        settings
+            .custom_providers
+            .push(super::super::store::CustomProvider {
+                id: "mock-anthropic".into(),
+                kind: "anthropic".into(),
+                base_url: format!("http://{address}"),
+                name: "Mock Anthropic".into(),
+                insist: false,
+            });
+        let target = Target {
+            model_id: "mock-anthropic/test".into(),
+            prov: "mock-anthropic".into(),
+            model: "test".into(),
+            account: None,
+            api_key: Some("test-key".into()),
+        };
+        let req = ChatRequest {
+            system: "system".into(),
+            messages: vec![Message::user_text("hello")],
+            tools: vec![],
+            effort: 2,
+            max_tokens: 100,
+            cache_key: "test".into(),
+        };
+        let mut on = |_| {};
+        let result = anthropic(
+            &reqwest::Client::new(),
+            &settings,
+            &target,
+            &req,
+            &mut on,
+            &CancellationToken::new(),
+            &mut None,
+        )
+        .await;
+        let Err(Fail::Bad(msg)) = result else {
+            panic!("expected Bad, got {:?}", result.err());
+        };
+        assert!(!msg.contains("sk-ant-dummy"), "{msg}");
+        assert!(msg.contains("<redacted>"), "{msg}");
+    }
+
     #[tokio::test]
     async fn openai_compatible_streams_retry_clean_eof_after_partial_output() {
         use tokio::io::AsyncWriteExt;
@@ -3204,6 +3532,242 @@ mod tests {
         for finish in ["stop", "length", "tool_calls"] {
             assert!(require_stream_finish(finish).is_ok());
         }
+    }
+
+    /// The regression this whole change exists for. DeepSeek's thinking mode
+    /// rejects a replayed history in which any assistant turn lacks
+    /// `reasoning_content` while the request carries `tools` — an agent sends
+    /// tools on every call, so the first tool loop after switching onto a
+    /// DeepSeek model used to die with HTTP 400 and only recover on a resume.
+    ///
+    /// It fails before the change: the shaper neither read the reasoning back
+    /// out of the turn nor had a field to put it in, so the replayed assistant
+    /// messages carried `tool_calls` alone.
+    #[test]
+    fn deepseek_history_round_trips_reasoning_content() {
+        // What a turn on a DeepSeek model now stores: the reasoning block the
+        // chat/completions reader folds in, ahead of the text and the calls.
+        let msgs = vec![
+            Message::user_text("what changed?"),
+            Message {
+                role: "assistant".into(),
+                content: vec![
+                    json!({"type":"thinking","thinking":"Check the diff first."}),
+                    json!({"type":"text","text":"Let me look."}),
+                    json!({"type":"tool_use","id":"c1","name":"bash","input":{"command":"git diff"}}),
+                ],
+                model: "deepseek-v4.1-flash".into(),
+            },
+            Message::user(vec![
+                json!({"type":"tool_result","tool_use_id":"c1","content":"+1 -1"}),
+            ]),
+            Message {
+                role: "assistant".into(),
+                content: vec![
+                    json!({"type":"thinking","thinking":"That is the whole change."}),
+                    json!({"type":"text","text":"One line changed."}),
+                ],
+                model: "deepseek-v4.1-flash".into(),
+            },
+        ];
+        let o = to_openai_messages("sys", &msgs, Some("deepseek-v4.1-flash"));
+        let asst: Vec<&Value> = o.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(asst.len(), 2, "both turns replay: {o:?}");
+        assert_eq!(
+            asst[0]["reasoning_content"], "Check the diff first.",
+            "the turn that called the tool must carry its reasoning"
+        );
+        assert_eq!(asst[1]["reasoning_content"], "That is the whole change.");
+        // The reasoning must not be smuggled into `content`: DeepSeek reads the
+        // two fields separately, and a model that saw its own thoughts as the
+        // answer would answer the thoughts.
+        assert_eq!(asst[0]["content"], "Let me look.");
+        assert_eq!(asst[0]["tool_calls"][0]["function"]["name"], "bash");
+        // Nothing is sent to a backend that did not ask for it.
+        let plain = to_openai_messages("sys", &msgs, None);
+        assert!(
+            plain.iter().all(|m| m.get("reasoning_content").is_none()),
+            "no reasoning field without a DeepSeek target: {plain:?}"
+        );
+    }
+
+    /// The mid-chat-swap case, which is how this was hit: the user picks a
+    /// DeepSeek model part-way through a chat, so the turns already in the
+    /// history were produced by a *different* model and have no reasoning to
+    /// replay. The provider checks each message, so those turns still have to
+    /// carry the field — an absent one is the 400.
+    ///
+    /// They carry an empty string rather than a foreign model's reasoning: a
+    /// chain of thought is not transferable between models (the same reason
+    /// `anthropic_messages` drops a thinking block whose producing model does
+    /// not match), and DeepSeek's docs and the clients that fixed this use `""`
+    /// for exactly this case.
+    #[test]
+    fn a_swapped_in_deepseek_chat_fills_in_its_older_turns() {
+        let msgs = vec![
+            Message::user_text("do the thing"),
+            Message {
+                role: "assistant".into(),
+                // Another model's turn: reasoning it wrote, under its own name.
+                content: vec![
+                    json!({"type":"thinking","thinking":"gpt thinking","signature":"sig"}),
+                    json!({"type":"tool_use","id":"c1","name":"bash","input":{"command":"ls"}}),
+                ],
+                model: "openrouter/free".into(),
+            },
+            Message::user(vec![
+                json!({"type":"tool_result","tool_use_id":"c1","content":"a.rs"}),
+            ]),
+            Message {
+                role: "assistant".into(),
+                content: vec![
+                    json!({"type":"tool_use","id":"c2","name":"read_file","input":{"path":"a.rs"}}),
+                ],
+                model: "deepseek-v4.1-flash".into(),
+            },
+            Message::user(vec![
+                json!({"type":"tool_result","tool_use_id":"c2","content":"fn main() {}"}),
+            ]),
+        ];
+        let o = to_openai_messages("sys", &msgs, Some("deepseek-v4.1-flash"));
+        let asst: Vec<&Value> = o.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(asst.len(), 2);
+        // Present, and empty — not missing, and not the other model's words.
+        assert_eq!(
+            asst[0]["reasoning_content"], "",
+            "a pre-swap turn satisfies the check without borrowing foreign reasoning"
+        );
+        assert_eq!(asst[1]["reasoning_content"], "");
+        // A turn that only reasoned and said nothing has no text to send, so it
+        // is still dropped — an absent turn cannot be missing a field.
+        let bare = vec![
+            Message::user_text("hi"),
+            Message {
+                role: "assistant".into(),
+                content: vec![json!({"type":"thinking","thinking":"hm","signature":"s"})],
+                model: "deepseek-v4.1-flash".into(),
+            },
+            Message::user_text("go on"),
+        ];
+        let o = to_openai_messages("sys", &bare, Some("deepseek-v4.1-flash"));
+        assert!(o.iter().all(|m| m["role"] != "assistant"), "{o:?}");
+    }
+
+    /// Which targets get the round-trip is a decision, not "anything that looks
+    /// OpenAI-shaped": sending `reasoning_content` to a provider that does not
+    /// model it is the mirror-image risk of omitting it where it is required.
+    #[test]
+    fn only_deepseek_targets_enforce_the_reasoning_round_trip() {
+        // Matched on the provider id…
+        assert!(needs_reasoning_replay("deepseek", "deepseek-chat"));
+        // …and on the model name, because a gateway's own id says nothing about
+        // which upstream model it routes to. This is the id shape that was
+        // actually failing: OpenCode Go lists DeepSeek among many vendors.
+        assert!(needs_reasoning_replay("opencode-go", "deepseek-v4.1-flash"));
+        assert!(needs_reasoning_replay(
+            "openrouter",
+            "deepseek/deepseek-v4-pro"
+        ));
+        // A custom endpoint pointed at api.deepseek.com under any name the user
+        // chose is covered by the provider slug it gets, and by the model name.
+        assert!(needs_reasoning_replay("my-deepseek-proxy", "anything"));
+        // Case does not matter: model ids are not case-normalised anywhere else.
+        assert!(needs_reasoning_replay("opencode-go", "DeepSeek-V4.1-Flash"));
+        // Everything else is left alone.
+        assert!(!needs_reasoning_replay("anthropic", "claude-opus-5"));
+        assert!(!needs_reasoning_replay("opencode-go", "kimi-k3"));
+        assert!(!needs_reasoning_replay("openai", "gpt-6-luna"));
+        assert!(!needs_reasoning_replay("openrouter", "z-ai/glm-5.3"));
+    }
+
+    /// The reader side: reasoning that streams in has to end up *in the turn*,
+    /// not only on its way to the UI. Streaming it to the transcript and
+    /// dropping it from `content` is what left nothing to replay.
+    #[tokio::test]
+    async fn streamed_reasoning_is_kept_on_the_turn() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Two reasoning deltas, a text delta, and a complete stream.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Think \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first.\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        let mut settings = Settings::default();
+        settings.providers.insert(
+            "mock".into(),
+            super::super::store::ProviderCfg {
+                base_url: format!("http://{address}/v1"),
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let target = Target {
+            model_id: "mock/deepseek-v4.1-flash".into(),
+            prov: "mock".into(),
+            model: "deepseek-v4.1-flash".into(),
+            account: None,
+            api_key: Some("test-key".into()),
+        };
+        let req = ChatRequest {
+            system: "system".into(),
+            messages: vec![Message::user_text("hello")],
+            tools: vec![],
+            effort: 2,
+            max_tokens: 100,
+            cache_key: "test".into(),
+        };
+        let mut events = vec![];
+        let mut on = |event| events.push(event);
+        let turn = openai_compat(
+            &reqwest::Client::new(),
+            &settings,
+            &target,
+            &req,
+            &mut on,
+            &CancellationToken::new(),
+            &mut None,
+        )
+        .await
+        .expect("the stream completes");
+
+        assert_eq!(
+            turn.content
+                .iter()
+                .find(|b| b["type"] == "thinking")
+                .and_then(|b| b["thinking"].as_str()),
+            Some("Think first."),
+            "the reasoning is part of the turn: {:?}",
+            turn.content
+        );
+        assert_eq!(
+            turn.content
+                .iter()
+                .find(|b| b["type"] == "text")
+                .and_then(|b| b["text"].as_str()),
+            Some("Done.")
+        );
+        // Still streamed to the UI as it arrives, not swallowed.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Thinking(s) if s == "Think ")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Text(s) if s == "Done.")));
     }
 
     #[test]
@@ -3446,6 +4010,15 @@ mod tests {
             classify(429, r#"{"error":{"message":"slow down"}}"#, &h),
             Fail::Exhausted { hard: false, .. }
         ));
+        // A gateway 429 that is really "upstream is down", not a rate limit.
+        assert!(matches!(
+            classify(
+                429,
+                r#"{"error":{"message":"Upstream request failed: Endpoint is unavailable."}}"#,
+                &h
+            ),
+            Fail::Transient(_)
+        ));
         assert!(matches!(
             classify(
                 400,
@@ -3456,6 +4029,20 @@ mod tests {
         ));
         assert!(matches!(
             classify(404, r#"{"error":{"message":"model not found"}}"#, &h),
+            Fail::Bad(_)
+        ));
+        // A gateway blaming the upstream, not the request: retryable.
+        assert!(matches!(
+            classify(
+                400,
+                r#"{"error":{"message":"endpoint is unavailable"}}"#,
+                &h
+            ),
+            Fail::Transient(_)
+        ));
+        // ...but only that exact blip: an ordinary 4xx stays a hard reject.
+        assert!(matches!(
+            classify(404, r#"{"error":{"message":"no channel available"}}"#, &h),
             Fail::Bad(_)
         ));
         assert!(matches!(
@@ -3636,16 +4223,38 @@ mod tests {
             a[2]["content"][0]["content"][1]["source"]["media_type"],
             "image/png"
         );
-        // OpenAI-compat: one tool message with text + image_url parts.
-        let o = to_openai_messages("sys", &msgs);
-        let tm = o.iter().find(|m| m["role"] == "tool").unwrap();
+        // OpenAI-compat: a `tool` message may only carry text, so the result
+        // stays text and the image follows in a user message (as for Codex).
+        let o = to_openai_messages("sys", &msgs, None);
+        let ti = o.iter().position(|m| m["role"] == "tool").unwrap();
+        let tm = &o[ti];
         assert_eq!(tm["tool_call_id"], "c1");
-        assert_eq!(tm["content"][0]["type"], "text");
-        assert_eq!(tm["content"][1]["type"], "image_url");
-        assert!(tm["content"][1]["image_url"]["url"]
+        assert!(tm["content"].is_string(), "{:?}", tm["content"]);
+        let um = &o[ti + 1];
+        assert_eq!(um["role"], "user");
+        let img = um["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .expect("the image survives");
+        assert!(img["image_url"]["url"]
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,"));
+        // A thinking-only assistant turn would be `content: null` with no
+        // calls, which Chat Completions rejects: it is left out instead.
+        let thinking = vec![
+            Message::user_text("hi"),
+            Message {
+                role: "assistant".into(),
+                content: vec![json!({"type":"thinking","thinking":"hm","signature":"s"})],
+                model: String::new(),
+            },
+            Message::user_text("go on"),
+        ];
+        let o = to_openai_messages("sys", &thinking, None);
+        assert!(o.iter().all(|m| m["role"] != "assistant"), "{o:?}");
         // Codex: text stays in function_call_output, image follows as a user message.
         let c = codex_input(&msgs);
         assert_eq!(c[1]["type"], "function_call");
@@ -3654,7 +4263,7 @@ mod tests {
         assert_eq!(c[3]["content"][0]["type"], "input_image");
     }
 
-    /// Images the user pasted (or a parent agent handed a sub-agent) sit
+    /// Images the user pasted (or a parent agent handed a subagent) sit
     /// directly on a user turn. They used to be dropped silently on every
     /// non-Anthropic backend, so the model only ever saw the caption.
     #[test]
@@ -3665,7 +4274,7 @@ mod tests {
             json!({"type": "text", "text": "why is this broken?"}),
         ])];
         // OpenAI-compat (openrouter / openai / google / zai / opencode).
-        let o = to_openai_messages("sys", &with_text);
+        let o = to_openai_messages("sys", &with_text, None);
         let um = o
             .iter()
             .find(|m| m["role"] == "user")
@@ -3679,7 +4288,7 @@ mod tests {
             .unwrap()
             .starts_with("data:image/png;base64,"));
         // An image with no caption at all still has to become a message.
-        let o2 = to_openai_messages("sys", &[Message::user(vec![img])]);
+        let o2 = to_openai_messages("sys", &[Message::user(vec![img])], None);
         let um2 = o2
             .iter()
             .find(|m| m["role"] == "user")
@@ -3690,7 +4299,7 @@ mod tests {
             um2["content"]
         );
         // A text-only turn stays a plain string (unchanged behaviour).
-        let o3 = to_openai_messages("sys", &[Message::user_text("just text")]);
+        let o3 = to_openai_messages("sys", &[Message::user_text("just text")], None);
         assert_eq!(o3[1]["content"], "just text");
         // Codex / Responses API: its own user message with input_image.
         let c = codex_input(&with_text);

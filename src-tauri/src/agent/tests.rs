@@ -6,9 +6,10 @@
 //! AGENTS.md: do not drop the lock to quiet the lint.
 #![allow(clippy::await_holding_lock)]
 
+use super::accounts::{AcctUsage, Window};
 use super::providers::{ChatRequest, StreamEvent};
 use super::router::{self, RouteErr, Who};
-use super::store::{Account, CustomProvider, McpServerCfg, ProviderCfg, Route, Settings};
+use super::store::{Account, CustomProvider, McpServerCfg, ProviderCfg, Route, Settings, UsageCap};
 use super::*;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -204,7 +205,7 @@ impl Mock {
             tagged,
         }
     }
-    fn push_for(&self, tag: &str, r: Resp) {
+    pub(crate) fn push_for(&self, tag: &str, r: Resp) {
         let mut g = self.tagged.lock().unwrap();
         match g.iter_mut().find(|(t, _)| t == tag) {
             Some((_, q)) => q.push_back(r),
@@ -348,6 +349,7 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
         effort: 2,
         perm: "auto".into(),
         plan: false,
+        plan_artifict: None,
         ultra: false,
         ultra_wt: false,
         ultra_x: None,
@@ -369,10 +371,13 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
         stop_note: None,
         bg_live: vec![],
         busy: 0,
+        bg_now: vec![],
         wrap_up: false,
+        summarise_first: false,
         model_map: Default::default(),
         archived: false,
         pinned: false,
+        artifict_open: false,
         order: 0.0,
         items: vec![],
         messages: vec![],
@@ -380,16 +385,19 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
         subs: vec![],
         usage: Default::default(),
         read_files: Default::default(),
+        read_hashes: Default::default(),
         checkpoints: vec![],
         touched: Default::default(),
         hidden: false,
+        unread: false,
         forked_from: None,
         created_at: now,
         updated_at: now,
         touched_at: now,
-        // Fixtures build in-memory tasks, so they hold their sub-agent maps
+        // Fixtures build in-memory tasks, so they hold their subagent maps
         // rather than leaving them on disk.
         hydrated: true,
+        docker: None,
     }
 }
 
@@ -518,9 +526,12 @@ async fn routing_end_to_end() {
     std::env::set_var("OPENLEASH_ANTHROPIC_BASE", &m.base);
 
     transient_errors_are_retried(&m).await;
+    unavailable_4xx_is_retried(&m).await;
+    unavailable_429_is_retried(&m).await;
     a_retry_line_does_not_outlive_its_failure(&m).await;
     bad_requests_give_up_fast_unless_insist(&m).await;
     codex_pool_rotates_past_exhausted_account(&m).await;
+    codex_pool_skips_an_account_that_reached_its_cap(&m).await;
     key_pool_rotates_keys(&m).await;
     route_falls_back_then_pauses_and_resumes(&m).await;
     swap_while_paused_retries_the_new_model(&m).await;
@@ -556,6 +567,62 @@ async fn transient_errors_are_retried(m: &Mock) {
     assert_eq!(reqs[0].body["model"], "m");
 }
 
+/// A gateway that flakes with a 4xx ("endpoint is unavailable") is transient
+/// noise, not a request the provider rejected, so it is retried instead of
+/// being sent once and given up on.
+async fn unavailable_4xx_is_retried(m: &Mock) {
+    let (cp, key) = custom("gateway", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let (h, _) = harness(s, vec![task("t1", "gateway/m")]);
+    let before = m.reqs().len();
+    for _ in 0..14 {
+        m.push(err(
+            400,
+            json!({"error": {"message": "endpoint is unavailable"}}),
+        ));
+    }
+    m.push(openai_ok("hello"));
+    let (turn, _) = run(&h, "gateway/m")
+        .await
+        .expect("retries the endpoint-unavailable blip");
+    assert_eq!(text(&turn), "hello");
+    assert_eq!(m.reqs().len() - before, 15, "fourteen blips + one success");
+}
+
+/// A 429 whose body blames the upstream ("Endpoint is unavailable") is a
+/// gateway blip, not this account being rate limited: it must retry the target
+/// instead of cooling the key and pausing the chain for the whole retry-after.
+async fn unavailable_429_is_retried(m: &Mock) {
+    let (cp, key) = custom("gw429", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    s.routes.push(Route {
+        id: "r".into(),
+        name: "r".into(),
+        steps: vec!["gw429/m".into()],
+        on_exhausted: "fail".into(),
+        ..Default::default()
+    });
+    router::set_routes(&s.routes);
+    let (h, _) = harness(s, vec![task("t1", "route/r")]);
+    let before = m.reqs().len();
+    for _ in 0..14 {
+        m.push(err(
+            429,
+            json!({"error": {"message": "Upstream request failed: Endpoint is unavailable."}}),
+        ));
+    }
+    m.push(openai_ok("hello"));
+    let (turn, _) = run(&h, "route/r")
+        .await
+        .expect("retries the endpoint-unavailable 429");
+    assert_eq!(text(&turn), "hello");
+    assert_eq!(m.reqs().len() - before, 15, "fourteen blips + one success");
+}
+
 /// A blip that gets retried must not keep reading as a retry after it works:
 /// the step line is what the chat's spinner shows, so a stale one looks like
 /// the agent hung on a failure that is long over.
@@ -581,7 +648,8 @@ async fn step_of(h: &Arc<Harness>, id: &str) -> String {
 }
 
 async fn bad_requests_give_up_fast_unless_insist(m: &Mock) {
-    // Normal provider: an odd 404 gets 3 tries, then the route (set to fail) gives up.
+    // Normal provider: a 404 is about the request itself, so it is not resent;
+    // the route (set to fail) gives up after one try.
     let (cp, key) = custom("odd", &m.base, false);
     let mut s = Settings::default();
     s.custom_providers.push(cp);
@@ -596,14 +664,35 @@ async fn bad_requests_give_up_fast_unless_insist(m: &Mock) {
     router::set_routes(&s.routes);
     let (h, _) = harness(s, vec![task("t1", "route/r")]);
     let before = m.reqs().len();
-    for _ in 0..3 {
-        m.push(err(
-            404,
-            json!({"error": {"message": "model not found (lol)"}}),
-        ));
-    }
+    m.push(err(
+        404,
+        json!({"error": {"message": "model not found (lol)"}}),
+    ));
     assert!(matches!(run(&h, "route/r").await, Err(RouteErr::Fatal(_))));
-    assert_eq!(m.reqs().len() - before, 3);
+    assert_eq!(m.reqs().len() - before, 1);
+
+    // Same, with the default "pause when everything is out": a pass where every
+    // target rejected the request is a failure, not an exhausted chain. Pausing
+    // and resuming would only resend the same rejected request forever.
+    let (cp, key) = custom("rejects", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let (h, _) = harness(s, vec![task("t1", "rejects/m")]);
+    let before = m.reqs().len();
+    m.push(err(
+        400,
+        json!({"error": {"message": "messages.3.content.0: unexpected `tool_use_id`"}}),
+    ));
+    let got = tokio::time::timeout(std::time::Duration::from_secs(20), run(&h, "rejects/m"))
+        .await
+        .expect("a rejected request fails instead of pausing the chat");
+    match got {
+        Err(RouteErr::Fatal(e)) => assert!(e.contains("tool_use_id"), "{e}"),
+        Ok(_) => panic!("a rejected request cannot succeed"),
+        Err(_) => panic!("expected Fatal"),
+    }
+    assert_eq!(m.reqs().len() - before, 1);
 
     // Insist provider: pushes through 8 weird errors.
     let (cp, key) = custom("stubborn", &m.base, true);
@@ -714,6 +803,65 @@ async fn codex_pool_rotates_past_exhausted_account(m: &Mock) {
     let (_, t) = run(&h, "codex/gpt-6-sol").await.ok().unwrap();
     assert_eq!(t.account.unwrap().id, "low");
     assert_eq!(m.reqs().len() - before, 1);
+}
+
+/// A cap of the user's own making takes an account out of the chain the way a
+/// spent quota does, and the point of the test is that finding that out costs
+/// nothing: the turn's *first* request has to land on the account below it.
+///
+/// It is deliberately not a bench. `cooldown_until` stays clear, because a bench
+/// is what a resume and a token refresh are allowed to clear and a cap is not —
+/// the settings entry is what holds the account, so it holds it again after a
+/// restart and after any number of resumes.
+async fn codex_pool_skips_an_account_that_reached_its_cap(m: &Mock) {
+    let mut capped = acct("high", "codex", 20);
+    capped.caps = vec![UsageCap {
+        window: "5h".into(),
+        used: 50.0,
+        until: 0,
+    }];
+    let s = Settings {
+        accounts: vec![capped, acct("low", "codex", 10)],
+        ..Default::default()
+    };
+    let (h, _) = harness(s, vec![task("tcap", "codex/gpt-6-sol")]);
+    // The provider's own reading of the window is past the line the user drew.
+    h.accts.set_usage(
+        "high",
+        AcctUsage {
+            windows: vec![Window {
+                label: "5h".into(),
+                used: 62.0,
+                resets_at: accounts::now() + 3600,
+            }],
+            ..Default::default()
+        },
+    );
+    let views = h.accts.views(&h.settings.read().await.accounts);
+    let high = views.iter().find(|v| v.id == "high").unwrap();
+    assert!(!high.available);
+    assert!(
+        high.caps[0].holding,
+        "the row has to say the cap is what is holding it, or the user sees an \
+         account stop for no reason they can act on"
+    );
+    assert_eq!(high.cooldown_until, 0, "a cap is not a bench");
+
+    let before = m.reqs().len();
+    m.push(codex_ok("from low", false));
+    let (turn, t) = run(&h, "codex/gpt-6-sol")
+        .await
+        .expect("the account below the cap serves");
+    assert_eq!(t.account.as_ref().unwrap().id, "low");
+    assert_eq!(text(&turn), "from low");
+    let reqs = &m.reqs()[before..];
+    assert_eq!(
+        reqs.len(),
+        1,
+        "the capped account must not be asked first, or every turn pays a \
+         wasted request to rediscover the cap"
+    );
+    assert!(reqs[0].headers.contains("authorization: bearer tok-low"));
 }
 
 async fn key_pool_rotates_keys(m: &Mock) {
@@ -1170,6 +1318,33 @@ async fn too_long_is_reported_for_compaction(m: &Mock) {
         run(&h, "small/m").await,
         Err(RouteErr::TooLong(_))
     ));
+}
+
+/// Once a task is parked, another pause request is not a second event. The route
+/// can reach this method concurrently from multiple requests, so the transition
+/// guard has to cover both task state and attention announcement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pausing_a_chat_announces_only_its_first_transition() {
+    let (h, events) = harness(Settings::default(), vec![task("t1", "p/m")]);
+
+    tokio::join!(
+        h.pause_task("t1", "exhausted", "provider unavailable"),
+        h.pause_task("t1", "exhausted", "provider unavailable"),
+    );
+    h.pause_task("t1", "exhausted", "provider unavailable")
+        .await;
+
+    let events = events.lock().unwrap();
+    let pauses: Vec<_> = events
+        .iter()
+        .filter(|(name, payload)| name == "ol://attention" && payload["kind"] == "paused")
+        .collect();
+    assert_eq!(
+        pauses.len(),
+        1,
+        "one pause transition gets one announcement"
+    );
+    assert_eq!(pauses[0].1["reason"], "provider unavailable");
 }
 
 async fn pause_interrupts_a_stream_and_retries(m: &Mock) {
@@ -1861,7 +2036,7 @@ async fn tool_search_loads_a_deferred_mcp_tool_into_the_next_request() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Main agent delegates to a sub-agent, the sub-agent asks a question that the
+/// Main agent delegates to a subagent, the subagent asks a question that the
 /// main agent answers on a side request, then a mid-task assist-mode change is
 /// announced — while the cached prefix (system + tools + earlier history) stays byte-identical.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1911,7 +2086,7 @@ async fn agent_loop_keeps_cache_prefix_and_relays_questions() {
     let sys = main1["messages"][0]["content"].as_str().unwrap();
     assert!(sys.contains("Your agent id: ol-t2"));
     let subsys = sub1["messages"][0]["content"].as_str().unwrap();
-    assert!(subsys.contains("sub-agent (`explore`)") && subsys.contains("ol-t2/"));
+    assert!(subsys.contains("subagent (`explore`)") && subsys.contains("ol-t2/"));
     assert!(sub1["tools"]
         .as_array()
         .unwrap()
@@ -1923,7 +2098,7 @@ async fn agent_loop_keeps_cache_prefix_and_relays_questions() {
         .iter()
         .any(|t| t["function"]["name"] == "task"));
 
-    // First turn announces assist mode + the sub-agent list (inside the user turn, not the system prompt).
+    // First turn announces assist mode + the subagent list (inside the user turn, not the system prompt).
     let first_user = main1["messages"][1]["content"].as_str().unwrap();
     assert!(first_user.contains("Assist mode: DEFAULT") && first_user.contains("`explore`"));
 
@@ -1990,7 +2165,7 @@ async fn agent_loop_keeps_cache_prefix_and_relays_questions() {
         last.contains("changed the assist mode") && last.contains("GUIDE") && last.contains("next")
     );
 
-    // Sub-agent transcript was recorded for the UI.
+    // Subagent transcript was recorded for the UI.
     let t = h.task("t2").await.unwrap();
     let t = t.lock().await;
     assert_eq!(t.subs.len(), 1);
@@ -2003,21 +2178,43 @@ async fn agent_loop_keeps_cache_prefix_and_relays_questions() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-async fn wait_idle(h: &Arc<Harness>, id: &str) {
+/// Block until a task stops running. Shared with the `reviewer_*` modules, which
+/// drive the same harness at the same level.
+pub(crate) async fn wait_idle(h: &Arc<Harness>, id: &str) {
+    // Kept so a timeout says *what* it was waiting for: "agent never finished"
+    // from a chat that did finish, at a status this wait does not accept, sends
+    // the reader looking in the wrong place — and a run stuck in the model
+    // layer's retries looks identical to work in progress without the step.
+    let mut last = "not opened".to_string();
     for _ in 0..500 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if !h
+        let running = h
             .runtime(id)
             .running
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let st = h.task(id).await.unwrap().lock().await.status.clone();
-            if st != "running" && st != "idle" {
-                return;
-            }
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (status, waiting, step, tail) = {
+            let t = h.task(id).await.unwrap();
+            let t = t.lock().await;
+            (
+                t.status.clone(),
+                t.waiting_kind.clone(),
+                t.step.clone(),
+                t.items
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .map(|i| i.kind.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if !running && status != "running" && status != "idle" {
+            return;
         }
+        last = format!(
+            "running={running}, status={status:?}, step={step:?}, waiting_kind={waiting:?}, last items={tail:?}"
+        );
     }
-    panic!("agent never finished");
+    panic!("agent never finished: {last}");
 }
 
 /// A background command is meant to outlive the run that started it — that is
@@ -2109,7 +2306,7 @@ async fn stopping_a_chat_kills_its_background_commands() {
 
 /// Answer a question/approval the agent is blocked on, the way the UI's
 /// `task_respond` command does.
-async fn answer(h: &Arc<Harness>, task_id: &str, item_id: &str, v: Value) {
+pub(crate) async fn answer(h: &Arc<Harness>, task_id: &str, item_id: &str, v: Value) {
     let tx = h
         .runtime(task_id)
         .pending
@@ -2121,7 +2318,7 @@ async fn answer(h: &Arc<Harness>, task_id: &str, item_id: &str, v: Value) {
 }
 
 /// Wait for the question item to register its answer channel, then take its id.
-async fn await_question(h: &Arc<Harness>, task_id: &str) -> String {
+pub(crate) async fn await_question(h: &Arc<Harness>, task_id: &str) -> String {
     for _ in 0..500 {
         if let Some(k) = h
             .runtime(task_id)
@@ -2442,6 +2639,15 @@ async fn ask_nonblocking_does_not_block_the_run_and_its_answer_arrives_as_a_note
     .await
     .unwrap();
     wait_idle(&h, "ta").await;
+    // Exactly one turn: the answer itself. A second, empty turn is what a stale
+    // spawn costs — the same request again, the model answering its own last
+    // message — and with nothing scripted for it this run would sit in the
+    // router's retries and never finish at all.
+    assert_eq!(
+        m.reqs().len(),
+        3,
+        "the answer starts one turn, not a spurious wake of its own"
+    );
 
     let reqs = m.reqs();
     let last = reqs[reqs.len() - 1].body["messages"].to_string();
@@ -2652,6 +2858,64 @@ async fn a_queued_follow_up_does_not_announce_the_run_it_continues() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A wake with nothing to read must not call the model.
+///
+/// This is not a hypothetical: a message delivered while the previous run was
+/// finishing is read by whichever run gets there first, and a `spawn_run` that
+/// loses that race used to send the previous request again — the model answering
+/// its own last turn, for a whole extra call. When that call fails (a rate limit,
+/// a provider hiccup) the chat is left "running" inside the router's retries,
+/// which looks exactly like work in progress. `resume` is the one path that means
+/// to carry on from an assistant turn, and it pushes its own reminder first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_with_nothing_to_read_does_not_call_the_model() {
+    let _m = MODELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("openleash-wake-{}", std::process::id()));
+    let _home = super::store::test_home(&dir);
+    let m = Mock::start().await;
+    let (cp, key) = custom("pw", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let mut t = task("tw", "pw/m");
+    t.status = "idle".into();
+    let (h, _) = harness(s, vec![t]);
+
+    m.push(openai_ok("all done"));
+    runner::send(h.clone(), "tw".into(), "do it".into())
+        .await
+        .unwrap();
+    wait_idle(&h, "tw").await;
+    assert_eq!(m.reqs().len(), 1, "the work itself is one turn");
+
+    // A bare wake: no note, no queue, no message. The history ends with the
+    // agent's own reply, so there is nothing to answer.
+    runner::spawn_run(h.clone(), "tw".into());
+    wait_idle(&h, "tw").await;
+    assert_eq!(
+        m.reqs().len(),
+        1,
+        "a wake with nothing new must not send a request"
+    );
+
+    // The same wake with something to read does go out, so the guard cannot be
+    // "a run that has nothing queued never works".
+    h.note(
+        "tw",
+        "main",
+        "<kind:agent>
+A background job finished."
+            .into(),
+    )
+    .await;
+    m.push(openai_ok("noted the job"));
+    runner::spawn_run(h.clone(), "tw".into());
+    wait_idle(&h, "tw").await;
+    assert_eq!(m.reqs().len(), 2, "a note is something to read");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A skipped `ask_nonblocking` question is a refusal to decide, and has to read as
 /// one — the same rule as the blocking form, and for the same reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2699,6 +2963,11 @@ async fn skipping_an_ask_nonblocking_question_is_told_as_a_refusal() {
     .await
     .unwrap();
     wait_idle(&h, "ts2").await;
+    assert_eq!(
+        m.reqs().len(),
+        3,
+        "the skip starts one turn of its own, not a spurious wake"
+    );
 
     let reqs = m.reqs();
     let last = reqs[reqs.len() - 1].body["messages"].to_string();
@@ -3141,7 +3410,7 @@ async fn stopped_subagents_continue_on_resume() {
             model: String::new(),
         },
         Message::user(vec![
-            json!({"type":"tool_result","tool_use_id":"call_t","content":"Sub-agent stopped: interrupted","is_error":true}),
+            json!({"type":"tool_result","tool_use_id":"call_t","content":"Subagent stopped: interrupted","is_error":true}),
         ]),
     ];
     t.subs = vec![SubInfo {
@@ -3186,7 +3455,7 @@ async fn stopped_subagents_continue_on_resume() {
         "main gets the real report"
     );
     assert!(
-        !main.contains("Sub-agent stopped"),
+        !main.contains("Subagent stopped"),
         "the stopped placeholder was replaced before the main agent saw it"
     );
     let t = h.task("t3").await.unwrap();
@@ -3197,8 +3466,8 @@ async fn stopped_subagents_continue_on_resume() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A picture the user pasted can be handed to a sub-agent through `task`'s
-/// `images` argument: the sub-agent's own request must carry the real image,
+/// A picture the user pasted can be handed to a subagent through `task`'s
+/// `images` argument: the subagent's own request must carry the real image,
 /// not just the brief that mentions it. On the OpenAI-compatible path (every
 /// non-Anthropic provider) these blocks used to be dropped on the floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3214,7 +3483,7 @@ async fn task_tool_hands_images_to_the_subagent() {
     let mut t = task("timg", "pi/m");
     t.status = "idle".into();
     let (h, _) = harness(s, vec![t]);
-    const SUB: &str = "sub-agent (`explore`)";
+    const SUB: &str = "subagent (`explore`)";
 
     m.push(openai_call(
         "task",
@@ -3250,14 +3519,14 @@ async fn task_tool_hands_images_to_the_subagent() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The exact bug: the chat's model was changed while a sub-agent was already
-/// working, and that sub-agent carried on with the old one. Its model used to be
+/// The exact bug: the chat's model was changed while a subagent was already
+/// working, and that subagent carried on with the old one. Its model used to be
 /// stamped on it at spawn and never re-read, so every agent a chat had already
 /// launched was stuck on whatever it was launched on for the rest of the task —
 /// the swap only ever reached the ones spawned afterwards.
 ///
 /// Driven through the real `task` tool rather than a hand-built `SubInfo`, because
-/// the frozen value was stamped at spawn: a test that sets up the sub-agent by hand
+/// the frozen value was stamped at spawn: a test that sets up the subagent by hand
 /// never touches the code that caused it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mid_task_model_change_reaches_the_subagents_already_running() {
@@ -3272,9 +3541,9 @@ async fn a_mid_task_model_change_reaches_the_subagents_already_running() {
     let mut t = task("tsw", "p/old");
     t.status = "idle".into();
     let (h, _) = harness(s, vec![t]);
-    const SUB: &str = "sub-agent (`explore`)";
+    const SUB: &str = "subagent (`explore`)";
 
-    // Turn 1: the main agent launches a sub-agent, which is still working when the
+    // Turn 1: the main agent launches a subagent, which is still working when the
     // user swaps the chat's model.
     m.push(openai_call(
         "task",
@@ -3286,7 +3555,7 @@ async fn a_mid_task_model_change_reaches_the_subagents_already_running() {
         .await
         .unwrap();
 
-    // Wait for the sub-agent to exist and be running, then swap under it.
+    // Wait for the subagent to exist and be running, then swap under it.
     let sid = loop {
         let arc = h.task("tsw").await.unwrap();
         let running = arc
@@ -3305,16 +3574,16 @@ async fn a_mid_task_model_change_reaches_the_subagents_already_running() {
     {
         let arc = h.task("tsw").await.unwrap();
         let g = arc.lock().await;
-        let s = g.subs.iter().find(|s| s.id == sid).expect("the sub-agent");
+        let s = g.subs.iter().find(|s| s.id == sid).expect("the subagent");
         assert_eq!(
             s.model, "",
-            "a sub-agent carries no model of its own unless one was chosen for it: \
+            "a subagent carries no model of its own unless one was chosen for it: \
              it follows the chat, which is what makes a swap reach the agents \
              already running"
         );
     }
 
-    // The sub-agent finishes its tool call and asks again: that request has to go
+    // The subagent finishes its tool call and asks again: that request has to go
     // to the new model, not the one it was launched on.
     m.push_for(SUB, openai_ok("X is in src/x.rs:1"));
     m.push(openai_ok("Found it: src/x.rs:1"));
@@ -3344,9 +3613,9 @@ async fn a_mid_task_model_change_reaches_the_subagents_already_running() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A sub-agent that finds the chat was messaged while it was parked used to spin
+/// A subagent that finds the chat was messaged while it was parked used to spin
 /// forever. `RouteErr::Refresh` is only cleared for the main agent, but the
-/// `steered` flag it keys on is per *task* — so a sub-agent hitting the same
+/// `steered` flag it keys on is per *task* — so a subagent hitting the same
 /// condition re-read it, rebuilt the identical request, got Refresh again, and
 /// looped without ever sending anything or releasing the slot it held. The chat
 /// sat at "Working" with a live subagent that never finished.
@@ -3363,10 +3632,10 @@ async fn a_subagent_parked_while_the_user_messaged_does_not_spin_forever() {
     t.status = "idle".into();
     t.agents = vec!["explore".into()];
     let (h, _) = harness(s, vec![t]);
-    const SUB: &str = "sub-agent (`explore`)";
+    const SUB: &str = "subagent (`explore`)";
 
-    // Turn 1: the main agent launches a sub-agent, which parks (every model out).
-    // The 429s are for the sub-agent's own request.
+    // Turn 1: the main agent launches a subagent, which parks (every model out).
+    // The 429s are for the subagent's own request.
     m.push(openai_call(
         "task",
         json!({"description": "find", "prompt": "Find X", "subagent_type": "explore"}),
@@ -3383,7 +3652,7 @@ async fn a_subagent_parked_while_the_user_messaged_does_not_spin_forever() {
         .await
         .unwrap();
 
-    // Wait for the sub-agent to exist *and* for the park to land: the pause is
+    // Wait for the subagent to exist *and* for the park to land: the pause is
     // raised when the chain is found empty, which is after the launch returns, so
     // resuming on the launch alone would be resuming a chat nobody has frozen yet.
     let mut saw_park = false;
@@ -3394,7 +3663,7 @@ async fn a_subagent_parked_while_the_user_messaged_does_not_spin_forever() {
             break;
         }
     }
-    assert!(saw_park, "the sub-agent's park landed on the chat");
+    assert!(saw_park, "the subagent's park landed on the chat");
 
     // Now the user messages the frozen chat. That is the real trigger: it sets
     // `steered` (so the frozen router abandons the request it holds) and lifts
@@ -3412,7 +3681,7 @@ async fn a_subagent_parked_while_the_user_messaged_does_not_spin_forever() {
     assert_ne!(
         t.subs.first().map(|s| s.status.as_str()),
         Some("running"),
-        "the sub-agent that was told to rebuild actually finished"
+        "the subagent that was told to rebuild actually finished"
     );
     assert_eq!(
         t.status, "done",
@@ -3436,7 +3705,7 @@ async fn background_subagents_and_direct_messages() {
     let mut t = task("t4", "p/m");
     t.status = "idle".into();
     let (h, _) = harness(s, vec![t]);
-    const SUB: &str = "sub-agent (`explore`)";
+    const SUB: &str = "subagent (`explore`)";
 
     m.push(openai_call("task", json!({"description": "scan", "prompt": "Scan the repo", "subagent_type": "explore", "run_in_background": true})));
     m.push(openai_ok(
@@ -3489,9 +3758,16 @@ async fn background_subagents_and_direct_messages() {
     // Direct message to the finished subagent → it continues → follow-up reaches main.
     m.push_for(SUB, openai_ok("FOLLOW-UP: tests live in /tests"));
     m.push(openai_ok("Noted the follow-up."));
-    runner::sub_message(&h, "t4", &sid, "also where are the tests?".into(), vec![])
-        .await
-        .unwrap();
+    runner::sub_message(
+        &h,
+        "t4",
+        &sid,
+        "also where are the tests?".into(),
+        vec![],
+        vec![],
+    )
+    .await
+    .unwrap();
     let mut got = false;
     for _ in 0..500 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3607,7 +3883,7 @@ async fn the_agent_renames_a_chat_only_when_allowed() {
 }
 
 /// The user broadcasts one message to every working agent: the main agent and
-/// every sub-agent, nested ones included, each carrying the rule that says to
+/// every subagent, nested ones included, each carrying the rule that says to
 /// ignore it unless it's about their own work. The main agent takes it as its
 /// own turn so it can act on it at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3622,7 +3898,7 @@ async fn broadcast_reaches_every_agent_with_the_ignore_rule() {
     let mut t = task("tc", "p/m");
     t.status = "idle".into();
     t.agents = vec!["explore".into(), "general".into()];
-    // One direct sub-agent and one nested under it, both working right now.
+    // One direct subagent and one nested under it, both working right now.
     let sub = |id: &str, role: &str, parent: &str, depth: u8| SubInfo {
         id: id.into(),
         role: role.into(),
@@ -3702,7 +3978,7 @@ async fn broadcast_reaches_every_agent_with_the_ignore_rule() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Ultrathread: a sub-agent gets the task tool and launches its own sub-agent;
+/// Ultrathread: a subagent gets the task tool and launches its own subagent;
 /// the nested one sits at the deepest level and can't spawn further. The main
 /// agent is told it's in ultrathread and isn't allowed to stop without a plan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3910,7 +4186,7 @@ async fn plan_mode_wins_over_the_ultrathread_stop_guard() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A sub-agent in plan mode can't call `exit_plan_mode` (it's main-only) and its
+/// A subagent in plan mode can't call `exit_plan_mode` (it's main-only) and its
 /// writes are refused, so it has to be told to investigate and report rather than
 /// discovering the wall by hitting it.
 /// A file-byte read goes through the same deny tier as an edit/command. Before the
@@ -3974,7 +4250,7 @@ async fn a_subagent_in_plan_mode_is_told_to_stay_read_only() {
     t.plan = true;
     t.agents = vec!["explore".into(), "general".into()];
     let (h, _) = harness(s, vec![t]);
-    const SUB: &str = "sub-agent (`explore`)";
+    const SUB: &str = "subagent (`explore`)";
 
     m.push(openai_call("task", json!({"description": "survey", "prompt": "Find the plan-mode plumbing", "subagent_type": "explore"})));
     m.push_for(SUB, openai_ok("permissions.rs and runner.rs handle it."));
@@ -4104,10 +4380,10 @@ async fn effort_change_lands_on_the_next_request_without_telling_the_agent() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
-/// A sub-agent that already reported is resumable in place: the follow-up runs
+/// A subagent that already reported is resumable in place: the follow-up runs
 /// in its own conversation (its brief and its earlier findings are both still
 /// there) and the new report comes back to the main agent, which never had to
-/// re-brief anyone. A sub-agent that is still running is not resumable — send
+/// re-brief anyone. A subagent that is still running is not resumable — send
 /// it more work instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn task_resume_continues_a_finished_subagent_in_place() {
@@ -4162,7 +4438,7 @@ async fn task_resume_continues_a_finished_subagent_in_place() {
             r.body["messages"][0]["content"]
                 .as_str()
                 .unwrap_or("")
-                .contains("sub-agent (`explore`)")
+                .contains("subagent (`explore`)")
         })
         .expect("the subagent was resumed");
     let msgs = sub.body["messages"].to_string();
@@ -4203,7 +4479,7 @@ async fn task_resume_continues_a_finished_subagent_in_place() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Resuming a sub-agent that is already running is refused, with a pointer to
+/// Resuming a subagent that is already running is refused, with a pointer to
 /// the tool that does apply — and it must not burn a request doing so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn task_resume_refuses_a_running_subagent() {
@@ -4290,7 +4566,7 @@ async fn task_resume_is_scoped_to_your_own_children() {
     t.ultra = true;
     t.agents = vec!["explore".into(), "general".into()];
     // The child's pill, as the coordinator's transcript holds it. Its id is the
-    // one the sub-agent's `item_id` points at, exactly as a real launch does.
+    // one the subagent's `item_id` points at, exactly as a real launch does.
     let pill = Item::new(
         "sub",
         "scan A",
@@ -4368,7 +4644,7 @@ async fn task_resume_is_scoped_to_your_own_children() {
     m.push(openai_ok("A/2 scanned")); // the leaf, continued
     m.push(openai_call("task_resume", json!({"id": "other"}))); // not the coordinator's child
     m.push(openai_ok("Area A covered")); // coordinator's report
-    runner::sub_message(&h, "tr3", "c1", "keep going".into(), vec![])
+    runner::sub_message(&h, "tr3", "c1", "keep going".into(), vec![], vec![])
         .await
         .unwrap();
     for _ in 0..500 {
@@ -4551,7 +4827,7 @@ async fn force_pause_all_freezes_chats_and_owes_the_agent_a_rerun() {
         "Running cargo build",
         json!({"name": "bash", "status": "running", "tool_use_id": "b1"}),
     )];
-    // A sub-agent mid-flight too, so the swarm case is covered by the same sweep.
+    // A subagent mid-flight too, so the swarm case is covered by the same sweep.
     busy.subs = vec![SubInfo {
         id: "s1".into(),
         role: "explore".into(),
@@ -4633,7 +4909,7 @@ async fn force_pause_all_freezes_chats_and_owes_the_agent_a_rerun() {
     assert_eq!(b.items[0].data["meta"], json!("cut off by quit"));
     assert_eq!(
         b.subs[0].status, "stopped",
-        "a sub-agent is stopped as well"
+        "a subagent is stopped as well"
     );
     let sub = b.sub_msgs.get("s1").unwrap();
     assert_eq!(
@@ -4750,7 +5026,7 @@ async fn an_idle_chat_stays_quiet() {
 /// The resume that needed pressing four times.
 ///
 /// The shape, as reported: a chat paused because every model in its chain ran out
-/// of usage, with a swarm of sub-agents parked behind the same pause. The user
+/// of usage, with a swarm of subagents parked behind the same pause. The user
 /// swaps the model and presses Resume — and nothing happens. Again. Then again.
 ///
 /// It is not the wakeup. `wait_unpaused` polls `is_paused` on every pass, so a
@@ -5059,4 +5335,71 @@ async fn a_background_job_does_not_hold_the_pausing_banner_open() {
         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     h.bg.kill_task_with_reasons("t1", "test cleanup");
     let _ = id;
+}
+
+/// The count the pause banner is made of has to be the count that is live when it
+/// is *published*, not the one that was live when the recount started.
+///
+/// `refresh_busy` reads `fg` and then waits for the task lock, and every command
+/// start and end calls it — so a swarm makes it concurrent: two subagents finish a
+/// moment apart and both recount at once. The recount that read the *older* count
+/// can be the one that queues behind the other and writes last, and the banner is
+/// then left naming a command that has already exited. Nothing recounts it again,
+/// because nothing is running any more. Reading the count under the lock is what
+/// makes the last write the true one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recount_publishes_the_count_that_is_live_when_it_writes() {
+    let (h, _) = harness(Settings::default(), vec![task("t1", "m1")]);
+    h.runtime("t1")
+        .fg
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    // Hold the task lock, so the recount gets as far as reading the count and no
+    // further. That window — read taken, write not yet made — is where the bug is.
+    let held = h.task("t1").await.unwrap();
+    let lock = held.lock().await;
+    let recount = tokio::spawn({
+        let h = h.clone();
+        async move { h.refresh_busy("t1").await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The command ends while that recount is still waiting its turn, so what it is
+    // about to publish is already wrong.
+    h.runtime("t1")
+        .fg
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    drop(lock);
+    recount.await.unwrap();
+
+    assert_eq!(
+        h.task("t1").await.unwrap().lock().await.busy,
+        0,
+        "the banner would name a command with nothing left running"
+    );
+}
+
+/// Pausing is when the count is read, so it is read *then* and not trusted from
+/// whatever recounted last.
+///
+/// `busy` is only as fresh as the last call to `refresh_busy`, and a pause can land
+/// between one and the next — a command that was already past the pause gate, a
+/// subagent's work starting while the chat is being frozen. `pause_task` on an
+/// already-frozen chat returned before it looked at anything, so the banner kept
+/// whatever number was there while the commands it names were still going: the one
+/// state where the user is told to wait for a count the app never took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pausing_reads_the_live_count_even_when_the_chat_is_already_frozen() {
+    let (h, _) = harness(Settings::default(), vec![task("t1", "m1")]);
+    h.pause_task("t1", "manual", "Paused by you").await;
+    // Two commands in flight that no recount has published yet.
+    h.runtime("t1")
+        .fg
+        .fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+    h.pause_task("t1", "manual", "Paused by you").await;
+    assert_eq!(
+        h.task("t1").await.unwrap().lock().await.busy,
+        2,
+        "the banner is the count taken at the pause, not an older one"
+    );
 }

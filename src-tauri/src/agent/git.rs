@@ -7,6 +7,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn output(cwd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    // A remote-SSH project runs git on its host. Never let the URI reach
+    // `current_dir`: on Windows `ssh://h/x` is a relative local path.
+    if super::host::is_ssh(cwd) {
+        return remote_output(cwd, args);
+    }
+    // A repository inside WSL is driven by the distro's own git: Windows git
+    // on a `\\wsl.localhost` path is slow, trips `safe.directory` (the files
+    // belong to a Linux uid), and disagrees with the distro about line endings
+    // and executable bits.
+    #[cfg(windows)]
+    if let Some((distro, linux)) = super::shell::wsl_target(cwd) {
+        let mut c = Command::new("wsl.exe");
+        c.args(["-d", &distro, "--cd", &linux, "--exec", "git"]);
+        for a in args {
+            c.arg(super::shell::wsl_arg(&distro, a));
+        }
+        c.env("GIT_TERMINAL_PROMPT", "0")
+            .env("WSLENV", "GIT_TERMINAL_PROMPT/u");
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        return c.output();
+    }
     let mut c = Command::new("git");
     c.args(args)
         .current_dir(cwd)
@@ -17,6 +41,52 @@ fn output(cwd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
         c.creation_flags(0x0800_0000);
     }
     c.output()
+}
+
+/// The remote command line for `git <args>`: every argument one quoted word.
+pub fn remote_git_command(args: &[&str]) -> String {
+    let mut c = "git".to_string();
+    for a in args {
+        c.push(' ');
+        c.push_str(&super::host::sh_quote(a));
+    }
+    c
+}
+
+/// `output` for an `ssh://` cwd. stdout is taken after a marker line
+/// (`ssh_session::exec_machine`), so a login profile that prints something
+/// can't be parsed as porcelain.
+fn remote_output(cwd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let p = super::host::parse_ssh(cwd)
+        .ok_or_else(|| std::io::Error::other(format!("{cwd} is not a valid SSH project path")))?;
+    let cmd = remote_git_command(args);
+    let out = super::ssh_session::block_on(super::ssh_session::exec_machine(
+        &p.host,
+        &p.path,
+        &cmd,
+        std::time::Duration::from_secs(120),
+        &tokio_util::sync::CancellationToken::new(),
+    ))
+    .map_err(std::io::Error::other)?;
+    if out.timed_out {
+        return Err(std::io::Error::other("git on the SSH host timed out"));
+    }
+    let code = out.code.unwrap_or(255);
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw((code & 0xff) << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
 }
 
 fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
@@ -91,6 +161,26 @@ pub fn head(cwd: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Whether this repository has `sha` as a commit object. `sha` may come from
+/// another machine (a transferred chat), so anything that isn't a plain hex
+/// object name is refused before it reaches git's argv.
+pub fn has_commit(cwd: &str, sha: &str) -> bool {
+    let hex = (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
+    hex && git(cwd, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+}
+
+/// What `git status` and the upstream say about a checkout: uncommitted
+/// entries, and commits not on the upstream (`None` = no upstream at all).
+pub fn sync_state(cwd: &str) -> (usize, Option<usize>) {
+    let dirty = git(cwd, &["status", "--porcelain"])
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let ahead = git(cwd, &["rev-list", "--count", "@{u}..HEAD"])
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    (dirty, ahead)
+}
+
 pub fn branches(cwd: &str) -> Vec<String> {
     git(
         cwd,
@@ -155,6 +245,7 @@ fn worktree_directory(project: &str, branch: &str) -> PathBuf {
 
 /// Create `ol/<slug>` in a uniquely named sibling worktree under ~/.openleash/worktrees.
 pub fn create_worktree(project: &str, base: &str, slug: &str) -> Result<(String, String), String> {
+    super::host::refuse(project, "Worktrees are")?;
     let base = if base.is_empty() { "HEAD" } else { base };
     let mut n = 1;
     loop {
@@ -207,10 +298,99 @@ pub fn create_worktree(project: &str, base: &str, slug: &str) -> Result<(String,
     }
 }
 
+/// A docker workspace's private repository: a local clone of `project` at
+/// `dir`, on a new `ol/<slug>` branch from `base`.
+///
+/// A clone rather than a worktree because the container has to be able to run
+/// git too, and a worktree's `.git` file points at the main repository by an
+/// absolute host path (`D:\code\app\.git\worktrees\x`) that does not
+/// exist inside the container. A clone is self-contained, so the same history
+/// works on both sides of the mount. `push_workspace_branch` brings the branch
+/// back into the project.
+pub fn clone_workspace(project: &str, dir: &str, base: &str, slug: &str) -> Result<String, String> {
+    super::host::refuse(project, "Docker workspaces are")?;
+    let parent = Path::new(dir).parent().ok_or("bad workspace path")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    git(
+        &parent.to_string_lossy(),
+        &["clone", "--quiet", "--no-checkout", project, dir],
+    )?;
+    let start = if base.is_empty() || base == "HEAD" {
+        "origin/HEAD".to_string()
+    } else {
+        format!("origin/{base}")
+    };
+    let branch = format!("ol/{slug}");
+    // A repository with no commits yet clones to an unborn HEAD: start the
+    // branch empty rather than failing the whole task.
+    if git(dir, &["checkout", "--quiet", "-b", &branch, &start]).is_err() {
+        git(dir, &["checkout", "--quiet", "--orphan", &branch])?;
+    }
+    Ok(branch)
+}
+
+/// Push a docker workspace's branch into the project it was cloned from, so
+/// the work can be merged there like any other branch. Never force-pushes: a
+/// branch the user already changed in the project is left for them to merge.
+pub fn push_workspace_branch(dir: &str, project: &str, branch: &str) -> Result<String, String> {
+    if branch.is_empty() {
+        return Err("this workspace has no branch".into());
+    }
+    git(
+        dir,
+        &[
+            "push",
+            "--quiet",
+            project,
+            &format!("HEAD:refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(branch.to_string())
+}
+
 /// Remove a worktree only after the caller has obtained explicit destructive
 /// intent: `--force` discards uncommitted and untracked files in that checkout.
 pub fn remove_worktree(project: &str, dir: &str) -> Result<(), String> {
+    super::host::refuse(project, "Worktrees are")?;
     git(project, &["worktree", "remove", "--force", dir]).map(|_| ())
+}
+
+/// Remove one checkout, finding the repository that owns it from the checkout
+/// itself rather than being told.
+///
+/// `remove_worktree` has to be handed the main repository, and for a chat's own
+/// worktree the caller always has it. A *worker's* checkout is not so simple: a
+/// docker workspace is its own clone, so an ultrathread worker in one is a
+/// worktree of that clone, not of the original project the chat was opened on.
+/// Asking the wrong repository makes `git worktree remove` fail with "is not a
+/// working tree", and for a delete that is fatal — the chat could not be deleted
+/// at all. A worktree's `.git` file names its owning repository, so it is read
+/// from the checkout here. A path that is not a registered worktree (or whose
+/// `.git` is gone) is deleted outright, which is what the caller wanted anyway.
+pub fn remove_worktree_at(dir: &str) -> Result<(), String> {
+    if let Some(main) = owning_repo(dir) {
+        if remove_worktree(&main, dir).is_ok() {
+            return Ok(());
+        }
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("couldn't remove {dir}: {e}")),
+    }
+}
+
+/// The main repository a linked worktree belongs to, read from the checkout's
+/// own `.git` file: `gitdir: <repo>/.git/worktrees/<name>` — three levels above
+/// the file it names.
+fn owning_repo(dir: &str) -> Option<String> {
+    let text = std::fs::read_to_string(Path::new(dir).join(".git")).ok()?;
+    let gitdir = text.strip_prefix("gitdir:")?.trim();
+    Path::new(gitdir)
+        .ancestors()
+        .nth(3)
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 // ─────────────────────── worktree setup (post_setup_worktree) ───────────────────────
@@ -268,6 +448,7 @@ fn worktree_include_lines(project: &Path) -> Vec<String> {
 /// a wrong entry in a repo's include file must not fail the worktree.
 pub fn populate_worktree(project: &str, worktree: &str) -> Result<usize, String> {
     use ignore::gitignore::GitignoreBuilder;
+    super::host::refuse(project, "Worktrees are")?;
 
     let root = Path::new(project);
     let dst = Path::new(worktree);
@@ -555,6 +736,93 @@ mod worktree_tests {
 
         let _ = std::fs::remove_dir_all(temp);
     }
+
+    #[test]
+    fn a_worktree_is_removed_through_the_repo_that_owns_it() {
+        let temp = std::env::temp_dir().join(format!("ol-git-owning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let home = temp.join("openleash-home");
+        let _home = super::super::store::test_home(&home);
+        let repo = temp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        output(&repo, &["init", "-q"]);
+        output(&repo, &["config", "user.name", "Test"]);
+        output(&repo, &["config", "user.email", "t@example.invalid"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        output(&repo, &["add", "-A"]);
+        output(&repo, &["commit", "-q", "-m", "init"]);
+        let repo_s = repo.to_string_lossy().to_string();
+
+        let (wt, branch) = create_worktree(&repo_s, "HEAD", "owner").unwrap();
+        remove_worktree_at(&wt).unwrap();
+        assert!(!Path::new(&wt).is_dir(), "the checkout is gone");
+        assert!(
+            git(
+                &repo_s,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}")
+                ]
+            )
+            .is_ok(),
+            "the branch survives"
+        );
+        // A folder git has never heard of is deleted outright rather than refused:
+        // the caller asked for the checkout to go, and a chat has to stay
+        // deletable when its worktree's registry entry was already cleaned by hand.
+        let stray = temp.join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("junk.txt"), "junk\n").unwrap();
+        remove_worktree_at(&stray.to_string_lossy()).unwrap();
+        assert!(
+            !stray.is_dir(),
+            "a folder that is not a worktree is still removed"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn a_clean_worktree_is_distinguished_from_a_failed_commit() {
+        let temp = std::env::temp_dir().join(format!("ol-git-cleanru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        output(&temp, &["init", "-q"]);
+        output(&temp, &["config", "user.name", "Test"]);
+        output(&temp, &["config", "user.email", "t@example.invalid"]);
+        std::fs::write(temp.join("base.txt"), "base\n").unwrap();
+        output(&temp, &["add", "-A"]);
+        output(&temp, &["commit", "-q", "-m", "init"]);
+        let dir = temp.to_string_lossy().to_string();
+
+        // Nothing changed: the one unambiguous "clean" answer.
+        assert_eq!(commit_worktree(&dir, "ultrathread: nothing").unwrap(), None);
+
+        std::fs::write(temp.join("work.txt"), "real work\n").unwrap();
+        let sha = commit_worktree(&dir, "ultrathread: real work")
+            .unwrap()
+            .expect("a dirty worktree commits");
+        assert_eq!(sha.len(), 7, "the short sha is reported: {sha}");
+
+        // A refused commit must be an error, never `Ok(None)` — the bug this
+        // helper exists to fix is a failing hook reading as "no work produced".
+        let hooks = temp.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(temp.join("more.txt"), "more work\n").unwrap();
+        let error =
+            commit_worktree(&dir, "ultrathread: refused").expect_err("a failing hook is an error");
+        assert!(!error.trim().is_empty(), "the failure names a reason");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
 }
 
 #[derive(Serialize)]
@@ -644,7 +912,7 @@ pub fn review(cwd: &str, base: &str) -> Result<Vec<FileDiff>, String> {
     }
     if let Ok(untracked) = git(cwd, &["ls-files", "--others", "--exclude-standard"]) {
         for p in untracked.lines().filter(|l| !l.is_empty()).take(200) {
-            let content = std::fs::read_to_string(Path::new(cwd).join(p)).unwrap_or_default();
+            let content = read_worktree_file(cwd, p).unwrap_or_default();
             let mut lines =
                 vec![json!({"k":"h","t":format!("@@ -0,0 +1,{} @@", content.lines().count())})];
             let mut add = 0;
@@ -670,8 +938,37 @@ pub fn revert_file(cwd: &str, base: &str, path: &str) -> Result<(), String> {
         git(cwd, &["checkout", base, "--", path]).map(|_| ())
     } else {
         let _ = git(cwd, &["rm", "--cached", "--quiet", "--", path]);
+        if let Some(root) = super::host::parse_ssh(cwd) {
+            let target = remote_rel(&root, path)?;
+            return super::ssh_session::block_on(super::ssh_session::remove_file(
+                &target.host,
+                &target.path,
+            ));
+        }
         std::fs::remove_file(Path::new(cwd).join(path)).map_err(|e| e.to_string())
     }
+}
+
+/// `rel` (a path git printed, relative to the checkout) under a remote root.
+/// Refused if it climbs out: it reaches SFTP as an exact path string.
+fn remote_rel(root: &super::host::SshPath, rel: &str) -> Result<super::host::SshPath, String> {
+    let t = root.join(rel.trim_start_matches('/'));
+    if !super::host::inside(&root.path, &t.path) || t.path == root.path {
+        return Err(format!("{rel} is not inside the project."));
+    }
+    Ok(t)
+}
+
+/// A file in the checkout as text (lossy), local or over SFTP.
+fn read_worktree_file(cwd: &str, rel: &str) -> Option<String> {
+    if let Some(root) = super::host::parse_ssh(cwd) {
+        let t = remote_rel(&root, rel).ok()?;
+        let (bytes, _) =
+            super::ssh_session::block_on(super::ssh_session::read(&t.host, &t.path, 4 << 20))
+                .ok()?;
+        return String::from_utf8(bytes).ok();
+    }
+    std::fs::read_to_string(Path::new(cwd).join(rel)).ok()
 }
 
 pub fn commit(cwd: &str, message: &str) -> Result<String, String> {
@@ -680,6 +977,44 @@ pub fn commit(cwd: &str, message: &str) -> Result<String, String> {
     Ok(git(cwd, &["rev-parse", "--short", "HEAD"])?
         .trim()
         .to_string())
+}
+
+/// Commit everything in a finished ultrathread worktree, and say which of the
+/// two outcomes happened: a commit, or a worktree that was already clean.
+///
+/// This exists because `commit`'s single `Result` cannot tell those apart from a
+/// *failure*. The runner used to read `commit(...).ok()` and call every miss
+/// "nothing new to commit" — so a repo with a failing pre-commit hook, or one
+/// with no `user.name`/`user.email` configured at all (common in a fresh CI or
+/// container checkout), silently reported that a worker had produced no work.
+/// The worker's branch then looked empty to the fuze agent, which is a lost
+/// change that reads as an empty task.
+///
+/// The tree is checked first, deliberately: `git status --porcelain` naming
+/// nothing is the one unambiguous "clean" signal, and on Windows a failed
+/// `git commit` returns non-zero with *empty stderr* (see `commit_with`), so the
+/// failure path has to be told apart before git is asked to commit.
+///
+/// `Ok(None)` = clean, nothing to commit. `Err` carries git's own reason.
+pub fn commit_worktree(cwd: &str, message: &str) -> Result<Option<String>, String> {
+    let dirty = git(cwd, &["status", "--porcelain"])?;
+    if dirty.trim().is_empty() {
+        return Ok(None);
+    }
+    git(cwd, &["add", "-A"])?;
+    git(cwd, &["commit", "-m", message]).map_err(|e| {
+        if e.trim().is_empty() {
+            "a pre-commit hook refused it (it printed nothing), or git has no user.name/user.email configured"
+                .to_string()
+        } else {
+            e
+        }
+    })?;
+    Ok(Some(
+        git(cwd, &["rev-parse", "--short", "HEAD"])?
+            .trim()
+            .to_string(),
+    ))
 }
 
 /// Commit with the two knobs the review screen needs: a message that already

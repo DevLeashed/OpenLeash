@@ -18,7 +18,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 import { api } from "../api";
 import { get, set } from "../store";
 import { submit } from "./Composer";
-import { annotationBlock, Annotations, pillPlace, SelectionNoteLayer, SentAnnotationMessage } from "./SelectionNote";
+import { annotationBlock, Annotations, AttachmentChips, parseAttachments, pillPlace, SelectionNoteLayer, SentAnnotationMessage, stripHarnessBlocks } from "./SelectionNote";
 import type { Note } from "../store";
 
 /** A selection the browser would leave behind: collapsed, so nothing is picked
@@ -239,7 +239,7 @@ describe("sending a chat that has annotations", () => {
 
     let sending!: Promise<void>;
     await act(async () => { sending = submit("session", later); });
-    expect(send).toHaveBeenCalledWith("t1", "", later, [image]);
+    expect(send).toHaveBeenCalledWith("t1", "", later, [image], [], ["image-1"]);
     expect(get().attach.t1).toEqual([]);
     expect(get().pendingMessages.t1?.[0]?.data.images).toEqual([image]);
 
@@ -331,7 +331,7 @@ describe("sending a chat that has annotations", () => {
   it("sends annotations without typed text, including queued sends", async () => {
     withChat([note({ body: "check this" })], "   ");
     await act(async () => { await submit("session", true); });
-    expect(send).toHaveBeenCalledWith("t1", annotationBlock([note({ body: "check this" })]), true, undefined);
+    expect(send).toHaveBeenCalledWith("t1", annotationBlock([note({ body: "check this" })]), true, undefined, [], []);
     expect(get().notes["t1"]).toEqual([]);
   });
 
@@ -363,6 +363,68 @@ describe("sent annotations", () => {
     render(<SentAnnotationMessage text={annotationBlock([{ id: "n1", item: "", text: "quote", body: "" }])} />);
     expect(screen.getByRole("button", { name: "1 annotation" })).toBeTruthy();
     expect(screen.queryByText("quote")).toBeNull();
+  });
+});
+
+// A staged attachment note is written for the model: it names a temp copy in
+// OpenLeash's hidden data folder, which is not a path the user chose and tells
+// them nothing they can act on. The user's own words are all that should show.
+describe("stripHarnessBlocks", () => {
+  const note = "- `C:\\Users\\me\\AppData\\Local\\Temp\\OpenLeash\\proj-abc\\task-1\\batch\\image.png`";
+  const wrapper = `\n\n<openleash-attachments>\nThe user sent these attachments. OpenLeash saved copies in its temporary attachment folder.\n${note}\n</openleash-attachments>`;
+
+  it("removes the staged-path wrapper wherever it sits", () => {
+    expect(stripHarnessBlocks(`look at this${wrapper}`)).toBe("look at this");
+    expect(stripHarnessBlocks(`${wrapper.slice(2)}\n\nand then this`)).toBe("and then this");
+    expect(stripHarnessBlocks(`before${wrapper}after`)).toBe("beforeafter");
+    expect(stripHarnessBlocks("no wrapper here")).toBe("no wrapper here");
+    // Unterminated: not a block, so leave it alone rather than eating text.
+    expect(stripHarnessBlocks("<openleash-attachments>trailing")).toBe("<openleash-attachments>trailing");
+  });
+
+  it("removes the attached-files list only when those files are staged", () => {
+    const list = "Attached files (read these with your tools, they are not inlined):\n- a.rs\n- b.rs";
+    const data = { attachments: [{ path: "x", name: "a.rs", size: 1 }] };
+    expect(stripHarnessBlocks(`here\n\n${list}`, data)).toBe("here");
+    // Written inline with nothing staged stays as the message it is.
+    expect(stripHarnessBlocks(`here\n\n${list}`)).toBe(`here\n\n${list}`);
+  });
+});
+
+// The staged block is scaffolding the *agent* reads, not something the user
+// should ever see as raw tags. It was rendered verbatim, which looked like a
+// stray piece of markup rather than part of the app.
+describe("the staged block becomes a chip list", () => {
+  const note = "- `C:\\Users\\me\\AppData\\Local\\Temp\\OpenLeash\\proj-abc\\task-1\\batch\\01-image-1.png`";
+  const wrapper = `\n\n<openleash-attachments>\nThe user sent these attachments. OpenLeash saved copies in its temporary attachment folder.\n${note}\n</openleash-attachments>`;
+
+  it("shows the name the user chose, not the temp path it was copied to", () => {
+    const files = parseAttachments(wrapper);
+    expect(files).toHaveLength(1);
+    // `01-image-1.png`, never the whole `.../Temp/OpenLeash/...` path.
+    expect(files[0]!.name).toBe("01-image-1.png");
+    expect(files[0]!.name).not.toContain("Temp");
+    expect(files[0]!.name).not.toContain("OpenLeash");
+  });
+
+  it("takes every entry, so a multi-file message lists them all", () => {
+    const many = `<openleash-attachments>\n- \`/tmp/a/one.rs\`\n- \`/tmp/a/two.rs\`\n</openleash-attachments>`;
+    expect(parseAttachments(many).map(f => f.name)).toEqual(["one.rs", "two.rs"]);
+  });
+
+  it("renders nothing when there is no block at all", () => {
+    expect(parseAttachments("just a plain message")).toEqual([]);
+    // Unterminated is not a block, so it must not render a half-parsed card.
+    expect(parseAttachments("<openleash-attachments>trailing")).toEqual([]);
+    const { container } = render(<AttachmentChips text="plain" />);
+    expect(container.querySelector(".ubatchip")).toBeNull();
+  });
+
+  it("renders one chip per file, with the stripped message beside it", () => {
+    const { container } = render(<AttachmentChips text={`look at this${wrapper}`} />);
+    const chips = container.querySelectorAll(".ubatchip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]!.textContent).toContain("image-1.png");
   });
 });
 

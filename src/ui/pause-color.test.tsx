@@ -138,7 +138,7 @@ describe("a frozen chat stops animating", () => {
   });
 });
 
-describe("pausing a chat yourself does not mark it unread", () => {
+describe("a pause you pressed yourself is not news", () => {
   /** The `listen` mock, plus the handler registry this suite adds. */
   const listenMock = listen as unknown as ReturnType<typeof vi.fn> & { handlers?: Record<string, (event: { payload: unknown }) => void> };
   /** Drive a real `ol://attention` event, the way the backend sends one. */
@@ -158,36 +158,29 @@ describe("pausing a chat yourself does not mark it unread", () => {
   const attention = (payload: Record<string, unknown>) =>
     listenMock.handlers!["ol://attention"]!({ payload: { task_id: "t1", ...payload } });
 
-  beforeEach(() => { set({ view: "home", task: null, unread: {}, notices: [] }); });
+  beforeEach(() => { set({ view: "home", task: null, notices: [] }); });
   afterEach(() => disposeBoot());
 
-  it("leaves the dot off for a pause you pressed", async () => {
-    // The user is standing in the chat pressing pause. `describe()` calls a
-    // manual pause not-news for the notice and the OS toast; the dot is the
-    // third copy of that same report and it has to agree, or the row they just
-    // paused lights up the unread blue and stays that way.
+  it("raises no notice for a pause you pressed", async () => {
+    // The user is standing in the chat pressing pause, so `describe()` calls a
+    // manual pause not-news: no notice card, no OS toast. The blue dot follows
+    // the same rule, but it is not this window's to draw any more — the backend
+    // marks the chat as it publishes the event, and `attention_is_news`
+    // (src-tauri/src/agent/mod.rs) carries the same exclusion. See
+    // `reviewer_unread.rs`.
     await bootWith(chat());
-    // Not viewing this chat, so nothing else would clear it.
     set({ view: "home", task: null });
     await act(async () => { attention({ kind: "paused", pause: "manual", reason: "Paused by you" }); });
-    expect(get().unread.t1, "you already read this — you did it").toBeFalsy();
-    expect(get().notices, "and it raises no notice either").toHaveLength(0);
+    expect(get().notices, "you already read this — you did it").toHaveLength(0);
   });
 
-  it("still marks it for a pause the app raised on its own", () => {
+  it("still raises one for a pause the app raised on its own", () => {
     // The other half: an exhausted route is genuinely news. Suppressing only
     // the user's own keystrokes must not silence the agent asking for help.
-    return bootWith(chat()).then(() => {
+    return bootWith(chat()).then(async () => {
       set({ view: "home", task: null });
-      attention({ kind: "paused", pause: "exhausted", reason: "Every model in the chain failed" });
-      expect(get().unread.t1, "a chat the agent stopped itself is news").toBe(true);
+      await act(async () => { attention({ kind: "paused", pause: "exhausted", reason: "Every model in the chain failed" }); });
+      expect(get().notices, "a chat the agent stopped itself is news").toHaveLength(1);
     });
-  });
-
-  it("does not take the dot for a chat the user is reading", async () => {
-    await bootWith(chat());
-    set({ view: "session", task: "t1" });
-    await act(async () => { attention({ kind: "done" }); });
-    expect(get().unread.t1).toBeFalsy();
   });
 });

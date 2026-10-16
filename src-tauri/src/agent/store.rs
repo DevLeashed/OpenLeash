@@ -7,7 +7,7 @@ use super::{
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Tests that point OPENLEASH_HOME at their own folder hold this for their whole run:
@@ -22,6 +22,10 @@ pub fn test_home(dir: &std::path::Path) -> std::sync::MutexGuard<'static, ()> {
     let _ = std::fs::remove_dir_all(dir);
     std::env::set_var("OPENLEASH_HOME", dir);
     g
+}
+
+fn default_docker_idle() -> u64 {
+    super::docker::DEFAULT_IDLE_MINUTES
 }
 
 pub fn data_dir() -> PathBuf {
@@ -97,6 +101,27 @@ pub struct CustomProvider {
     pub insist: bool,
 }
 
+/// A ceiling the user put on one of an account's usage windows, so the harness
+/// stops using that account before the window is spent.
+///
+/// Deliberately stored on the account rather than as a cooldown: a cooldown is
+/// live state that a resume or a refresh failure is allowed to clear, and a cap
+/// the user asked for has to survive both. It is also why nothing about it is
+/// derived from the current usage reading — the cap is a standing instruction,
+/// and the usage read it acts on arrives later.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct UsageCap {
+    /// Window label exactly as the provider reports it ("5h", "Week", "Month").
+    /// Matching on the label rather than an index is what keeps a cap attached
+    /// to the window across a provider adding or reordering its own list.
+    pub window: String,
+    /// Percent of the window used at which the account stops being used.
+    pub used: f64,
+    /// Unix seconds the cap lifts on its own; 0 = until the user removes it.
+    pub until: i64,
+}
+
 /// A subscription login (ChatGPT/Codex or Claude Pro/Max) used via OAuth.
 /// `Debug` is hand-written so the OAuth tokens never reach a log — see the
 /// note on `ProviderCfg`.
@@ -120,6 +145,8 @@ pub struct Account {
     /// File the login came from; rotated tokens are written back so the owning CLI keeps working.
     pub source: String,
     pub disabled_reason: String,
+    /// Caps the user set on this account's usage windows; empty is the norm.
+    pub caps: Vec<UsageCap>,
 }
 
 impl std::fmt::Debug for Account {
@@ -157,7 +184,7 @@ pub struct Route {
     pub on_exhausted: String,
 }
 
-/// A sub-agent definition (built-in or user-made).
+/// A subagent definition (built-in or user-made).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AgentDef {
@@ -185,12 +212,6 @@ pub struct AgentDef {
     /// `tools` above, which is what every agent saved before this field did.
     #[serde(default)]
     pub groups: Vec<ToolGroup>,
-    /// Graceful iteration ceiling (0 = no ceiling). On hitting it the agent is
-    /// told to summarise and recommend what is left instead of being cut off.
-    /// Applied by the runner; 0 keeps every agent that predates the field
-    /// running exactly as it did.
-    #[serde(default)]
-    pub steps: usize,
 }
 
 /// One entry of an `AgentDef`'s `groups`: Roo Code's two shapes, exactly —
@@ -482,16 +503,16 @@ impl std::fmt::Debug for McpServerCfg {
     }
 }
 
-/// One layer of an ULTRATHREAD X ladder: which model its sub-agents run on,
+/// One layer of an ULTRATHREAD X ladder: which model its subagents run on,
 /// how hard they think, and how many of them a coordinator may launch at once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UltraXLayer {
     /// Empty = the orchestrator's model.
     pub model: String,
-    /// Reasoning effort (0 = Max … 4 = Low). None = that sub-agent type's / the chat's.
+    /// Reasoning effort (0 = Max … 4 = Low). None = that subagent type's / the chat's.
     pub effort: Option<usize>,
-    /// How many sub-agents one agent on this layer may launch at the same time.
+    /// How many subagents one agent on this layer may launch at the same time.
     /// 0 = no per-agent cap (only the whole-tree running cap applies).
     pub fanout: u8,
 }
@@ -510,7 +531,7 @@ impl Default for UltraXLayer {
     }
 }
 
-/// ULTRATHREAD X: a configured ladder of sub-agent layers, each with its own
+/// ULTRATHREAD X: a configured ladder of subagent layers, each with its own
 /// model / effort / fanout. A shallow ladder is just ultrathread with per-layer
 /// models, so this is a superset rather than a separate mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,9 +539,9 @@ impl Default for UltraXLayer {
 pub struct UltraX {
     /// Layers below the orchestrator (1 = launched by the main agent). 1..=X_MAX_LAYERS.
     pub layers: Vec<UltraXLayer>,
-    /// Sub-agents running at once across the whole tree (0 = X_DEFAULT_RUNNING).
+    /// Subagents running at once across the whole tree (0 = X_DEFAULT_RUNNING).
     pub max_running: usize,
-    /// Sub-agents spawned for the whole task, ever (0 = X_DEFAULT_TOTAL).
+    /// Subagents spawned for the whole task, ever (0 = X_DEFAULT_TOTAL).
     pub max_total: usize,
     /// Run the nested tree in ULTRATHREAD worktrees.
     pub wt: bool,
@@ -538,7 +559,7 @@ impl Default for UltraX {
 }
 
 impl UltraX {
-    /// Deepest layer a sub-agent may launch another sub-agent on, 0..=layers.len().
+    /// Deepest layer a subagent may launch another subagent on, 0..=layers.len().
     pub fn max_depth(&self) -> u8 {
         self.layers.len().min(X_MAX_LAYERS) as u8
     }
@@ -548,7 +569,7 @@ impl UltraX {
         self.layers.len() > 1
     }
 
-    /// Cap on simultaneously running sub-agents for this tree.
+    /// Cap on simultaneously running subagents for this tree.
     pub fn running_cap(&self) -> usize {
         if self.max_running == 0 {
             X_DEFAULT_RUNNING
@@ -557,7 +578,7 @@ impl UltraX {
         }
     }
 
-    /// Cap on sub-agents spawned for the whole task, ever.
+    /// Cap on subagents spawned for the whole task, ever.
     pub fn total_cap(&self) -> usize {
         if self.max_total == 0 {
             X_DEFAULT_TOTAL
@@ -566,7 +587,7 @@ impl UltraX {
         }
     }
 
-    /// The layer `depth` agents run on (1 = the orchestrator's own sub-agents).
+    /// The layer `depth` agents run on (1 = the orchestrator's own subagents).
     pub fn layer(&self, depth: u8) -> Option<&UltraXLayer> {
         if depth == 0 {
             return None;
@@ -637,7 +658,7 @@ pub struct SavedPrompt {
     pub worktree: bool,
     #[serde(default)]
     pub branch: String,
-    /// Sub-agent ids it may use; empty = the current set.
+    /// Subagent ids it may use; empty = the current set.
     #[serde(default)]
     pub agents: Vec<String>,
     /// Pasted images, as data URLs.
@@ -678,6 +699,18 @@ pub struct Settings {
     pub subagents: bool,
     pub ui_size: String,
     pub send_with: String,
+    /// Let Enter send the message in a phone browser, with Shift Enter the
+    /// newline. Off by default.
+    ///
+    /// A phone's on-screen keyboard is the reason this is separate from
+    /// `send_with` and off rather than on: its Return key cannot be relied on
+    /// to say whether Shift is held, so Enter-sends there would also send every
+    /// message the user meant to put a line break in, with no modifier left to
+    /// ask for the newline. Off, Enter is always a newline and only the send
+    /// button sends — the one arrangement that cannot lose a draft to a
+    /// misread key. The desktop window is unaffected and follows `send_with`.
+    #[serde(default)]
+    pub phone_enter_sends: bool,
     /// Color theme: "raycast" (cyan) or "lavender".
     pub theme: String,
     /// Light or dark, or follow the OS. "light" / "dark" / "system".
@@ -708,7 +741,7 @@ pub struct Settings {
     pub accounts: Vec<Account>,
     pub routes: Vec<Route>,
     pub agents: Vec<AgentDef>,
-    /// Sub-agent ids new chats may use.
+    /// Subagent ids new chats may use.
     pub default_agents: Vec<String>,
     /// Skill names toggled off (hidden from agents, dimmed in settings).
     #[serde(default)]
@@ -726,20 +759,62 @@ pub struct Settings {
     pub paused_reason: String,
     /// Closing the window hides it to the tray; agents keep running.
     pub close_to_tray: bool,
+    /// Workspace for new tasks: "local" | "worktree" | "docker". Empty means
+    /// "follow `worktree`", which is all older settings files have.
+    #[serde(default)]
+    pub workspace: String,
+    /// Minutes a docker workspace may sit idle before its container is
+    /// stopped (0 = never). A project's `openleash.json` can override it.
+    #[serde(default = "default_docker_idle")]
+    pub docker_idle_minutes: u64,
+    /// Rebuild Docker images automatically if the build context changed. The first build still occurs.
+    #[serde(default = "t")]
+    pub docker_auto_rebuild: bool,
     /// Desktop notifications when a chat finishes, fails, needs you or auto-pauses (only while the window isn't focused).
     #[serde(default = "t")]
     pub notify: bool,
     /// Show the model's internal reasoning blocks in the transcript. Hidden by default.
     #[serde(default)]
     pub show_thinking: bool,
+    /// Show the estimated per-category split of the context window (system
+    /// prompt, project instructions, skills and memory, tool schemas,
+    /// attachments, conversation, compaction summary) under the context meter.
+    ///
+    /// Off by default, and off is the honest state: no provider reports that
+    /// split, so it is measured from the request the harness assembled and
+    /// rescaled to the provider's own prompt count. The ring's used/limit pair
+    /// is the measured part; this is the estimate, and it is drawn only for the
+    /// user who asks for it.
+    #[serde(default)]
+    pub ctx_breakdown: bool,
     /// Subscription kinds whose usage shows on the home screen.
     pub home_usage: Vec<String>,
+    /// Settings page the sidebar footer's shortcut button — the one beside the
+    /// usage bar — opens, as a tab id from the frontend's settings-tab list.
+    ///
+    /// Only the frontend reads it, and an unknown id resolves back to
+    /// [`sidebar_button_tab_default`] there, so a page this build does not have
+    /// cannot leave the button opening a blank settings screen. "accounts" is
+    /// the page that button has always opened, so an install upgrading into this
+    /// field keeps the button it already had.
+    #[serde(default = "sidebar_button_tab_default")]
+    pub sidebar_button_tab: String,
     /// Cross-chat inbox for pending approvals and questions. Hidden by default.
     #[serde(default)]
     pub needs_you: bool,
+    /// Show the optional GitHub pull-request screen next to Saved prompts.
+    #[serde(default)]
+    pub show_pull_requests: bool,
     /// Sidebar shows chats from every project, not just the current one.
     #[serde(default)]
     pub all_projects: bool,
+    /// Order of the Saved prompts list. Empty keeps the stored order (prompts are
+    /// appended as they are parked, so it reads oldest first); `newest` is most
+    /// recently parked first, `folder` groups the current folder's prompts above
+    /// the rest, `az` sorts by prompt text. The Saved screen offers these only
+    /// while `all_projects` is on, but the order is honoured whenever it is set.
+    #[serde(default)]
+    pub saved_sort: String,
     /// Accent per model id ("#rrggbb"), e.g. the working spinner. Unset = the family default.
     #[serde(default)]
     pub model_colors: HashMap<String, String>,
@@ -784,6 +859,20 @@ pub struct Settings {
     /// trust decision — see [`ProjectDocRule`].
     #[serde(default)]
     pub project_docs: Vec<ProjectDocRule>,
+    /// Let the agent see the user's other chats — and their live state — and
+    /// send one of them a message (`list_chats`, `message_chat`). Off by
+    /// default: this is the one tool pair that reaches *outside* the chat the
+    /// user opened, so an agent can read conversations it was never given and
+    /// start a turn in one of them. The main agent only — a chat's main agent is
+    /// the one with the wider view, and a fan-out of subagents each messaging
+    /// other chats is not something a brief asks for.
+    ///
+    /// The tool list does not change with the switch: a chat that already holds
+    /// the frozen prefix keeps its tools and is told the rules changed (see
+    /// `runner::announce_changes`), so toggling mid-chat cannot leave the cached
+    /// prefix disagreeing with what the model may do.
+    #[serde(default)]
+    pub cross_chat: bool,
     /// Let the agent keep this chat's name up to date as the work moves on
     /// (the `set_title` tool). It rides along on turns the agent is already
     /// making, so it costs nothing extra, and an unnamed chat in the sidebar
@@ -801,6 +890,10 @@ pub struct Settings {
     /// the user has manually dragged. Off preserves the manual order.
     #[serde(default = "t")]
     pub automatic_chat_reorder: bool,
+    /// Resume chats paused because provider accounts/keys were exhausted once one frees up.
+    /// Existing installs keep the established automatic-resume behavior.
+    #[serde(default = "t")]
+    pub automatic_resume: bool,
     /// Let the agent write notes to this project's memory folder and read them
     /// back in future chats (the `memory` tool). Off by default: the agent can
     /// only ever write *its own* notes, but that is still a file it creates
@@ -808,12 +901,6 @@ pub struct Settings {
     /// files are plain markdown under `~/.openleash/memory/`, editable by hand.
     #[serde(default)]
     pub memory: bool,
-    /// Idle window for "archive the chats I have not used in a while"
-    /// (Settings → Chats), in days. Only the default the button opens at: the
-    /// sweep is never automatic, so this decides nothing until the user presses
-    /// it, and the frontend clamps anything odd out of here before offering it.
-    #[serde(default = "two_weeks")]
-    pub archive_after_days: u32,
     #[serde(default = "t")]
     pub deny_env_files: bool,
     /// Folder trust decisions. A folder with no decision here is untrusted —
@@ -835,6 +922,44 @@ pub struct Settings {
     pub defer_plugins: bool,
     #[serde(default = "t")]
     pub checkpoints: bool,
+    /// Opt-in, local OTLP/HTTP trace export: the URL of a collector the *user*
+    /// runs. One span per model request and one per tool call go there, as
+    /// GenAI-semconv spans (see `agent::trace`).
+    ///
+    /// Empty — the default, and what every `settings.json` written before this
+    /// field existed loads as — means the exporter is not started at all: no
+    /// client, no thread, and nothing added to the request or tool path. That
+    /// is the whole safety model: OpenLeash still advertises no telemetry, and
+    /// spans only leave the machine when the user types an address for them.
+    ///
+    /// There is deliberately no vendor default and no API key field, and the
+    /// frontend's placeholder suggestion (`SUGGESTED_ENDPOINT` in
+    /// `agent::trace`) is a suggestion, never a stored value — storing one
+    /// would make "off by default" untrue.
+    #[serde(default)]
+    pub trace_endpoint: String,
+    /// Every key of `settings.json` this build has no field for.
+    ///
+    /// A catch-all, not a rejection: `deny_unknown_fields` is deliberately off
+    /// (see `research_tools_cannot_be_switched_off`), because a file written by
+    /// a newer build has to keep loading here. The missing half was what
+    /// happened next — those keys were dropped, so opening and re-saving your
+    /// settings on an older version quietly deleted what the newer one wrote,
+    /// and a mistyped key was reported nowhere at all. Keeping the keys makes
+    /// that round trip lossless, and [`unknown_settings_warning`] gives "why
+    /// didn't my setting do anything?" an answer. Values are held only so they
+    /// can be written back; nothing reads them.
+    ///
+    /// The names come from serde's own field dispatch, never from diffing the
+    /// keys in the file against the keys this build writes: a field with
+    /// `skip_serializing_if` — this one included — is absent from that output
+    /// while it holds no value, so a diff would report a real setting as unknown
+    /// the first time the user set it.
+    ///
+    /// `skip_serializing_if` here is what keeps the empty case byte-for-byte
+    /// what this build wrote before the field existed.
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 /// Four pings: about twenty minutes of a five-minute provider window, which
@@ -842,12 +967,13 @@ pub struct Settings {
 fn keepalive_pings_default() -> u32 {
     4
 }
-/// still in the sidebar, short enough that it does not become an archive of
-/// everything you have ever opened. Matches `DEFAULT_ARCHIVE_AGE` in
-/// `src/ui/Chrome.tsx` — the settings file written by a newer build is read by
-/// an older one, and a bare `default` would leave it at 0 (archive everything).
-fn two_weeks() -> u32 {
-    14
+
+/// The page the sidebar footer's shortcut button opens on a fresh install, and
+/// for any stored id the frontend has no page for. Accounts, beside a usage bar
+/// that is itself about accounts, is the page that button has always opened;
+/// matches `SIDEBAR_SETTINGS_TAB_DEFAULT` in `src/ui/settingsTabs.ts`.
+fn sidebar_button_tab_default() -> String {
+    "accounts".into()
 }
 
 impl Default for Settings {
@@ -862,6 +988,11 @@ impl Default for Settings {
             // the migration below and get rewritten to 90%.
             ui_size: "v2".into(),
             send_with: "enter".into(),
+            // A phone browser's Enter is a newline until the user asks for
+            // Enter-to-send: see the field's comment. Off is the default for a
+            // fresh install and for every settings.json written before this
+            // field existed, which is the whole point of it.
+            phone_enter_sends: false,
             theme: "raycast".into(),
             mode: "dark".into(),
             projects: vec![],
@@ -904,16 +1035,23 @@ impl Default for Settings {
             paused_all: false,
             paused_reason: String::new(),
             close_to_tray: true,
+            workspace: String::new(),
+            docker_idle_minutes: default_docker_idle(),
+            docker_auto_rebuild: true,
             notify: true,
             show_thinking: false,
+            ctx_breakdown: false,
             model_colors: HashMap::new(),
             home_usage: super::providers::PROVIDERS
                 .iter()
                 .filter(|p| p.account.is_some())
                 .map(|p| p.id.into())
                 .collect(),
+            sidebar_button_tab: sidebar_button_tab_default(),
             needs_you: false,
+            show_pull_requests: false,
             all_projects: false,
+            saved_sort: String::new(),
             plugins: Default::default(),
             diagnostics: true,
             verify_nudge: true,
@@ -924,8 +1062,9 @@ impl Default for Settings {
             project_docs: vec![],
             agent_titles: true,
             automatic_chat_reorder: true,
+            automatic_resume: true,
             memory: false,
-            archive_after_days: two_weeks(),
+            cross_chat: false,
             deny_env_files: true,
             trust: vec![],
             git_attribution: "co-authored-by".into(),
@@ -935,6 +1074,13 @@ impl Default for Settings {
             tool_search: true,
             defer_plugins: false,
             checkpoints: true,
+            // Exporting traces requires the user to name a collector. A fresh
+            // install has none, so this starts off and stays off until they do.
+            trace_endpoint: String::new(),
+            // A fresh install has no file, so nothing can be unrecognised. The
+            // catch-all is filled only by `load_settings`, from a file this
+            // build did not write.
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -950,9 +1096,49 @@ impl Settings {
     }
 }
 
+/// The `settings.json` keys this build does not recognise, sorted. Empty when
+/// the file is one this build understands — the common case.
+///
+/// Read from [`Settings::unknown`], which `load_settings` fills in; nothing is
+/// re-read from disk here. Names only, never values: a key name is what the user
+/// mistyped or what a newer build added, and a value can be anything at all,
+/// including something pasted from a credential.
+pub fn unknown_settings_keys(s: &Settings) -> Vec<String> {
+    s.unknown.keys().cloned().collect()
+}
+
+/// A one-line warning naming the keys in [`unknown_settings_keys`] and how many
+/// there are, or `None` when there are none — so a caller can show nothing at
+/// all rather than an empty notice.
+///
+/// This is the "why didn't my setting work?" answer: the keys were kept (see
+/// [`Settings::unknown`]) but nothing in this build reads them, so the settings
+/// screen cannot show them and the only other signal would be silence.
+pub fn unknown_settings_warning(s: &Settings) -> Option<String> {
+    let keys = unknown_settings_keys(s);
+    if keys.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "settings.json has {} setting{} this build does not recognise: {}. \
+         They were kept, but nothing here reads them — check the spelling, or the \
+         version you are running.",
+        keys.len(),
+        if keys.len() == 1 { "" } else { "s" },
+        keys.join(", ")
+    ))
+}
+
 pub fn load_settings() -> Settings {
     let raw = std::fs::read_to_string(data_dir().join("settings.json")).unwrap_or_default();
     let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
+    // A mistyped or newer-build key is not an error — the file has to keep
+    // loading — but silence is not an answer either: say which keys this build
+    // ignored, and in `Settings::unknown` keep them so the next save cannot
+    // delete them. Names only; a value may be a secret the user pasted.
+    if let Some(warning) = unknown_settings_warning(&s) {
+        eprintln!("[openleash] {warning}");
+    }
     if s.ui_zoom < 50 || s.ui_zoom > 200 {
         // Old named sizes: what used to be "Large" is the new 100%.
         s.ui_zoom = match s.ui_size.as_str() {
@@ -1003,15 +1189,15 @@ pub fn save_settings(s: &Settings) {
 }
 
 pub fn save_task(t: &Task) {
-    // A task whose sub-agent maps are still on disk cannot be written back: the
-    // in-memory copy is a header, and saving it would replace real sub-agent
+    // A task whose subagent maps are still on disk cannot be written back: the
+    // in-memory copy is a header, and saving it would replace real subagent
     // history with two empty maps. Nothing should reach here — `Harness::task`
     // hydrates first, and every save path goes through it — but a silent
     // rewrite of the user's history is the worst thing this program can do, so
     // the backstop is a hard refusal rather than a best-effort merge.
     if !t.hydrated {
         eprintln!(
-            "[openleash] refused to save {}: its sub-agent history has not been loaded. \
+            "[openleash] refused to save {}: its subagent history has not been loaded. \
              This is a bug — the write was skipped rather than truncate the file.",
             t.id
         );
@@ -1028,7 +1214,7 @@ pub fn save_task(t: &Task) {
 pub fn try_save_task(t: &Task) -> Result<(), String> {
     if !t.hydrated {
         return Err(format!(
-            "refused to save {}: sub-agent history is not loaded",
+            "refused to save {}: subagent history is not loaded",
             t.id
         ));
     }
@@ -1053,6 +1239,52 @@ pub fn task_path(id: &str) -> PathBuf {
     data_dir().join("tasks").join(format!("{id}.json"))
 }
 
+/// Delete the temp files an interrupted `try_write_atomic` left in the tasks
+/// folder.
+///
+/// A task file can be hundreds of megabytes, so the window between
+/// `File::create(&tmp)` and `rename` is seconds long, and this is a desktop app
+/// that gets killed, crashes and runs out of disk. The temp is removed on the
+/// error path, but a process that dies inside that window leaves it behind
+/// forever: nothing ever renames or rereads a dotfile, so those bytes are pure
+/// loss — the real dataset this was measured on carried 886 MB of them.
+///
+/// Runs from `load_tasks`, which the app calls once at startup *before* any
+/// writer task is registered, so there is no in-flight write to mistake for an
+/// orphan. The name pattern is matched exactly rather than deleting every
+/// dotfile, so a `.gitkeep` or the user's own hidden file survives.
+pub fn sweep_temp_files() {
+    let dir = data_dir().join("tasks");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_temp_name(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether a file name is one `try_write_atomic` writes: `.<name>.<id>.tmp`.
+///
+/// Both parts are hex, so the shape cannot collide with a real task file (those
+/// are `<id>.json`) or with an unrelated hidden file.
+fn is_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".tmp") else {
+        return false;
+    };
+    match rest.rsplit_once('.') {
+        Some((_, id)) => !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 /// Read one task file with the heavy fields skipped. See `Task::hydrated`.
 pub fn read_task_header(path: &Path) -> Result<Task, String> {
     let s = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -1065,12 +1297,12 @@ pub fn read_task_full(path: &Path) -> Result<Task, String> {
     parse_task(&s, true)
 }
 
-/// Deserialize a task file, optionally leaving the two sub-agent fields behind.
+/// Deserialize a task file, optionally leaving the two subagent fields behind.
 ///
 /// The header pass keeps `items`, `messages`, `touched`, `read_files`,
 /// `checkpoints` and `subs` fully populated, so the review view, rewind,
 /// checkpointing and `task_get` need no hydration at all — only the two
-/// sub-agent maps do.
+/// subagent maps do.
 fn parse_task(s: &str, full: bool) -> Result<Task, String> {
     // `HEAVY_MODE` is thread-local and these files are parsed on a thread pool,
     // so it must be set on the thread that runs serde — not around the call.
@@ -1090,7 +1322,7 @@ fn parse_task(s: &str, full: bool) -> Result<Task, String> {
     Ok(t)
 }
 
-/// `Task` with the two sub-agent fields intercepted.
+/// `Task` with the two subagent fields intercepted.
 ///
 /// The deserializers dispatch on `HEAVY_MODE`, a thread-local set by
 /// `parse_task`, rather than `Task` carrying a `deserialize_with` that would
@@ -1109,7 +1341,7 @@ struct RawTask {
 }
 
 thread_local! {
-    /// True = materialise the sub-agent maps, false = skip their bytes.
+    /// True = materialise the subagent maps, false = skip their bytes.
     static HEAVY_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
@@ -1147,6 +1379,7 @@ impl RawTask {
 /// same work is 14 seconds on a real dataset; skipping alone gets it to ~3,
 /// skipping plus the pool lands well under one.
 pub fn load_tasks() -> Vec<Task> {
+    sweep_temp_files();
     let paths: Vec<PathBuf> = std::fs::read_dir(data_dir().join("tasks"))
         .map(|rd| {
             rd.flatten()
@@ -1193,7 +1426,7 @@ pub fn pool() -> &'static rayon::ThreadPool {
 }
 
 /// Everything `load_tasks` does to a freshly-parsed task, apart from the
-/// sub-agent transcript repair that needs a hydrated body.
+/// subagent transcript repair that needs a hydrated body.
 ///
 /// Split out of the reader so it runs per-file on the pool.
 fn repair_loaded(mut t: Task) -> Task {
@@ -1213,7 +1446,7 @@ fn repair_loaded(mut t: Task) -> Task {
     // Anything mid-flight when the app closed is no longer running.
     let crashed = t.status == "running" || t.status == "waiting";
     // `t.subs` is in the header, so this repair still runs at boot; the matching
-    // repair of each sub-agent's *conversation* is not, because `sub_msgs` is
+    // repair of each subagent's *conversation* is not, because `sub_msgs` is
     // still on disk. `hydrate` does it instead — see `store::hydrate_task`.
     for sub in t.subs.iter_mut().filter(|x| x.status == "running") {
         sub.status = "stopped".into();
@@ -1287,7 +1520,7 @@ fn repair_loaded(mut t: Task) -> Task {
     t
 }
 
-/// Repair a sub-agent conversation truncated by a crash, once its body is loaded.
+/// Repair a subagent conversation truncated by a crash, once its body is loaded.
 ///
 /// The boot pass used to do this for every task. It cannot any more: `sub_msgs`
 /// is skipped at boot, so there is nothing to repair yet. It runs here instead,
@@ -1370,9 +1603,9 @@ pub fn try_write_atomic(path: &PathBuf, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// ───────────────────────────── sub-agent definitions ─────────────────────────────
+// ───────────────────────────── subagent definitions ─────────────────────────────
 
-/// Built-in sub-agents that are always available: they can't be deleted and
+/// Built-in subagents that are always available: they can't be deleted and
 /// can't be toggled off (per-chat or as new-chat defaults).
 pub const REQUIRED_AGENTS: &[&str] = &["explore", "general"];
 
@@ -1406,7 +1639,6 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             inject_instructions: true,
             effort: None,
             groups: vec![],
-            steps: 25,
         },
         AgentDef {
             id: "general".into(),
@@ -1421,7 +1653,6 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             inject_instructions: true,
             effort: None,
             groups: vec![],
-            steps: 60,
         },
     ]
 }
@@ -1432,7 +1663,7 @@ pub fn fuze_agent() -> AgentDef {
         id: "fuze".into(),
         name: "Fuze".into(),
         description: "Ultrathread worktrees: merges finished worker branches into the main checkout, resolves conflicts, and verifies the combined build.".into(),
-        prompt: "You are the FUZE agent. You work in the main checkout (the task's working directory). Your brief lists worker branches. For each: `git merge --no-ff <branch>` (commit or stash anything uncommitted in the main checkout first, and say so). Resolve conflicts by reading both sides and keeping the intent of both — never blindly take one side, never drop a worker's change without saying why. After merging, build and run the tests; fix integration breakage yourself. Once a branch is merged cleanly, remove its worktree with `git worktree remove <path>` (keep the branch). Report: merged branches, conflicts and how you resolved them, build/test results, anything you couldn't merge.".into(),
+        prompt: "You are the FUZE agent. You work in the main checkout (the task's working directory). Your brief lists worker branches. For each: `git merge --no-ff <branch>` (commit or stash anything uncommitted in the main checkout first, and say so). Resolve conflicts by reading both sides and keeping the intent of both — never blindly take one side, never drop a worker's change without saying why. After merging, build and run the tests; fix integration breakage yourself. Once a branch is merged cleanly, remove its worktree with `git worktree remove --force <path>` — `--force` is required, because a worktree carries ignored files copied into it at setup (`.env`, `node_modules`) and plain `git worktree remove` refuses over untracked files. The branch is kept either way. A brief that marks a branch COULD NOT COMMIT means its changes are still uncommitted in that worktree: commit them there first (`git -C <path> add -A && git -C <path> commit -m ...`), or merge the worktree's files by hand. Report: merged branches, conflicts and how you resolved them, build/test results, anything you couldn't merge.".into(),
         model: String::new(),
         tools: "all".into(),
         color: "#f472b6".into(),
@@ -1441,7 +1672,6 @@ pub fn fuze_agent() -> AgentDef {
         inject_instructions: true,
         effort: None,
         groups: vec![],
-        steps: 60,
     }
 }
 
@@ -1731,11 +1961,6 @@ pub(crate) fn parse_agent_md(text: &str, file_stem: &str) -> Option<AgentDef> {
             "inject_instructions" | "instructions" => {
                 d.inject_instructions = !matches!(v.to_lowercase().as_str(), "false" | "no" | "off")
             }
-            // opencode's per-agent iteration ceiling, plus the spellings Claude
-            // Code and Roo use for the same idea.
-            "steps" | "max_steps" | "maxturns" | "max_turns" | "max-steps" => {
-                d.steps = v.trim().parse::<usize>().unwrap_or(0)
-            }
             _ => {}
         }
     }
@@ -1779,7 +2004,9 @@ pub fn all_agents(s: &Settings, project: &str) -> Vec<AgentDef> {
 /// Untrusted callers must go through `all_agents`, which applies the gate.
 pub fn read_project_agents(project: &str) -> Vec<(AgentDef, std::path::PathBuf)> {
     let mut out = vec![];
-    if project.is_empty() {
+    // A remote (SSH) project's agent files are on its host and are not
+    // loaded (phase 2A); the URI must never be joined into a local path.
+    if project.is_empty() || super::host::is_ssh(project) {
         return out;
     }
     for dir in [".openleash/agents", ".claude/agents", ".opencode/agent"] {
@@ -1811,7 +2038,8 @@ pub fn read_project_agents(project: &str) -> Vec<(AgentDef, std::path::PathBuf)>
 /// Project skill directories (checked in order). `.openleash/skills` is
 /// native; `.claude/skills` is read for Claude Code compatibility.
 fn project_skill_dirs(project: &str) -> Vec<std::path::PathBuf> {
-    if project.is_empty() {
+    // Remote (SSH) project skills are not loaded; see `read_project_agents`.
+    if project.is_empty() || super::host::is_ssh(project) {
         return vec![];
     }
     let root = std::path::Path::new(project);
@@ -2245,6 +2473,13 @@ mod task_header_tests {
     use super::*;
 
     #[test]
+    fn new_pull_request_page_is_off_by_default_and_for_old_settings() {
+        assert!(!Settings::default().show_pull_requests);
+        let old: Settings = serde_json::from_str(r#"{"model":"m","effort":1,"perm":"turbo","worktree":false,"subagents":true}"#).unwrap();
+        assert!(!old.show_pull_requests);
+    }
+
+    #[test]
     fn a_task_without_a_permission_mode_defaults_to_full_access() {
         let mut value =
             serde_json::to_value(crate::agent::tests::task("unset-perm", "test-model")).unwrap();
@@ -2342,12 +2577,43 @@ mod tests {
         assert_eq!(old.perm, "turbo");
         assert!(!old.needs_you);
         assert!(!old.all_projects);
+        // An unset saved-prompt order is the stored one: a settings file written
+        // before the field existed must not come back as some other order.
+        assert!(old.saved_sort.is_empty());
         let on: Settings = serde_json::from_str(
-            r#"{"ui_size":"v2","ui_zoom":110,"needs_you":true,"all_projects":true}"#,
+            r#"{"ui_size":"v2","ui_zoom":110,"needs_you":true,"all_projects":true,"saved_sort":"folder"}"#,
         )
         .unwrap();
         assert!(on.needs_you);
         assert!(on.all_projects);
+        assert_eq!(on.saved_sort, "folder");
+    }
+
+    #[test]
+    fn accounts_saved_before_caps_existed_load_without_any() {
+        // A cap is an instruction the user gave by hand, so the only honest
+        // reading of a settings file that predates the field is "no caps". The
+        // old JSON therefore has to carry no `caps` key for this to prove
+        // anything, and the new one has to survive round-tripping with the
+        // window label it was set on.
+        let old: Settings = serde_json::from_str(
+            r#"{"accounts":[{"id":"a1","kind":"codex","label":"ChatGPT 1","priority":10,"enabled":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.accounts.len(), 1);
+        assert!(old.accounts[0].caps.is_empty());
+        let capped: Settings = serde_json::from_str(
+            r#"{"accounts":[{"id":"a1","caps":[{"window":"5h","used":50,"until":0}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            capped.accounts[0].caps,
+            vec![UsageCap {
+                window: "5h".into(),
+                used: 50.0,
+                until: 0
+            }]
+        );
     }
 
     #[test]
@@ -2380,6 +2646,75 @@ mod tests {
         let on: Settings =
             serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"show_thinking":true}"#).unwrap();
         assert!(on.show_thinking);
+    }
+
+    #[test]
+    fn the_context_breakdown_split_is_opt_in() {
+        // `ctx_breakdown` is a bare `#[serde(default)]`, so the off state has to
+        // be asserted from both directions: a fresh install and a settings.json
+        // written before the field existed. The split is an estimate scaled to
+        // the provider's count, not a number any provider reports, so it is the
+        // ring and its token pair that everyone sees by default — moving this
+        // to `default = "t"` would put the estimate in every details panel.
+        assert!(!Settings::default().ctx_breakdown);
+        let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
+        assert!(!old.ctx_breakdown);
+        // An explicit `true` from the user is still honoured, and stored.
+        let on: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"ctx_breakdown":true}"#).unwrap();
+        assert!(on.ctx_breakdown);
+        assert!(serde_json::to_value(&on).unwrap()["ctx_breakdown"]
+            .as_bool()
+            .unwrap());
+    }
+
+    #[test]
+    fn a_phone_browser_starts_with_enter_as_a_newline() {
+        // `phone_enter_sends` is a bare `#[serde(default)]` and the off state is
+        // the safety property, not a preference: a phone's on-screen Return key
+        // cannot be trusted to report Shift, so an install that upgraded into
+        // Enter-sends would send the messages its owner was breaking into
+        // paragraphs. Asserted from both directions so moving this to
+        // `default = "t"` fails here rather than in someone's draft.
+        assert!(!Settings::default().phone_enter_sends);
+        let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
+        assert!(!old.phone_enter_sends);
+        // Turning it on in Settings is still honoured, and stored.
+        let on: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"phone_enter_sends":true}"#)
+                .unwrap();
+        assert!(on.phone_enter_sends);
+        assert!(serde_json::to_value(&on).unwrap()["phone_enter_sends"]
+            .as_bool()
+            .unwrap());
+        // The desktop switch it deliberately does not follow.
+        let ctrl: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"send_with":"ctrl-enter"}"#)
+                .unwrap();
+        assert!(!ctrl.phone_enter_sends);
+        assert_eq!(ctrl.send_with, "ctrl-enter");
+    }
+
+    #[test]
+    fn automatic_resume_is_on_for_new_and_existing_settings() {
+        assert!(Settings::default().automatic_resume);
+        let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
+        assert!(old.automatic_resume);
+        let off: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"automatic_resume":false}"#)
+                .unwrap();
+        assert!(!off.automatic_resume);
+    }
+
+    #[test]
+    fn automatic_docker_rebuild_defaults_on_for_old_settings_and_respects_false() {
+        assert!(Settings::default().docker_auto_rebuild);
+        let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
+        assert!(old.docker_auto_rebuild);
+        let off: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"docker_auto_rebuild":false}"#)
+                .unwrap();
+        assert!(!off.docker_auto_rebuild);
     }
 
     #[test]
@@ -2422,6 +2757,12 @@ mod tests {
         // toggle still existed can carry `"research": false`; deserialising has to
         // keep working (no `deny_unknown_fields`), and that stale false must not
         // survive a save-and-reload, or it would look like the switch still works.
+        //
+        // The save-and-reload here is the deliberate one: a hand-built struct
+        // that never carried the key. A real load/save pair *does* write it back
+        // now — as an unrecognised key, held in `Settings::unknown` so an older
+        // build cannot delete a newer build's settings — and no code reads it, so
+        // the switch is still gone. See `unknown_settings_keys_are_reported_and_kept`.
         let old: Settings =
             serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"research":false}"#).unwrap();
         let round = Settings {
@@ -2437,6 +2778,233 @@ mod tests {
     }
 
     #[test]
+    fn unknown_settings_keys_are_reported_and_kept() {
+        // A key this build has no field for — a typo, or a setting a newer build
+        // added — must not be an error (the file still has to load) and must not
+        // be silently deleted on the next save. It is reported by name instead,
+        // which is the only answer to "why didn't my setting do anything?".
+        let root = std::env::temp_dir().join(format!("ol-unknown-keys-{}", std::process::id()));
+        let _home = test_home(&root);
+        // The claim on the folder is fresh, so it does not exist yet: the hand
+        // written file below is the only thing in it.
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"ui_size":"v2","ui_zoom":110,"theme":"lavender","frm_the_future":true,"another":7}"#,
+        )
+        .unwrap();
+
+        let s = load_settings();
+        assert_eq!(s.theme, "lavender", "the known settings still load");
+        assert_eq!(
+            unknown_settings_keys(&s),
+            vec!["another".to_string(), "frm_the_future".to_string()],
+            "both unrecognised keys are named, sorted, and nothing else is"
+        );
+        let warning =
+            unknown_settings_warning(&s).expect("an unknown key must be reported, not silent");
+        assert!(
+            warning.contains("frm_the_future") && warning.contains("another"),
+            "the warning names the keys: {warning}"
+        );
+        assert!(warning.contains('2'), "the warning counts them: {warning}");
+        assert!(
+            !warning.contains("true") && !warning.contains('7'),
+            "values are never repeated — one of them may be a pasted credential: {warning}"
+        );
+
+        // Save → load: the keys are still there, values intact, and the file on
+        // disk is what a restart reads back.
+        save_settings(&s);
+        let reloaded = load_settings();
+        assert_eq!(unknown_settings_keys(&reloaded), unknown_settings_keys(&s));
+        assert_eq!(
+            reloaded.unknown.get("frm_the_future"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(reloaded.unknown.get("another"), Some(&serde_json::json!(7)));
+        let raw = std::fs::read_to_string(&file).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(on_disk["frm_the_future"], serde_json::json!(true));
+        assert_eq!(on_disk["another"], serde_json::json!(7));
+        // And the known settings did not shift underneath them.
+        assert_eq!(reloaded.theme, "lavender");
+        assert_eq!(reloaded.ui_zoom, 110);
+        // The other way settings travel: the whole struct through a JSON value,
+        // which is the path the UI's settings patch takes. The keys have to
+        // survive that too, or a theme change would drop them.
+        let via_value: Settings =
+            serde_json::from_value(serde_json::to_value(&reloaded).unwrap()).unwrap();
+        assert_eq!(
+            unknown_settings_keys(&via_value),
+            unknown_settings_keys(&reloaded)
+        );
+        assert_eq!(
+            via_value.unknown.get("frm_the_future"),
+            Some(&serde_json::json!(true))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The trace-endpoint switch is a new field on an old struct, so both
+    /// halves of that matter: a file written before it existed has to load with
+    /// export off, and the field has to be a *known* one — a settings file that
+    /// carries it must not have it reported as unrecognised and round-tripped
+    /// as a mystery value nothing reads.
+    #[test]
+    fn the_trace_endpoint_setting_is_known_and_defaults_to_off() {
+        let root = std::env::temp_dir().join(format!("ol-trace-endpoint-{}", std::process::id()));
+        let _home = test_home(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"ui_size":"v2","ui_zoom":110}"#,
+        )
+        .unwrap();
+        let s = load_settings();
+        assert_eq!(
+            s.trace_endpoint, "",
+            "export is off until the user names a collector"
+        );
+        assert!(
+            unknown_settings_keys(&s).is_empty(),
+            "the new field must be recognised, not reported: {:?}",
+            unknown_settings_keys(&s)
+        );
+
+        // Round trip: the user's URL survives a save and reload as a real value.
+        let mut s = s;
+        s.trace_endpoint = "http://127.0.0.1:4318/v1/traces".into();
+        save_settings(&s);
+        assert_eq!(
+            load_settings().trace_endpoint,
+            "http://127.0.0.1:4318/v1/traces"
+        );
+
+        // And a file that already carries the key loads it, rather than treating
+        // it as one of `unknown`'s mystery keys.
+        let parsed: Settings = serde_json::from_str(
+            r#"{"ui_size":"v2","ui_zoom":110,"trace_endpoint":"http://localhost:4318/v1/traces"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.trace_endpoint, "http://localhost:4318/v1/traces");
+        assert!(unknown_settings_keys(&parsed).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_settings_file_this_build_understands_reports_nothing() {
+        // The feature's failure mode is noise: a report that fires on a file with
+        // nothing wrong with it is worse than no report, because the one time it
+        // matters it reads like every other time. A file containing only fields
+        // this build has must stay silent, and must survive load + save byte for
+        // byte — a file it understands is not a file it rewrites.
+        let root = std::env::temp_dir().join(format!("ol-known-keys-{}", std::process::id()));
+        let _home = test_home(&root);
+        let file = root.join("settings.json");
+        let mut s = load_settings();
+        s.theme = "lavender".into();
+        save_settings(&s);
+        let written = std::fs::read_to_string(&file).unwrap();
+
+        let loaded = load_settings();
+        assert!(
+            unknown_settings_keys(&loaded).is_empty(),
+            "a file this build wrote reports nothing: {:?}",
+            unknown_settings_keys(&loaded)
+        );
+        assert!(unknown_settings_warning(&loaded).is_none());
+        assert!(loaded.unknown.is_empty());
+        save_settings(&loaded);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            written,
+            "load + save must not touch a file it fully understands"
+        );
+
+        // A hand-written file with only known keys — partial, older — is the same
+        // case, and every field it leaves out is a default rather than a key this
+        // build does not know.
+        std::fs::write(
+            &file,
+            r#"{"ui_size":"v2","ui_zoom":110,"theme":"lavender","send_with":"ctrl-enter"}"#,
+        )
+        .unwrap();
+        let partial = load_settings();
+        assert!(unknown_settings_keys(&partial).is_empty());
+        assert_eq!(partial.send_with, "ctrl-enter");
+        assert!(partial.close_to_tray, "unmentioned fields default");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_key_cannot_shadow_a_real_setting() {
+        // The report is what a user is meant to act on, so it has to be about the
+        // keys *this build has no field for* — not about names that merely look
+        // like something. A near-miss must be listed as unknown and leave the real
+        // setting exactly as the file set it.
+        let s: Settings = serde_json::from_str(
+            r#"{"ui_size":"v2","ui_zoom":110,"model":"anthropic/claude-opus-5",
+                "uiZoom":7,"ui_zooms":["x"],"models":1,"Model":"typo"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.ui_zoom, 110, "the real setting keeps the file's value");
+        assert_eq!(s.model, "anthropic/claude-opus-5");
+        assert_eq!(
+            unknown_settings_keys(&s),
+            vec![
+                "Model".to_string(),
+                "models".to_string(),
+                "uiZoom".to_string(),
+                "ui_zooms".to_string()
+            ]
+        );
+        // Neither half overwrote the other: the struct holds the real value under
+        // the real name, and the look-alike under its own.
+        let written = serde_json::to_value(&s).unwrap();
+        assert_eq!(written["ui_zoom"], serde_json::json!(110));
+        assert_eq!(
+            written["model"],
+            serde_json::json!("anthropic/claude-opus-5")
+        );
+        assert_eq!(written["uiZoom"], serde_json::json!(7));
+        assert_eq!(written["models"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn a_setting_that_serialises_conditionally_is_not_reported_as_unknown() {
+        // The tempting implementation is a diff — "keys in the file, minus keys
+        // this build writes back" — and it is wrong for every field marked
+        // `skip_serializing_if`: such a field is absent from this build's own
+        // output while it holds no value, so the diff would call a *real* setting
+        // unknown the first time the user set it. `unknown` is that field here,
+        // which is why the names come from which fields the deserializer filled
+        // in instead.
+        let written = serde_json::to_value(Settings::default()).unwrap();
+        assert!(
+            written.get("unknown").is_none(),
+            "the field is skipped in this build's own output, so a diff would not \
+             know the name at all"
+        );
+        // A file whose only extra key is that field's own name: the catch-all
+        // holds the rest of the file, so its name is not a setting — it is
+        // reported like any other key this build has no field for, rather than
+        // being swallowed or hidden.
+        let s: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"unknown":{"typo":1}}"#).unwrap();
+        assert_eq!(
+            unknown_settings_keys(&s),
+            vec!["unknown".to_string()],
+            "the catch-all's own name is not a field name the file can fill"
+        );
+        assert_eq!(
+            s.unknown.get("unknown"),
+            Some(&serde_json::json!({"typo": 1}))
+        );
+    }
+
+    #[test]
     fn memory_is_off_until_asked_for() {
         // Memory writes files that survive between sessions, so it is opt-in.
         // Unlike research, the serde default here is deliberately `false`.
@@ -2446,23 +3014,21 @@ mod tests {
     }
 
     #[test]
-    fn the_age_archive_window_opens_at_two_weeks() {
-        // The frontend's `DEFAULT_ARCHIVE_AGE` has to agree with this, or the
-        // button reads "14 days" and sweeps on whatever the file happens to say.
-        // And it must NOT be a bare `default`: a settings.json written before
-        // this field existed would read 0 days, and 0 is "idle for a moment" —
-        // the sweep would put every non-running chat away on its first press.
-        assert_eq!(Settings::default().archive_after_days, 14);
+    fn cross_chat_is_off_until_asked_for() {
+        // Reading another chat's state and messaging it reaches outside the one
+        // conversation the user opened, so it is opt-in like memory. A
+        // settings.json written before the flag existed must load with it off,
+        // not with whatever a field-level default happened to be.
+        assert!(!Settings::default().cross_chat);
         let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
-        assert_eq!(
-            old.archive_after_days, 14,
-            "an older file keeps the default"
-        );
-        // An explicit choice still wins over it.
-        let chosen: Settings =
-            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"archive_after_days":90}"#)
-                .unwrap();
-        assert_eq!(chosen.archive_after_days, 90);
+        assert!(!old.cross_chat);
+        // And an explicit choice still round-trips.
+        let on: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"cross_chat":true}"#).unwrap();
+        assert!(on.cross_chat);
+        assert!(serde_json::to_string(&Settings::default())
+            .unwrap()
+            .contains("\"cross_chat\":false"));
     }
 
     #[test]
@@ -3018,6 +3584,45 @@ mod secret_debug_tests {
     }
 
     #[test]
+    fn the_interrupted_write_temp_is_recognised_and_removed() {
+        // An interrupted `try_write_atomic` leaves `.{name}.{id}.tmp` behind, and
+        // nothing ever renames or rereads it — the real dataset carried 886 MB
+        // of these. Before the sweep existed, a crash during a 700 MB write cost
+        // half a gigabyte of disk per event, forever.
+        let root = std::env::temp_dir().join(format!("ol-sweep-{}", std::process::id()));
+        let _home = test_home(&root);
+        let tasks = data_dir().join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+
+        let orphan = tasks.join(".b3c99f60e9a4.json.75fa3393765d.tmp");
+        std::fs::write(&orphan, "half a task").unwrap();
+        let keep = tasks.join("b3c99f60e9a4.json");
+        std::fs::write(&keep, "{}").unwrap();
+        // Hidden files that are not ours must survive: the pattern is matched,
+        // not every dotfile.
+        let other = tasks.join(".gitkeep");
+        std::fs::write(&other, "").unwrap();
+        // A wrong extension is not our temp either.
+        std::fs::write(tasks.join(".b3c99f60e9a4.json.75fa3393765d.tmp.bak"), "x").unwrap();
+
+        assert!(is_temp_name(".b3c99f60e9a4.json.75fa3393765d.tmp"));
+        assert!(!is_temp_name("b3c99f60e9a4.json"), "a real task file");
+        assert!(!is_temp_name(".gitkeep"));
+        assert!(!is_temp_name("..tmp"));
+        assert!(!is_temp_name("no-id-here.tmp"));
+
+        sweep_temp_files();
+        assert!(!orphan.exists(), "the orphaned write temp is gone");
+        assert!(keep.exists(), "the real task file survives");
+        assert!(other.exists(), "an unrelated hidden file survives");
+        assert!(tasks
+            .join(".b3c99f60e9a4.json.75fa3393765d.tmp.bak")
+            .exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn an_empty_secret_still_reads_as_empty_not_redacted() {
         // Otherwise "no key configured" and "a key is configured but hidden"
         // look identical in a debug log, which is the one thing you check first.
@@ -3196,6 +3801,7 @@ mod memory_tests {
             effort: 2,
             perm: "auto".into(),
             plan: false,
+            plan_artifict: None,
             ultra: false,
             ultra_wt: false,
             ultra_x: None,
@@ -3218,12 +3824,18 @@ mod memory_tests {
             stop_note: None,
             bg_live: vec![],
             busy: 0,
+            bg_now: vec![],
             wrap_up: false,
+            summarise_first: false,
             model_map: Default::default(),
             archived: false,
             pinned: false,
+            artifict_open: false,
             order: 0.0,
             hidden: false,
+            // `Task::unread` is the sidebar's blue dot; this fixture is a saved
+            // chat, and nothing here is waiting to be looked at.
+            unread: false,
             forked_from: None,
             items: vec![],
             messages: vec![],
@@ -3231,12 +3843,14 @@ mod memory_tests {
             subs: vec![],
             usage: Default::default(),
             read_files: Default::default(),
+            read_hashes: Default::default(),
             checkpoints: vec![],
             touched: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             touched_at: chrono::Utc::now(),
             hydrated: true,
+            docker: None,
         };
         save_task(&t);
         // What is on disk still carries the old prompt; that is the whole point --

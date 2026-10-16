@@ -577,7 +577,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: 6, paddingTop: 2 }}>
-        <span style={{ fontSize: 11, color: err ? "#ff8a8a" : "var(--dim)" }}>
+        <span className="question-keyhint" style={{ fontSize: 11, color: err ? "#ff8a8a" : "var(--dim)" }}>
           {err ?? (dismissing ? "Confirm below to dismiss" : footHint)}
         </span>
         <div style={{ flex: 1 }} />

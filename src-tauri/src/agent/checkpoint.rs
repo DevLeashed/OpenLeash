@@ -41,7 +41,7 @@
 //! The `mine` ledger is written only by [`record_agent_write`], called by the
 //! executor immediately after a successful `edit_file`, `multi_edit`, or
 //! `write_file`. A whole-worktree diff is deliberately not enough: a file that
-//! changed during a turn could have been written by `bash`, a sub-agent or the
+//! changed during a turn could have been written by `bash`, a subagent or the
 //! user, and guessing ownership from it would let rewind erase work it does not
 //! own. On restore, a file is eligible only while its current blob matches this
 //! explicit post-write blob; anything else is left alone and reported back.
@@ -114,6 +114,8 @@ impl Snapshot {
     /// created, which is the user asking for the old behaviour (and for not
     /// carrying a second copy of their folder around).
     pub fn of(t: &super::Task, enabled: bool) -> Option<Self> {
+        // Checkpoints shadow a *local* folder; a remote (SSH) project has none.
+        let enabled = enabled && !super::host::is_ssh(&t.cwd);
         enabled.then(|| Snapshot {
             chat: t.id.clone(),
             cwd: t.cwd.clone(),
@@ -272,6 +274,7 @@ fn config(chat: &str, key: &str, value: &str) {
 /// "which tree is this about" an explicit parameter of every call rather than
 /// something git infers from the folder it happens to sit in.
 pub fn ensure(chat: &str, worktree: &str) -> Result<(), String> {
+    super::host::refuse(worktree, "Checkpoints are")?;
     let dir = store(chat);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("cannot create the checkpoint folder: {e}"))?;
@@ -311,6 +314,8 @@ pub fn record_agent_write(
     msg_index: usize,
     absolute_path: &Path,
 ) -> Result<(), String> {
+    super::host::refuse(worktree, "Checkpoints are")?;
+    super::tools::local_guard(absolute_path)?;
     let root = Path::new(worktree)
         .canonicalize()
         .map_err(|e| format!("cannot resolve worktree: {e}"))?;
@@ -349,6 +354,7 @@ pub fn record_agent_write(
 /// Capture the most recently submitted user turn without the caller needing to
 /// reconstruct the snapshot ledger's internal marker tuple.
 pub fn capture_latest_turn(task_id: &str, worktree: &str) -> Result<(), String> {
+    super::host::refuse(worktree, "Checkpoints are")?;
     let (count, item, msg) = read_turns(task_id)
         .into_iter()
         .rev()
@@ -382,6 +388,7 @@ fn snapshot_at(
     msg_index: usize,
     kind: Kind,
 ) -> Result<Option<String>, String> {
+    super::host::refuse(worktree, "Checkpoints are")?;
     if worktree.is_empty() || !Path::new(worktree).is_dir() {
         return Err("That chat's folder is not there any more.".into());
     }
@@ -648,7 +655,7 @@ pub fn changed(chat: &str, from: &str, to: &str) -> Vec<FileStat> {
 /// including files the store has never committed, which for the turn in
 /// progress is most of them.
 pub fn changed_now(chat: &str, worktree: &str, from: &str) -> Vec<FileStat> {
-    if !exists(chat) {
+    if !exists(chat) || super::host::is_ssh(worktree) {
         return vec![];
     }
     let mut out = changed(chat, from, "HEAD");
@@ -699,6 +706,10 @@ fn safe_rel(path: &str) -> bool {
 /// keeps the user's index untouched and keeps ours consistent, which the next
 /// snapshot's `status` depends on.
 pub fn restore(chat: &str, worktree: &str, commit: &str, paths: &[String]) -> Restored {
+    // Fail closed: nothing restored on a remote (SSH) folder.
+    if super::host::is_ssh(worktree) {
+        return Restored::default();
+    }
     let _guard = lock_writes();
     let mut out = Restored::default();
     let mut mine = read_mine(chat);
@@ -779,6 +790,7 @@ pub fn candidates(chat: &str, worktree: &str, commit: &str) -> Vec<String> {
 /// `git status` would then lie about what had changed, and the skip rule is
 /// built on that answer.
 pub fn materialize(chat: &str, commit: &str, dest: &str) -> Result<usize, String> {
+    super::host::refuse(dest, "Checkpoints are")?;
     if !Path::new(dest).is_dir() {
         return Err("The new worktree is not there.".into());
     }

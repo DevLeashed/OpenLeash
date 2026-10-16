@@ -1,19 +1,29 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import "./App.css";
 import { api } from "./api";
-import { boot, DEFAULT_ZOOM, disposeBoot, flash, get, go, set, stepZoom, useStore, zoom } from "./store";
+import { boot, disposeBoot, flash, get, go, requestPause, set, stepZoom, useStore, zoom, zoomFactor } from "./store";
+import { isRemoteClient } from "./remote";
+import { applyMode } from "./theme";
 import { AppUpdateBanner } from "./ui/AppUpdate";
 import { Sidebar, Titlebar } from "./ui/Chrome";
 import { togglePlan } from "./ui/Composer";
 import { Home, pickFolder } from "./ui/Home";
 import { Overlays } from "./ui/Overlays";
 import { Paused } from "./ui/Paused";
-import { Review } from "./ui/Review";
-import { Saved } from "./ui/Saved";
 import { Session } from "./ui/Session";
-import { SettingsView } from "./ui/Settings";
+import { RemotePicker } from "./ui/RemotePicker";
 import { SelectionNoteLayer } from "./ui/SelectionNote";
 import { Loader, LightboxProvider } from "./ui/primitives";
+
+// Views that are never on screen at launch load on first visit, so their code
+// (Settings pulls in every settings panel) stays out of the bundle the window
+// has to parse before its first paint.
+const loadReview = () => import("./ui/Review");
+const loadSaved = () => import("./ui/Saved");
+const loadSettings = () => import("./ui/Settings");
+const Review = lazy(() => loadReview().then((m) => ({ default: m.Review })));
+const Saved = lazy(() => loadSaved().then((m) => ({ default: m.Saved })));
+const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.SettingsView })));
 
 function pendingApproval(): string | null {
   const s = get();
@@ -45,7 +55,15 @@ function onKey(e: KeyboardEvent) {
       const paused = !!t?.paused || (!!s.settings?.paused_all && !t?.unpaused);
       if (t && (t.status === "running" || t.status === "waiting")) {
         if (paused) api.dismissPause(t.id).then(() => flash("Stopped")).catch(() => {});
-        else api.pause(t.id).then(() => flash("Paused · Esc again to stop")).catch(() => {});
+        else {
+          const request = requestPause(t.id);
+          if (request) {
+            // The task summary and Esc feedback should not wait for checkpoint
+            // snapshots or persistence to finish inside the pause command.
+            flash("Pausing · Esc again to stop");
+            void request.catch((error) => flash(String(error)));
+          }
+        }
       }
     }
     return;
@@ -74,10 +92,24 @@ export default function App() {
   const ready = useStore((s) => s.ready);
   const err = useStore((s) => s.bootError);
   const view = useStore((s) => s.view);
-  const z = useStore((s) => (s.settings?.ui_zoom ?? DEFAULT_ZOOM) / 100);
+  const z = useStore((s) => zoomFactor(s.settings?.ui_zoom));
   const theme = useStore((s) => s.settings?.theme ?? "raycast");
   useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
-  useEffect(() => { document.documentElement.dataset.mode = "dark"; }, []);
+  // Light/dark comes from the setting, including "follow the OS". This used to
+  // be a hardcoded "dark", which meant the `mode` setting and the whole
+  // `[data-mode="light"]` half of the stylesheet were unreachable.
+  const mode = useStore((s) => s.settings?.mode);
+  useEffect(() => applyMode(mode), [mode]);
+  // Browser-only styling (safe areas, no pull-to-refresh) hangs off this class.
+  useEffect(() => { document.documentElement.classList.toggle("remote", isRemoteClient()); }, []);
+  // Warm the lazy views once startup has settled, so the first visit to one
+  // doesn't wait on a chunk load. Module imports are cached, so this is free
+  // if the user already got there.
+  useEffect(() => {
+    if (!ready) return;
+    const t = window.setTimeout(() => { for (const load of [loadSettings, loadReview, loadSaved]) load().catch(() => {}); }, 1500);
+    return () => window.clearTimeout(t);
+  }, [ready]);
 
   useEffect(() => {
     void boot();
@@ -94,7 +126,12 @@ export default function App() {
 
   return (
     <LightboxProvider>
-    <div className="app" style={{ zoom: z, width: `${100 / z}vw`, height: `${100 / z}vh` }}>
+    // A phone browser's `vh` is the height with its toolbars hidden, so the
+    // bottom of the app (the composer) would sit under them; `dvh` follows the
+    // toolbars and, with `interactive-widget` in index.html, the keyboard. Only
+    // in a remote browser: the desktop webview has neither, and an engine without
+    // `dvh` drops the value and falls back to `.app`'s own `inset: 0`.
+    <div className="app" style={{ zoom: z, width: `${100 / z}vw`, height: `${100 / z}${isRemoteClient() ? "dvh" : "vh"}` }}>
       <Titlebar />
       <AppUpdateBanner />
       <div className="body">
@@ -102,17 +139,20 @@ export default function App() {
         <main className="main">
           {!ready ? <Loader className="app-loader" size={18} label="Starting…" /> : (
             <div className="viewwrap" key={view === "session" || view === "diff" ? view + get().task : view}>
+              <Suspense fallback={<Loader className="app-loader" size={18} />}>
               {view === "home" && <Home />}
               {view === "session" && <Session />}
               {view === "diff" && <Review />}
               {view === "saved" && <Saved />}
               {view === "paused" && <Paused />}
               {view === "settings" && <SettingsView />}
+              </Suspense>
             </div>
           )}
         </main>
       </div>
       <Overlays z={z} />
+      <RemotePicker />
       {/* Outside the zoomed view tree but inside the app root: the note pill is
           placed from a selection rect in unzoomed window pixels, and it has to
           land over the transcript without scrolling with it. */}

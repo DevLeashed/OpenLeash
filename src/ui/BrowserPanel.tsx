@@ -7,7 +7,10 @@ export function browserPoint(clientX: number, clientY: number, rect: Pick<DOMRec
   return { x: (clientX - rect.left) / rect.width * frame.viewport_width, y: (clientY - rect.top) / rect.height * frame.viewport_height };
 }
 
-export function BrowserPanel({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+/** The agent's own browser, over the same page and cookies. `embedded` drops the
+ *  modal frame so the workspace pane can host it as one of its views — the pane
+ *  is the frame then, and switching views is the close. */
+export function BrowserPanel({ taskId, onClose, embedded = false }: { taskId: string; onClose: () => void; embedded?: boolean }) {
   const [frame, setFrame] = useState<BrowserPanelFrame | null>(null);
   const [url, setUrl] = useState("");
   const [text, setText] = useState("");
@@ -32,10 +35,7 @@ export function BrowserPanel({ taskId, onClose }: { taskId: string; onClose: () 
     const timer = window.setInterval(() => { void run({ kind: "snapshot" }); }, 2000);
     return () => { alive.current = false; window.clearInterval(timer); };
   }, [run]);
-  return <Modal onClose={onClose} style={{ width: "min(1100px, 95vw)", maxHeight: "90vh", overflow: "auto" }}><section className="mb" aria-label="Agent browser">
-    <div style={{ display: "flex", gap: 8 }}><strong>Main agent browser</strong><button className="btn" onClick={onClose}>Close browser panel</button></div>
-    <p className="desc">Same page and cookies as the main agent. Your clicks and typing act on websites immediately. The agent may act at the same time.</p>
-    <p className="desc">Closing this panel does not close the browser. Run cleanup closes it; the next refresh may open a fresh session.</p>
+  const fields = <>
     <form onSubmit={e => { e.preventDefault(); void run({ kind: "navigate", url }); }} style={{ display: "flex", gap: 8 }}>
       <button className="btn" type="button" disabled={busy} onClick={() => void run({ kind: "back" })}>Back</button>
       <button className="btn" type="button" disabled={busy} onClick={() => void run({ kind: "refresh" })}>Reload page</button>
@@ -50,5 +50,15 @@ export function BrowserPanel({ taskId, onClose }: { taskId: string; onClose: () 
       <button className="btn" disabled={busy || !text}>Type in page</button>
     </form>
     <div style={{ display: "flex", gap: 8 }}>{(["Enter", "Tab"] as const).map(key => <button className="btn" key={key} disabled={busy} onClick={() => void run({ kind: "key", key })}>{key} in page</button>)}<button className="btn" disabled={busy} onClick={() => void run({ kind: "scroll", delta_y: -500 })}>Scroll up</button><button className="btn" disabled={busy} onClick={() => void run({ kind: "scroll", delta_y: 500 })}>Scroll down</button></div>
+  </>;
+  if (embedded) return <section className="browser-panel" aria-label="Agent browser">
+    <p className="desc">Same page and cookies as the main agent. Your clicks and typing act on websites immediately, and the agent may act at the same time. Leaving this view does not close the browser; the next refresh may open a fresh session.</p>
+    {fields}
+  </section>;
+  return <Modal onClose={onClose} style={{ width: "min(1100px, 95vw)", maxHeight: "90vh", overflow: "auto" }}><section className="mb" aria-label="Agent browser">
+    <div style={{ display: "flex", gap: 8 }}><strong>Main agent browser</strong><button className="btn" onClick={onClose}>Close browser panel</button></div>
+    <p className="desc">Same page and cookies as the main agent. Your clicks and typing act on websites immediately. The agent may act at the same time.</p>
+    <p className="desc">Closing this panel does not close the browser. Run cleanup closes it; the next refresh may open a fresh session.</p>
+    {fields}
   </section></Modal>;
 }

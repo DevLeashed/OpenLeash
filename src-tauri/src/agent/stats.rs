@@ -21,6 +21,24 @@ pub struct Counter {
     /// Subset of `output` (only where the provider reports it).
     pub reasoning: u64,
     pub errors: u64,
+    /// Failure rate as a fraction (0.0–1.0): `errors / (requests + errors)`.
+    ///
+    /// Recorded alongside the two counts it comes from rather than derived on
+    /// every read, because this is the per-model figure the stats screen ranks
+    /// on and a non-UI reader should not have to know the formula.
+    ///
+    /// The denominator is attempts (`requests + errors`), not `requests`: a
+    /// failed attempt is recorded as an error and never increments `requests`
+    /// (see `Stats::error`), so dividing by `requests` alone would report a
+    /// rate above 1.0 and disagree with every other failure figure the UI
+    /// prints. A `f64` so an older stats file without the key defaults to 0.0.
+    ///
+    /// Whether the UI reads this or re-derives it: it re-derives (see
+    /// `failureRate` in `ui/Stats.tsx`), because the derive is correct for
+    /// *aggregates* and for files that predate the field — `#[serde(default)]`
+    /// hands an old model row a `0.0` that would otherwise read as "no
+    /// failures" for a model whose every attempt failed.
+    pub failure_rate: f64,
     /// Sum of request durations (ms), for averages.
     pub total_ms: u64,
     /// Sum of time-to-first-token (ms) over requests that streamed.
@@ -46,6 +64,21 @@ impl Counter {
         }
         self.cost += u.cost;
         self.last_used = chrono::Utc::now().to_rfc3339();
+        self.update_failure_rate();
+    }
+
+    /// Recompute `failure_rate` from the two counts it is derived from.
+    ///
+    /// Called from every path that moves `requests` or `errors`, so the stored
+    /// rate can never drift from the counts beside it. Zero attempts reads as
+    /// 0.0, not NaN: nothing was tried, so nothing failed.
+    fn update_failure_rate(&mut self) {
+        let attempts = self.requests + self.errors;
+        self.failure_rate = if attempts == 0 {
+            0.0
+        } else {
+            self.errors as f64 / attempts as f64
+        };
     }
 }
 
@@ -135,7 +168,7 @@ pub const MAX_CHATS: usize = 100;
 pub const MAX_CHAT_TOOLS: usize = 25;
 
 /// How many usage ids one chat keeps. A big ultrathread tree is dozens of
-/// sub-agents, each with its own row; past this the least expensive fall out.
+/// subagents, each with its own row; past this the least expensive fall out.
 pub const MAX_CHAT_AGENTS: usize = 50;
 
 /// One finished model request.
@@ -229,7 +262,7 @@ impl Stats {
                 c.started = chrono::Utc::now().to_rfc3339();
             }
             // Bounded the way the tool list is: this map is serialized in full on
-            // every flush, and a big ultrathread tree is dozens of sub-agents each
+            // every flush, and a big ultrathread tree is dozens of subagents each
             // with a row, so the cheapest fall out. Sorting by `(cost, key)` rather
             // than cost alone gives equal costs a stable order, so two zero-cost
             // rows do not take turns evicting each other on alternate flushes.
@@ -347,11 +380,17 @@ impl Stats {
     pub fn error(&self, chat: &str, model: &str, account: Option<&str>) {
         let day = chrono::Local::now().format("%Y-%m-%d").to_string();
         let mut d = self.data.lock().unwrap();
-        d.models.entry(model.into()).or_default().errors += 1;
+        let m = d.models.entry(model.into()).or_default();
+        m.errors += 1;
+        m.update_failure_rate();
         if let Some(a) = account {
-            d.accounts.entry(a.into()).or_default().errors += 1;
+            let a = d.accounts.entry(a.into()).or_default();
+            a.errors += 1;
+            a.update_failure_rate();
         }
-        d.daily.entry(day.clone()).or_default().errors += 1;
+        let daily = d.daily.entry(day.clone()).or_default();
+        daily.errors += 1;
+        daily.update_failure_rate();
         // A failed attempt is the chat's spend of attention too, and unlike a tool call
         // this one *creates* the row: a chat whose every attempt failed is
         // exactly the one a user opens stats on to find out why, and it would
@@ -360,6 +399,7 @@ impl Stats {
         let c = d.chats.entry(chat.into()).or_default();
         c.total.errors += 1;
         c.total.last_used = chrono::Utc::now().to_rfc3339();
+        c.total.update_failure_rate();
         if !c.models.contains_key(model) {
             // Keep the model's `last_used` in step with the chat's: the LRU trim
             // reads the chat's stamp, but a model row with an empty one is the
@@ -367,16 +407,20 @@ impl Stats {
             // as older than everything.
             c.models.entry(model.into()).or_default().last_used = c.total.last_used.clone();
         }
-        c.models.entry(model.into()).or_default().errors += 1;
+        let cm = c.models.entry(model.into()).or_default();
+        cm.errors += 1;
+        cm.update_failure_rate();
         if c.started.is_empty() {
             c.started = c.total.last_used.clone();
         }
-        d.model_daily
+        let md = d
+            .model_daily
             .entry(day)
             .or_default()
             .entry(model.into())
-            .or_default()
-            .errors += 1;
+            .or_default();
+        md.errors += 1;
+        md.update_failure_rate();
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -781,6 +825,115 @@ mod tests {
         );
     }
 
+    /// The failure rate is derived from *attempts*, not requests.
+    ///
+    /// A failed attempt never increments `requests` (`Stats::error` records it as
+    /// an error and nothing else), so `errors / requests` would exceed 100% on a
+    /// chat that failed more than it succeeded and would disagree with the count
+    /// the UI prints beside it. This pins the denominator on every dimension the
+    /// rate is stored on.
+    #[test]
+    fn failure_rate_divides_errors_by_attempts_not_requests() {
+        let s = Stats::default();
+        let smp = || Sample {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            ms: 1,
+            ttft_ms: None,
+            cost: 0.0,
+        };
+        s.record(
+            "chat-1",
+            "codex/gpt-6-sol",
+            Some("ChatGPT 1"),
+            "main",
+            "main",
+            &smp(),
+        );
+        s.error("chat-1", "codex/gpt-6-sol", Some("ChatGPT 1"));
+        s.error("chat-1", "codex/gpt-6-sol", Some("ChatGPT 1"));
+        s.error("chat-1", "codex/gpt-6-sol", Some("ChatGPT 1"));
+        let d = s.snapshot();
+        // 1 request + 3 errors = 4 attempts, so 3/4 = 0.75 — not 3/1 = 3.0.
+        let m = &d.models["codex/gpt-6-sol"];
+        assert_eq!((m.requests, m.errors), (1, 3));
+        assert!(
+            (m.failure_rate - 0.75).abs() < 1e-9,
+            "expected 3 errors over 4 attempts, got {}",
+            m.failure_rate
+        );
+        // Every other dimension that stores a rate has to agree with the model's,
+        // or the same chat reads two ways on two screens.
+        let md = &d.model_daily.values().next().unwrap()["codex/gpt-6-sol"];
+        let daily = d.daily.values().next().unwrap();
+        let checks: [(&str, &Counter); 5] = [
+            ("account", &d.accounts["ChatGPT 1"]),
+            ("chat total", &d.chats["chat-1"].total),
+            ("chat model", &d.chats["chat-1"].models["codex/gpt-6-sol"]),
+            ("daily", daily),
+            ("model_daily", md),
+        ];
+        for (what, c) in checks {
+            assert!(
+                (c.failure_rate - 0.75).abs() < 1e-9,
+                "{what} rate drifted: {}",
+                c.failure_rate
+            );
+        }
+    }
+
+    /// A counter that has moved only on the success side must not report a
+    /// stale rate: `record` moves the denominator, so it has to recompute too.
+    #[test]
+    fn failure_rate_tracks_successes_as_well_as_failures() {
+        let s = Stats::default();
+        let smp = || Sample {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            ms: 1,
+            ttft_ms: None,
+            cost: 0.0,
+        };
+        s.record("chat-1", "codex/gpt-6-sol", None, "main", "main", &smp());
+        s.error("chat-1", "codex/gpt-6-sol", None);
+        // 1 of 2 attempts.
+        assert!((s.snapshot().models["codex/gpt-6-sol"].failure_rate - 0.5).abs() < 1e-9);
+        // A later success must lower it, not leave 0.5 frozen on the row.
+        s.record("chat-1", "codex/gpt-6-sol", None, "main", "main", &smp());
+        let m = &s.snapshot().models["codex/gpt-6-sol"];
+        assert_eq!((m.requests, m.errors), (2, 1));
+        assert!(
+            (m.failure_rate - 1.0 / 3.0).abs() < 1e-9,
+            "a success has to move the rate it is the denominator of, got {}",
+            m.failure_rate
+        );
+        // Nothing attempted reads as 0, never NaN.
+        assert!(
+            Stats::default().snapshot().models.is_empty(),
+            "no request means no row at all"
+        );
+        assert_eq!(Counter::default().failure_rate, 0.0);
+    }
+
+    /// A stats file written before `failure_rate` existed must load, and its
+    /// missing rate must default rather than fail the whole file.
+    #[test]
+    fn an_old_stats_file_without_a_failure_rate_still_loads() {
+        let old = r#"{"version":1,"models":{"codex/gpt-6-sol":{"requests":1,"errors":1}}}"#;
+        let d: StatsData = serde_json::from_str(old).unwrap();
+        assert_eq!(d.models["codex/gpt-6-sol"].errors, 1);
+        // `#[serde(default)]` gives the absent key 0.0. The UI re-derives from
+        // the counts for exactly this case, so the stored 0 is not what a reader
+        // sees — but the file has to load either way.
+        assert_eq!(d.models["codex/gpt-6-sol"].failure_rate, 0.0);
+    }
+
     #[test]
     fn forgetting_a_chat_leaves_every_other_dimension_alone() {
         let s = Stats::default();
@@ -976,7 +1129,7 @@ mod tests {
         assert_eq!(c.total.requests, 3);
     }
 
-    /// An ultrathread tree spawns dozens of sub-agents, and this map is
+    /// An ultrathread tree spawns dozens of subagents, and this map is
     /// serialized in full on every flush, so it has to be capped. The costliest
     /// rows win because a row with ~no spend is noise next to one that ran the
     /// task; no request may fall out of `total` when a row is evicted.

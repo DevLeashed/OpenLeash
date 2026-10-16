@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, Plugins, PluginsStatus } from "../api";
+import { copyText } from "./clipboard";
 import { Dropdown, Switch, Button } from "./primitives";
 import { flash, saveSettings, useStore } from "../store";
 import { AppConnectors } from "./Connectors";
@@ -36,6 +37,9 @@ export function PluginsTab() {
   const { p, st, busy, saving, check, save } = usePlugins();
   const pc = st?.computer;
   const primary = pc?.monitors.find((m) => m.primary) ?? pc?.monitors[0];
+  // Displays that can be looked at but not clicked: only the primary takes
+  // input, and the switch has to say so rather than imply the whole desktop.
+  const undriven = pc?.monitors.filter((m) => !m.driveable).length ?? 0;
   const br = st?.browser;
   // Match the backend's unset-dimension defaults, and retain custom saved sizes.
   const width = p.browser.width > 0 ? p.browser.width : 1280;
@@ -49,8 +53,8 @@ export function PluginsTab() {
     <div className="desc">Still finding its shape, and each one hands the agent real capabilities on this machine — every plugin below is off until you switch it on yourself. Availability below checks readiness, not whether a plugin is enabled.</div>
     <fieldset disabled={saving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} aria-busy={saving}>
       <div className="sgroup">
-        <div className="srowx"><div style={{ flex: 1 }}><div>Computer use</div><div className="desc">{!pc ? "Checking…" : pc.ok && primary ? `Screen available · ${primary.name || "primary"} · ${primary.w}×${primary.h}${pc.monitors.length > 1 ? ` · ${pc.monitors.length - 1} other monitors ignored` : ""}` : `Can't capture the screen: ${pc.error ?? "no monitors"}`}</div></div><Switch label="Computer use" checked={p.computer.enabled} onChange={(enabled) => void save({ ...p, computer: { ...p.computer, enabled } })} /></div>
-        <Details name="Computer use"><div className="srowx desc">Agents see your primary screen and drive the mouse and keyboard. Every action returns a fresh screenshot. Clicks and typing ask first unless you always-allow them or use Full access.</div><div className="srowx"><div style={{ flex: 1 }}>Settle time<div className="desc">Wait after an action before the screenshot. Raise it for slow apps.</div></div><Dropdown search={false} style={{ width: 120 }} value={String(settle)} onChange={(v) => void save({ ...p, computer: { ...p.computer, settle_ms: Number(v) } })} options={Array.from(new Set([300, 600, 1000, 1500, 2500, settle])).map((ms) => ({ value: String(ms), label: `${ms} ms` }))} /></div></Details>
+        <div className="srowx"><div style={{ flex: 1 }}><div>Computer use</div><div className="desc">{!pc ? "Checking…" : pc.ok && primary ? `Screen available · ${primary.name || "primary"} · ${primary.w}×${primary.h}${undriven > 0 ? ` · ${undriven} more can be looked at, not clicked` : ""}` : `Can't capture the screen: ${pc.error ?? "no monitors"}`}</div></div><Switch label="Computer use" checked={p.computer.enabled} onChange={(enabled) => void save({ ...p, computer: { ...p.computer, enabled } })} /></div>
+        <Details name="Computer use"><div className="srowx desc">Agents see your screen and drive the mouse and keyboard. Every action returns a fresh screenshot of what they are working in, with the mouse marked, and they can zoom into a small region to read fine detail. Only the primary display takes clicks and keystrokes — another one can be looked at but not clicked. Clicks and typing ask first unless you always-allow them or use Full access. Press Esc while they are working to make them stop.</div><div className="srowx"><div style={{ flex: 1 }}>Settle time<div className="desc">Wait after an action before the screenshot. Raise it for slow apps.</div></div><Dropdown search={false} style={{ width: 120 }} value={String(settle)} onChange={(v) => void save({ ...p, computer: { ...p.computer, settle_ms: Number(v) } })} options={Array.from(new Set([300, 600, 1000, 1500, 2500, settle])).map((ms) => ({ value: String(ms), label: `${ms} ms` }))} /></div></Details>
       </div>
       <div className="sgroup" style={{ marginTop: 16 }}>
         <div className="srowx"><div style={{ flex: 1 }}>Browser<div className="desc">{!br ? "Checking…" : br.ok ? `Browser available · ${br.browser} · headless` : `Can't start a browser: ${br.error ?? "no browser found"}. Install Chrome or Edge.`}</div></div><Switch label="Browser plugin" checked={p.browser.enabled} onChange={(enabled) => void save({ ...p, browser: { ...p.browser, enabled } })} /></div>
@@ -75,7 +79,7 @@ export function ConnectorsTab() {
     try {
       const d = await api.githubLoginStart();
       setLogin({ code: d.user_code, url: d.verification_uri });
-      navigator.clipboard?.writeText(d.user_code).catch(() => {});
+      copyText(d.user_code);
       void openUrl(d.verification_uri).catch((e) => flash(String(e)));
       const who = await api.githubLoginWait(d.device_code, d.interval, d.expires_in);
       flash(`Signed in to GitHub as ${who}`); check();
@@ -98,7 +102,7 @@ export function ConnectorsTab() {
         <div className="srowx"><div style={{ flex: 1 }}>GitHub<div className="desc">{!gh ? "Checking…" : gh.ok ? `Account available · ${gh.login} · token from ${gh.source}` : gh.source ? `Token from ${gh.source} doesn't work: ${gh.error}` : "No token · not connected"}</div></div><Switch label="GitHub plugin" checked={p.github.enabled} onChange={(enabled) => void save({ ...p, github: { ...p.github, enabled } })} /></div>
         <Details name="GitHub">
           <div className="srowx desc">Issues, pull requests, reviews, merges, Actions runs and logs, code search and files — through the API as you. Changes ask first unless you're in Full access.</div>
-          {login ? <div className="srowx" style={{ flexWrap: "wrap" }}><span>Enter this code on GitHub, then Authorize: <b className="mono sel">{login.code}</b></span><Button onClick={() => { void navigator.clipboard?.writeText(login.code).catch((e) => flash(String(e))); }}>Copy</Button><Button onClick={() => void openUrl(login.url).catch((e) => flash(String(e)))}>Open GitHub</Button><Button onClick={() => void api.githubLoginCancel().catch((e) => flash(String(e)))}>Cancel</Button></div> : <div className="srowx"><div className="desc" style={{ flex: 1 }}>Sign in through your browser, use GH_TOKEN, or run gh auth login.</div><Button disabled={authBusy} onClick={() => st && !st.can_login ? setAdv(true) : void signIn()}>{authBusy ? "Waiting…" : "Sign in with GitHub"}</Button></div>}
+          {login ? <div className="srowx" style={{ flexWrap: "wrap" }}><span>Enter this code on GitHub, then Authorize: <b className="mono sel">{login.code}</b></span><Button onClick={() => copyText(login.code)}>Copy</Button><Button onClick={() => void openUrl(login.url).catch((e) => flash(String(e)))}>Open GitHub</Button><Button onClick={() => void api.githubLoginCancel().catch((e) => flash(String(e)))}>Cancel</Button></div> : <div className="srowx"><div className="desc" style={{ flex: 1 }}>Sign in through your browser, use GH_TOKEN, or run gh auth login.</div><Button disabled={authBusy} onClick={() => st && !st.can_login ? setAdv(true) : void signIn()}>{authBusy ? "Waiting…" : "Sign in with GitHub"}</Button></div>}
           <div className="srowx"><input aria-label="GitHub token" className="input mono" type="password" style={{ flex: 1, minWidth: 0 }} value={token} placeholder={st?.has_token ? "Saved · paste to replace" : "ghp_… or github_pat_… (repo, workflow scopes)"} onChange={(e) => setToken(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" && token.trim()) void saveToken(token.trim()); }} /><Button disabled={authBusy || !token.trim()} onClick={() => void saveToken(token.trim())}>Save token</Button>{st?.has_token && <Button disabled={authBusy} onClick={() => void saveToken("")}>Sign out</Button>}</div>
           <div className="srowx"><Button aria-expanded={adv} onClick={() => setAdv(!adv)}>Advanced · OAuth app</Button></div>
           {adv && <><div className="srowx desc">Sign-in uses a GitHub OAuth App with Device Flow enabled. Create one in GitHub Settings → Developer settings → OAuth Apps, enable Device Flow, and paste its Client ID here. Any homepage/callback URL works; no secret needed.</div><div className="srowx"><input aria-label="GitHub OAuth Client ID" className="input mono" style={{ flex: 1 }} value={cid} onChange={(e) => setCid(e.currentTarget.value)} placeholder={st?.can_login ? "using the built-in app" : "Ov23li…"} /><Button onClick={() => void save({ ...p, github: { ...p.github, client_id: cid.trim() } }).then((saved) => { if (saved) { flash("Saved"); check(); } })}>Save client ID</Button></div></>}

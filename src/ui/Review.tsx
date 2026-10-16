@@ -3,7 +3,7 @@ import { api, FileDiff, ATTRIBUTIONS, Attribution } from "../api";
 import { flash, go, saveSettings, useStore } from "../store";
 import { Tooltip } from "./primitives";
 import { Check, ChevronLeft, Sparkles, X } from "lucide-react";
-import { Loader, Button, Dropdown, Input, Kbd, Pressable, Switch } from "./primitives";
+import { Loader, Button, ConfirmDialog, Dropdown, Input, Kbd, Pressable, Switch } from "./primitives";
 
 /** How many changed files / diff lines the view mounts at once. A review either
  *  walks the list with the arrow keys (bounded, and it only reads what's on
@@ -31,6 +31,7 @@ export function Review() {
   const [err, setErr] = useState("");
   const [genning, setGenning] = useState(false);
   const [genErr, setGenErr] = useState("");
+  const [confirmReplace, setConfirmReplace] = useState(false);
   const taskId = task?.id;
   const load = useCallback(() => {
     if (!taskId) return;
@@ -79,9 +80,8 @@ export function Review() {
   /** Draft a message from the diff. Never clears what the user already typed
    *  without asking, and says when the answer was a local fallback rather than
    *  the model's — a guess presented as the model's is worse than a plain one. */
-  const generate = async () => {
+  const runGenerate = async () => {
     if (!task || !data?.git || genning) return;
-    if (msg.trim() && msg.trim() !== (task.title ?? "").trim() && !window.confirm("Replace the message you typed with a generated one?")) return;
     setGenning(true);
     setGenErr("");
     try {
@@ -93,6 +93,15 @@ export function Review() {
     } finally {
       setGenning(false);
     }
+  };
+
+  /** Entry point for the button. Asks before overwriting text the user typed,
+   *  in the app's own dialog rather than `window.confirm` — which in a native
+   *  window paints browser chrome and is unreachable by this app's keyboard. */
+  const generate = () => {
+    if (!task || !data?.git || genning) return;
+    if (msg.trim() && msg.trim() !== (task.title ?? "").trim()) { setConfirmReplace(true); return; }
+    void runGenerate();
   };
   const commit = async () => {
     if (!task || !data?.git) return;
@@ -216,6 +225,13 @@ export function Review() {
           </div>
         </div>
       )}
+      {confirmReplace && <ConfirmDialog
+        title="Replace your commit message?"
+        body="Generating a message will overwrite what you typed."
+        confirm="Replace"
+        onConfirm={() => void runGenerate()}
+        onClose={() => setConfirmReplace(false)}
+      />}
     </>
   );
 }

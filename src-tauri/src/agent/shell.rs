@@ -59,7 +59,87 @@ pub fn shell() -> ShellKind {
     }
 }
 
+/// A project inside a WSL distro, addressed the way Windows sees it:
+/// `\\wsl.localhost\<distro>\<path>` (or the older `\\wsl$\...`). Returns
+/// the distro and the Linux path. Commands for such a project run *inside*
+/// the distro through `wsl.exe`, so the agent gets the project's real
+/// toolchain; the file tools keep using the UNC path, which Windows serves
+/// natively.
+pub fn wsl_target(path: &str) -> Option<(String, String)> {
+    let p = path.replace('/', "\\");
+    let rest = p
+        .strip_prefix("\\\\wsl.localhost\\")
+        .or_else(|| p.strip_prefix("\\\\wsl$\\"))
+        .or_else(|| p.strip_prefix("\\\\?\\UNC\\wsl.localhost\\"))
+        .or_else(|| p.strip_prefix("\\\\?\\UNC\\wsl$\\"))?;
+    let mut parts = rest.splitn(2, '\\');
+    let distro = parts.next().filter(|d| !d.is_empty())?.to_string();
+    // A distro name never starts with `-`: wsl.exe would read it as a flag.
+    if distro.starts_with('-') {
+        return None;
+    }
+    let linux = parts
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\\')
+        .replace('\\', "/");
+    Some((distro, format!("/{linux}")))
+}
+
+/// Map a Windows path argument for a command running in `distro`: a path in
+/// the same distro becomes its Linux path, a drive path becomes `/mnt/<drive>`.
+/// Anything else is passed through untouched.
+pub fn wsl_arg(distro: &str, arg: &str) -> String {
+    if let Some((d, linux)) = wsl_target(arg) {
+        if d.eq_ignore_ascii_case(distro) {
+            return linux;
+        }
+    }
+    let b = arg.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return format!(
+            "/mnt/{}/{}",
+            (b[0] as char).to_ascii_lowercase(),
+            arg[3..].replace('\\', "/")
+        );
+    }
+    arg.to_string()
+}
+
+/// The local shell must never be started "in" a remote project's `ssh://`
+/// URI: that command would run on *this* machine (and on Windows the URI is
+/// a relative local path). Remote projects use `run_remote`/`spawn_remote`.
+fn local_cwd(cwd: &str) -> Result<(), String> {
+    if super::host::is_ssh(cwd) {
+        return Err(format!(
+            "internal error: {cwd} is a remote (SSH) folder; refusing to run the command locally"
+        ));
+    }
+    Ok(())
+}
+
 fn command(cmd: &str, cwd: &str) -> Command {
+    if let Some((distro, linux)) = wsl_target(cwd).filter(|_| cfg!(windows)) {
+        // `--exec` hands the arguments to bash verbatim, with no default
+        // shell re-parsing the command line in between.
+        let mut c = Command::new("wsl.exe");
+        c.args(["-d", &distro, "--cd", &linux, "--exec", "bash", "-lc", cmd])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        c.env("GIT_TERMINAL_PROMPT", "0")
+            .env("NO_COLOR", "1")
+            .env("CI", "1")
+            .env("WSLENV", "GIT_TERMINAL_PROMPT/u:NO_COLOR/u:CI/u");
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            c.creation_flags(CREATE_NO_WINDOW);
+        }
+        return c;
+    }
     let sh = shell();
     let mut c = Command::new(&sh.program);
     c.args(&sh.args)
@@ -94,6 +174,16 @@ pub fn kill_tree(child: &mut Child) {
 }
 
 pub fn truncate_output(s: &str) -> String {
+    truncate_output_with(s, true)
+}
+
+/// `truncate_output`, choosing whether to keep the whole output on disk.
+///
+/// A remote (SSH) project passes `false`: the spill file is on *this*
+/// machine, but that agent's `read_file`/`grep` go to the remote host, so
+/// pointing it at a local spill path would send it looking for a file that
+/// isn't there (or, worse, one that is, under the same name, remotely).
+pub fn truncate_output_with(s: &str, keep: bool) -> String {
     if s.len() <= MAX_OUT {
         return s.to_string();
     }
@@ -104,14 +194,19 @@ pub fn truncate_output(s: &str) -> String {
         .nth(MAX_OUT * 2 / 3)
         .map(|x| x.0)
         .unwrap_or(0);
-    let saved = spill(s)
-        .map(|p| {
-            format!(
-                " Full output saved to {} — grep/read_file it instead of re-running.",
-                p.display()
-            )
-        })
-        .unwrap_or_default();
+    let saved = if keep {
+        spill(s)
+            .map(|p| {
+                format!(
+                    " Full output saved to {} — grep/read_file it instead of re-running.",
+                    p.display()
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        " To see all of it, re-run with the output redirected to a file and grep/read_file that."
+            .to_string()
+    };
     format!(
         "{head}\n\n… [{} characters truncated.{saved}] …\n\n{}",
         s.len() - MAX_OUT,
@@ -165,10 +260,98 @@ pub async fn run_env(
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<ExecResult, String> {
+    local_cwd(cwd)?;
     let mut c = command(cmd, cwd);
     for (k, v) in env {
         c.env(k, v);
     }
+    if wsl_target(cwd).is_some() && cfg!(windows) && !env.is_empty() {
+        // Windows variables only cross into WSL when WSLENV names them.
+        let mut list = "GIT_TERMINAL_PROMPT/u:NO_COLOR/u:CI/u".to_string();
+        for (k, _) in env {
+            list.push(':');
+            list.push_str(k);
+            list.push_str("/u");
+        }
+        c.env("WSLENV", list);
+    }
+    run_built(c, timeout_ms, cancel, None).await
+}
+
+/// `run` for a remote-SSH project (`cwd` is its `ssh://` URI): the command
+/// runs on the host in that directory, and a timeout or cancel kills the
+/// remote process group (`ssh_session::exec`). stdout then stderr, since the
+/// two arrive on separate channels.
+pub async fn run_remote(
+    cmd: &str,
+    cwd: &str,
+    timeout_ms: u64,
+    cancel: &CancellationToken,
+) -> Result<ExecResult, String> {
+    let p = super::host::parse_ssh(cwd)
+        .ok_or_else(|| format!("{cwd} is not a valid SSH project path."))?;
+    let r = super::ssh_session::exec(
+        &p.host,
+        &p.path,
+        cmd,
+        &[],
+        None,
+        std::time::Duration::from_millis(timeout_ms),
+        cancel,
+    )
+    .await?;
+    let mut out = String::from_utf8_lossy(&r.stdout).to_string();
+    let err = String::from_utf8_lossy(&r.stderr);
+    if !err.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&err);
+    }
+    Ok(ExecResult {
+        output: truncate_output_with(&out, false),
+        code: r.code,
+        timed_out: r.timed_out,
+        interrupted: r.interrupted,
+    })
+}
+
+/// `run`, inside a docker workspace's container. `cwd` is the host path; it
+/// is mapped to the matching directory under the container's mount.
+pub async fn run_docker(
+    denv: &super::docker::DockerEnv,
+    cmd: &str,
+    cwd: &str,
+    timeout_ms: u64,
+    cancel: &CancellationToken,
+) -> Result<ExecResult, String> {
+    let cfg = super::docker::load_config(&denv.project).unwrap_or_default();
+    let job = format!("fg_{}", &super::new_id()[..8]);
+    let c = docker_exec(denv, &job, cmd, cwd, &cfg);
+    run_built(c, timeout_ms, cancel, Some((denv.clone(), job))).await
+}
+
+fn docker_exec(
+    denv: &super::docker::DockerEnv,
+    job: &str,
+    cmd: &str,
+    cwd: &str,
+    cfg: &super::docker::Config,
+) -> Command {
+    let mut c = super::docker::docker_command();
+    c.args(super::docker::exec_args(denv, job, cmd, cwd, &[], cfg));
+    c
+}
+
+/// Spawn a built command and collect its output, killing it on timeout or
+/// cancel. `docker_job` names the in-container process tree to kill too:
+/// ending the local `docker exec` client leaves the real process running.
+async fn run_built(
+    mut c: Command,
+    timeout_ms: u64,
+    cancel: &CancellationToken,
+    docker_job: Option<(super::docker::DockerEnv, String)>,
+) -> Result<ExecResult, String> {
     let mut child = c
         .spawn()
         .map_err(|e| format!("failed to spawn shell: {e}"))?;
@@ -182,6 +365,9 @@ pub async fn run_env(
         _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => { timed_out = true; kill_tree(&mut child); None }
         _ = cancel.cancelled() => { interrupted = true; kill_tree(&mut child); None }
     };
+    if let (true, Some((denv, job))) = (timed_out || interrupted, &docker_job) {
+        Box::pin(super::docker::kill_job(denv, job)).await;
+    }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let _ = r1.await;
         let _ = r2.await;
@@ -236,6 +422,8 @@ pub struct BgJob {
     pub kill_reason: Arc<Mutex<Option<String>>>,
     /// Cancelled once `exit` is set.
     pub done: CancellationToken,
+    /// Runs on an SSH host: its output is never spilled to a local file.
+    pub remote: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -255,10 +443,104 @@ pub struct BgManager {
 
 impl BgManager {
     pub fn spawn(&self, task_id: &str, cmd: &str, cwd: &str) -> Result<String, String> {
-        let mut child = command(cmd, cwd)
-            .spawn()
-            .map_err(|e| format!("failed to spawn: {e}"))?;
+        local_cwd(cwd)?;
         let id = format!("bg_{}", &super::new_id()[..6]);
+        self.spawn_built(task_id, cmd, command(cmd, cwd), id, None)
+    }
+
+    /// `spawn` for a remote-SSH project: started over ssh (async, since the
+    /// job first reports its remote process group), killed with
+    /// `RemoteJob::kill` so the remote tree ends too, not just the client.
+    pub async fn spawn_remote(
+        &self,
+        task_id: &str,
+        cmd: &str,
+        cwd: &str,
+    ) -> Result<String, String> {
+        let p = super::host::parse_ssh(cwd)
+            .ok_or_else(|| format!("{cwd} is not a valid SSH project path."))?;
+        let job = super::ssh_session::spawn_bg(&p.host, &p.path, cmd, &[]).await?;
+        // Taken apart so the output pumps own the streams while the waiter
+        // keeps what `RemoteJob::kill` needs (host, pgid, the local client).
+        let super::ssh_session::RemoteJob {
+            host,
+            pgid,
+            mut child,
+            stdout,
+            stderr,
+        } = job;
+        let id = format!("bg_{}", &super::new_id()[..6]);
+        let buf = Arc::new(Mutex::new(String::new()));
+        pump(Some(stdout), buf.clone());
+        pump(stderr, buf.clone());
+        let (exit, stop) = (Arc::new(Mutex::new(None)), CancellationToken::new());
+        let (kill_reason, done) = (Arc::new(Mutex::new(None)), CancellationToken::new());
+        let bg = Arc::new(BgJob {
+            id: id.clone(),
+            task_id: task_id.into(),
+            cmd: cmd.into(),
+            started: chrono::Utc::now(),
+            buf,
+            read_pos: Mutex::new(0),
+            exit: exit.clone(),
+            stop: stop.clone(),
+            kill_reason: kill_reason.clone(),
+            done: done.clone(),
+            remote: true,
+        });
+        self.jobs.lock().unwrap().insert(id.clone(), bg);
+        self.prune_finished();
+        tokio::spawn(async move {
+            let waited = tokio::select! {
+                s = child.wait() => Some(s),
+                _ = stop.cancelled() => None,
+            };
+            let res = match waited {
+                Some(s) => s
+                    .ok()
+                    .and_then(|s| s.code())
+                    .map(|c| format!("exit {c}"))
+                    .unwrap_or("exited".into()),
+                None => {
+                    let _ = super::ssh_session::kill(&host, pgid).await;
+                    let _ = child.start_kill();
+                    kill_reason
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .map(|r| format!("killed: {r}"))
+                        .unwrap_or("killed".into())
+                }
+            };
+            *exit.lock().unwrap() = Some(res);
+            done.cancel();
+        });
+        Ok(id)
+    }
+
+    /// `spawn`, inside a docker workspace's container.
+    pub fn spawn_docker(
+        &self,
+        denv: &super::docker::DockerEnv,
+        task_id: &str,
+        cmd: &str,
+        cwd: &str,
+    ) -> Result<String, String> {
+        let cfg = super::docker::load_config(&denv.project).unwrap_or_default();
+        let id = format!("bg_{}", &super::new_id()[..6]);
+        let c = docker_exec(denv, &id, cmd, cwd, &cfg);
+        self.spawn_built(task_id, cmd, c, id.clone(), Some((denv.clone(), id)))
+    }
+
+    fn spawn_built(
+        &self,
+        task_id: &str,
+        cmd: &str,
+        mut c: Command,
+        id: String,
+        docker_job: Option<(super::docker::DockerEnv, String)>,
+    ) -> Result<String, String> {
+        let mut child = c.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
         let buf = Arc::new(Mutex::new(String::new()));
         pump(child.stdout.take(), buf.clone());
         pump(child.stderr.take(), buf.clone());
@@ -276,6 +558,7 @@ impl BgManager {
             stop: stop.clone(),
             kill_reason: kill_reason.clone(),
             done: done.clone(),
+            remote: false,
         });
         self.jobs.lock().unwrap().insert(id.clone(), job);
         self.prune_finished();
@@ -284,6 +567,9 @@ impl BgManager {
                 s = child.wait() => s.ok().and_then(|s| s.code()).map(|c| format!("exit {c}")).unwrap_or("exited".into()),
                 _ = stop.cancelled() => {
                     kill_tree(&mut child);
+                    if let Some((denv, job)) = &docker_job {
+                        Box::pin(super::docker::kill_job(denv, job)).await;
+                    }
                     kill_reason.lock().unwrap().clone().map(|r| format!("killed: {r}")).unwrap_or("killed".into())
                 }
             };
@@ -340,7 +626,7 @@ impl BgManager {
         drop(pos);
         drop(buf);
         let exit = j.exit.lock().unwrap().clone();
-        Some((truncate_output(&out), exit))
+        Some((truncate_output_with(&out, !j.remote), exit))
     }
 
     pub fn kill(&self, id: &str) -> bool {
@@ -421,5 +707,55 @@ fn bg_info(j: &BgJob) -> BgInfo {
         last_line,
         running: exit.is_none(),
         exit,
+    }
+}
+
+#[cfg(test)]
+mod wsl_tests {
+    use super::*;
+
+    #[test]
+    fn wsl_paths_parse() {
+        assert_eq!(
+            wsl_target(r"\\wsl.localhost\Ubuntu\home\me\app"),
+            Some(("Ubuntu".into(), "/home/me/app".into()))
+        );
+        assert_eq!(
+            wsl_target(r"\\wsl$\Debian\srv\"),
+            Some(("Debian".into(), "/srv".into()))
+        );
+        assert_eq!(
+            wsl_target("//wsl.localhost/Ubuntu"),
+            Some(("Ubuntu".into(), "/".into()))
+        );
+        assert_eq!(
+            wsl_target(r"\\?\UNC\wsl.localhost\Ubuntu\x"),
+            Some(("Ubuntu".into(), "/x".into()))
+        );
+        assert_eq!(wsl_target(r"C:\code\app"), None);
+        assert_eq!(wsl_target(r"\\server\share\x"), None);
+        assert_eq!(
+            wsl_target(r"\\wsl.localhost\-x\y"),
+            None,
+            "a distro can't smuggle in a flag"
+        );
+    }
+
+    #[test]
+    fn wsl_args_map_windows_paths() {
+        assert_eq!(
+            wsl_arg("Ubuntu", r"C:\Users\me\.openleash\worktrees\a"),
+            "/mnt/c/Users/me/.openleash/worktrees/a"
+        );
+        assert_eq!(
+            wsl_arg("Ubuntu", r"\\wsl.localhost\Ubuntu\home\me"),
+            "/home/me"
+        );
+        assert_eq!(
+            wsl_arg("Ubuntu", r"\\wsl.localhost\Debian\home\me"),
+            r"\\wsl.localhost\Debian\home\me"
+        );
+        assert_eq!(wsl_arg("Ubuntu", "HEAD"), "HEAD");
+        assert_eq!(wsl_arg("Ubuntu", "--quiet"), "--quiet");
     }
 }

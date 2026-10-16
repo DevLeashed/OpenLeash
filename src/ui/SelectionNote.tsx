@@ -91,12 +91,84 @@ export function annotationBlock(notes: Note[]): string {
   return `Annotations the user added to your answers:\n\n${rows.join("\n\n")}\n\n<!-- /openleash-annotations -->`;
 }
 
+/** One staged file the user sent, as the message bubble should show it: the name
+ *  they chose it by, not the temp path OpenLeash copied it to. */export interface ShownAttachment { name: string; size: number }
+
+/**
+ * The staged-path wrapper `<openleash-attachments>`, parsed for display.
+ *
+ * The wrapper is written into the *model-facing* text so the agent knows where
+ * the copies live; the user picked a file, not a path inside a hidden temp
+ * folder, so the bubble shows this list instead of the raw block. Parsed rather
+ * than reconstructed from the item's `attachments` field because older messages
+ * (and subagent ones) carry the note without it.
+ */
+export function parseAttachments(text: string): ShownAttachment[] {
+  const match = /<openleash-attachments>([\s\S]*?)<\/openleash-attachments>/.exec(text);
+  if (!match) return [];
+  const out: ShownAttachment[] = [];
+  for (const line of match[1]!.split("\n")) {
+    // Each entry is `- `name`` — a backticked name on a bullet.
+    const name = /^\s*-\s*`([^`]+)`\s*$/.exec(line)?.[1];
+    if (!name) continue;
+    const size = /^\s*-\s*`[^`]+`\s*\(([\d.]+)\s*(B|KB|MB|GB)\)\s*$/.exec(line)?.[1];
+    out.push({ name: name.split(/[\\/]/).pop() || name, size: size ? Number(size) : 0 });
+  }
+  return out;
+}
+
+/**
+ * The files a message carried, shown the way the composer shows its own chips.
+ *
+ * The staged-path block itself never reaches the screen: it is scaffolding the
+ * agent reads, and a path in a hidden temp folder tells the user nothing they can
+ * act on. What they can act on is *which files* went out, so that is the card.
+ */
+export function AttachmentChips({ text }: { text: string }) {
+  const files = parseAttachments(text);
+  if (!files.length) return null;
+  return (
+    <div className="ubattach">
+      {files.map((f, i) => (
+        <span key={i} className="ubatchip" title={f.name}>
+          <span className="ubatico" aria-hidden="true">{I.paperclip(12)}</span>
+          <span className="ubatname">{f.name}</span>
+          {f.size > 0 && <span className="ubatsize">{f.size < 1024 ? `${f.size} B` : f.size < 1024 * 1024 ? `${Math.round(f.size / 1024)} KB` : `${(f.size / 1024 / 1024).toFixed(1)} MB`}</span>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** Blocks the backend puts in a message for the model's benefit only, which the
+ *  user never needs to see verbatim. The annotations are still available behind
+ *  `SentAnnotationMessage`'s chip; a staged attachment's `<openleash-attachments>`
+ *  note is a list of temp paths in a hidden data folder, which is chat noise at
+ *  best and a misleading path at worst — the user picked a file, not that path.
+ *  Staged copies are on the item's `attachments` field, which is what an edit
+ *  resends from, so nothing is lost by not showing it. */
+export function stripHarnessBlocks(text: string, data?: { attachments?: unknown }): string {
+  let body = text;
+  // Model text can put anything before or after a staged note, so the wrapper is
+  // matched rather than assumed to be a suffix.
+  body = body.replace(/\n*<openleash-attachments>[\s\S]*?<\/openleash-attachments>/g, "");
+  if (Array.isArray(data?.attachments) && data.attachments.length) {
+    body = body
+      .replace(/^\s*Attached files \(read these with your tools, they are not inlined\):\n(?:- .*\n?)+/, "")
+      .replace(/\n*Attached files \(read these with your tools, they are not inlined\):\n(?:- .*\n?)+/g, "");
+  }
+  return body.trim();
+}
+export const ANNOTATION_PREFIX = "Annotations the user added to your answers:\n\n";
+export const ANNOTATION_MARKER = "\n\n<!-- /openleash-annotations -->";
+
 /** Keep the model's annotation context out of the visible message body. The
  * delimiter makes the boundary unambiguous even when quotes contain headings. */
+
 export function SentAnnotationMessage({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
-  const prefix = "Annotations the user added to your answers:\n\n";
-  const marker = "\n\n<!-- /openleash-annotations -->";
+  const prefix = ANNOTATION_PREFIX;
+  const marker = ANNOTATION_MARKER;
   const end = text.startsWith(prefix) ? text.indexOf(marker, prefix.length) : -1;
   if (end < 0) return <>{text}</>;
   const annotations = text.slice(prefix.length, end);

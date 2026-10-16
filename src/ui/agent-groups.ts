@@ -70,13 +70,3 @@ export function restrictionLabel(rows: GroupRow[]): string | null {
   if (!edit) return null;
   return edit.description.trim() ? `edits ${edit.description.trim()}` : `edits matching ${edit.fileRegex.trim()}`;
 }
-
-// The iteration ceiling. 0 means "no ceiling", which keeps agents saved before
-// the field running exactly as they did.
-export const NO_STEPS = 0;
-
-/** Human line for the ceiling, shown under the field and on the agent row. */
-export function stepsLabel(steps: number | undefined): string {
-  const n = steps ?? NO_STEPS;
-  return n > 0 ? `stops after ${n} step${n === 1 ? "" : "s"}` : "no step limit";
-}

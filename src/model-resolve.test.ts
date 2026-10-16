@@ -1,7 +1,7 @@
-// A sub-agent's model used to be stamped on it once, when it was spawned, and
+// A subagent's model used to be stamped on it once, when it was spawned, and
 // never re-read. Changing the chat's model mid-task therefore moved the main
-// agent and left every sub-agent already running on the old one — and the panels
-// that named a sub-agent's model read that same stored value, so they showed a
+// agent and left every subagent already running on the old one — and the panels
+// that named a subagent's model read that same stored value, so they showed a
 // model nothing was actually running on.
 //
 // `subModel` is the one place the UI asks that question, and it has to answer it
@@ -21,7 +21,7 @@ const task = (extra: Partial<TaskSummary> = {}): TaskSummary =>
 
 const ladder = (models: string[]): UltraX => ({ layers: models.map((model) => ({ model, effort: null, fanout: 0 })), max_running: 0, max_total: 0, wt: false }) as UltraX;
 
-describe("which model a sub-agent is on", () => {
+describe("which model a subagent is on", () => {
   it("follows the chat, because that is what an empty model means", () => {
     // The regression itself: `sub.model` is empty for an agent nobody chose a
     // model for, and that is "on the chat's model", not "on no model".

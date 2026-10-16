@@ -1,42 +1,106 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, Code2, Square, Copy, Maximize2, Minimize2 } from "lucide-react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { copyText, mdComponents, remarkOl } from "./mdx";
+import { copyText, MD_PLUGINS, mdComponents, replyUrlTransform } from "./mdx";
 import { Button, Thumb, useEscapeClose } from "./primitives";
 import { ImageExplanation } from "./ImageExplanation";
+import { svgImageUrl } from "./hostTheme";
+import { buildVisualizationDocument, captureTheme } from "./vizDocument";
 import { listenForVisualizationDraft, type VisualizationFeedbackDraft } from "./visualizationFeedback";
+
+// Re-exported for callers and tests that treat the viewer as the home of the
+// document builder; the implementation lives beside the frame that runs it.
+export { buildVisualizationDocument, captureTheme };
 
 export const MAX_VIZ_BYTES = 240 * 1024; // leave space for the document wrapper
 export const MAX_VIZ_COUNT = 8;
 const toolbarButtonStyle = { height: 27, padding: "0 9px", borderRadius: 7, fontSize: 11.5, gap: 6 } as const;
 export type VizPart = { kind: "markdown"; source: string } | { kind: "visualization" | "diagram" | "image"; source: string } | { kind: "placeholder"; source: string; message?: string };
 /** Parse fences before rendering: Markdown accepts unclosed fences while streaming.
- * Only exact, top-level opt-in fences qualify; all other Markdown stays inert. */
+ *
+ *  Two syntaxes qualify, and both are read here rather than in Markdown, which
+ *  has no idea what these blocks mean: an exact, top-level `openleash-*` fence,
+ *  and a bare complete top-level `<svg>` block. Everything else stays inert
+ *  Markdown — including raw HTML that is not one whole SVG document. */
 export function visualizationParts(text: string): VizPart[] {
   const lines = text.split(/\r?\n/); const out: VizPart[] = []; let plain: string[] = []; let count = 0;
+  /** One diagram/visualization, whichever syntax named it. The bounds are the
+   *  reply's, not the fence's: an unfenced SVG shares them, so it cannot smuggle
+   *  a block past the count or the size limit. */
+  const emit = (kind: "visualization" | "diagram" | "image", source: string, closed: boolean) => {
+    if (plain.length) out.push({ kind: "markdown", source: plain.join("\n") });
+    plain = [];
+    if (!closed) out.push({ kind: "placeholder", source });
+    else if (!source.trim()) out.push({ kind: "placeholder", source, message: "This interactive visualization is empty." });
+    else if (count >= MAX_VIZ_COUNT) out.push({ kind: "placeholder", source, message: `Only ${MAX_VIZ_COUNT} visualizations per reply can run.` });
+    else if (new TextEncoder().encode(source).length > MAX_VIZ_BYTES) out.push({ kind: "placeholder", source, message: "This interactive visualization is too large to run." });
+    else { out.push({ kind, source }); count++; }
+  };
   for (let i = 0; i < lines.length; i++) {
     const opening = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(lines[i] ?? "");
-    if (!opening) { plain.push(lines[i] ?? ""); continue; }
+    if (!opening) {
+      // A bare SVG. Only at the start of a block, and only when the whole block
+      // is one complete SVG document: an SVG nested in other raw HTML, or one
+      // being discussed inline in a sentence, is not a diagram and stays text.
+      const end = i === 0 || !(lines[i - 1] ?? "").trim() ? bareSvgEnd(lines, i) : -1;
+      if (end >= i) {
+        const source = lines.slice(i, end + 1).join("\n");
+        if (isSvgDocument(source)) { emit("diagram", source, true); i = end; continue; }
+      }
+      plain.push(lines[i] ?? "");
+      continue;
+    }
     const marker = opening[2]!; let end = i + 1;
     const closing = new RegExp(`^ {0,3}${marker[0]}{${marker.length},}\\s*$`);
     while (end < lines.length && !closing.test(lines[end] ?? "")) end++;
     const source = lines.slice(i + 1, end).join("\n");
-    if (opening[3] !== "openleash-viz" && opening[3] !== "openleash-svg" && opening[3] !== "openleash-image") plain.push(...lines.slice(i, Math.min(end + 1, lines.length)));
-    else {
-      if (plain.length) out.push({ kind: "markdown", source: plain.join("\n") });
-      plain = [];
-      if (end === lines.length) out.push({ kind: "placeholder", source });
-      else if (!source.trim()) out.push({ kind: "placeholder", source, message: "This interactive visualization is empty." });
-      else if (count >= MAX_VIZ_COUNT) out.push({ kind: "placeholder", source, message: `Only ${MAX_VIZ_COUNT} visualizations per reply can run.` });
-      else if (new TextEncoder().encode(source).length > MAX_VIZ_BYTES) out.push({ kind: "placeholder", source, message: "This interactive visualization is too large to run." });
-      else { out.push({ kind: opening[3] === "openleash-svg" ? "diagram" : opening[3] === "openleash-image" ? "image" : "visualization", source }); count++; }
-    }
+    const tag = opening[3];
+    if (tag !== "openleash-viz" && tag !== "openleash-svg" && tag !== "openleash-image") plain.push(...lines.slice(i, Math.min(end + 1, lines.length)));
+    else emit(tag === "openleash-svg" ? "diagram" : tag === "openleash-image" ? "image" : "visualization", source, end < lines.length);
     i = end;
   }
   if (plain.length) out.push({ kind: "markdown", source: plain.join("\n") });
   return out;
+}
+
+/** The line that ends a bare SVG block, or -1 when this is not one.
+ *
+ *  Blank lines do not end it, even though Markdown's own HTML-block rule says
+ *  they do: a real diagram is written with them between its groups, and that rule
+ *  is part of why the field case showed as a wall of escaped XML — Markdown broke
+ *  one element into half a dozen blocks and the rest of the reply carried on
+ *  around it. What bounds the block instead is its closing tag, and what proves
+ *  it was a diagram at all is `isSvgDocument`: everything between has to parse as
+ *  exactly one `<svg>` element, so prose that merely mentions `<svg` collects a
+ *  range that fails the parse and stays text. */
+function bareSvgEnd(lines: string[], start: number): number {
+  if (!/^ {0,3}<svg(?=[\s/>])/i.test(lines[start] ?? "")) return -1;
+  for (let end = start; end < lines.length; end++) {
+    if (/<\/svg>\s*$/.test(lines[end] ?? "")) return end;
+  }
+  return -1;
+}
+
+/** Is this all one drawn SVG document? Parsed detached, like `diagramTitle`, so
+ *  the check never touches the application's DOM.
+ *
+ *  Well-formedness alone is too weak to be the rule, because loose text is legal
+ *  XML: a range that swallowed a paragraph between two `<svg>` lines parses too,
+ *  and drawing it would drop that paragraph from the reader's view. A diagram
+ *  puts its words in `<text>`/`<title>`/`<desc>`, never directly between its
+ *  elements, so the root's own text nodes — and a root with nothing to draw —
+ *  mean this was prose, not markup. */
+function isSvgDocument(source: string): boolean {
+  // No DOM to check with: the image either renders or reports that it could not,
+  // which is the same bargain the fenced path makes.
+  if (typeof DOMParser === "undefined") return true;
+  const doc = new DOMParser().parseFromString(source, "image/svg+xml");
+  if (doc.querySelector("parsererror")) return false;
+  const root = doc.documentElement;
+  if (root?.localName !== "svg") return false;
+  const kids = [...root.childNodes];
+  return kids.some((n) => n.nodeType === 1) && !kids.some((n) => n.nodeType === 3 && (n.nodeValue ?? "").trim() !== "");
 }
 
 function VisualizationPlaceholder({ source, message }: { source: string; message: string }) {
@@ -47,20 +111,10 @@ function VisualizationPlaceholder({ source, message }: { source: string; message
     {showSource && <pre style={{ padding: 12, maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap" }}><code>{source}</code></pre>}
   </section>;
 }
-export function captureTheme(): Record<string, string> {
-  const s = getComputedStyle(document.documentElement);
-  const get = (name: string, fallback: string) => s.getPropertyValue(`--${name}`).trim() || fallback;
-  return { bg: get("bg", "#111"), fg: get("fg", "#eee"), card: get("panel", "#222"), muted: get("mut", "#999"), accent: get("accent", "#a78bfa"), primary: get("accent", "#a78bfa"), border: get("line", "#444"),
-    ...Object.fromEntries(["#a78bfa", "#60a5fa", "#34d399", "#fbbf24", "#f472b6", "#fb923c"].map((c, i) => [`chart${i + 1}`, get(`chart${i + 1}`, c)])),
-    "font-sans": s.fontFamily || "system-ui, sans-serif", "font-mono": "ui-monospace, monospace", radius: "10px" };
-}
+/** CSS values are host-owned, but escape structural characters defensively. The
+ *  wrapper precedes any supplied head/body so tokens exist when scripts run. */
 /** CSS values are host-owned, but escape structural characters defensively. The
  * wrapper precedes any supplied head/body so tokens exist when scripts run. */
-export function buildVisualizationDocument(source: string, theme: Record<string, string>): string {
-  const css = Object.entries(theme).filter(([k]) => /^[a-z0-9-]+$/.test(k)).map(([k, v]) => `--${k}:${v.replace(/[<>;{}\\]/g, "")};`).join("");
-  const feedbackBridge = `<script>(()=>{const send=(draft)=>{try{parent.postMessage({type:"openleash:feedback-draft",version:1,...draft},"*")}catch{}};window.openleashFeedbackDraft=send;document.addEventListener("click",e=>{const t=e.target;const el=t instanceof Element?t.closest("[data-openleash-target]"):null;if(!el)return;const label=(el.getAttribute("data-openleash-target")||"").slice(0,300);if(label)send({target:{selector:"[data-openleash-target]",label}})},true)})();</script>`;
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>:root{${css}}body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font-family:var(--font-sans)}*{box-sizing:border-box}</style>${feedbackBridge}</head><body>${source}</body></html>`;
-}
 export function Visualization({ source, autoStart = false, label, onFeedbackDraft }: { source: string; autoStart?: boolean; label?: string; onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void }) {
   const title = label?.trim() || "Interactive visualization";
   const frame = useRef<HTMLIFrameElement>(null);
@@ -127,7 +181,7 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
     if (current.current) release(current.current);
     current.current = null; setId(null); setBusy(false); collapse();
   };
-  return <section aria-label={title} style={{ border: "1px solid var(--line)", borderRadius: 10, margin: "12px 0", overflow: "hidden" }}>
+  return <section className="viz-frame" aria-label={title}>
     {expanded && <div aria-hidden="true" onClick={collapse} style={{ position: "fixed", inset: 0, zIndex: 959, background: "rgba(0,0,0,.65)" }} />}
     {/* Change only host layout: moving the iframe to a portal would reload its document and lose interactive state. */}
     <div ref={viewer} className={expanded ? "viz-expanded-viewer" : undefined} role={expanded ? "dialog" : undefined} aria-modal={expanded ? true : undefined} aria-label={expanded ? `${title} preview` : undefined} style={expanded ? { position: "fixed", inset: 16, zIndex: 960, display: "flex", flexDirection: "column", background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden", boxShadow: "0 24px 80px rgba(0,0,0,.5)" } : undefined}>
@@ -167,13 +221,20 @@ function InlineDiagram({ source }: { source: string }) {
       <Button variant="ghost" aria-expanded={showSource} onClick={() => setShowSource(value => !value)}>{showSource ? "Hide source" : "Source"}</Button>
       <Button variant="ghost" onClick={() => copyText(source, "Diagram source copied")}>Copy source</Button>
     </div>
-    {failed ? <p role="status">This diagram could not be displayed. Source is still available.</p> : <Thumb src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`} alt={title} onError={() => setFailed(true)} style={{ display: "block", width: "100%", maxHeight: 560, objectFit: "contain" }} />}
+    {failed ? <p role="status">This diagram could not be displayed. Source is still available.</p> : <Thumb src={svgImageUrl(source)} alt={title} onError={() => setFailed(true)} style={{ display: "block", width: "100%", maxHeight: 560, objectFit: "contain" }} />}
     {showSource && <pre style={{ maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap" }}><code>{source}</code></pre>}
   </section>;
 }
 
 export function AssistantMarkdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
-  const mapped = visualizationParts(text).map((part, i) => part.kind === "visualization"
+  // Memoized on the text alone. Splitting the reply into lines and building a
+  // matcher per fence is O(reply length), and this component re-renders on every
+  // throttled tick of a streamed reply (~8/s at MD_THROTTLE_MS), so unmemoized it
+  // re-scanned the whole answer each time for a part list that only changes when
+  // the text does. `streaming` is deliberately not a dependency of the parts: it
+  // only affects the placeholder message below.
+  const parts = useMemo(() => visualizationParts(text), [text]);
+  const mapped = parts.map((part, i) => part.kind === "visualization"
     ? <Visualization key={`${i}:${part.source}`} source={part.source} autoStart />
     : part.kind === "image"
       ? <ImageExplanation key={`${i}:${part.source}`} source={part.source} />
@@ -181,6 +242,6 @@ export function AssistantMarkdown({ text, streaming = false }: { text: string; s
       ? <InlineDiagram key={`${i}:${part.source}`} source={part.source} />
     : part.kind === "placeholder"
       ? <VisualizationPlaceholder key={i} source={part.source} message={part.message ?? (streaming ? "Working on the interactive preview…" : "This interactive visualization is incomplete.")} />
-      : <ReactMarkdown key={i} remarkPlugins={[remarkGfm, remarkOl]} components={mdComponents}>{part.source}</ReactMarkdown>);
+      : <ReactMarkdown key={i} remarkPlugins={MD_PLUGINS} components={mdComponents} urlTransform={replyUrlTransform}>{part.source}</ReactMarkdown>);
   return mapped;
 }

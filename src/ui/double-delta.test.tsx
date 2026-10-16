@@ -116,4 +116,24 @@ describe("one boot attaches one event listener", () => {
 
     expect(get().items.t1?.map((x) => x.text)).toEqual(["I'll look at how it's built. Before that,"]);
   });
+
+  // The end of a turn re-emits every text item carrying its whole text (that is
+  // where the model name is stamped on it). Chunks the page is still holding —
+  // the normal state on a phone, where a hidden document runs no animation
+  // frames and so flushes nothing until it is shown again — are already in that
+  // copy, and appending them on top is the reported duplication: the tail of
+  // the reply repeated from a chunk boundary on.
+  it("does not repeat the buffered tail when the finished item is re-emitted", async () => {
+    await boot();
+    expect(liveHandlers("ol://event")).toHaveLength(1);
+
+    fire({ kind: "item", payload: replyItem("The wait-") });
+    fire({ kind: "delta", payload: { item_id: "a", text: "and-refuse branch works." } });
+    // Nothing has been folded in yet: the flush is waiting on a frame.
+    expect(get().items.t1?.[0]?.text).toBe("The wait-");
+    fire({ kind: "item", payload: replyItem("The wait-and-refuse branch works.") });
+    flushDeltas();
+
+    expect(get().items.t1?.map((x) => x.text)).toEqual(["The wait-and-refuse branch works."]);
+  });
 });

@@ -4,7 +4,7 @@ export function RecoverySummary({ task }: { task: TaskSummary }) {
   const jobs = useStore(s => s.bg[task.id]);
   const active = (jobs ?? []).filter(job => job.running);
   const remaining = task.todos.filter(todo => todo.status !== "completed");
-  return <details style={{ fontSize: 12, marginBottom: 6 }}>
+  return <details className="pb-recovery">
     <summary>Recovery context · {remaining.length} unfinished tasks · {active.length} live background jobs</summary>
     <div>Last agent step: {task.step || "No step recorded"}</div>
     {active.map(job => <div key={job.id}><code>{job.id}</code> — still running</div>)}

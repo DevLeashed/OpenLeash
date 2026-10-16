@@ -102,7 +102,7 @@ impl Drop for Session {
 
 impl Session {
     /// Launch a headless browser and attach to it. The caller owns the key this
-    /// is filed under (the task, plus its sub-agent), which is what keeps one
+    /// is filed under (the task, plus its subagent), which is what keeps one
     /// conversation's page out of another's reach.
     pub async fn launch(width: u32, height: u32) -> Result<Arc<Self>, String> {
         let browsers = browsers_installed();
@@ -712,7 +712,7 @@ pub async fn session_for(owner: &str, width: u32, height: u32) -> Result<Arc<Ses
     let fresh = Session::launch(width, height).await?;
     map.insert(owner.to_string(), fresh.clone());
     // Every new browser is a moment to notice the ones nobody is using any
-    // more. A finished sub-agent's page is never closed explicitly (only a
+    // more. A finished subagent's page is never closed explicitly (only a
     // task's main one is, at the end of a run), so without this an ultrathread
     // would leave a headless Chrome per worker running for the session.
     let stale: Vec<String> = map
@@ -735,7 +735,7 @@ pub fn close(owner: &str) {
     drop(victim);
 }
 
-/// Close every browser a task owns, main agent and sub-agents alike.
+/// Close every browser a task owns, main agent and subagents alike.
 pub fn close_task(task_id: &str) {
     let mut map = match sessions().try_lock() {
         Ok(m) => m,

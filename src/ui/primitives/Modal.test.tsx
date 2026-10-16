@@ -23,4 +23,11 @@ describe("Modal scroll layout", () => {
   it("preserves the height of form rows, headers and footers", () => {
     expect(css).toMatch(/\.modal > :not\(\.mb\), \.modal \.mb > \*\s*\{\s*flex-shrink:\s*0;\s*\}/);
   });
+
+  it("lets a two-column field pair give way instead of clipping its second column", () => {
+    // A phone cannot fit two labelled inputs side by side; the pair stacks rather
+    // than running the second one off the edge of a vertically-scrolling body.
+    expect(css).toMatch(/\.modal \.mb > \.fieldrow\s*\{\s*flex-shrink:\s*1;\s*\}/);
+    expect(css).toMatch(/@media \(max-width: 640px\)[\s\S]*\.fieldrow \{\s*flex-direction: column;/);
+  });
 });

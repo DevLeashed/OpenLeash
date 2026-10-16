@@ -1,6 +1,10 @@
 [package]
 name = "openleash"
-version = "0.1.1"
+version = "0.1.2"
+# Which binary `cargo build`/`tauri build` means when the crate has more than
+# one — the headless entry point below is a second `[[bin]]`, and without this
+# the Tauri CLI refuses to guess ("failed to find main binary").
+default-run = "openleash"
 description = "OpenLeash - desktop agent harness"
 authors = ["The OpenLeash Authors"]
 edition = "2021"
@@ -20,6 +24,21 @@ exclude = ["dist", "compiled", "published", "node_modules"]
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "openleash_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Non-interactive entry point: one prompt, NDJSON on stdout, no GUI. Its source
+# lives outside `src/bin/` so cargo's bin autodiscovery cannot also claim it as
+# a second, differently-named target for the same file. The desktop app's own
+# `src/main.rs` target is untouched.
+[[bin]]
+name = "openleash-headless"
+path = "src/headless/main.rs"
+
+# Agent Client Protocol (ACP) server over stdio, for editor integrations (Zed,
+# JetBrains, VS Code, Neovim, …). Also outside `src/bin/` for the same reason as
+# the headless target: bin autodiscovery must not claim a second name for it.
+[[bin]]
+name = "openleash-acp"
+path = "src/acp/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -64,9 +83,16 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 tauri-plugin-notification = "2"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "tokio-rustls", "rustls-tls-webpki-roots"] }
 tauri-plugin-single-instance = "2"
-
-[dev-dependencies]
-minisign-verify = "0.2.5"
+# Remote control (src/remote): a request-head parser for the small built-in
+# HTTP server. Already in the tree via hyper, so no new download.
+httparse = "1"
+# The pairing QR code in Settings -> Remote. SVG output only, no image deps.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Remote-SSH projects (agent/ssh_session.rs): the SFTP client speaks over the
+# stdio of the user's own `ssh -s <target> sftp`, so authentication stays with
+# their ssh config, keys and agent. The only optional feature is async-trait,
+# which the client doesn't need.
+russh-sftp = { version = "3", default-features = false }
 
 
 # These APIs are used only by the Windows guard and COM integration. Keeping

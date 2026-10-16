@@ -1,8 +1,9 @@
 // Settings: Accounts (subscription logins + live usage), Routing (fallback
-// chains) and Sub-agents (custom agent definitions).
-import { useLayoutEffect, useRef, useState } from "react";
-import { AccountProviderInfo, AccountView, AgentDef, api, EFFORTS, effortLabel, effortSteps, isRequiredAgent, ProviderView, Route, until, Window, withRequiredAgents } from "../api";
+// chains) and Subagents (custom agent definitions).
+import { Fragment, useLayoutEffect, useRef, useState } from "react";
+import { AccountProviderInfo, AccountView, AgentDef, api, EFFORTS, effortLabel, effortSteps, isRequiredAgent, ProviderView, Route, until, UsageCap, Window, withRequiredAgents } from "../api";
 import { flash, get, isConnected, modelInfo, saveSettings, set, shownProviders, useNow, useStore, zoom } from "../store";
+import { copyText } from "./clipboard";
 import { Dropdown, Opt } from "./primitives";
 import { I } from "./icons";
 import { Modal, MorphText } from "./primitives";
@@ -12,7 +13,7 @@ import { ctxPlace, MenuRow, MenuScrim, menuLayer } from "./primitives";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Bot, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CircleAlert, ExternalLink, RefreshCw } from "lucide-react";
 import { Loader, Button, ColorPicker, IconButton, Input, Pressable, RemovableChip, Segmented, Switch, TextArea, TextButton } from "./primitives";
-import { GROUP_NAMES, GroupRow, groupsOf, NO_STEPS, restrictionLabel, stepsLabel, toToolGroups, validateGroups } from "./agent-groups";
+import { GROUP_NAMES, GroupRow, groupsOf, restrictionLabel, toToolGroups, validateGroups } from "./agent-groups";
 
 // Stable fallbacks for selectors (a fresh [] each render loops useSyncExternalStore).
 const NO_ROUTES: Route[] = [];
@@ -20,14 +21,82 @@ const NO_IDS: string[] = [];
 
 const tone = (used: number) => (used >= 95 ? "var(--red)" : "var(--mut2)");
 
-export function UsageBar({ w, compact, style }: { w: Window; compact?: boolean; style?: React.CSSProperties }) {
+/** What a cap is drawn in: the app's own amber for work that is being held
+ *  back, so a capped account reads as held on purpose rather than as broken. */
+const CAP_COLOR = "var(--st-pause)";
+
+/** The caps the backend reports for an account. Absent on a backend that
+ *  predates them, since a phone browser drives this same backend. */
+export function capsOf(a: AccountView): UsageCap[] {
+  return a.caps ?? [];
+}
+
+/** The cap standing on one window of one account, if there is one. A temporary
+ *  cap whose time has run out holds nothing, so no line draws one. */
+export function liveCap(a: AccountView, window: string): UsageCap | null {
+  const c = capsOf(a).find((x) => x.window === window);
+  return c && (c.until === 0 || c.until * 1000 > Date.now()) ? c : null;
+}
+
+/** What a provider's “All …” line can say about the caps on one window: the cap
+ *  every account carries when they all carry the same one, and how many carry
+ *  any at all when they do not. */
+export function capSummary(list: AccountView[], window: string): { shared: UsageCap | null; n: number } {
+  const caps: UsageCap[] = [];
+  let missing = false;
+  for (const a of list) {
+    const c = liveCap(a, window);
+    if (c) caps.push(c);
+    else missing = true;
+  }
+  const first = caps[0];
+  const same = !!first && !missing && caps.every((c) => c.used === first.used && c.until === first.until);
+  // The aggregated line only reads "capped" when every account carrying the cap
+  // has reached it: one account held while another still works is not the pool
+  // being capped, and the row bars already say which one is.
+  return { shared: same ? { ...first, holding: caps.every((c) => c.holding) } : null, n: caps.length };
+}
+
+/** A cap in words, for a tooltip: where it holds, and what lifts it. */
+export function capText(c: UsageCap) {
+  const at = `${c.used.toFixed(0)}% of the ${c.window} window`;
+  const when = c.until === 0 ? "until you remove it" : `lifts in ${until(c.until)}`;
+  return c.holding
+    ? `Capped at ${at} — reached, so the harness has stopped using this account (${when})`
+    : `Capped at ${at} (${when})`;
+}
+
+/** What the badge beside a capped line says: the cap itself while it is still
+ *  ahead of the usage, “capped” once it is what holds the account back. */
+function capBadge(c: UsageCap) {
+  const when = c.until === 0 ? "" : ` · ${until(c.until)}`;
+  return c.holding ? `capped${when}` : `cap ${c.used.toFixed(0)}%${when}`;
+}
+
+export function UsageBar({ w, cap, onCap, hint, compact, style }: { w: Window; cap?: UsageCap | null; onCap?: () => void; hint?: string; compact?: boolean; style?: React.CSSProperties }) {
   const used = Math.max(0, Math.min(100, w.used));
   const left = 100 - used;
+  // A reached cap is drawn as the account being held, not as an error: amber
+  // fill, amber figure, and a badge that names the cap rather than the
+  // percentage. The marker sits where the fill stops when the cap is reached,
+  // so the line reads as a floor the bar is not allowed to shrink past.
+  const held = !!cap?.holding;
+  const color = held ? CAP_COLOR : tone(used);
+  const tip = [
+    `${w.label}: ${left.toFixed(0)}% left`,
+    w.resets_at ? `resets in ${until(w.resets_at)}` : "",
+    cap ? capText(cap) : "",
+    onCap ? hint ?? "Double-click to cap this window" : "",
+  ].filter(Boolean).join(" · ");
   return (
-    <Tooltip content={`${w.label}: ${left.toFixed(0)}% left${w.resets_at ? ` · resets in ${until(w.resets_at)}` : ""}`}><div className="ubar" style={style}>
+    <Tooltip content={tip}><div className="ubar" style={style} onDoubleClick={onCap}>
       <span className="ublabel">{w.label}</span>
-      <span className="minibar"><span style={{ width: left + "%", background: tone(used) }} /></span>
-      <MorphText className="ubpct" style={{ color: tone(used) }}>{left.toFixed(0)}%</MorphText>
+      <span className="minibar">
+        <span style={{ width: left + "%", background: color }} />
+        {cap && <span className={"capmark" + (held ? " held" : "")} style={{ left: 100 - Math.max(0, Math.min(100, cap.used)) + "%" }} />}
+      </span>
+      <MorphText className="ubpct" style={{ color }}>{left.toFixed(0)}%</MorphText>
+      {cap && <span className={"capbadge" + (held ? " held" : "")}>{capBadge(cap)}</span>}
       {!compact && w.resets_at > 0 && <span className="ubreset">{until(w.resets_at)}</span>}
     </div></Tooltip>
   );
@@ -50,7 +119,7 @@ export function netWindows(list: AccountView[]): Window[] {
   });
 }
 
-function AccountRow({ a, i, n, revealed }: { a: AccountView; i: number; n: number; revealed: boolean }) {
+function AccountRow({ a, i, n, revealed, onCap }: { a: AccountView; i: number; n: number; revealed: boolean; onCap: (a: AccountView, w: { label: string; used: number | null; resets_at: number }) => void }) {
   const [edit, setEdit] = useState(false);
   const [label, setLabel] = useState(a.label);
   const [del, setDel] = useState(false);
@@ -58,8 +127,14 @@ function AccountRow({ a, i, n, revealed }: { a: AccountView; i: number; n: numbe
   const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
   const upd = async (patch: Parameters<typeof api.accountUpdate>[1]) => set({ accounts: await api.accountUpdate(a.id, patch) });
   const cooling = a.cooldown_until * 1000 > Date.now();
+  // The cap the harness is acting on, if one is. It is shown ahead of a
+  // cooldown because it is what the *user* did: a bench the provider reported
+  // and a bench of their own making look identical from the row otherwise, and
+  // only one of the two is theirs to lift.
+  const capped = capsOf(a).find((c) => c.holding) ?? null;
   const state = a.disabled_reason ? { t: a.disabled_reason, c: "#ff6363", tip: undefined as string | undefined }
     : !a.enabled ? { t: "Off", c: "var(--dim)", tip: undefined }
+    : capped ? { t: capped.until === 0 ? "Capped" : `Capped · ${until(capped.until)}`, c: CAP_COLOR, tip: `${capText(capped)}${cooling ? ` · also benched: ${a.cooldown_reason || "back shortly"} until ${until(a.cooldown_until)}` : ""}` }
     : cooling ? { t: until(a.cooldown_until), c: "var(--mut2)", tip: `${a.cooldown_reason || "Usage limit (per live usage)"} · back in ${until(a.cooldown_until)}` }
     : a.active ? { t: "Serving now", c: "var(--fg3)", tip: undefined } : { t: "Ready", c: "var(--mut2)", tip: undefined };
   return (
@@ -87,10 +162,22 @@ function AccountRow({ a, i, n, revealed }: { a: AccountView; i: number; n: numbe
         </div>
         {a.usage?.windows.length ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "3px 16px" }}>
-            {a.usage.windows.map((w) => <UsageBar key={w.label} w={w} />)}
+            {a.usage.windows.map((w) => <UsageBar key={w.label} w={w} cap={liveCap(a, w.label)} onCap={() => onCap(a, { label: w.label, used: w.used, resets_at: w.resets_at })} />)}
           </div>
         ) : (
-          <div style={{ fontSize: 11, color: a.usage?.error ? "#ff8a8a" : "var(--dim)" }}>{a.usage?.error || "Usage not read yet"}</div>
+          <div style={{ fontSize: 11, color: a.usage?.error ? "#ff8a8a" : "var(--dim)", display: "flex", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
+            <span>{a.usage?.error || "Usage not read yet"}</span>
+            {/* A cap stands on the account rather than on a reading, so it
+                outlives a provider that stopped reporting the window it names.
+                Without this it would be a cap with no line to be lifted from —
+                one the user can neither see nor remove. */}
+            {capsOf(a).filter((c) => c.until === 0 || c.until * 1000 > Date.now()).map((c) => (
+              <Pressable key={c.window} className={"capbadge" + (c.holding ? " held" : "")} aria-label={`Cap on the ${c.window} window — change or lift it`}
+                onClick={() => onCap(a, { label: c.window, used: null, resets_at: 0 })}>
+                {c.window} · {capBadge(c)}
+              </Pressable>
+            ))}
+          </div>
         )}
       </div>
       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
@@ -140,7 +227,7 @@ function AccountMenu({ a, x, y, close }: { a: AccountView; x: number; y: number;
   const [h, setH] = useState(96);
   useLayoutEffect(() => { setH(ref.current?.offsetHeight || 96); }, [shown]);
   const email = a.email.trim();
-  const copy = (what: string) => { navigator.clipboard?.writeText(what).then(() => flash(what === email ? "Email copied" : "Copied")).catch(() => flash("Couldn't copy")); };
+  const copy = (what: string) => { copyText(what, { what: what === email ? "Email copied" : "Copied" }); };
   return (
     <div style={menuLayer(zoom())}>
       <MenuScrim layer={90} onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
@@ -168,7 +255,7 @@ function AccountMenu({ a, x, y, close }: { a: AccountView; x: number; y: number;
 function Copy({ text }: { text: string }) {
   const [done, setDone] = useState(false);
   return (
-    <Pressable className="copybox" onClick={() => { navigator.clipboard?.writeText(text); setDone(true); setTimeout(() => setDone(false), 1400); }}>
+    <Pressable className="copybox" onClick={() => copyText(text, { onResult: (ok) => { if (!ok) return; setDone(true); setTimeout(() => setDone(false), 1400); } })}>
       <span className="mono">{text}</span>
       <span className={"copyhint" + (done ? " done" : "")}>{done && <Check size={11} />}<MorphText>{done ? "Copied" : "Copy"}</MorphText></span>
     </Pressable>
@@ -274,6 +361,85 @@ const meta_url_label = (url: string) => {
   return host.replace(/^www\./, "") + "'s terms";
 };
 
+/** What a double-click on a usage line opens.
+ *
+ * A cap is an instruction the user gives, not a bench the provider reported.
+ * Nothing that clears a bench — a resume, a retry, a token refresh — touches it,
+ * and it rides in settings beside the account, so it survives a restart. That is
+ * the distinction this dialog has to keep legible, and it is what the two
+ * choices mean: Temporary is *this cap lifts by itself at a time you pick*, never
+ * "this cap is a suggestion".
+ */
+export type CapTarget = {
+  ids: string[];
+  kind: string;
+  /** Who the cap lands on, in words: an account label, or "each of the 4 …". */
+  who: string;
+  window: string;
+  /** The cap already standing on this line, if any. */
+  cap: UsageCap | null;
+  /** The highest usage on this line right now, or null when nothing was read. */
+  used: number | null;
+  /** When the window rolls over; 0 = the provider did not say. */
+  resets_at: number;
+};
+
+const CAP_HOURS = { "1h": 1, "4h": 4, "24h": 24 } as const;
+type CapDur = keyof typeof CAP_HOURS | "window";
+
+function CapDialog({ target, onClose }: { target: CapTarget; onClose: () => void }) {
+  // Opens on the cap already standing, so double-clicking a line is also how one
+  // is adjusted; a fresh cap starts at 80% used, which is headroom without
+  // parking most of an account.
+  const [at, setAt] = useState(target.cap ? Math.round(target.cap.used) : 80);
+  // Permanent is the default. A cap that lifts on its own is the one that can
+  // quietly stop holding a window while the user still believes it does.
+  const [span, setSpan] = useState<"perm" | "temp">(target.cap && target.cap.until > 0 ? "temp" : "perm");
+  const [dur, setDur] = useState<CapDur>("1h");
+  const [busy, setBusy] = useState(false);
+  const resetIn = Math.max(0, (target.resets_at || 0) - Math.floor(Date.now() / 1000));
+  const secs = span === "perm" ? 0 : dur === "window" ? resetIn : CAP_HOURS[dur] * 3600;
+  const nowAt = target.used;
+  const run = async (f: () => Promise<AccountView[]>) => {
+    setBusy(true);
+    try { set({ accounts: await f() }); onClose(); } catch (e) { flash(String(e)); }
+    setBusy(false);
+  };
+  return (
+    <Modal onClose={onClose} style={{ width: "min(500px, 100%)" }}>
+      <div className="mh"><ProviderIcon provider={target.kind} size={18} /><span style={{ flex: 1 }}>Cap usage · {target.window}</span><IconButton label="Close" onClick={onClose}>{I.close()}</IconButton></div>
+      <div className="mb">
+        <div className="field">
+          <label>Stop at {at}% used <span style={{ color: "var(--dim)" }}>· {100 - at}% of the window left</span></label>
+          <Input className="capslider" type="range" min={5} max={95} step={5} value={at} aria-label="Cap" aria-valuetext={`${at}% used`} onChange={(e) => setAt(Number(e.currentTarget.value))} />
+          <div className="desc">{nowAt != null ? `Now at ${nowAt.toFixed(0)}% used. ` : ""}{nowAt != null && nowAt >= at ? "The cap is at or below that already, so it takes effect immediately." : ""}</div>
+        </div>
+        <div className="field"><label>How long it stands</label>
+          <Segmented label="How long the cap stands" value={span} onChange={setSpan} style={{ width: "100%" }} options={[
+            { value: "perm", label: "Permanent", hint: "Stands until you lift it from this line" },
+            { value: "temp", label: "Temporary", hint: "Lifts by itself, without you coming back" },
+          ]} />
+        </div>
+        {span === "temp" && <div className="field"><label>Lifts after</label>
+          <Segmented label="When a temporary cap lifts" value={dur} onChange={setDur} style={{ width: "100%" }} options={[
+            { value: "1h", label: "1 hour" },
+            { value: "4h", label: "4 hours" },
+            { value: "24h", label: "24 hours" },
+            { value: "window", label: "This window", hint: resetIn > 0 ? `When the window rolls over, in ${until(target.resets_at)}` : "This provider does not say when the window rolls over", disabled: resetIn <= 0 },
+          ]} />
+          <div className="desc">A temporary cap can be renewed from the same line before it lifts.</div>
+        </div>}
+      </div>
+      <div className="mf">
+        {target.cap && <Button variant="ghost" style={{ color: "#ff8a8a" }} disabled={busy} onClick={() => void run(() => api.accountCapClear(target.ids, target.window))}>Remove cap</Button>}
+        <div style={{ flex: 1 }} />
+        <Button variant="ghost" onClick={onClose}>Cancel</Button>
+        <Button variant="primary" disabled={busy} onClick={() => void run(() => api.accountCapSet(target.ids, target.window, at, secs))}>{busy && <Loader size={13} />}{target.cap ? "Update cap" : "Set cap"}</Button>
+      </div>
+    </Modal>
+  );
+}
+
 function ImportDialog({ provider, onClose }: { provider: ProviderView; onClose: () => void }) {
   const kind = provider.id;
   const meta = provider.account!;
@@ -333,6 +499,8 @@ export function AccountsTab() {
   const [busy, setBusy] = useState(false);
   const [revealed, setRevealed] = useState(false);
   const [revealWarning, setRevealWarning] = useState(false);
+  // The cap editor: which lines a double-click opened it on, or null when shut.
+  const [cap, setCap] = useState<CapTarget | null>(null);
   // Just the relative "resets in" strings, on this tab's own clock.
   useNow(15_000);
   const refresh = async () => {
@@ -341,6 +509,23 @@ export function AccountsTab() {
     setBusy(false);
   };
   const close = () => setDialog(null);
+  // One account's own line: the cap lands on it alone. `used` is null when the
+  // line is a cap standing on a window the provider is not reporting, where
+  // there is no reading to show or compare against.
+  const capAccount = (a: AccountView, w: { label: string; used: number | null; resets_at: number }) => setCap({
+    ids: [a.id], kind: a.kind, who: a.label, window: w.label,
+    cap: liveCap(a, w.label), used: w.used, resets_at: w.resets_at,
+  });
+  // A provider's "All …" line: the same ceiling on every account of the kind,
+  // which is what the aggregated bar is made of — an average of accounts each
+  // holding at the cap is an average that cannot exceed it.
+  const capPool = (p: ProviderView, list: AccountView[], w: Window) => setCap({
+    ids: list.map((a) => a.id), kind: p.id,
+    who: list.length === 1 ? "this account" : `each of the ${list.length} ${p.account!.display_name} accounts`,
+    window: w.label, cap: capSummary(list, w.label).shared,
+    used: Math.max(0, ...list.map((a) => a.usage?.windows.find((x) => x.label === w.label)?.used ?? 0)),
+    resets_at: w.resets_at,
+  });
   return (
     <>
       <div className="settings-head">
@@ -360,12 +545,23 @@ export function AccountsTab() {
                 <div style={{ fontWeight: 600 }}>{p.account!.display_name}</div>
                 <div className="desc">{list.length ? `${avail} of ${list.length} available` : "No accounts yet"}</div>
               </div>
-              {net.length > 0 && net.map((w) => <UsageBar key={w.label} w={{ ...w, label: "All " + w.label }} compact />)}
+              {net.length > 0 && net.map((w) => {
+                const caps = capSummary(list, w.label);
+                return (
+                  <Fragment key={w.label}>
+                    <UsageBar w={{ ...w, label: "All " + w.label }} compact cap={caps.shared} onCap={() => capPool(p, list, w)}
+                      hint={`Double-click to cap every ${p.account!.short_name} account's ${w.label} window`} />
+                    {/* Caps that do not agree cannot be drawn as one line, so the
+                        header says how many accounts carry one instead. */}
+                    {!caps.shared && caps.n > 0 && <Tooltip content={`${caps.n} of ${list.length} accounts have a cap on this window · double-click a row's line to see it`}><span className="capnote">{caps.n} capped</span></Tooltip>}
+                  </Fragment>
+                );
+              })}
               {/* The terms gate makes the extra step clear before the connect
                   dialog, while keeping the account action itself labelled Add. */}
               <Button onClick={() => setDialog({ id: p.id, gate: p.account!.terms_gate ? "terms" : null })}>{I.plus(12)}Add</Button>
             </div>
-            {list.map((a, i) => <AccountRow key={a.id} a={a} i={i} n={list.length} revealed={revealed} />)}
+            {list.map((a, i) => <AccountRow key={a.id} a={a} i={i} n={list.length} revealed={revealed} onCap={capAccount} />)}
           </div>
         );
       })}
@@ -387,6 +583,7 @@ export function AccountsTab() {
               onClose={close}
             />
           : <ImportDialog provider={activeProvider} onClose={close} />)}
+      {cap && <CapDialog target={cap} onClose={() => setCap(null)} />}
     </>
   );
 }
@@ -503,7 +700,7 @@ export function RoutingTab() {
   );
 }
 
-// sub-agents
+// subagents
 
 const TOOLSETS: [AgentDef["tools"], string, string][] = [["all", "All tools", "Edit files and run commands"], ["no_shell", "No shell", "Can edit files, can't run commands"], ["read_only", "Read-only", "Search and read only"]];
 
@@ -512,7 +709,6 @@ function AgentDialog({ init, onClose }: { init: AgentDef | null; onClose: () => 
   // Tool restrictions, held as editable rows and folded back to the wire shape
   // on save. Empty means this agent keeps whatever `tools` above says.
   const [rows, setRows] = useState<GroupRow[]>(() => groupsOf(init ?? {}));
-  const [steps, setSteps] = useState<number>(init?.steps ?? NO_STEPS);
   // This subagent may run on a model of its own, and a different model takes a
   // different set of levels: an empty pick means the chat's model decides.
   const effMi = modelInfo(d.model || get().home.model);
@@ -528,7 +724,7 @@ function AgentDialog({ init, onClose }: { init: AgentDef | null; onClose: () => 
     // the settings write failing with a message after the dialog has closed.
     const gerr = validateGroups(rows);
     if (gerr) return flash(gerr);
-    const next = { ...d, id, name: d.name.trim() || id, groups: toToolGroups(rows), steps };
+    const next = { ...d, id, name: d.name.trim() || id, groups: toToolGroups(rows) };
     await saveSettings({ agents: [...s.agents.filter((a) => a.id !== id), next] });
     set({ agents: await api.agents() });
     if (!init) {
@@ -564,12 +760,6 @@ function AgentDialog({ init, onClose }: { init: AgentDef | null; onClose: () => 
             ))}
             <TextButton onClick={() => setRows([...rows, { name: "edit", fileRegex: "", description: "" }])}>+ Add file restriction</TextButton>
             <div className="desc">A pattern is matched against the file's path relative to the project root. Only the <span className="mono">edit</span> group can carry one — e.g. a docs writer that may only touch <span className="mono">*.md</span>. Invalid patterns are refused when you save.</div>
-          </div>
-          <div className="field"><label>Step limit <span style={{ color: "var(--dim)" }}>optional — how many tool rounds before it wraps up</span></label>
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              <Input className="input" type="number" min={0} aria-label="Step limit" value={steps} onChange={(e) => setSteps(Math.max(0, Math.floor(Number(e.currentTarget.value) || 0)))} style={{ width: 110 }} />
-              <span className="desc">{stepsLabel(steps)}. On reaching it the agent is told to summarise its work and recommend what is left, rather than being cut off.</span>
-            </div>
           </div>
           <div className="srowx" style={{ padding: "2px 0", minHeight: 0 }}>
             <div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Inject project instructions</div><div className="desc">Include project instructions in this agent's context.</div></div>
@@ -613,6 +803,9 @@ function AgentDialog({ init, onClose }: { init: AgentDef | null; onClose: () => 
 export function AgentsTab() {
   const agents = useStore((s) => s.agents);
   const defaults = useStore((s) => s.settings?.default_agents ?? NO_IDS);
+  // The built-ins are always present, so a failure to list the project's own
+  // agents used to look like "no subagents here" — which is a different claim.
+  const catalogError = useStore((s) => s.catalogError);
   const [dialog, setDialog] = useState<null | { init: AgentDef | null }>(null);
   const toggleDefault = async (id: string) => {
     // `explore` + `general` are always on: ignore attempts to toggle them off.
@@ -649,15 +842,12 @@ export function AgentsTab() {
               </div>
               <div className="desc" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.description}{d.model && <> · {modelInfo(d.model).name}</>}</div>
               {(() => {
-                // Surface the two new ceilings on the row so a restriction is
-                // discoverable, not a surprise found mid-task. Both are silent
-                // in the description, which is user-authored prose.
+                // Keep file restrictions discoverable without changing the
+                // description, which is user-authored prose.
                 const rest = restrictionLabel(groupsOf(d));
-                const capped = (d.steps ?? 0) > 0;
-                if (!rest && !capped) return null;
+                if (!rest) return null;
                 return <div className="desc" style={{ display: "flex", gap: 8, color: "var(--mut3)", marginTop: 2 }}>
-                  {rest && <span title="This agent can only edit these paths">✎ {rest}</span>}
-                  {capped && <span title="The agent wraps up and reports after this many tool rounds">{stepsLabel(d.steps)}</span>}
+                  <span title="This agent can only edit these paths">✎ {rest}</span>
                 </div>;
               })()}
             </div>
@@ -666,6 +856,9 @@ export function AgentsTab() {
               : <Switch label={`${defaults.includes(d.id) ? "Disable" : "Enable"} ${d.name} by default`} hint="On by default in new chats" small checked={defaults.includes(d.id)} onChange={(_, e) => { e.stopPropagation(); void toggleDefault(d.id); }} />}
           </Pressable>
         ))}
+        {catalogError && (
+          <div className="empty" role="alert" style={{ color: "#ff8a8a" }}>Couldn't list this project's subagents · {catalogError}</div>
+        )}
       </div>
       <div style={{ fontSize: 11.5, color: "var(--mut3)" }}>The switch sets which subagents new chats start with. Explore and General are built in and always on. Change a chat's set any time from the composer.</div>
       {dialog && <AgentDialog init={dialog.init} onClose={() => setDialog(null)} />}
