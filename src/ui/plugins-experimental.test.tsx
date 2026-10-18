@@ -168,7 +168,6 @@ describe("compact details and connectors", () => {
   it("moves GitHub to Connectors with an off switch and collapsed authentication", () => {
     store(allOff, "connectors");
     render(<ConnectorsTab />);
-    for (const n of ["Linear", "Jira", "Slack", "Notion", "GitLab", "Telegram", "Slack (chat)"]) fireEvent.click(screen.getByRole("button", { name: n }));
     // GitHub plus the five service plugins, every one of them off — including
     // for a settings.json written before the service plugins existed.
     expect(switches()).toHaveLength(6);

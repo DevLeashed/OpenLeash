@@ -36,9 +36,6 @@ const status = {
 const store = (plugins: Plugins) =>
   set({ settings: { plugins, mcp: [], allow: [], settingsTab: "connectors" } as unknown as Settings, settingsTab: "connectors" });
 
-/** Service cards without a token start hidden; reveal them from the add row. */
-const addAll = () => { for (const s of SERVICE_SPECS) fireEvent.click(screen.getByRole("button", { name: s.name })); };
-
 beforeEach(() => vi.spyOn(api, "pluginsStatus").mockResolvedValue(status));
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -46,7 +43,6 @@ describe("service plugin cards", () => {
   it("lists the five services in backend order, all off for an old settings file", () => {
     store(old);
     render(<ConnectorsTab />);
-    addAll();
     expect(SERVICE_SPECS.map((s) => s.id)).toEqual(["linear", "jira", "slack", "notion", "gitlab"]);
     for (const s of SERVICE_SPECS) {
       expect(screen.getByRole("switch", { name: `${s.name} plugin` }).getAttribute("aria-checked")).toBe("false");
@@ -57,7 +53,6 @@ describe("service plugin cards", () => {
     store({ ...old, linear: { enabled: false } });
     const save = vi.spyOn(api, "settings").mockResolvedValue({} as unknown as Settings);
     render(<ConnectorsTab />);
-    addAll();
     fireEvent.click(screen.getByRole("switch", { name: "Linear plugin" }));
     await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1));
     const sent = JSON.stringify(save.mock.calls[0]);
@@ -70,7 +65,6 @@ describe("service plugin cards", () => {
     const setSecret = vi.spyOn(api, "pluginSecretSet").mockResolvedValue();
     const save = vi.spyOn(api, "settings");
     render(<ConnectorsTab />);
-    addAll();
     fireEvent.click(screen.getByRole("button", { name: "Slack Details" }));
     const bot = await screen.findByLabelText("Slack bot token") as HTMLInputElement;
     await vi.waitFor(() => expect(bot.placeholder).toBe("Saved · paste to replace"));
@@ -88,7 +82,6 @@ describe("service plugin cards", () => {
     store(old);
     vi.spyOn(api, "pluginServiceTest").mockResolvedValue({ ok: true, identity: "Ada · acme", source: "GITLAB_TOKEN" });
     render(<ConnectorsTab />);
-    addAll();
     fireEvent.click(screen.getByRole("button", { name: "GitLab Details" }));
     fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
     expect(await screen.findByText(/Connected · Ada · acme · from GITLAB_TOKEN/)).toBeTruthy();
@@ -98,27 +91,11 @@ describe("service plugin cards", () => {
     store(old);
     const save = vi.spyOn(api, "settings").mockResolvedValue({} as unknown as Settings);
     render(<ConnectorsTab />);
-    addAll();
     fireEvent.click(screen.getByRole("button", { name: "Jira Details" }));
     const site = screen.getByLabelText("Jira site URL");
     fireEvent.change(site, { target: { value: "https://acme.atlassian.net " } });
     fireEvent.keyDown(site, { key: "Enter" });
     await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1));
     expect(JSON.stringify(save.mock.calls[0])).toContain("\"base_url\":\"https://acme.atlassian.net\"");
-  });
-});
-
-describe("connectors without a token", () => {
-  it("hides service cards until they have a token, keeps GitHub and Discord, and offers them to add", () => {
-    set({ settings: { plugins: old, mcp: [], allow: [], settingsTab: "connectors" } as unknown as Settings, settingsTab: "connectors" });
-    render(<ConnectorsTab />);
-    expect(screen.queryByRole("switch", { name: "Linear plugin" })).toBeNull();
-    expect(screen.getByRole("switch", { name: "GitHub plugin" })).toBeTruthy();
-    expect(screen.getByText("Discord connector")).toBeTruthy();
-    // Slack has a saved token in the mocked status, so it is shown already.
-    expect(screen.queryByRole("button", { name: "Linear" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Linear" }));
-    expect(screen.getByRole("switch", { name: "Linear plugin" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Linear" })).toBeNull();
   });
 });
