@@ -4,6 +4,7 @@ import { api, Plugins, PluginsStatus } from "../api";
 import { copyText } from "./clipboard";
 import { Dropdown, Switch, Button } from "./primitives";
 import { flash, saveSettings, useStore } from "../store";
+import { connectorsApi } from "../connectors";
 import { AppConnectors } from "./Connectors";
 import { DiscordConnector } from "./DiscordConnector";
 import { SlackConnector } from "./SlackConnector";
@@ -95,25 +96,48 @@ export function ConnectorsTab() {
     finally { authPending.current = false; setAuthBusy(false); }
   };
   const gh = st?.github;
-  return <>
+  // Telegram, Slack and the service plugins do nothing without a token, so they
+  // stay out of the list until they have one (or are switched on) or you add
+  // them from the row below; hiding the setup form entirely would leave no way
+  // to enter the first token. Discord and GitHub are always shown.
+  const [chat, setChat] = useState<{ telegram: boolean; slack: boolean }>({ telegram: false, slack: false });
+  const [added, setAdded] = useState<string[]>([]);
+  useEffect(() => {
+    let live = true;
+    const ok = <T,>(f: () => Promise<T>, pick: (s: T) => boolean) => f().then((s) => !!s && pick(s)).catch(() => false);
+    void Promise.all([
+      ok(connectorsApi.telegramStatus, (s) => s.has_token),
+      ok(connectorsApi.slackStatus, (s) => s.has_app_token || s.has_bot_token),
+    ]).then(([telegram, slack]) => { if (live) setChat({ telegram, slack }); });
+    return () => { live = false; };
+  }, []);
+  const shown = (id: string, configured: boolean) => configured || added.includes(id);
+    const showService = (id: string) => shown(id, !!(p as unknown as Record<string, { enabled?: boolean }>)[id]?.enabled || Object.values((st?.secrets as Record<string, Record<string, boolean>> | undefined)?.[id] ?? {}).some(Boolean));
+  const hidden: [string, string][] = [
+    ...(shown("telegram", chat.telegram) ? [] : [["telegram", "Telegram"] as [string, string]]),
+    ...(shown("slack-chat", chat.slack) ? [] : [["slack-chat", "Slack (chat)"] as [string, string]]),
+    ...SERVICE_SPECS.filter((spec) => !showService(spec.id)).map((spec): [string, string] => [spec.id, spec.name]),
+  ];
+    return <>
     <div className="settings-head"><div className="settings-head-main settings-title">Connectors</div><Button disabled={busy} onClick={check}>{busy ? "Checking…" : "Check again"}</Button></div>
     <div className="desc">Connect accounts and apps. Connecting does not pre-approve tools. GitHub tools follow the switch below; GitHub device sign-in also enables it. Other app connections enable their MCP server. Changes to GitHub tools apply to new chats or after /compact.</div>
+    {hidden.length > 0 && <div className="srowx" role="group" aria-label="Add a connector" style={{ flexWrap: "wrap" }}><span className="desc">Add a connector:</span>{hidden.map(([id, name]) => <Button key={id} onClick={() => setAdded((a) => [...a, id])}>{name}</Button>)}</div>}
     <div className="settings-section-label">Chat with your agent</div>
     <DiscordConnector />
-    <TelegramConnector />
-    <SlackConnector />
+    {shown("telegram", chat.telegram) && <TelegramConnector />}
+    {shown("slack-chat", chat.slack) && <SlackConnector />}
     <div className="settings-section-label">Accounts and apps</div>
     <div className="sgroup">
       <fieldset disabled={saving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} aria-busy={saving}>
-        <div className="srowx"><div style={{ flex: 1 }}>GitHub<div className="desc">{!gh ? "Checking…" : gh.ok ? `Account available · ${gh.login} · token from ${gh.source}` : gh.source ? `Token from ${gh.source} doesn't work: ${gh.error}` : "No token · not connected"}</div></div><Switch label="GitHub plugin" checked={p.github.enabled} onChange={(enabled) => void save({ ...p, github: { ...p.github, enabled } })} /></div>
+        <><div className="srowx"><div style={{ flex: 1 }}>GitHub<div className="desc">{!gh ? "Checking…" : gh.ok ? `Account available · ${gh.login} · token from ${gh.source}` : gh.source ? `Token from ${gh.source} doesn't work: ${gh.error}` : "No token · not connected"}</div></div><Switch label="GitHub plugin" checked={p.github.enabled} onChange={(enabled) => void save({ ...p, github: { ...p.github, enabled } })} /></div>
         <Details name="GitHub">
           <div className="srowx desc">Issues, pull requests, reviews, merges, Actions runs and logs, code search and files — through the API as you. Changes ask first unless you're in Full access.</div>
           {login ? <div className="srowx" style={{ flexWrap: "wrap" }}><span>Enter this code on GitHub, then Authorize: <b className="mono sel">{login.code}</b></span><Button onClick={() => copyText(login.code)}>Copy</Button><Button onClick={() => void openUrl(login.url).catch((e) => flash(String(e)))}>Open GitHub</Button><Button onClick={() => void api.githubLoginCancel().catch((e) => flash(String(e)))}>Cancel</Button></div> : <div className="srowx"><div className="desc" style={{ flex: 1 }}>Sign in through your browser, use GH_TOKEN, or run gh auth login.</div><Button disabled={authBusy} onClick={() => st && !st.can_login ? setAdv(true) : void signIn()}>{authBusy ? "Waiting…" : "Sign in with GitHub"}</Button></div>}
           <div className="srowx"><input aria-label="GitHub token" className="input mono" type="password" style={{ flex: 1, minWidth: 0 }} value={token} placeholder={st?.has_token ? "Saved · paste to replace" : "ghp_… or github_pat_… (repo, workflow scopes)"} onChange={(e) => setToken(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" && token.trim()) void saveToken(token.trim()); }} /><Button disabled={authBusy || !token.trim()} onClick={() => void saveToken(token.trim())}>Save token</Button>{st?.has_token && <Button disabled={authBusy} onClick={() => void saveToken("")}>Sign out</Button>}</div>
           <div className="srowx"><Button aria-expanded={adv} onClick={() => setAdv(!adv)}>Advanced · OAuth app</Button></div>
           {adv && <><div className="srowx desc">Sign-in uses a GitHub OAuth App with Device Flow enabled. Create one in GitHub Settings → Developer settings → OAuth Apps, enable Device Flow, and paste its Client ID here. Any homepage/callback URL works; no secret needed.</div><div className="srowx"><input aria-label="GitHub OAuth Client ID" className="input mono" style={{ flex: 1 }} value={cid} onChange={(e) => setCid(e.currentTarget.value)} placeholder={st?.can_login ? "using the built-in app" : "Ov23li…"} /><Button onClick={() => void save({ ...p, github: { ...p.github, client_id: cid.trim() } }).then((saved) => { if (saved) { flash("Saved"); check(); } })}>Save client ID</Button></div></>}
-        </Details>
-        {SERVICE_SPECS.map((spec) => <ServicePluginCard key={spec.id} spec={spec} p={p} st={st} save={save} busy={saving} />)}
+        </Details></>
+        {SERVICE_SPECS.filter((spec) => showService(spec.id)).map((spec) => <ServicePluginCard key={spec.id} spec={spec} p={p} st={st} save={save} busy={saving} />)}
       </fieldset>{saving && <div role="status">Saving…</div>}
     </div>
     <AppConnectors />
