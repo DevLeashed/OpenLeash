@@ -55,11 +55,38 @@ pub fn enabled(cfg: &PluginsCfg, name: &str) -> bool {
     }
 }
 
-/// Schemas for every enabled service plugin, in `SERVICES` order.
+/// Whether a service has a credential to call it with: one saved in settings
+/// or in its environment variable. Without one every call would only fail, so
+/// the tool is not offered (it would just cost schema tokens and invite a
+/// useless call). `env` is injected so tests never touch the process environment.
+pub fn has_credential(cfg: &PluginsCfg, name: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    let any = |saved: &[&str], keys: &[&'static str]| {
+        saved.iter().any(|s| !s.trim().is_empty())
+            || keys.iter().any(|k| env(k).is_some_and(|v| !v.trim().is_empty()))
+    };
+    match name {
+        "linear" => any(&[&cfg.linear.token], &["LINEAR_API_KEY"]),
+        "jira" => any(&[&cfg.jira.token], &["JIRA_API_TOKEN"]),
+        "slack" => any(
+            &[&cfg.slack.token, &cfg.slack.user_token],
+            &["SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"],
+        ),
+        "notion" => any(&[&cfg.notion.token], &["NOTION_TOKEN"]),
+        "gitlab" => any(&[&cfg.gitlab.token], &["GITLAB_TOKEN"]),
+        _ => false,
+    }
+}
+
+/// Schemas for every enabled service plugin that has a credential, in
+/// `SERVICES` order.
 pub fn schemas(cfg: &PluginsCfg) -> Vec<Value> {
+    schemas_with_env(cfg, &real_env)
+}
+
+pub fn schemas_with_env(cfg: &PluginsCfg, env: &dyn Fn(&str) -> Option<String>) -> Vec<Value> {
     SERVICES
         .iter()
-        .filter(|n| enabled(cfg, n))
+        .filter(|n| enabled(cfg, n) && has_credential(cfg, n, env))
         .map(|n| match *n {
             "linear" => plugin_linear::schema(),
             "jira" => plugin_jira::schema(),
@@ -852,18 +879,41 @@ mod tests {
         c.slack.enabled = true;
         c.notion.enabled = true;
         c.gitlab.enabled = true;
-        let names: Vec<String> = schemas(&c)
+        let no_env = |_: &str| None;
+        // Enabled but no token anywhere: nothing is offered.
+        assert!(schemas_with_env(&c, &no_env).is_empty());
+        c.linear.token = "t".into();
+        c.jira.token = "t".into();
+        c.slack.user_token = "t".into();
+        c.notion.token = "t".into();
+        c.gitlab.token = "t".into();
+        let names: Vec<String> = schemas_with_env(&c, &no_env)
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, SERVICES);
-        for s in schemas(&c) {
+        for s in schemas_with_env(&c, &no_env) {
             let enum_ = s["input_schema"]["properties"]["action"]["enum"]
                 .as_array()
                 .expect("every service tool has an action enum");
             assert!(!enum_.is_empty());
             assert_eq!(s["input_schema"]["required"], json!(["action"]));
         }
+    }
+
+    #[test]
+    fn tool_needs_a_token_from_settings_or_env() {
+        let mut c = PluginsCfg::default();
+        c.gitlab.enabled = true;
+        c.linear.enabled = true;
+        let env = |k: &str| (k == "GITLAB_TOKEN").then(|| " x ".to_string());
+        let names: Vec<String> = schemas_with_env(&c, &env)
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["gitlab"]);
+        c.linear.token = "   ".into();
+        assert!(!has_credential(&c, "linear", &|_| None));
     }
 
     /// Every action in a schema's enum is classified, and the unknown ones are
