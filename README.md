@@ -10,7 +10,7 @@
 
 # OpenLeash
 
-**Yet another desktop harness for coding agents. crazy, i know.**
+**Yet another desktop harness for coding agents**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
