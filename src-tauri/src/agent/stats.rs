@@ -82,6 +82,47 @@ impl Counter {
     }
 }
 
+/// How long the app was open, split by whether the user was looking at it.
+///
+/// All four are wall-clock milliseconds of *app uptime*, sampled by
+/// [`Stats::tick`]; `background` is not stored because it is `open - focused`
+/// and a stored copy could only ever disagree with its two parents.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Presence {
+    /// The app process was running (window shown, minimised or in the tray).
+    pub open_ms: u64,
+    /// The main window had focus.
+    pub focused_ms: u64,
+    /// At least one chat was running its agent, focused or not.
+    pub working_ms: u64,
+    /// Subset of `working_ms` during which the window did *not* have focus —
+    /// the agent getting on with it while the user was elsewhere.
+    pub unattended_ms: u64,
+}
+
+impl Presence {
+    fn add(&mut self, ms: u64, focused: bool, working: bool) {
+        self.open_ms += ms;
+        if focused {
+            self.focused_ms += ms;
+        }
+        if working {
+            self.working_ms += ms;
+            if !focused {
+                self.unattended_ms += ms;
+            }
+        }
+    }
+}
+
+/// The longest gap between two ticks that still counts as time in the app.
+///
+/// Ticks are every few seconds; a gap far larger than that means the machine
+/// slept or the process was frozen, and crediting it would report hours of
+/// "open" for a laptop lid that was shut. The excess is dropped, not carried.
+pub const MAX_TICK_MS: u64 = 15_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ToolCount {
@@ -144,6 +185,19 @@ pub struct StatsData {
     /// that ran once a year ago is still a real number — so it is capped by
     /// count instead, least recently used first (`MAX_CHATS`).
     pub chats: BTreeMap<String, ChatStat>,
+    /// Time in the app, all time.
+    pub presence: Presence,
+    /// yyyy-mm-dd (local) -> time in the app that day, last 365 days.
+    pub presence_daily: BTreeMap<String, Presence>,
+    /// yyyy-mm-ddTHH (local) -> time in the app that hour, last 14 days.
+    pub presence_hourly: BTreeMap<String, Presence>,
+    /// How many times the app has been started.
+    pub launches: u64,
+    /// Open time of the current run (ms). Starts at 0 on every launch, so after
+    /// a restart the stored value is stale until the first tick overwrites it.
+    pub session_ms: u64,
+    /// The longest single run of the app, ms.
+    pub longest_session_ms: u64,
 }
 
 /// How many chats [`StatsData::chats`] keeps.
@@ -187,6 +241,8 @@ pub struct Sample {
 pub struct Stats {
     data: Mutex<StatsData>,
     dirty: AtomicBool,
+    /// When [`Stats::tick`] last ran, to measure the gap to the next one.
+    last_tick: Mutex<Option<std::time::Instant>>,
 }
 
 fn path() -> std::path::PathBuf {
@@ -203,10 +259,78 @@ impl Stats {
             d.since = chrono::Utc::now().to_rfc3339();
         }
         d.version = 1;
+        // A new run: the stored session length belongs to the previous one.
+        d.launches += 1;
+        d.session_ms = 0;
         Stats {
             data: Mutex::new(d),
             dirty: AtomicBool::new(false),
+            last_tick: Mutex::new(None),
         }
+    }
+
+    /// Credit the time since the previous tick to "in the app", split by
+    /// whether the window is focused and whether any chat is working.
+    ///
+    /// The first call only starts the clock. Sampling (rather than listening
+    /// for focus events) is deliberate: a hidden-to-tray, minimised or
+    /// covered window all just read as "not focused", and a missed event can
+    /// never leave a counter running forever.
+    pub fn tick(&self, focused: bool, working: bool) {
+        let now = std::time::Instant::now();
+        let prev = self.last_tick.lock().unwrap().replace(now);
+        let Some(prev) = prev else { return };
+        let ms = (now.duration_since(prev).as_millis() as u64).min(MAX_TICK_MS);
+        self.add_presence(ms, focused, working, chrono::Local::now());
+    }
+
+    fn add_presence(
+        &self,
+        ms: u64,
+        focused: bool,
+        working: bool,
+        now: chrono::DateTime<chrono::Local>,
+    ) {
+        if ms == 0 {
+            return;
+        }
+        let mut d = self.data.lock().unwrap();
+        d.presence.add(ms, focused, working);
+        d.presence_daily
+            .entry(now.format("%Y-%m-%d").to_string())
+            .or_default()
+            .add(ms, focused, working);
+        d.presence_hourly
+            .entry(now.format("%Y-%m-%dT%H").to_string())
+            .or_default()
+            .add(ms, focused, working);
+        d.session_ms += ms;
+        d.longest_session_ms = d.longest_session_ms.max(d.session_ms);
+        let cutoff = (now - chrono::Duration::days(14))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        d.presence_hourly.retain(|k, _| *k >= cutoff);
+        let day_cutoff = (now - chrono::Duration::days(365))
+            .format("%Y-%m-%d")
+            .to_string();
+        d.presence_daily.retain(|k, _| *k >= day_cutoff);
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Drop the stats of every chat `keep` rejects. Returns how many went.
+    ///
+    /// Only the per-chat rows go: the chat's tokens, cost and requests stay in
+    /// the model/day/account totals, which is what keeps those reconciling with
+    /// the spend ledger.
+    pub fn retain_chats(&self, keep: impl Fn(&str) -> bool) -> usize {
+        let mut d = self.data.lock().unwrap();
+        let before = d.chats.len();
+        d.chats.retain(|id, _| keep(id));
+        let removed = before - d.chats.len();
+        if removed > 0 {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        removed
     }
 
     pub fn record(
@@ -364,12 +488,12 @@ impl Stats {
 
     /// Stop counting a chat's usage against it, keeping every other dimension.
     ///
-    /// Not called when a chat is deleted — the numbers for a chat that is gone
-    /// are still what was spent on it, and a usage ledger that shrinks as you
-    /// tidy up stops adding up. This exists for the case where a chat's id is
-    /// *wrong* rather than gone (a fork reusing one), which would otherwise
-    /// silently merge two chats' history into one row forever.
-    #[allow(dead_code)]
+    /// Deleting a chat calls this only when the user turned "Keep stats for
+    /// deleted chats" off: by default the numbers for a chat that is gone are
+    /// still what was spent on it, and a usage ledger that shrinks as you tidy
+    /// up stops adding up. It also covers a chat whose id is *wrong* rather
+    /// than gone (a fork reusing one), which would otherwise silently merge two
+    /// chats' history into one row forever.
     pub fn forget_chat(&self, chat: &str) {
         let mut d = self.data.lock().unwrap();
         if d.chats.remove(chat).is_some() {
@@ -465,11 +589,18 @@ impl Stats {
     }
 
     pub fn reset(&self) {
-        *self.data.lock().unwrap() = StatsData {
+        let mut d = self.data.lock().unwrap();
+        // The app is still on its current run, so the run itself is not reset.
+        let session = d.session_ms;
+        *d = StatsData {
             version: 1,
             since: chrono::Utc::now().to_rfc3339(),
+            launches: 1,
+            session_ms: session,
+            longest_session_ms: session,
             ..Default::default()
         };
+        drop(d);
         self.dirty.store(true, Ordering::SeqCst);
         self.flush();
     }
@@ -1214,5 +1345,66 @@ mod tests {
             ..Default::default()
         };
         assert!(d.chats.is_empty());
+    }
+
+    #[test]
+    fn presence_splits_focused_background_and_unattended_work() {
+        let s = Stats::default();
+        let now = chrono::Local::now();
+        s.add_presence(4_000, true, false, now);
+        s.add_presence(6_000, false, true, now);
+        s.add_presence(2_000, true, true, now);
+        let d = s.snapshot();
+        assert_eq!(
+            (
+                d.presence.open_ms,
+                d.presence.focused_ms,
+                d.presence.working_ms,
+                d.presence.unattended_ms
+            ),
+            (12_000, 6_000, 8_000, 6_000)
+        );
+        assert_eq!(
+            d.presence_daily.values().map(|p| p.open_ms).sum::<u64>(),
+            12_000
+        );
+        assert_eq!(d.longest_session_ms, 12_000);
+    }
+
+    #[test]
+    fn the_first_tick_only_starts_the_clock_and_a_long_gap_is_capped() {
+        let s = Stats::default();
+        s.tick(true, false);
+        assert_eq!(s.snapshot().presence.open_ms, 0);
+        *s.last_tick.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3600));
+        s.tick(true, false);
+        assert_eq!(
+            s.snapshot().presence.open_ms,
+            MAX_TICK_MS,
+            "a slept laptop is not hours of use"
+        );
+    }
+
+    #[test]
+    fn retain_chats_drops_only_rejected_rows_and_keeps_totals() {
+        let s = Stats::default();
+        let smp = || Sample {
+            input: 5,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            ms: 1,
+            ttft_ms: None,
+            cost: 0.0,
+        };
+        s.record("live", "m", None, "main", "main", &smp());
+        s.record("gone", "m", None, "main", "main", &smp());
+        assert_eq!(s.retain_chats(|id| id == "live"), 1);
+        let d = s.snapshot();
+        assert!(d.chats.contains_key("live") && !d.chats.contains_key("gone"));
+        assert_eq!(d.models["m"].input, 10);
+        assert_eq!(s.retain_chats(|id| id == "live"), 0);
     }
 }

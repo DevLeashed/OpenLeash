@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { VisualizationFeedbackDraft } from "./visualizationFeedback";
 import { ImageExplanation, parseImageSpec } from "./ImageExplanation";
+import { Dropdown } from "./primitives";
 
 type Ref = { path: string; line?: number };
 type Evidence = { command: string; result: string; scope?: string; path?: string };
@@ -37,7 +38,7 @@ export function ArtifictRecord({ record, onDraft, bare = false }: { record: Coll
     <h3>{record.title}</h3><p>{record.purpose}</p>
     <p><b>Recorded stage: {record.stage}</b> · supplied by the author, not independently certified by OpenLeash.</p>
     {record.image && <ImageExplanation source={record.image} onFeedbackDraft={onDraft} />}
-    {!!record.nodes.length && <><label>Explore component <select aria-label="Architecture component" value={selected} onChange={e => setSelected(e.target.value)}>{record.nodes.map(n => <option key={n.id} value={n.id}>{n.title}</option>)}</select></label>
+    {!!record.nodes.length && <><label>Explore component <Dropdown placeholder="Architecture component" search={record.nodes.length > 10} value={selected} onChange={setSelected} options={record.nodes.map(n => ({ value: n.id, label: n.title }))} style={{ height: 28, minWidth: 180, padding: "0 8px", fontSize: 12 }} /></label>
     {node && <div><h4>{node.title}</h4><p>{node.description}</p><ul>{node.refs.map((r, i) => <li key={i}><code>{r.path}{r.line ? `:${r.line}` : ""}</code></li>)}</ul><button type="button" className="artifict-target" disabled={!onDraft} onClick={() => target(`Component ${node.id}: ${node.title}`)}>Discuss this component</button></div>}
     <ul>{record.edges.filter(e => e.from === selected || e.to === selected).map((e, i) => <li key={i}><button type="button" className="artifict-target" disabled={!onDraft} onClick={() => target(`Dependency ${e.from} → ${e.to}: ${e.reason}`)}>{e.from} → {e.to}</button> — {e.reason}</li>)}</ul></>}
     <h4>Implementation and verification record</h4>{!record.evidence.length && <p>No verification evidence recorded.</p>}

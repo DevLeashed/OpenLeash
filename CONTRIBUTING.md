@@ -18,8 +18,8 @@ npm run tauri dev
 ```
 
 Note that the Rust crate does not currently compile on Linux — see the note in
-`src-tauri/Cargo.toml` and the `rust` job in `.github/workflows/ci.yml`. CI runs
-the Rust tests on Windows for this reason. Frontend work is unaffected.
+`src-tauri/Cargo.toml` and [building.md](docs/building.md). The Rust tests run on
+Windows for this reason. Frontend work is unaffected.
 
 ## Before you open a pull request
 

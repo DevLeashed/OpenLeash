@@ -102,6 +102,20 @@ impl Rung {
     }
 }
 
+/// How much a permission value lets an agent do without asking, as a rank on
+/// the same ladder `Rung::of` reads (0 = Disabled … 3 = Turbo). Lets a caller
+/// compare two choices — "never run stronger than the user's default" — through
+/// the one mapping the checks use, so an unknown value ranks where it is
+/// enforced (the middle rung) instead of wherever a copy of the table guessed.
+pub fn strength(perm: &str) -> u8 {
+    match Rung::of(perm) {
+        Rung::Disabled => 0,
+        Rung::Allowlist => 1,
+        Rung::Auto => 2,
+        Rung::Turbo => 3,
+    }
+}
+
 impl Ctx<'_> {
     fn rung(&self) -> Rung {
         Rung::of(self.perm)
@@ -226,6 +240,15 @@ fn named_deny(name: &str, ctx: &Ctx) -> Option<String> {
         .map(|r| denied_message(&r.pattern))
 }
 
+/// A command's user-authored *named tool* denial (not its command-pattern
+/// denial). Used when one capability delegates to another's implementation,
+/// e.g. `bisect_edits` executes a `bash` command but must still respect an
+/// explicit `!bisect_edits` tool rule before it gets to bash's own command
+/// policy.
+pub fn named_tool_deny(name: &str, ctx: &Ctx) -> Option<String> {
+    named_deny(name, ctx)
+}
+
 /// A deny rule that names a plugin action: `!github:create_issue`,
 /// `!browser:click`, `!computer *`.
 fn plugin_deny(tool: &str, action: &str, ctx: &Ctx) -> Option<String> {
@@ -233,6 +256,9 @@ fn plugin_deny(tool: &str, action: &str, ctx: &Ctx) -> Option<String> {
         "github" => format!("github:{action}"),
         "computer" => "computer *".to_string(),
         "browser" => format!("browser:{action}"),
+        // For `lsp` the "action" is the language server the runner resolved.
+        "lsp" => format!("lsp:{action}"),
+        t if super::plugin_services::is_service(t) => format!("{t}:{action}"),
         _ => return None,
     };
     let star = format!("{tool} *");
@@ -415,7 +441,14 @@ pub fn doom_loop_decision(tool: &str, input: &Value, repeats: u32) -> Option<Dec
             repeats + 1
         )));
     }
-    let detail = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+    // The card is persisted in the transcript: an `http_request` input carries
+    // credentials in its headers, so the card shows the redacted copy.
+    let shown = if tool == super::http_tool::TOOL {
+        super::http_tool::redact_input(input)
+    } else {
+        input.clone()
+    };
+    let detail = serde_json::to_string_pretty(&shown).unwrap_or_else(|_| shown.to_string());
     Some(Decision::Ask {
         title: format!("Repeated `{tool}` call"),
         detail: detail.chars().take(600).collect(),
@@ -465,13 +498,10 @@ pub fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
-/// Tools that only read the web. The deep-research pair qualifies, so a fan-out
-/// of `web_read_many` calls still runs concurrently — they touch no state.
+/// Tools that only read the web. Search and `web_read_many` qualify, so a batch
+/// of them still runs concurrently — they touch no state.
 pub fn is_web_read_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "web_fetch" | "web_search" | "web_search_deep" | "web_read_many"
-    )
+    matches!(name, "web_fetch" | "web_search" | "web_read_many")
 }
 
 const READ_ONLY_CMDS: &[&str] = &[
@@ -1232,13 +1262,31 @@ fn deny_tier(
     }
     // The plugin arms name their action in the rule, so they match on the
     // composed `github:create_issue` / `browser:click` / `computer *` form the
-    // UI writes, not on a command line.
-    if let Some(msg) = plugin_deny(tool, input["action"].as_str().unwrap_or(""), ctx) {
+    // UI writes, not on a command line. `lsp` names its server the same way.
+    let action = if tool == "lsp" {
+        input["__server"].as_str().unwrap_or("")
+    } else {
+        input["action"].as_str().unwrap_or("")
+    };
+    if let Some(msg) = plugin_deny(tool, action, ctx) {
         return Some(Decision::Deny(msg));
+    }
+    // The browser's deny rules can also name a site (`!browser:site evil.com`,
+    // `!browser:type bank.example`), which needs the host the runner put in
+    // the input, not just the action.
+    if tool == "browser" {
+        if let Some(msg) = browser_deny(input, ctx) {
+            return Some(Decision::Deny(msg));
+        }
     }
     // Every other tool: an exact `tool` / `tool *` deny rule.
     if let Some(msg) = named_deny(tool, ctx) {
         return Some(Decision::Deny(msg));
+    }
+    if tool == super::http_tool::TOOL {
+        if let Some(msg) = http_deny(input, ctx) {
+            return Some(Decision::Deny(msg));
+        }
     }
     if matches!(tool, "bash" | "shell") {
         let hits = command_denies(input, ctx);
@@ -1250,6 +1298,35 @@ fn deny_tier(
     }
     None
 }
+
+/// Reapply the HTTP deny tier to the effective request at a redirect hop.
+/// The initial call already passed the full gate; redirects do not inherit an
+/// exemption from tool-wide or method/host denies (including scoped rules).
+pub fn http_hop_denial(method: &str, url: &reqwest::Url, ctx: &Ctx) -> Option<String> {
+    let input = serde_json::json!({"method": method, "url": url.as_str()});
+    named_deny(super::http_tool::TOOL, ctx).or_else(|| http_deny(&input, ctx))
+}
+
+/// A deny rule that names `http_request` calls by method and host:
+/// `!http_request:POST api.example.com`, `!http_request:* api.example.com`,
+/// `!http_request:DELETE *`. Globbed and case-insensitive, unlike the allow
+/// side: a deny that matches more is fail-closed.
+fn http_deny(input: &Value, ctx: &Ctx) -> Option<String> {
+    let subject = super::http_tool::deny_subject(input)?.to_ascii_lowercase();
+    ctx.allow
+        .iter()
+        .find(|r| {
+            deny_pattern(&r.pattern).is_some_and(|p| {
+                rule_scope_matches(&r.project, ctx.project)
+                    && p.get(..13)
+                        .is_some_and(|h| h.eq_ignore_ascii_case("http_request:"))
+                    && glob_match(&p[13..].to_ascii_lowercase(), &subject)
+            })
+        })
+        .map(|r| denied_message(&r.pattern))
+}
+
+const PLAN_DENY_HTTP: &str = "Plan mode is active: only GET and HEAD requests may run. Call exit_plan_mode with your plan first.";
 
 pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) -> Decision {
     // Deny first, over everything. See `deny_tier`.
@@ -1396,6 +1473,56 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
             }
         }
         "kill_bash" => Decision::Allow,
+        // An HTTP request. See `http_tool` for the target classes. Order:
+        // malformed and blocked targets are refused on every rung (no rule can
+        // reach the metadata service); plan mode refuses writes; a GET/HEAD to
+        // the public internet is a web read and runs everywhere, like
+        // `web_fetch`; then an exact per-method-per-host allow rule; then Full
+        // Access, which covers *public* writes only. Loopback and private
+        // targets always fall through to the card: Full Access was granted for
+        // the project's work, and the router or another local service is not
+        // obviously that.
+        "http_request" => {
+            use super::http_tool::{self as ht, Target};
+            let req = match ht::parse_request(input) {
+                Ok(r) => r,
+                Err(e) => return Decision::Deny(e),
+            };
+            if req.target == Target::Blocked {
+                return Decision::Deny(format!(
+                    "Refused: {} is a cloud-metadata, link-local or reserved address. http_request never reaches those, on any permission rung and whatever the rules say.",
+                    ht::authority(&req.url)
+                ));
+            }
+            let read = ht::is_read_method(&req.method);
+            if ctx.plan && !read {
+                return Decision::Deny(PLAN_DENY_HTTP.into());
+            }
+            let public = req.target == Target::Public;
+            if read && public {
+                return Decision::Allow;
+            }
+            // Exact match only: an allow glob is one typo from covering
+            // `api.example.com.evil.com`.
+            let rule = ht::rule_key(&req.method, &req.url);
+            let allowed = ctx.allow.iter().any(|r| {
+                deny_pattern(&r.pattern).is_none()
+                    && rule_scope_matches(&r.project, ctx.project)
+                    && r.pattern.trim().eq_ignore_ascii_case(&rule)
+            });
+            if allowed || (rung == Rung::Turbo && public) {
+                return Decision::Allow;
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            Decision::Ask {
+                title: format!("HTTP {} {}", req.method, ht::authority(&req.url)),
+                detail: ht::approval_detail(input, &req),
+                reason: ht::approval_reason(&req, rung == Rung::Auto),
+                rule: Some(rule),
+            }
+        }
         // Plugins: the runner only gates GitHub writes and computer actions (reads/screenshots skip this).
         "github" | "computer" => {
             let action = input["action"].as_str().unwrap_or("");
@@ -1447,46 +1574,8 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 rule: Some(rule),
             }
         }
-        // The browser plugin, for the two actions that change a site. The reads
-        // never reach here — the runner lets `navigate`/`read`/`screenshot`/`js`
-        // through, because they touch nothing of the user's and nothing of the
-        // site's either.
-        //
-        // A browser is not the user's screen, so "always" is offered per action
-        // rather than as one blanket `browser *`: allowing clicks forever is a
-        // much larger grant than allowing them in this project, and unlike
-        // `computer *` it does not hand over a mouse and keyboard.
-        "browser" => {
-            let action = input["action"].as_str().unwrap_or("");
-            // The reads never reach here in practice (the runner lets them
-            // through), but if one does it must not be treated as a write:
-            // reading and screenshotting pages is how a plan gets its facts, and
-            // plan mode is about not *doing* things, not not looking.
-            if !matches!(action, "click" | "type") {
-                return Decision::Allow;
-            }
-            if ctx.plan {
-                return Decision::Deny("Plan mode is active: clicking and typing on a page are disabled until the plan is approved. Reading and screenshotting pages still work.".into());
-            }
-            let rule = format!("browser:{action}");
-            let allowed = ctx.allow.iter().any(|r| {
-                deny_pattern(&r.pattern).is_none()
-                    && (r.pattern == rule || r.pattern == "browser *")
-            });
-            if rung == Rung::Turbo || allowed {
-                return Decision::Allow;
-            }
-            if disabled {
-                return Decision::Deny(DISABLED_MSG.into());
-            }
-            let what = input["detail"].as_str().unwrap_or(action);
-            Decision::Ask {
-                title: format!("Browser · {}", action),
-                detail: format!("{what}\n\non {}", input["__page"].as_str().unwrap_or("the current page")),
-                reason: "This clicks or types on a real site, which can submit something. The agent's browser is a throwaway profile — it is not carrying your cookies or logins.".into(),
-                rule: Some(rule),
-            }
-        }
+        // The browser plugin. See `browser_check` for the whole decision table.
+        "browser" => browser_check(input, ctx),
         // A message that starts a turn in a *different* chat. Not covered by the
         // read-only shortcut (only `list_chats` is read-only), so it lands here:
         // plan mode refuses it like any other "do something" action, and the
@@ -1530,6 +1619,89 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
         "message_chat" => {
             Decision::Deny("`to` is required: a chat id or title from `list_chats`.".into())
         }
+        // A language-server query. Every `lsp` operation only *asks* the server
+        // something, but it is deliberately not in `is_read_only_tool`: starting
+        // rust-analyzer, gopls or tsserver loads the project's build
+        // configuration and drives its toolchain (`cargo metadata` honours a
+        // repo's `.cargo/config.toml`, gopls runs `go list`), and a repository
+        // controls that configuration. A read-only classification would start
+        // one on every rung and in plan mode on a freshly cloned repo, unasked.
+        //
+        // The rule is per server (`lsp:rust-analyzer`), the way the browser's
+        // is per action: allowing the TypeScript server in a web project is not
+        // allowing every toolchain on the machine. Plan mode asks even on Full
+        // access — it promises nothing runs that the user did not see — while an
+        // explicit allow rule is the user's standing answer and still applies.
+        "lsp" => {
+            let server = input["__server"].as_str().unwrap_or("").trim();
+            let rule = format!("lsp:{server}");
+            let allowed = ctx.allow.iter().any(|r| {
+                deny_pattern(&r.pattern).is_none()
+                    && rule_scope_matches(&r.project, ctx.project)
+                    && (r.pattern == rule || r.pattern == "lsp *" || r.pattern == "lsp")
+            });
+            if allowed || (rung == Rung::Turbo && !ctx.plan) {
+                return Decision::Allow;
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            let server = if server.is_empty() {
+                "a language server"
+            } else {
+                server
+            };
+            Decision::Ask {
+                title: format!("Start language server {server}"),
+                detail: format!(
+                    "{} {}\n\n{}",
+                    input["operation"].as_str().unwrap_or("query"),
+                    input["path"].as_str().unwrap_or(""),
+                    input["__root"].as_str().unwrap_or(ctx.cwd)
+                ),
+                reason: format!("{server} answers code-navigation questions, but it loads this project's build configuration and can run its toolchain. Allow it for projects you trust; \"Always\" allows {server} here without asking again."),
+                rule: Some(rule),
+            }
+        }
+        // The service plugins (Linear, Jira, Slack, Notion, GitLab), mirroring
+        // GitHub's rules: `linear:create_issue` per action, `linear *` for all.
+        // Unlike GitHub, the runner gates their reads too, so they arrive here
+        // and are allowed once the deny tier above has had its say — that is
+        // what makes a `!slack:history` rule mean something. Classification is
+        // `plugin_services::is_write`, which fails closed.
+        t if super::plugin_services::is_service(t) => {
+            if !super::plugin_services::is_write(t, input) {
+                return Decision::Allow;
+            }
+            let action = input["action"].as_str().unwrap_or("");
+            let label = super::plugin_services::label(t);
+            if ctx.plan {
+                return Decision::Deny(format!("Plan mode is active: {label} `{action}` is disabled until the plan is approved. Read-only actions still work."));
+            }
+            let rule = format!("{t}:{action}");
+            let star = format!("{t} *");
+            let allowed = ctx.allow.iter().any(|r| {
+                deny_pattern(&r.pattern).is_none()
+                    && rule_scope_matches(&r.project, ctx.project)
+                    && (r.pattern == rule || r.pattern == star)
+            });
+            if rung == Rung::Turbo || allowed {
+                return Decision::Allow;
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            let mut shown = input.clone();
+            if let Some(o) = shown.as_object_mut() {
+                o.remove("action");
+            }
+            Decision::Ask {
+                title: format!("{label} · {}", action.replace('_', " ")),
+                detail: serde_json::to_string_pretty(&shown).unwrap_or_default(),
+                reason: format!("This changes things on {label} as you."),
+                rule: Some(rule),
+            }
+        }
         t if t.starts_with("mcp__") => {
             if ctx.plan {
                 return Decision::Deny(
@@ -1563,6 +1735,224 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 detail: input.to_string(),
                 reason: String::new(),
                 rule: None,
+            }
+        }
+    }
+}
+
+/// A browser rule, parsed: `browser:<verb>` → `(verb, None)`,
+/// `browser:<verb> <hostpat>` → `(verb, Some(hostpat))`. `None` for anything
+/// else (including `browser *`, which callers check by name, and a host part
+/// with more than one word, which matches nothing rather than something).
+fn browser_rule(pattern: &str) -> Option<(&str, Option<&str>)> {
+    let rest = pattern.strip_prefix("browser:")?.trim();
+    match rest.split_once(char::is_whitespace) {
+        Some((verb, host)) => {
+            let host = host.trim();
+            (!verb.is_empty() && !host.is_empty() && !host.contains(char::is_whitespace))
+                .then_some((verb, Some(host)))
+        }
+        None => (!rest.is_empty()).then_some((rest, None)),
+    }
+}
+
+/// The first in-scope browser rule of the given polarity that `hit` accepts.
+fn browser_rule_hit<'a>(
+    ctx: &Ctx<'a>,
+    deny: bool,
+    hit: impl Fn(&str, Option<&str>) -> bool,
+) -> Option<&'a str> {
+    ctx.allow
+        .iter()
+        .filter(|r| rule_scope_matches(&r.project, ctx.project))
+        .filter(|r| deny_pattern(&r.pattern).is_some() == deny)
+        .find(|r| {
+            let p = deny_pattern(&r.pattern).unwrap_or(&r.pattern).trim();
+            browser_rule(p).is_some_and(|(verb, host)| hit(verb, host))
+        })
+        .map(|r| r.pattern.as_str())
+}
+
+/// What the gate judges a browser call as (`browser_policy::action_class`;
+/// accepting a dialog arrives as `dialog_accept`). An action this build does
+/// not know is treated as an interaction — fail closed.
+fn browser_class(input: &Value) -> super::browser_policy::ActionClass {
+    use super::browser_policy::{action_class, ActionClass};
+    let action = input["action"].as_str().unwrap_or("").trim();
+    action_class(action).unwrap_or(ActionClass::Interact)
+}
+
+/// The browser's site-aware deny rules (the plain `!browser:<action>` and
+/// `!browser *` are `plugin_deny`'s):
+/// - `!browser:<action> <hostpat>` — that action on that site (`lan` too);
+/// - `!browser:site <hostpat>` — every interaction and raw CDP call on that
+///   site, and opening it as a LAN host. Not reads: a page the agent cannot
+///   even look at, or navigate away from, would trap it there.
+fn browser_deny(input: &Value, ctx: &Ctx) -> Option<String> {
+    use super::browser_policy::{normalize_host, site_matches, ActionClass};
+    let action = input["action"].as_str().unwrap_or("").trim();
+    let host = normalize_host(input["__host"].as_str().unwrap_or(""));
+    let class = browser_class(input);
+    let reaches_site = action == "lan" || class != ActionClass::Read;
+    browser_rule_hit(ctx, true, |verb, pat| match pat {
+        None => verb == action,
+        Some(p) => site_matches(p, &host) && (verb == action || (verb == "site" && reaches_site)),
+    })
+    .map(denied_message)
+}
+
+/// The browser gate. The runner builds the input itself (the model cannot
+/// put `__*` keys in it): `action`, `detail`, `__page`, `__host`,
+/// `__default` ("ask" | "allow" | "block": Settings → Plugins → Browser →
+/// page interactions), `__sensitive` (why the target is sensitive, from
+/// `browser_policy::sensitive_reason`, or null), `__dev` (developer mode).
+/// A LAN host is `{"action": "lan", "__host", "__page", "detail"}`.
+///
+/// Deny rules already ran (`deny_tier`). Then:
+/// 1. Reads → Allow, in plan mode and on the Disabled rung too: looking at a
+///    page is how a plan gets its facts.
+/// 2. `lan` → `browser:lan <host>` allows; Disabled denies; otherwise Ask,
+///    even in Turbo and in plan mode (opening a page is a read, but a private
+///    network is a boundary the user draws, not a page action).
+/// 3. `cdp` → plan denies; developer mode off denies; otherwise always Ask
+///    with no rule offered — raw CDP can switch off every other safeguard.
+/// 4. Interactions → plan denies; default "block" denies unless a rule names
+///    this host (`browser:site`, `browser:<action> <host>`); `browser:ask
+///    <host>` asks (beats Turbo, the "allow" default and every blanket rule);
+///    a sensitive target is allowed only by `browser:site <host>` and asks
+///    otherwise, even in Turbo; an ordinary one is allowed by Turbo, the
+///    "allow" default, `browser *`, `browser:<action>`, `browser:<action>
+///    <host>` or `browser:site <host>`, else Disabled denies, else Ask.
+fn browser_check(input: &Value, ctx: &Ctx) -> Decision {
+    use super::browser_policy::{normalize_host, site_matches, ActionClass};
+    let rung = ctx.rung();
+    let disabled = rung == Rung::Disabled;
+    let action = input["action"].as_str().unwrap_or("").trim();
+    let host = normalize_host(input["__host"].as_str().unwrap_or(""));
+    let page = input["__page"]
+        .as_str()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or("the current page");
+    let what = input["detail"]
+        .as_str()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(action);
+    let detail = format!("{what}\n\non {page}");
+    let h = host.as_str();
+    let on_host = |verb: &str| {
+        browser_rule_hit(ctx, false, |v, p| {
+            v == verb && p.is_some_and(|p| site_matches(p, h))
+        })
+        .is_some()
+    };
+
+    if action == "lan" {
+        if on_host("lan") {
+            return Decision::Allow;
+        }
+        if disabled {
+            return Decision::Deny(DISABLED_MSG.into());
+        }
+        let shown = if host.is_empty() { "a LAN host" } else { &host };
+        return Decision::Ask {
+            title: format!("Browser · open LAN host {shown}"),
+            detail,
+            reason: format!("{shown} is on your private network (a router, NAS, printer or internal service), not the public internet. Devices there often trust anything that can reach them, so each LAN host is approved on its own — even with Full access."),
+            rule: (!host.is_empty()).then(|| format!("browser:lan {host}")),
+        };
+    }
+
+    match browser_class(input) {
+        ActionClass::Read => Decision::Allow,
+        ActionClass::Developer => {
+            if ctx.plan {
+                return Decision::Deny("Plan mode is active: raw CDP calls are disabled until the plan is approved. Reading pages still works.".into());
+            }
+            if input["__dev"].as_bool() != Some(true) {
+                return Decision::Deny("Raw CDP is unavailable: developer mode is off (Settings → Plugins → Browser). Use the ordinary browser actions instead.".into());
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            Decision::Ask {
+                title: "Browser · raw CDP".into(),
+                detail,
+                reason: "A raw DevTools Protocol command can do anything to the browser, including switching off the network policy and the other safeguards, so it is asked every time and cannot be always-allowed.".into(),
+                rule: None,
+            }
+        }
+        ActionClass::Interact => {
+            if ctx.plan {
+                return Decision::Deny(format!("Plan mode is active: browser `{action}` is disabled until the plan is approved. Looking at pages (navigate, snapshot, read, query, screenshot) still works."));
+            }
+            let default = input["__default"].as_str().unwrap_or("ask").trim();
+            let site_trusted = on_host("site");
+            let host_excepted = site_trusted || on_host(action);
+            if default == "block" && !host_excepted {
+                return Decision::Deny(if host.is_empty() {
+                    format!("Browser interactions are set to Block (Settings → Plugins → Browser), so `{action}` is refused. Don't retry; tell the user if the task needs it.")
+                } else {
+                    format!("Browser interactions are set to Block (Settings → Plugins → Browser), so `{action}` on {host} is refused. The user can allow this site with the rule `browser:site {host}` in Settings → Permissions. Don't retry; tell the user if the task needs it.")
+                });
+            }
+            if on_host("ask") {
+                if disabled {
+                    return Decision::Deny(DISABLED_MSG.into());
+                }
+                return Decision::Ask {
+                    title: format!("Browser · {action}"),
+                    detail,
+                    reason: format!(
+                        "You asked to always be asked before the agent acts on {host}."
+                    ),
+                    rule: None,
+                };
+            }
+            if let Some(why) = input["__sensitive"]
+                .as_str()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+            {
+                if site_trusted {
+                    return Decision::Allow;
+                }
+                if disabled {
+                    return Decision::Deny(DISABLED_MSG.into());
+                }
+                let trust = if host.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Only trusting the whole site (`browser:site {host}`) skips this question.")
+                };
+                return Decision::Ask {
+                    title: format!("Browser · sensitive {action}"),
+                    detail,
+                    reason: format!("This looks sensitive: {why}. It is asked even with Full access or an always-allow rule for `{action}`, because it may buy, delete, send or sign in to something.{trust}"),
+                    rule: (!host.is_empty()).then(|| format!("browser:site {host}")),
+                };
+            }
+            let blanket = ctx.allow.iter().any(|r| {
+                deny_pattern(&r.pattern).is_none()
+                    && rule_scope_matches(&r.project, ctx.project)
+                    && r.pattern.trim() == "browser *"
+            });
+            let any_site =
+                browser_rule_hit(ctx, false, |v, p| v == action && p.is_none()).is_some();
+            if rung == Rung::Turbo || default == "allow" || blanket || any_site || host_excepted {
+                return Decision::Allow;
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            Decision::Ask {
+                title: format!("Browser · {action}"),
+                detail,
+                reason: "This acts on a real site and can change or submit something there. The agent's browser has its own profile, never your everyday browser's; it only carries sign-ins if \"Keep sign-ins between chats\" is on and you signed in there.".into(),
+                rule: Some(if host.is_empty() {
+                    format!("browser:{action}")
+                } else {
+                    format!("browser:{action} {host}")
+                }),
             }
         }
     }
@@ -1854,9 +2244,9 @@ mod tests {
             );
             assert!(matches!(d, Decision::Ask { .. }), "{act} should ask");
         }
-        // The reads never reach `check` at all (the runner lets them through), so
-        // a verdict here would only be a fallback. They must not be asks.
-        for act in ["navigate", "read", "screenshot", "js", "info", "back"] {
+        // Reads must not be asks. `js` is not among them any more: a page
+        // script can do whatever a click can (see `browser_policy`).
+        for act in ["navigate", "read", "snapshot", "screenshot", "info", "back"] {
             let d = check("browser", &json!({"action": act}), None, &ctx);
             assert!(!matches!(d, Decision::Ask { .. }), "{act} must not ask");
         }
@@ -1874,7 +2264,7 @@ mod tests {
             allow: &[],
         };
         // Full access does not override plan mode.
-        for act in ["click", "type"] {
+        for act in ["click", "type", "js"] {
             assert!(
                 matches!(
                     check("browser", &json!({"action": act}), None, &ctx),
@@ -1883,7 +2273,7 @@ mod tests {
                 "{act} must be denied in plan mode"
             );
         }
-        for act in ["navigate", "read", "screenshot", "js"] {
+        for act in ["navigate", "read", "screenshot", "snapshot"] {
             assert!(
                 !matches!(
                     check("browser", &json!({"action": act}), None, &ctx),
@@ -1932,5 +2322,508 @@ mod tests {
             matches!(ask, Decision::Ask { rule: Some(r), .. } if r == "browser:click"),
             "the offered rule should be per-action"
         );
+    }
+
+    // ── The browser gate (site rules, sensitive targets, LAN, developer) ──
+
+    fn bctx<'a>(perm: &'a str, plan: bool, allow: &'a [AllowRule]) -> Ctx<'a> {
+        Ctx {
+            perm,
+            plan,
+            cwd: "D:/openleash",
+            project: "D:/openleash",
+            allow,
+        }
+    }
+
+    fn rule(p: &str) -> AllowRule {
+        AllowRule {
+            pattern: p.into(),
+            project: String::new(),
+        }
+    }
+
+    /// The input the runner builds for one browser action (never the model's
+    /// own keys, so `__*` cannot be injected).
+    fn bin(action: &str, host: &str, default: &str, sensitive: Option<&str>) -> Value {
+        json!({
+            "action": action,
+            "detail": format!("{action} `#go`"),
+            "__page": format!("https://{host}/page"),
+            "__host": host,
+            "__default": default,
+            "__sensitive": sensitive,
+            "__dev": false,
+        })
+    }
+
+    fn label(d: &Decision) -> String {
+        match d {
+            Decision::Allow => "Allow".into(),
+            Decision::Deny(r) => format!("Deny({r})"),
+            Decision::Ask { title, rule, .. } => format!("Ask({title}, rule={rule:?})"),
+        }
+    }
+
+    /// Turbo is "don't ask me about ordinary work", not "pay for things": a
+    /// click the page facts say submits or pays still asks.
+    #[test]
+    fn browser_sensitive_click_asks_even_in_turbo() {
+        let d = check(
+            "browser",
+            &bin(
+                "click",
+                "shop.example.com",
+                "allow",
+                Some("the button says \"Place order\""),
+            ),
+            None,
+            &bctx("turbo", false, &[]),
+        );
+        assert!(
+            matches!(&d, Decision::Ask { rule: Some(r), reason, .. }
+                if r == "browser:site shop.example.com" && reason.contains("Place order")),
+            "{}",
+            label(&d)
+        );
+        // Neither `browser *` nor `browser:click` covers a sensitive target.
+        let blanket = [rule("browser *"), rule("browser:click")];
+        let d = check(
+            "browser",
+            &bin("click", "shop.example.com", "ask", Some("a password field")),
+            None,
+            &bctx("ask", false, &blanket),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{}", label(&d));
+        // Explicit site trust does.
+        let site = [rule("browser:site shop.example.com")];
+        let d = check(
+            "browser",
+            &bin("click", "shop.example.com", "ask", Some("a password field")),
+            None,
+            &bctx("ask", false, &site),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        // No host (a file: page) means there is no site rule to offer.
+        let d = check(
+            "browser",
+            &bin("click", "", "ask", Some("a submit button")),
+            None,
+            &bctx("turbo", false, &[]),
+        );
+        assert!(
+            matches!(d, Decision::Ask { rule: None, .. }),
+            "{}",
+            label(&d)
+        );
+    }
+
+    /// Plan mode is for proposing: every interaction is refused, including the
+    /// ones the old gate let through (`js`, `fill`, `upload`, `dialog`).
+    #[test]
+    fn browser_plan_mode_denies_js_and_every_interaction() {
+        for act in [
+            "click",
+            "type",
+            "fill",
+            "press",
+            "select",
+            "check",
+            "uncheck",
+            "drag",
+            "upload",
+            "js",
+            "dialog_accept",
+            "cdp",
+        ] {
+            let d = check(
+                "browser",
+                &bin(act, "example.com", "allow", None),
+                None,
+                &bctx("turbo", true, &[rule("browser *")]),
+            );
+            assert!(matches!(d, Decision::Deny(_)), "{act}: {}", label(&d));
+        }
+    }
+
+    /// A page script can do anything a click can, so `js` is an interaction.
+    #[test]
+    fn browser_js_asks_by_default_with_a_per_site_rule() {
+        let d = check(
+            "browser",
+            &bin("js", "example.com", "ask", None),
+            None,
+            &bctx("ask", false, &[]),
+        );
+        assert!(
+            matches!(&d, Decision::Ask { rule: Some(r), .. } if r == "browser:js example.com"),
+            "{}",
+            label(&d)
+        );
+        let d = check(
+            "browser",
+            &bin("js", "example.com", "ask", None),
+            None,
+            &bctx("ask", false, &[rule("browser:js example.com")]),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        // The per-site rule does not leak to another site.
+        let d = check(
+            "browser",
+            &bin("js", "other.com", "ask", None),
+            None,
+            &bctx("ask", false, &[rule("browser:js example.com")]),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{}", label(&d));
+    }
+
+    /// `browser:ask <site>` beats Turbo, the default "allow", `browser *` and a
+    /// per-action rule — but only on that site.
+    #[test]
+    fn browser_ask_site_rule_beats_turbo_and_blanket_allows() {
+        let allow = [
+            rule("browser:ask example.com"),
+            rule("browser *"),
+            rule("browser:click"),
+        ];
+        let d = check(
+            "browser",
+            &bin("click", "example.com", "allow", None),
+            None,
+            &bctx("turbo", false, &allow),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{}", label(&d));
+        let d = check(
+            "browser",
+            &bin("click", "elsewhere.org", "ask", None),
+            None,
+            &bctx("turbo", false, &allow),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        // A deny still beats it.
+        let both = [rule("browser:ask example.com"), rule("!browser:click")];
+        let d = check(
+            "browser",
+            &bin("click", "example.com", "ask", None),
+            None,
+            &bctx("ask", false, &both),
+        );
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+    }
+
+    /// Site-scoped deny rules always win and stay on their site.
+    #[test]
+    fn browser_site_deny_rules_win_and_stay_on_their_site() {
+        let deny = [rule("!browser:site evil.com"), rule("browser *")];
+        for act in ["click", "js", "type"] {
+            let d = check(
+                "browser",
+                &bin(act, "evil.com", "allow", None),
+                None,
+                &bctx("turbo", false, &deny),
+            );
+            assert!(matches!(d, Decision::Deny(_)), "{act}: {}", label(&d));
+        }
+        let d = check(
+            "browser",
+            &bin("click", "good.com", "ask", None),
+            None,
+            &bctx("turbo", false, &deny),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        // Per action and site.
+        let deny = [rule("!browser:type bank.example")];
+        let d = check(
+            "browser",
+            &bin("type", "bank.example", "ask", None),
+            None,
+            &bctx("turbo", false, &deny),
+        );
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+        let d = check(
+            "browser",
+            &bin("click", "bank.example", "ask", None),
+            None,
+            &bctx("turbo", false, &deny),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        // A suffix trick is not the site.
+        let deny = [rule("!browser:site *.evil.com")];
+        let d = check(
+            "browser",
+            &bin("click", "notevil.com", "ask", None),
+            None,
+            &bctx("turbo", false, &deny),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        let d = check(
+            "browser",
+            &bin("click", "a.b.evil.com", "ask", None),
+            None,
+            &bctx("turbo", false, &deny),
+        );
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+    }
+
+    /// The "Block" interaction default refuses even in Turbo, and a per-site
+    /// exception is the way out.
+    #[test]
+    fn browser_default_block_denies_unless_the_site_is_excepted() {
+        let d = check(
+            "browser",
+            &bin("click", "example.com", "block", None),
+            None,
+            &bctx("turbo", false, &[rule("browser *"), rule("browser:click")]),
+        );
+        assert!(
+            matches!(&d, Decision::Deny(m)
+                if m.contains("Settings") && m.contains("browser:site example.com")),
+            "{}",
+            label(&d)
+        );
+        for exc in ["browser:site example.com", "browser:click example.com"] {
+            let d = check(
+                "browser",
+                &bin("click", "example.com", "block", None),
+                None,
+                &bctx("ask", false, &[rule(exc)]),
+            );
+            assert!(matches!(d, Decision::Allow), "{exc}: {}", label(&d));
+        }
+    }
+
+    /// Raw CDP is the developer escape hatch: off unless developer mode is on,
+    /// and then it always asks, with nothing to "always allow".
+    #[test]
+    fn browser_cdp_always_asks_and_never_offers_a_rule() {
+        let mut input = bin("cdp", "example.com", "allow", None);
+        input["__dev"] = json!(true);
+        let allow = [
+            rule("browser *"),
+            rule("browser:cdp"),
+            rule("browser:site example.com"),
+        ];
+        let d = check("browser", &input, None, &bctx("turbo", false, &allow));
+        assert!(
+            matches!(d, Decision::Ask { rule: None, .. }),
+            "{}",
+            label(&d)
+        );
+        input["__dev"] = json!(false);
+        let d = check("browser", &input, None, &bctx("turbo", false, &allow));
+        assert!(
+            matches!(&d, Decision::Deny(m) if m.contains("developer mode")),
+            "{}",
+            label(&d)
+        );
+    }
+
+    /// A LAN host is a network boundary, not a page action: it asks even in
+    /// Turbo and in plan mode, and `browser:lan <host>` is the standing answer.
+    #[test]
+    fn browser_lan_asks_even_in_turbo_and_plan() {
+        let lan = json!({
+            "action": "lan",
+            "__host": "192.168.1.5",
+            "__page": "http://192.168.1.5/",
+            "detail": "open http://192.168.1.5/",
+        });
+        for (perm, plan) in [("turbo", false), ("ask", true), ("auto", false)] {
+            let d = check(
+                "browser",
+                &lan,
+                None,
+                &bctx(perm, plan, &[rule("browser *")]),
+            );
+            assert!(
+                matches!(&d, Decision::Ask { rule: Some(r), .. } if r == "browser:lan 192.168.1.5"),
+                "{perm}/{plan}: {}",
+                label(&d)
+            );
+        }
+        let ok = [rule("browser:lan 192.168.1.5")];
+        let d = check("browser", &lan, None, &bctx("ask", false, &ok));
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        let d = check("browser", &lan, None, &bctx("disabled", false, &[]));
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+        let both = [
+            rule("!browser:lan 192.168.1.5"),
+            rule("browser:lan 192.168.1.5"),
+        ];
+        let d = check("browser", &lan, None, &bctx("turbo", false, &both));
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+    }
+
+    /// Looking is free, in plan mode and on the Disabled rung alike.
+    #[test]
+    fn browser_read_actions_are_allowed_in_plan_and_disabled() {
+        for act in [
+            "navigate",
+            "back",
+            "forward",
+            "reload",
+            "snapshot",
+            "read",
+            "query",
+            "info",
+            "screenshot",
+            "diff",
+            "wait_for",
+            "hover",
+            "scroll",
+            "tabs",
+            "tab_new",
+            "tab_switch",
+            "tab_close",
+            "emulate",
+            "pdf",
+            "console",
+            "network",
+            "network_body",
+            "cookies",
+            "storage",
+            "perf",
+            "downloads",
+        ] {
+            for (perm, plan) in [("ask", true), ("disabled", false)] {
+                let d = check(
+                    "browser",
+                    &bin(act, "example.com", "block", None),
+                    None,
+                    &bctx(perm, plan, &[]),
+                );
+                assert!(matches!(d, Decision::Allow), "{act}: {}", label(&d));
+            }
+        }
+        // Dismissing a dialog is a read; accepting one is an interaction.
+        let dismiss = bin("dialog", "example.com", "ask", None);
+        let d = check("browser", &dismiss, None, &bctx("ask", true, &[]));
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        let accept = bin("dialog_accept", "example.com", "ask", None);
+        let d = check("browser", &accept, None, &bctx("ask", true, &[]));
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+        let d = check("browser", &accept, None, &bctx("ask", false, &[]));
+        assert!(
+            matches!(&d, Decision::Ask { rule: Some(r), .. } if r == "browser:dialog_accept example.com"),
+            "{}",
+            label(&d)
+        );
+    }
+
+    /// `*.example.com` is the site and its subdomains, never a lookalike.
+    #[test]
+    fn browser_site_rule_wildcards_cover_subdomains_not_lookalikes() {
+        let allow = [rule("browser:site *.example.com")];
+        for host in [
+            "a.example.com",
+            "example.com",
+            "x.y.example.com",
+            "EXAMPLE.com.",
+        ] {
+            let d = check(
+                "browser",
+                &bin("click", host, "ask", Some("a submit button")),
+                None,
+                &bctx("ask", false, &allow),
+            );
+            assert!(matches!(d, Decision::Allow), "{host}: {}", label(&d));
+        }
+        for host in ["notexample.com", "example.com.evil.com", "evil-example.com"] {
+            let d = check(
+                "browser",
+                &bin("click", host, "ask", None),
+                None,
+                &bctx("ask", false, &allow),
+            );
+            assert!(matches!(d, Decision::Ask { .. }), "{host}: {}", label(&d));
+        }
+        // A rule saved for another project does not apply here.
+        let other = [AllowRule {
+            pattern: "browser:site example.com".into(),
+            project: "D:/elsewhere".into(),
+        }];
+        let d = check(
+            "browser",
+            &bin("click", "example.com", "ask", None),
+            None,
+            &bctx("ask", false, &other),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{}", label(&d));
+    }
+
+    /// The non-sensitive path: default "allow" and Turbo allow, the offered
+    /// rule is per action and site, and Disabled refuses instead of asking.
+    #[test]
+    fn browser_ordinary_interactions_follow_default_rules_and_rung() {
+        let d = check(
+            "browser",
+            &bin("fill", "example.com", "allow", None),
+            None,
+            &bctx("ask", false, &[]),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        let d = check(
+            "browser",
+            &bin("fill", "example.com", "ask", None),
+            None,
+            &bctx("turbo", false, &[]),
+        );
+        assert!(matches!(d, Decision::Allow), "{}", label(&d));
+        let d = check(
+            "browser",
+            &bin("fill", "example.com", "ask", None),
+            None,
+            &bctx("ask", false, &[]),
+        );
+        assert!(
+            matches!(&d, Decision::Ask { rule: Some(r), .. } if r == "browser:fill example.com"),
+            "{}",
+            label(&d)
+        );
+        let d = check(
+            "browser",
+            &bin("fill", "example.com", "ask", None),
+            None,
+            &bctx("disabled", false, &[]),
+        );
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+        // A sensitive one on the Disabled rung is refused, not asked.
+        let d = check(
+            "browser",
+            &bin("click", "example.com", "ask", Some("a submit button")),
+            None,
+            &bctx("disabled", false, &[]),
+        );
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+    }
+
+    /// A site deny reaches interactions and LAN loads, not reads: an agent
+    /// that cannot even navigate away from a denied page would be stuck on it.
+    /// And an action this build doesn't know is an interaction, never a read.
+    #[test]
+    fn browser_site_deny_spares_reads_and_unknown_actions_fail_closed() {
+        let deny = [rule("!browser:site evil.com")];
+        for act in ["navigate", "snapshot", "back"] {
+            let d = check(
+                "browser",
+                &bin(act, "evil.com", "ask", None),
+                None,
+                &bctx("ask", false, &deny),
+            );
+            assert!(matches!(d, Decision::Allow), "{act}: {}", label(&d));
+        }
+        let lan = json!({"action": "lan", "__host": "nas.local", "__page": "http://nas.local/"});
+        let deny_lan = [rule("!browser:site *.local")];
+        let d = check("browser", &lan, None, &bctx("turbo", false, &deny_lan));
+        assert!(matches!(d, Decision::Deny(_)), "{}", label(&d));
+        for act in ["Click", "evaluate", "submit_form", ""] {
+            let d = check(
+                "browser",
+                &bin(act, "example.com", "ask", None),
+                None,
+                &bctx("ask", true, &[]),
+            );
+            assert!(matches!(d, Decision::Deny(_)), "{act:?}: {}", label(&d));
+        }
     }
 }

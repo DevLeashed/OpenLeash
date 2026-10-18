@@ -96,12 +96,24 @@ describe("net usage across accounts", () => {
     const w = netWindows([acct("a", [20, 50]), acct("b", [60, 10])]);
     expect(w.map((x) => [x.label, x.used])).toEqual([["5h", 40], ["Week", 30]]);
   });
+  it("keeps usage independent between separate windows", () => {
+    const w = netWindows([acct("a", [20, 100])]);
+    expect(w.map((x) => [x.label, x.used])).toEqual([["5h", 20], ["Week", 100]]);
+  });
   it("ignores disabled and broken accounts", () => {
     const w = netWindows([acct("a", [80]), acct("b", [0], { enabled: false }), acct("c", [0], { disabled_reason: "Login expired" })]);
     expect(w[0]!.used).toBe(80);
   });
+  it("does not dilute measured usage with accounts that have no windows", () => {
+    const w = netWindows([acct("a", [80, 60]), acct("empty", []), acct("missing", [], { usage: null })]);
+    expect(w.map((x) => [x.label, x.used])).toEqual([["5h", 80], ["Week", 60]]);
+  });
+  it("averages only the accounts reporting each particular window", () => {
+    const w = netWindows([acct("a", [80, 60]), acct("b", [20])]);
+    expect(w.map((x) => [x.label, x.used])).toEqual([["5h", 50], ["Week", 60]]);
+  });
   it("is empty without usage", () => {
-    expect(netWindows([acct("a", [], { usage: null })])).toEqual([]);
+    expect(netWindows([acct("a", [], { usage: null }), acct("empty", [])])).toEqual([]);
   });
 });
 
@@ -837,6 +849,68 @@ describe("question notes and saved forms", () => {
     const html = renderToStaticMarkup(createElement(Question, { it: many, task }));
     expect(html).toContain("1 with a note");
     expect(html).not.toContain("because of the FTS index");
+  });
+
+  // A count or range the agent set is a limit on that one answer. Removing it for
+  // this answer lifts the check and nothing else: the question keeps its limits,
+  // and a required question still needs something picked.
+  it("lifts a count or range limit for one answer, and only while it is set", () => {
+    const capped: Q = { ...choice, type: "multi", max: 1 };
+    const a = initial(capped);
+    a.sel = [0, 1];
+    expect(valid(capped, a)).toBe("Pick at most 1");
+    a.unlimited = true;
+    expect(valid(capped, a)).toBeNull();
+    // Only this answer: a fresh one is held to the question's own limit again.
+    expect(valid(capped, { ...initial(capped), sel: [0, 1] })).toBe("Pick at most 1");
+
+    const minimum: Q = { ...choice, type: "multi", min: 2 };
+    const short = initial(minimum);
+    short.sel = [0];
+    expect(valid(minimum, short)).toBe("Pick at least 2");
+    short.unlimited = true;
+    expect(valid(minimum, short)).toBeNull();
+    // Removing the minimum does not remove the requirement to pick at all.
+    const none = initial(minimum);
+    none.unlimited = true;
+    expect(valid(minimum, none)).toBe("Pick at least one");
+
+    const ranged: Q = { question: "How many?", type: "number", min: 3, max: 10 };
+    const n = initial(ranged);
+    n.text = "12";
+    expect(valid(ranged, n)).toBe("Max 10");
+    n.unlimited = true;
+    expect(valid(ranged, n)).toBeNull();
+    // Not a number is still refused: that is not a limit.
+    n.text = "lots";
+    expect(valid(ranged, n)).toBe("Not a number");
+  });
+
+  it("offers the button only where there is a limit, and says what was removed", () => {
+    const limited = renderToStaticMarkup(createElement(Question, { it: mkQ([{ ...choice, type: "multi", max: 2 }]), task }));
+    expect(limited).toContain("Pick any · at most 2");
+    expect(limited).toContain("Remove limits");
+    const ranged = renderToStaticMarkup(createElement(Question, { it: mkQ([{ question: "How many?", type: "number", min: 3, max: 10 }]), task }));
+    expect(ranged).toContain("Remove limits");
+    expect(ranged).toContain("3-10");
+    const free = renderToStaticMarkup(createElement(Question, { it: mkQ([{ ...choice, type: "multi" }]), task }));
+    expect(free).not.toContain("Remove limits");
+    expect(free).toContain("Pick any");
+    expect(free).not.toContain("at most");
+  });
+
+  it("keeps a lifted limit through the draft, and counts it as a touched form", () => {
+    const capped: Q = { ...choice, type: "multi", max: 1 };
+    const lifted = initial(capped);
+    lifted.sel = [0, 1];
+    lifted.unlimited = true;
+    const back = restore(draftOf({ page: 0, ans: [lifted], dismissing: false, note: "" })!, [capped])!;
+    expect(back.ans[0]!.unlimited).toBe(true);
+    // Lifted with nothing picked yet is still a choice worth keeping across a switch.
+    const bare = initial(capped);
+    bare.unlimited = true;
+    expect(draftOf({ page: 0, ans: [bare], dismissing: false, note: "" })).not.toBeNull();
+    expect(restore(JSON.stringify({ page: 0, ans: [{}] }), [capped])!.ans[0]!.unlimited).toBe(false);
   });
 
   it("never writes a file for a form nobody has touched", () => {
@@ -1621,8 +1695,16 @@ describe("archiving the chats past the sidebar cap", () => {
     expect(excess[0]?.id).toBe("old-0");
   });
 
-  it("never archives when protected chats alone fill the limit", () => {
+  it("keeps the open chat visible and never archives when protected chats alone fill the limit", () => {
     const tasks = list(...Array.from({ length: SIDEBAR_CHAT_LIMIT + 1 }, (_, i) => chat(`live-${i}`, { status: "running" })));
+    expect(excessSidebarChats(tasks, SIDEBAR_CHAT_LIMIT)).toEqual([]);
+  });
+
+  it("archives excess scheduled chats older than 100, while leaving normal chats out of that count", () => {
+    const tasks = list(...Array.from({ length: 102 }, (_, i) => chat(`scheduled-${i}`, {
+      title: `⏰ Nightly ${i}`, touched_at: idleFor((102 - i) * DAY),
+    })));
+    expect(excessSidebarChats(tasks, SIDEBAR_CHAT_LIMIT, null, false, true).map((task) => task.id)).toEqual(["scheduled-0", "scheduled-1"]);
     expect(excessSidebarChats(tasks, SIDEBAR_CHAT_LIMIT)).toEqual([]);
   });
 });
@@ -1986,14 +2068,15 @@ describe("paused chats view", () => {
 });
 
 describe("memory and chat-naming settings", () => {
-  it("defaults memory off and chat naming on when the key is absent", () => {
+  it("defaults memory and chat naming on when the key is absent", () => {
     // A settings.json written before these existed has none of these keys. Each
-    // toggle must read `undefined` as its own default, which is not the same for
-    // both -- so a missing key can never render an undefined checked state.
+    // toggle must read `undefined` as its own default (Settings.tsx reads
+    // `memory !== false`), so a missing key can never render an undefined
+    // checked state.
     const old = {} as Settings;
     expect(old.memory).toBeUndefined();
     expect(old.agent_titles).toBeUndefined();
-    expect(old.memory ?? false).toBe(false);
+    expect(old.memory !== false).toBe(true);
     expect(old.agent_titles ?? true).toBe(true);
   });
 
@@ -2024,9 +2107,15 @@ describe("transcripts held in memory", () => {
     // chat that ever produced an event stayed in the store for the life of the
     // process -- including chats running in the background that were never
     // opened. Switching to one chat has to release the others.
-    set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, subItems: { a: { s1: [item("4")] }, b: { s2: [item("5")] } }, bg: { a: [], b: [] } });
+    const long = (n: number) => Array.from({ length: n }, (_, i) => item(`${n}-${i}`));
+    set({ items: { a: long(100), b: long(100), c: [item("3")] }, subItems: { a: { s1: [item("4")] }, b: { s2: [item("5")] } }, bg: { a: [], b: [] } });
     const patch = evictTranscripts(get(), "b");
-    expect(Object.keys(patch.items ?? {})).toEqual(["b"]);
+    // Items are trimmed to a tail, not dropped, so reopening paints at once:
+    // the open chat keeps everything, a short list is left alone.
+    expect(patch.items?.["a"]).toHaveLength(40);
+    expect(patch.items?.["a"]?.at(-1)?.id).toBe("100-99");
+    expect(patch.items?.["b"]).toHaveLength(100);
+    expect(patch.items?.["c"]).toHaveLength(1);
     // A's subagent transcript goes with the chat it belonged to: a swarm whose
     // drawer was never opened is the largest thing the store can be holding.
     expect(Object.keys(patch.subItems ?? {})).toEqual(["b"]);
@@ -2048,7 +2137,7 @@ describe("transcripts held in memory", () => {
     // was not in the store before this call.
     set({ items: { a: [item("1")] } });
     const patch = evictTranscripts(get(), "b");
-    expect(Object.keys(patch.items ?? {})).toEqual([]);
+    expect(patch.items).toBeUndefined();
     expect(evictTranscripts(get(), "a")).toEqual({});
   });
 
@@ -2056,7 +2145,7 @@ describe("transcripts held in memory", () => {
     // `back()` deliberately does not refetch -- it trusts the transcript is
     // already loaded. Evicting a chat on the nav stack would show it empty.
     set({ items: { a: [item("1")], b: [item("2")], c: [item("3")] }, hist: [{ view: "chat", task: "c" }] } as unknown as Partial<Parameters<typeof set>[0]>);
-    expect(Object.keys(evictTranscripts(get(), "a").items ?? {})).toEqual(["a", "c"]);
+    expect(evictTranscripts(get(), "a").items).toBeUndefined();
   });
 
   it("leaves Home alone as a nav entry", () => {

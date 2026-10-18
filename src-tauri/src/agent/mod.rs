@@ -15,27 +15,54 @@
 
 pub mod accounts;
 pub mod attachments;
+pub mod bisect;
 pub mod browser;
+pub mod browser_annotate;
+pub mod browser_panel;
+pub mod browser_policy;
+pub mod browser_proxy;
+pub mod browser_snapshot;
+pub mod burner;
+pub mod burner_policy;
 pub mod chats;
 pub mod checkpoint;
 pub mod checks;
 pub mod commitmsg;
 pub mod docker;
 pub mod git;
+pub mod http_tool;
+pub mod imagefit;
+pub mod lsp;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod memory;
 pub mod pcguard;
 pub mod permissions;
+pub mod plugin_gitlab;
+pub mod plugin_jira;
+pub mod plugin_linear;
+pub mod plugin_notion;
+pub mod plugin_services;
+pub mod plugin_slack;
 pub mod plugins;
 pub mod projects;
 pub mod prompt;
+pub mod proof;
 pub mod providers;
+pub mod routerules;
+pub mod race;
+mod race_safety;
 pub mod review;
 #[cfg(test)]
 mod reviewer_accounting;
 #[cfg(test)]
 mod reviewer_bg_jobs;
+#[cfg(test)]
+mod reviewer_browser_core;
+#[cfg(test)]
+mod reviewer_bisect;
+#[cfg(test)]
+mod reviewer_burner;
 #[cfg(test)]
 mod reviewer_checkpoint;
 #[cfg(test)]
@@ -50,6 +77,8 @@ mod reviewer_docs;
 mod reviewer_edits;
 #[cfg(test)]
 mod reviewer_hooks;
+#[cfg(test)]
+mod reviewer_http_request;
 #[cfg(test)]
 mod reviewer_mcp;
 #[cfg(test)]
@@ -69,11 +98,17 @@ mod reviewer_privacy;
 #[cfg(test)]
 mod reviewer_prompt_rules;
 #[cfg(test)]
+mod reviewer_router_rules;
+#[cfg(test)]
+mod reviewer_run_timeline;
+#[cfg(test)]
 mod reviewer_runtime;
 #[cfg(test)]
 mod reviewer_runtime_wake;
 #[cfg(test)]
 mod reviewer_sandbox;
+#[cfg(test)]
+mod reviewer_service_plugins;
 #[cfg(test)]
 mod reviewer_ssh;
 #[cfg(test)]
@@ -98,7 +133,10 @@ mod reviewer_unread;
 mod reviewer_webfetch;
 pub mod router;
 pub mod runner;
+pub mod schedule;
 pub mod shell;
+pub mod skillgen;
+pub mod spans;
 // Remote-SSH projects: addressing/quoting (`host`) and live SFTP + command
 // sessions (`ssh_session`). Phase 2 wires them into tools/runner/git; until
 // then most of their API has no caller.
@@ -109,7 +147,7 @@ pub mod ssh_session;
 pub mod stats;
 pub mod store;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub mod toolindex;
 pub mod tools;
 pub mod tools_remote;
@@ -434,6 +472,9 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<docker::DockerEnv>,
     pub model: String,
+    /// Backend-installed restriction, persisted before startup is dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burner: Option<burner_policy::BurnPolicy>,
     pub effort: usize,
     #[serde(
         default = "crate::agent::permissions::default_perm",
@@ -586,10 +627,17 @@ pub struct Task {
     /// read would otherwise go unnoticed. Missing in older task files.
     #[serde(default)]
     pub read_hashes: HashMap<String, String>,
+    /// Timed record of the run (model requests, tool calls, waits) behind the
+    /// run timeline. See `spans.rs`. Absent in older task files, and not
+    /// written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<spans::Span>,
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
-    #[serde(default)]
     pub touched: HashMap<String, Option<String>>,
+    /// Router decisions persisted for activity history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_log: Vec<router::RouteEvent>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// When the user last *did* something here: sent a message, answered a
@@ -1091,6 +1139,8 @@ pub struct Runtime {
     /// this merge cleanly with every other agent adding `Task` fields.
     pub loaded_tools: Mutex<HashMap<String, Vec<String>>>,
     pub repeats: Mutex<HashMap<String, u32>>,
+    /// Router rule counters and active holds by requesting agent.
+    pub router: std::sync::Mutex<HashMap<String, router::AgentRoute>>,
     /// Startup/setup work for a newly-created chat, independent of background agent jobs.
     pub startup_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// Prevents follow-up sends from starting a turn before workspace setup and
@@ -1131,6 +1181,97 @@ pub struct Runtime {
     /// the rest of the chat keeps going. Esc still reaches all of them, through
     /// the parent token each one was created from.
     pub sub_cancel: std::sync::Mutex<HashMap<String, CancellationToken>>,
+    /// The newest queued shadow-checkpoint job for this task (`None` = none
+    /// ever queued); it settles to `true` once that job and every job queued
+    /// before it are done. See [`Runtime::queue_checkpoint`].
+    pub checkpoint_chain: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    /// Deletion fences out late end-of-run captures before draining the chain.
+    pub checkpoints_closed: std::sync::atomic::AtomicBool,
+}
+
+impl Runtime {
+    /// Run a blocking shadow-checkpoint job after every job queued before it,
+    /// without making the caller wait, and return a handle that settles when
+    /// it is done.
+    ///
+    /// The send path's user snapshot is the reason this exists. On a new chat
+    /// it is `init`, config, `status`, `add -A` of the whole checkout and a
+    /// commit — seconds on a large repository — and it used to be awaited
+    /// before the run even started, so the first model request sat behind it.
+    /// It now runs here, and everything whose correctness depends on it having
+    /// landed waits on [`Runtime::checkpoints_settled`] instead: every tool
+    /// (a command or edit that ran first would be committed as the *user's*
+    /// work, and rewind would then refuse to put it back), the end-of-run
+    /// capture, rewind, fork and deletion.
+    ///
+    /// Chained rather than merely serialised: `checkpoint`'s write lock keeps
+    /// two git processes off one index, but it is not FIFO, and the `turns`
+    /// ledger is read last-wins — a later touch's snapshot overtaking an
+    /// earlier one would record the timeline out of order.
+    pub fn queue_checkpoint(
+        &self,
+        job: impl FnOnce() + Send + 'static,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let previous = {
+            let mut chain = self
+                .checkpoint_chain
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.checkpoints_closed.load(Ordering::SeqCst) {
+                let _ = tx.send(true);
+                return rx;
+            }
+            chain.replace(rx.clone())
+        };
+        tokio::spawn(async move {
+            if let Some(mut previous) = previous {
+                // `Err` = that job's sender is gone (it panicked or the runtime is
+                // shutting down): nothing more is coming from it either way.
+                let _ = previous.wait_for(|done| *done).await;
+            }
+            let _ = tokio::task::spawn_blocking(job).await;
+            let _ = tx.send(true);
+        });
+        rx
+    }
+
+    /// Prevent late jobs from recreating a deleted task's checkpoint store.
+    /// Taken under the queue lock so a concurrent queue is either included in
+    /// the drain or rejected, never registered after the drain observed it.
+    pub fn close_checkpoints(&self) {
+        let _chain = self
+            .checkpoint_chain
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.checkpoints_closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until every checkpoint job queued so far has finished. Returns at
+    /// once when none is pending, which is the steady state: only the first
+    /// tool after a send ever actually waits.
+    pub async fn checkpoints_settled(&self) {
+        let pending = self
+            .checkpoint_chain
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(mut rx) = pending {
+            let _ = rx.wait_for(|done| *done).await;
+        }
+    }
+
+    /// [`Runtime::checkpoints_settled`], abandoned if `cancel` fires first.
+    /// `false` = cancelled while still waiting, so the caller must not go on to
+    /// do whatever it was waiting to do. A snapshot is bounded, but Esc has to
+    /// work during one on a huge checkout too.
+    pub async fn checkpoints_settled_or(&self, cancel: &CancellationToken) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.checkpoints_settled() => true,
+            _ = cancel.cancelled() => false,
+        }
+    }
 }
 
 impl Runtime {
@@ -1507,16 +1648,52 @@ impl Harness {
 
     /// Block while paused. Returns false if cancelled.
     pub async fn wait_unpaused(&self, task_id: &str, cancel: &CancellationToken) -> bool {
+        let mut waited: Option<DateTime<Utc>> = None;
         loop {
             let bell = self.pause_bell.notified();
             if !self.is_paused(task_id).await {
+                if let Some(from) = waited {
+                    self.note_unpaused(task_id, from).await;
+                }
                 return true;
             }
+            waited.get_or_insert_with(Utc::now);
             tokio::select! {
                 _ = bell => {},
                 _ = cancel.cancelled() => return false,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
             }
+        }
+    }
+
+    /// The run-timeline side of a pause lifting, seen by a waiter that was held
+    /// since `from`. Closes the chat's own pause; a global "Pause all" never
+    /// opened one, so the first waiter to notice records it — later waiters
+    /// find that span overlapping their wait and add nothing.
+    async fn note_unpaused(&self, task_id: &str, from: DateTime<Utc>) {
+        let Ok(t) = self.task(task_id).await else {
+            return;
+        };
+        let settings = self.settings.read().await;
+        let mut t = t.lock().await;
+        // The pause may have been raised again after the waiter's first read.
+        // Never let a stale waiter close the new pause (and never close parks).
+        if t.paused.is_some() || Self::held_by_global(&t.summary(), settings.paused_all) {
+            return;
+        }
+        let now = Utc::now();
+        spans::close_waits(&mut t.spans, "pause", now);
+        let covered = t.spans.iter().any(|s| {
+            s.kind == "wait"
+                && s.name == "pause"
+                && s.start <= now
+                && s.end.is_none_or(|e| e >= from)
+        });
+        if !covered {
+            let mut span = spans::Span::new("wait", None, "pause").detail("global");
+            span.start = from;
+            span.end = Some(now);
+            spans::push(&mut t.spans, span);
         }
     }
 
@@ -1531,6 +1708,10 @@ impl Harness {
         let newly_paused = self
             .update_task_quiet(task_id, |t| {
                 if t.paused.is_none() {
+                    // Only an actual pause-lifting transition closes this;
+                    // other agents and background commands may still drain.
+                    let span = spans::Span::new("wait", None, "pause").detail(&kind);
+                    spans::push(&mut t.spans, span);
                     t.paused = Some(Pause {
                         reason,
                         kind,
@@ -2160,11 +2341,21 @@ impl Harness {
             // user's own work — see `checkpoint`'s module note. Done before the
             // task lock is taken for the bookkeeping below, because it is a disk
             // operation and that lock gates every other reader of this chat.
-            if !self.runtime(task_id).running.load(Ordering::SeqCst) {
+            //
+            // The marker (`Snapshot::of`: counts and indices) is fixed here, as
+            // the message is sent; the git work is queued, not awaited, because
+            // the send path would otherwise hold the first model request behind
+            // a full `add -A` of the checkout. Every tool, the end-of-run
+            // capture, rewind and fork wait for it instead
+            // (`Runtime::checkpoints_settled`).
+            let rt = self.runtime(task_id);
+            if !rt.running.load(Ordering::SeqCst) {
                 let enabled = self.settings.read().await.checkpoints;
                 let snap = checkpoint::Snapshot::of(&*t.lock().await, enabled);
                 if let Some(snap) = snap {
-                    let _ = tokio::task::spawn_blocking(move || snap.user().take()).await;
+                    rt.queue_checkpoint(move || {
+                        snap.user().take();
+                    });
                 }
             }
             let mut t = t.lock().await;
@@ -2179,9 +2370,24 @@ impl Harness {
     pub async fn update_task(&self, task_id: &str, f: impl FnOnce(&mut Task)) {
         if let Ok(t) = self.task(task_id).await {
             let mut t = t.lock().await;
+            let was_paused = t.paused.is_some();
+            let was_parked = t.waiting_kind.as_deref() == Some("wake");
             f(&mut t);
+            Self::close_timeline_wait_transitions(&mut t, was_paused, was_parked);
             t.updated_at = Utc::now();
             self.emit_summary(&t);
+        }
+    }
+
+    /// Close only the wait whose state was actually lifted. Used by both task
+    /// mutation paths so send, wake and resume share the same timing boundary.
+    fn close_timeline_wait_transitions(t: &mut Task, was_paused: bool, was_parked: bool) {
+        let now = Utc::now();
+        if was_paused && t.paused.is_none() {
+            spans::close_waits(&mut t.spans, "pause", now);
+        }
+        if was_parked && t.waiting_kind.as_deref() != Some("wake") {
+            spans::close_waits(&mut t.spans, "park", now);
         }
     }
 
@@ -2200,7 +2406,10 @@ impl Harness {
         };
         let mut t = t.lock().await;
         let before = self.emit_key(&t);
+        let was_paused = t.paused.is_some();
+        let was_parked = t.waiting_kind.as_deref() == Some("wake");
         f(&mut t);
+        Self::close_timeline_wait_transitions(&mut t, was_paused, was_parked);
         if self.emit_key(&t) == before {
             return false;
         }
@@ -2461,20 +2670,31 @@ impl Harness {
     ) -> Option<Value> {
         let rt = self.runtime(task_id);
         let (tx, rx) = oneshot::channel();
+        let mut span = spans::Span::new("wait", None, kind);
+        span.item = item_id.to_string();
         rt.pending.lock().await.insert(item_id.to_string(), tx);
         self.update_task(task_id, |t| {
             t.status = "waiting".into();
             t.waiting_kind = Some(kind.into());
         })
         .await;
-        self.attention(task_id, json!({"task_id": task_id, "kind": kind}))
-            .await;
+        self.attention(
+            task_id,
+            json!({"task_id": task_id, "item_id": item_id, "kind": kind}),
+        )
+        .await;
         let res = tokio::select! {
             r = rx => r.ok(),
             _ = cancel.cancelled() => None,
         };
         rt.pending.lock().await.remove(item_id);
+        let answered = res.is_some();
         self.update_task(task_id, |t| {
+            // On the lane of whichever agent asked: the item says which.
+            span.agent = spans::agent_of_item(t, item_id);
+            span.end = Some(Utc::now());
+            span.status = if answered { "answered" } else { "cancelled" }.into();
+            spans::push(&mut t.spans, span);
             if t.status == "waiting" {
                 t.status = "running".into();
             }
@@ -2487,5 +2707,24 @@ impl Harness {
         })
         .await;
         res
+    }
+
+    /// Answer a pending approval/question through the single channel shared by
+    /// desktop and remote notification actions.
+    pub async fn respond_pending(
+        &self,
+        task_id: &str,
+        item_id: &str,
+        response: Value,
+    ) -> Result<(), String> {
+        let tx = self.runtime(task_id).pending.lock().await.remove(item_id);
+        match tx {
+            Some(tx) => {
+                self.touch(task_id).await;
+                let _ = tx.send(response);
+                Ok(())
+            }
+            None => Err("That request is no longer pending.".into()),
+        }
     }
 }

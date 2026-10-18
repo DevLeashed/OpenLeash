@@ -8,6 +8,24 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke, convertFileSrc: (id: string) =>
 vi.mock("./Visualization", () => ({ Visualization: () => <div>Preview</div> }));
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
+/** Comment the way a user does: turn on comment mode and click the sheet. jsdom
+ *  has no layout, so the sheet is given a box for the click to land in. */
+function pinCommentOnSheet(label: RegExp | string, at = { clientX: 50, clientY: 20 }) {
+  fireEvent.click(screen.getByRole("radio", { name: "Comment" }));
+  const surface = screen.getByLabelText(label);
+  surface.getBoundingClientRect = () => ({ left: 0, top: 0, width: 200, height: 100, right: 200, bottom: 100, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+  fireEvent.click(surface, at);
+}
+/** Comments, Tweaks, Details: floating cards opened from the studio toolbar. */
+const openTab = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
+/** Pick a version from the studio's themed version menu by its number. */
+function pickVersion(number: number) {
+  fireEvent.click(screen.getByLabelText("Exact artifict version"));
+  const option = screen.getAllByRole("option").find((o) => o.querySelector(".dd-option-label")?.textContent === `v${number}`);
+  fireEvent.click(option!);
+}
+const shownVersion = () => screen.getByLabelText("Exact artifict version").querySelector(".ddv")?.textContent;
+
 
 it("renders the title, kind, and version in the artifict header", async () => {
   const version = { id: "v1", parentId: null, createdAt: "2026-10-08T10:00:00Z", content: "<h1>Hello</h1>", decisions: [], constraints: [], codeRefs: [] };
@@ -60,8 +78,8 @@ it("opens the requested durable artifict version when navigated from an inline c
   invoke.mockImplementation(async (command: string) => command === "artifict_list" ? [{ id: artifict.id, title: artifict.title, kind: artifict.kind, currentVersionId: artifict.currentVersionId, createdAt: artifict.createdAt, updatedAt: artifict.updatedAt }] : structuredClone(artifict));
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" initialSelection={{ artifictId: "art-2", versionId: versions[0]!.id }} />);
   expect(await screen.findByText("Pinned Artifict")).toBeTruthy();
-  const selectedVersion = await screen.findByLabelText("Exact artifict version") as HTMLSelectElement;
-  expect(selectedVersion.value).toBe(versions[0]!.id);
+  await screen.findByLabelText("Exact artifict version");
+  expect(shownVersion()).toBe("v1");
   await screen.findByText("old");
   expect(invoke).toHaveBeenCalledWith("artifict_get", expect.objectContaining({ taskId: "task-1", artifictId: "art-2" }));
 });
@@ -86,24 +104,24 @@ function mockDraftArtifict(fail: string) {
   });
 }
 
-it("keeps feedback text and state after a failed submission", async () => {
+it("keeps captured state after a failed submission", async () => {
   mockDraftArtifict("artifict_feedback_submit");
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
-  await screen.findByLabelText("Follow up for agent");
-  fireEvent.change(screen.getByLabelText("Follow up for agent"), { target: { value: "Please fix the labels" } });
+  await screen.findByText("Second version");
+  openTab("Details");
   fireEvent.change(screen.getByLabelText("Interactive state JSON"), { target: { value: '{"sort":"score"}' } });
-  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  fireEvent.click(screen.getByRole("button", { name: "Send to agent" }));
   await screen.findByRole("alert");
-  expect((screen.getByLabelText("Follow up for agent") as HTMLTextAreaElement).value).toBe("Please fix the labels");
   expect((screen.getByLabelText("Interactive state JSON") as HTMLTextAreaElement).value).toBe('{"sort":"score"}');
 });
 
 it("keeps comment text after a failed save", async () => {
   mockDraftArtifict("artifict_annotate");
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
-  await screen.findByLabelText("Comment text");
-  fireEvent.change(screen.getByLabelText("Comment text"), { target: { value: "This label is wrong" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save comment" }));
+  await screen.findByText("Second version");
+  pinCommentOnSheet("Draft test · v2");
+  fireEvent.change(await screen.findByLabelText("Comment text"), { target: { value: "This label is wrong" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
   await screen.findByRole("alert");
   expect((screen.getByLabelText("Comment text") as HTMLTextAreaElement).value).toBe("This label is wrong");
 });
@@ -112,82 +130,111 @@ it("keeps drafts separate for each exact version and restores them on return", a
   mockDraftArtifict("");
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
   await screen.findByText("Second version");
-  fireEvent.change(screen.getByLabelText("Follow up for agent"), { target: { value: "Change version two" } });
-  fireEvent.change(screen.getByLabelText("Comment text"), { target: { value: "Version two note" } });
+  pinCommentOnSheet("Draft test · v2");
+  fireEvent.change(await screen.findByLabelText("Comment text"), { target: { value: "Version two note" } });
+  openTab("Details");
   fireEvent.change(screen.getByLabelText("Interactive state JSON"), { target: { value: '{"version":2}' } });
-  fireEvent.change(screen.getByLabelText("Exact artifict version"), { target: { value: "draft-v1" } });
+  pickVersion(1);
   await screen.findByText("First version");
-  expect((screen.getByLabelText("Follow up for agent") as HTMLTextAreaElement).value).toBe("");
-  expect((screen.getByLabelText("Comment text") as HTMLTextAreaElement).value).toBe("");
+  // The comment being written belongs to v2, so v1 has no composer open.
+  expect(screen.queryByLabelText("Comment text")).toBeNull();
   expect((screen.getByLabelText("Interactive state JSON") as HTMLTextAreaElement).value).toBe("");
-  fireEvent.change(screen.getByLabelText("Exact artifict version"), { target: { value: "draft-v2" } });
-  await waitFor(() => expect((screen.getByLabelText("Follow up for agent") as HTMLTextAreaElement).value).toBe("Change version two"));
-  expect((screen.getByLabelText("Comment text") as HTMLTextAreaElement).value).toBe("Version two note");
+  pickVersion(2);
+  await waitFor(() => expect((screen.getByLabelText("Comment text") as HTMLTextAreaElement).value).toBe("Version two note"));
+  expect((screen.getByLabelText("Interactive state JSON") as HTMLTextAreaElement).value).toBe('{"version":2}');
 });
 
-it("stages an exact-revision implementation request without sending or approving it", async () => {
+it("has no second chat: nothing to type a request into, and no send bar until something is queued", async () => {
   mockDraftArtifict("");
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
   await screen.findByText("Second version");
-  fireEvent.click(screen.getByText("Ask for…"));
-  fireEvent.click(screen.getByRole("button", { name: "Implement this revision" }));
-  const request = (screen.getByLabelText("Follow up for agent") as HTMLTextAreaElement).value;
-  expect(request).toContain("draft-art, exact revision draft-v2");
-  expect(request).toContain("existing permissions");
-  expect(invoke.mock.calls.some(([command]) => command === "artifict_feedback_submit")).toBe(false);
-  fireEvent.click(screen.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(invoke).toHaveBeenCalledWith("artifict_feedback_submit", expect.objectContaining({ versionId: "draft-v2", text: request.trim() })));
+  expect(screen.queryByLabelText("Follow up for agent")).toBeNull();
+  expect(screen.queryByText("Ask for…")).toBeNull();
+  expect(screen.queryByRole("region", { name: "Send to the agent" })).toBeNull();
+  openTab("Details");
+  fireEvent.change(screen.getByLabelText("Interactive state JSON"), { target: { value: '{"a":1}' } });
+  expect(screen.getByRole("region", { name: "Send to the agent" }).textContent).toContain("State attached");
 });
 
-it("prioritizes simple feedback and shows version metadata", async () => {
+it("keeps the record's notes in cards that float over the canvas, closed until asked for", async () => {
   const annotated = { ...draftArtifict, versions: draftVersions.map((v) => ({ ...v, decisions: ["Keep axes consistent"], constraints: ["No external assets"], codeRefs: [{ path: "src/chart.ts", startLine: 12, description: "Chart entry" }] })) };
   invoke.mockImplementation(async (command: string) => command === "artifict_list" ? [annotated] : structuredClone(annotated));
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
-  await screen.findByText("Comments · v2");
-  const captured = screen.getByText(/Captured state/).closest("details");
-  expect(captured?.open).toBe(false);
-  // One panel: the record's comments, and the request that goes with them.
-  // There is no second conversation beside it — the chat pane is the chat.
-  const comments = screen.getByRole("region", { name: "Comments on this version" });
-  expect(comments.contains(screen.getByLabelText("Follow up for agent"))).toBe(true);
-  expect(comments.contains(captured!)).toBe(true);
+  await screen.findByText("Second version");
+  // No column takes the design's width until a card is opened.
+  expect(screen.queryByRole("region", { name: "Review" })).toBeNull();
+  openTab("Comments");
+  expect(screen.getByRole("region", { name: "Comments on this version" }).textContent).toContain("click anything in the design");
   expect(screen.queryByRole("complementary", { name: "Artifict conversation" })).toBeNull();
+  openTab("Details");
+  expect(screen.queryByRole("region", { name: "Comments on this version" })).toBeNull();
+  expect(screen.getByText("Keep axes consistent")).toBeTruthy();
+  expect(screen.getByText("No external assets")).toBeTruthy();
+  expect(screen.getByText("src/chart.ts:12")).toBeTruthy();
   // The set is reachable from the header and returns to the record it opened.
   fireEvent.click(screen.getByRole("button", { name: "All artificts" }));
   expect(screen.getAllByText("Draft test").length).toBeGreaterThan(0);
   fireEvent.click(screen.getByRole("button", { name: "Back to artifict" }));
   expect(screen.getByLabelText("Exact artifict version")).toBeTruthy();
-  expect(screen.getAllByText("Keep axes consistent").length).toBeGreaterThan(0);
-  expect(screen.getByText("No external assets")).toBeTruthy();
-  expect(screen.getByText("src/chart.ts:12")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Close panel" }));
+  expect(screen.queryByRole("region", { name: "Review" })).toBeNull();
 });
 
-it("warns that the record on screen is a work in progress, naming only a real recorded stage", async () => {
+it("opens the real new-chat screen in Artificts mode, about the artifict on screen", async () => {
+  const { get: getStore, set: setStore } = await import("../store");
+  setStore({ view: "session", task: "task-1", tasks: { "task-1": { id: "task-1", project: "D:/proj" } as never } });
+  mockDraftArtifict("");
+  render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
+  await screen.findByText("Second version");
+  fireEvent.click(screen.getByRole("button", { name: "New chat about this artifict" }));
+  // No card of its own: the new-task screen, its composer and model picker,
+  // with this revision beside it through the chat it came from.
+  expect(getStore().view).toBe("home");
+  expect(getStore().home.artificts).toBe(true);
+  expect(getStore().home.studio).toEqual({ taskId: "task-1", artifictId: "draft-art", versionId: "draft-v2", title: "Draft test", number: 2, kind: "markdown" });
+  expect(invoke.mock.calls.some(([c]) => c === "task_create")).toBe(false);
+  setStore((s) => ({ home: { ...s.home, artificts: false, studio: null } }));
+});
+
+it("borrowed onto the new-task screen, requests start a new chat instead of writing to the old one", async () => {
+  mockDraftArtifict("");
+  const { get: getStore, set: setStore } = await import("../store");
+  const base = invoke.getMockImplementation()!;
+  invoke.mockImplementation(async (command: string, ...rest: unknown[]) => {
+    if (command === "task_create") throw new Error("stop here");
+    return base(command, ...rest);
+  });
+  setStore((s) => ({ settings: { ...(s.settings ?? {}), project: "D:/proj" } as never }));
+  render(<ArtifictWorkspace taskId="task-1" taskTitle="New chat" browseOnly />);
+  await screen.findByText("Second version");
+  // The whole editor is there, comments and requests included.
+  expect(screen.getByRole("radio", { name: "Comment" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Comments" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "New chat about this artifict" })).toBeTruthy();
+  openTab("Ask the agent");
+  fireEvent.click(screen.getByText("Review this design"));
+  await waitFor(() => expect(invoke.mock.calls.some(([c]) => c === "task_create")).toBe(true));
+  expect(invoke.mock.calls.some(([c]) => c === "artifict_feedback_submit")).toBe(false);
+  expect(getStore().home.studio?.artifictId).toBe("draft-art");
+  setStore((s) => ({ home: { ...s.home, artificts: false, studio: null }, draft: "" }));
+});
+
+it("can open on the gallery of the project's artificts", async () => {
+  mockDraftArtifict("");
+  render(<ArtifictWorkspace taskId="task-1" taskTitle="New chat" browseOnly startInGallery />);
+  expect(await screen.findByLabelText("Filter artificts")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Open Draft test" })).toBeTruthy();
+});
+
+it("shows no work-in-progress banner in the studio", async () => {
   const record = { schema: "openleash.collaboration.v1", title: "Architecture", purpose: "Explain real code", stage: "prototype", nodes: [], edges: [], evidence: [], limitations: [] };
   const collaborationVersions = [{ id: "w1", parentId: null, createdAt: "2026-10-08T10:00:00Z", content: JSON.stringify(record), decisions: [], constraints: [], codeRefs: [] }];
   const collaboration = { id: "wip-1", title: "Architecture", kind: "json", currentVersionId: "w1", createdAt: collaborationVersions[0]!.createdAt, updatedAt: collaborationVersions[0]!.createdAt, versions: collaborationVersions, annotations: [], feedback: [] };
   invoke.mockImplementation(async (command: string) => command === "artifict_list" ? [{ id: collaboration.id, title: collaboration.title, kind: collaboration.kind, currentVersionId: collaboration.currentVersionId, createdAt: collaboration.createdAt, updatedAt: collaboration.updatedAt }] : structuredClone(collaboration));
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
   await screen.findByText("Explain real code");
-  // Above the content it describes: the version on screen, and the stage quoted
-  // as its author's claim rather than as a verdict.
-  const notice = screen.getByRole("note");
-  expect(notice.textContent).toContain("Work in progress");
-  expect(notice.textContent).toContain("not a finished deliverable or an approval");
-  expect(notice.textContent).toContain("v1 · Recorded stage: prototype");
-  expect(notice.textContent).toContain("author-reported, not independently certified");
-  cleanup();
-  // A record that declares no stage — or declares one nothing can read — is
-  // warned about all the same, and none is invented for it.
-  const fragmentVersions = [{ id: "f1", parentId: null, createdAt: "2026-10-08T10:00:00Z", content: '{"stage":"verified"}', decisions: [], constraints: [], codeRefs: [] }];
-  const fragment = { id: "wip-2", title: "Fragment", kind: "json", currentVersionId: "f1", createdAt: fragmentVersions[0]!.createdAt, updatedAt: fragmentVersions[0]!.createdAt, versions: fragmentVersions, annotations: [], feedback: [] };
-  invoke.mockImplementation(async (command: string) => command === "artifict_list" ? [{ id: fragment.id, title: fragment.title, kind: fragment.kind, currentVersionId: fragment.currentVersionId, createdAt: fragment.createdAt, updatedAt: fragment.updatedAt }] : structuredClone(fragment));
-  render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
-  await screen.findByLabelText("Exact artifict version");
-  const plain = screen.getByRole("note");
-  expect(plain.textContent).toContain("Work in progress");
-  expect(plain.textContent).not.toContain("Recorded stage");
-  expect(plain.textContent).not.toContain("verified");
+  expect(screen.queryByText(/Work in progress/)).toBeNull();
+  expect(screen.queryByText("Draft · prototype")).toBeNull();
 });
 
 it("uses the successful mutation reply and clears only submitted fields", async () => {
@@ -198,15 +245,20 @@ it("uses the successful mutation reply and clears only submitted fields", async 
   });
   render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
   await screen.findByText("Second version");
-  fireEvent.change(screen.getByLabelText("Follow up for agent"), { target: { value: "Submitted request" } });
+  openTab("Details");
   fireEvent.change(screen.getByLabelText("Interactive state JSON"), { target: { value: '{"sort":"cost"}' } });
-  fireEvent.click(screen.getByRole("button", { name: "Send" }));
-  expect((screen.getByLabelText("Exact artifict version") as HTMLSelectElement).disabled).toBe(true);
-  fireEvent.change(screen.getByLabelText("Follow up for agent"), { target: { value: "My next request" } });
-  resolve({ ...draftArtifict, feedback: [{ id: "feedback-new", versionId: "draft-v2", text: "Submitted request", annotationIds: [], createdAt: draftVersions[1]!.createdAt, status: "submitted" }] });
-  await screen.findByText("Submitted request");
-  expect((screen.getByLabelText("Follow up for agent") as HTMLTextAreaElement).value).toBe("My next request");
-  expect((screen.getByLabelText("Interactive state JSON") as HTMLTextAreaElement).value).toBe("");
+  fireEvent.click(screen.getByRole("button", { name: "Send to agent" }));
+  const picker = screen.getByLabelText("Exact artifict version");
+  expect(picker.getAttribute("aria-disabled")).toBe("true");
+  // Disabled means it does not open, not merely that it looks dimmed.
+  fireEvent.click(picker);
+  expect(screen.queryByRole("listbox")).toBeNull();
+  fireEvent.change(screen.getByLabelText("Interactive state JSON"), { target: { value: '{"sort":"name"}' } });
+  resolve({ ...draftArtifict, feedback: [{ id: "feedback-new", versionId: "draft-v2", text: "", annotationIds: [], createdAt: draftVersions[1]!.createdAt, status: "submitted" }] });
+  // The agent's state is named on the canvas; the reply itself is in the chat.
+  expect(await screen.findByText("Sent — waiting for the agent")).toBeTruthy();
+  // A value edited after Send was not what was sent, so it is kept.
+  expect((screen.getByLabelText("Interactive state JSON") as HTMLTextAreaElement).value).toBe('{"sort":"name"}');
 });
 
 it("previews the richer kinds through the shared canvas, not just HTML and Markdown", async () => {
@@ -228,8 +280,6 @@ it("keeps the whole record in one column, with no second conversation beside it"
   // offers to open one.
   expect(workspace.querySelectorAll("aside, [aria-label='Artifict conversation']")).toHaveLength(0);
   expect(screen.queryByRole("button", { name: "Conversation" })).toBeNull();
-  // The request box is part of the record's own panel.
-  expect(screen.getByRole("region", { name: "Send to the agent" })).toBeTruthy();
 });
 
 it("keeps exactly one card live — the record the workspace is on", async () => {
@@ -244,10 +294,12 @@ it("keeps exactly one card live — the record the workspace is on", async () =>
   });
   const { container } = render(<ArtifictWorkspace taskId="task-1" taskTitle="Chat" />);
   await screen.findByText("First");
+  // The open record runs on the stage; that is the studio, not a card.
+  await waitFor(() => expect(invoke.mock.calls.filter(([command]) => command === "visualization_publish")).toHaveLength(1));
   fireEvent.click(screen.getByRole("button", { name: "All artificts" }));
   // Running every card would publish a document per artifact and start that
-  // artifact's scripts; only the one the workspace is on is rendered.
+  // artifact's scripts; only the one the studio is on is rendered.
   await waitFor(() => expect(container.querySelectorAll("iframe.artifict-thumb-frame")).toHaveLength(1));
   expect(screen.getByText("Second")).toBeTruthy();
-  expect(invoke.mock.calls.filter(([command]) => command === "visualization_publish")).toHaveLength(1);
+  expect(invoke.mock.calls.filter(([command]) => command === "visualization_publish")).toHaveLength(2);
 });

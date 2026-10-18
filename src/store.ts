@@ -5,8 +5,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { defaultMode } from "./workspaces";
 import { isRemoteClient, type SshHostView } from "./remote";
 import { AccountView, AgentDef, AppUpdateStatus, api, Assist, baseName, Bg, Boot, FileRef, Item, ModelInfo, normPath, Perm, ProviderPreset, ProviderView, SavedPrompt, Settings, SkillDef, SubInfo, TaskSummary, UltraX, withRequiredAgents, WslDistro, xOn } from "./api";
+import type { SchedulesState } from "./api";
+import { listenRaces } from "./race";
+import { BisectEvent, BisectProbe, BisectReport } from "./api";
 
-export type View = "home" | "session" | "diff" | "saved" | "pulls" | "paused" | "settings";
+export type View = "home" | "session" | "diff" | "saved" | "pulls" | "paused" | "settings" | "schedules";
 export type Menu = null | "plus" | "perm" | "branch" | "folder" | "model" | "assist" | "agents" | "route";
 
 export interface State {
@@ -51,6 +54,15 @@ export interface State {
    *  Refresh. Only ids are held: the content is always re-read through
    *  `artifict_get`, so a stale preview is never rendered from an event. */
   artificts: Record<string, Record<string, string>>;
+  /** task id → the latest checkpoint bisect's progress, folded from its
+   *  `bisect` events. Here rather than in the panel so a run (the user's or the
+   *  agent's, through its tool) keeps showing after the Review view remounts. */
+  bisect: Record<string, BisectProgress>;
+  /** task id → the artifict revision that chat's open studio is showing. Set by
+   *  the studio while it is mounted, cleared when it closes; the composer tells
+   *  the agent about it (`studioNote`) so "this", "the button" and "v3" in a
+   *  message mean what the user is looking at. */
+  studioView: Record<string, { artifictId: string; versionId: string; title: string; number: number; kind: string }>;
   view: View;
   hist: { view: View; task: string | null }[];
   /** Screens popped off `hist` by Back, newest last. Forward replays them and
@@ -70,7 +82,14 @@ export interface State {
    *  links a path to its thumbnail, including when two images have equal bytes. */
   attachFiles: Record<string, (FileRef & { imageDataUrl?: string; imageIndex?: number })[]>;
   // composer options for new tasks
-  home: { plan: boolean; ultra: boolean; ultra_wt: boolean; ultra_x: UltraX | null; perm: Perm; model: string; effort: number; worktree: boolean; docker: boolean; branch: string; subagents: boolean; assist: Assist; agents: string[]; route: string };
+  home: { plan: boolean; ultra: boolean; ultra_wt: boolean; ultra_x: UltraX | null; perm: Perm; model: string; effort: number; worktree: boolean; docker: boolean; branch: string; subagents: boolean; assist: Assist; agents: string[]; route: string;
+    /** Open the new chat on its Artificts studio and ask for a saved artifict.
+     *  One-shot, like `plan`: reset once the chat is created. */
+    artificts?: boolean;
+    /** The artifict the new chat is about, when it was started from a chat's
+     *  studio: `taskId` is that chat, which the studio browses through until
+     *  the new chat exists (artificts are read through a chat's project). */
+    studio?: { taskId: string; artifictId: string; versionId: string; title: string; number: number; kind: string } | null };
   projectInfo: { path: string; exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; docs: string[]; disabled_docs: string[]; trusted: boolean; decided: boolean } | null;
   sidebar: boolean;
   details: boolean;
@@ -118,10 +137,22 @@ export interface State {
   fork: string | null;
   /** "Send to another machine" box: the chat being sent, or null. */
   transfer: string | null;
+  /** "Move chat to…" chooser: the chat being moved, or null. */
+  move: string | null;
+  /** "Save as skill…" box: the chat being distilled, or null. Only ever set
+   *  from a user click (context menu, palette), never from a command. */
+  skillFrom: string | null;
+  /** Router activity box: the chat whose route log is on screen, or null. */
+  routerLog: string | null;
   /** Per-chat stats panel: the chat whose numbers are on screen, or null. An id
    *  rather than the record, because the numbers have to be fetched fresh and
    *  this must survive the chat being deleted underneath it. */
   chatStats: string | null;
+  /** Run-timeline panel: the chat whose timings are on screen, or null. An id
+   *  for the same reason as `chatStats` — the timeline is fetched fresh. */
+  runTimeline: string | null;
+  /** The welcome tour (`ui/Welcome.tsx`) is on screen. */
+  welcome: boolean;
   /** The folder-trust dialog is open for the current project. Raised when a
    *  folder nobody has decided about is opened, because "no decision" means
    *  "untrusted" and the user has to be told that rather than left wondering why
@@ -135,6 +166,9 @@ export interface State {
   /** Saved SSH hosts (Settings → Remote), for naming `ssh://` projects by
    *  host name. Null until first loaded (`loadSshHosts`). */
   sshHosts: SshHostView[] | null;
+  /** Scheduled runs, as the backend last published them (`schedules_list` /
+   *  `ol://schedules`). Null until the Schedules screen first loads them. */
+  schedules: SchedulesState | null;
 }
 
 /** An in-app attention notice: the window is focused, so an OS toast would be noise. */
@@ -168,7 +202,7 @@ export interface Note {
 
 let state: State = {
   ready: false, bootError: null, settings: null, providers: [], providerPresets: [], models: [], shell: "", dataDir: "", monthSpend: 0, claudeAllowed: false,
-  tasks: {}, items: {}, pendingMessages: {}, bg: {}, subItems: {}, artificts: {}, accounts: [], agents: [], skills: [], subOpen: null, pickFor: null, renaming: null,
+  tasks: {}, items: {}, pendingMessages: {}, bg: {}, subItems: {}, artificts: {}, bisect: {}, studioView: {}, accounts: [], agents: [], skills: [], subOpen: null, pickFor: null, renaming: null,
   view: "home", hist: [], fwd: [], task: null, settingsTab: "general", modelSetupOpen: false, ultraXOpen: false,
   draft: "", sessionDrafts: {}, attach: {}, attachFiles: {},
   home: { plan: false, ultra: false, ultra_wt: false, ultra_x: null, perm: "turbo", model: "anthropic/claude-opus-5", effort: 2, worktree: false, docker: false, branch: "", subagents: true, assist: "default", agents: ["explore", "general"], route: "" },
@@ -176,13 +210,14 @@ let state: State = {
   // A phone opens on the content: there the sidebar is a drawer over it.
   sidebar: !isNarrow(), details: typeof window === "undefined" || window.innerWidth >= 1100,
   pal: false, find: false, findSeed: "", swap: false, notes: {}, menu: null, menuAnchor: null, projCtx: null, toast: null, toastAction: null, openError: null, catalogError: null,
-  notices: [], picked: {}, selecting: false, mass: false, massAll: false, fork: null, transfer: null, chatStats: null,
+  notices: [], picked: {}, selecting: false, mass: false, massAll: false, fork: null, transfer: null, move: null, skillFrom: null, routerLog: null, chatStats: null, runTimeline: null, welcome: false,
   appUpdate: { status: "idle", version: null, error: null, can_install: false },
   appUpdateDismissed: null, appUpdateBusy: false, appUpdateActionError: null,
   trustPrompt: false,
   openFrom: null,
   wsl: [],
   sshHosts: null,
+  schedules: null,
 };
 
 const subs = new Set<() => void>();
@@ -446,7 +481,9 @@ export async function watchWindowState() {
     // you were away have done their job and the next event is news again.
     if (inFront && !wasInFront) toasts.forgetAll();
   };
-  const poll = window.setInterval(() => { void w.isFocused().then((f) => refresh(f)).catch(() => {}); }, 1000);
+  // Three IPC round-trips per tick for the whole life of the app; focus changes
+  // already arrive as events, so this only has to catch tray hides eventually.
+  const poll = window.setInterval(() => { void w.isFocused().then((f) => refresh(f)).catch(() => {}); }, 2500);
   trackDetach(() => window.clearInterval(poll));
   try {
     await refresh(await w.isFocused().catch(() => inFront));
@@ -568,11 +605,16 @@ export async function openTask(id: string) {
   // folded in: a run that ended while this request was in flight published its
   // "done" already, and writing this snapshot over it left the chat spinning
   // with nothing to correct it. See `newerSummary`.
-  set((s) => ({ tasks: { ...s.tasks, [id]: newerSummary(s.tasks[id], r.summary) }, items: { ...s.items, [id]: r.items }, bg: { ...s.bg, [id]: r.bg } }));
+  set((s) => ({ tasks: { ...s.tasks, [id]: newerSummary(s.tasks[id], r.summary) }, items: { ...s.items, [id]: r.items }, bg: { ...s.bg, [id]: r.bg }, ...settleNewChatEcho(s, id, r.items) }));
   historyCursor.set(id, r.cursor);
+  // Older history is fetched when the reader scrolls near the top (Session's
+  // scroll handler). The one case that handler can't reach is a first page too
+  // short to scroll at all, so only that case is filled in here. Fetching the
+  // next 100 rows unconditionally on every open more than tripled the markdown
+  // the feed had to parse before it settled, for rows nobody had asked to see.
   if (r.cursor) setTimeout(() => {
     const timeline = document.querySelector<HTMLElement>(".timeline");
-    if (timeline && state.task === id) void loadPreviousHistory(id, timeline);
+    if (timeline && state.task === id && timeline.scrollHeight <= timeline.clientHeight + 200) void loadPreviousHistory(id, timeline);
   }, 0);
   if (state.sessionDrafts[id] === undefined) {
     void api.draftGet(id).then((d) => {
@@ -595,6 +637,73 @@ export async function openTask(id: string) {
   set((s) => evictTranscripts(s, id));
 }
 
+/** The chats whose transcript this window keeps current: the one named, plus
+ *  every chat on a nav stack. Shared by eviction and by the live-event gate
+ *  below, so what is *dropped* at open time and what is *not re-created* by a
+ *  background event can never disagree. */
+function pinnedChats(s: State, keepId: string | null): Set<string> {
+  const out = new Set<string>();
+  for (const id of [keepId, ...s.hist.map((h) => h.task), ...s.fwd.map((h) => h.task)]) if (id) out.add(id);
+  return out;
+}
+
+/** Does this window show (or can it return, without a refetch, to) this chat's
+ *  transcript? Streaming events for any other chat are not worth applying.
+ *
+ *  Before this gate, every `item`/`sitem`/`bg` event for a chat running in the
+ *  background re-created the transcript `evictTranscripts` had just dropped, so
+ *  with N chats working the store re-grew N transcripts — each event copying one
+ *  whole — and every one of those writes re-ran every mounted selector. Nothing
+ *  reads those copies: opening a chat re-fetches it. */
+export function keepsTranscript(s: State, id: string): boolean {
+  return s.task === id || pinnedChats(s, null).has(id);
+}
+
+/** How many of the newest items a chat nobody is looking at still keeps.
+ *
+ *  Enough to fill a screen, so opening the chat paints its latest messages at
+ *  once and `task_open` only has to fill in behind them. Bounded, so N working
+ *  chats cost N small lists rather than N whole transcripts. */
+export const TAIL_ITEMS = 40;
+const tail = (list: Item[]): Item[] => (list.length > TAIL_ITEMS ? list.slice(-TAIL_ITEMS) : list);
+
+/** The id prefix of the stand-in user message a new chat shows the moment it
+ *  opens (see `submit` in Composer). */
+export const NEW_CHAT_ECHO = "pending-new-";
+
+/** Retire a new chat's stand-in first message once the backend has settled it:
+ *  the real `user` row arrived, or startup ended without one (the startup notice
+ *  turned into a warning, an error notice, or a row was taken back). Returns a
+ *  partial state, empty when there is nothing to retire, so it can ride inside
+ *  an existing `set`. */
+export function settleNewChatEcho(s: Pick<State, "pendingMessages">, id: string, arrived: Item[] | null): Partial<State> {
+  const list = s.pendingMessages[id];
+  if (!list?.some((item) => item.id.startsWith(NEW_CHAT_ECHO))) return {};
+  const settles = arrived === null || arrived.some((item) =>
+    item.kind === "user"
+    || (item.data?.startup === true && item.data?.working === false)
+    || (item.kind === "notice" && item.data?.level === "error"));
+  if (!settles) return {};
+  const remaining = list.filter((item) => !item.id.startsWith(NEW_CHAT_ECHO));
+  const pendingMessages = { ...s.pendingMessages };
+  if (remaining.length) pendingMessages[id] = remaining;
+  else delete pendingMessages[id];
+  return { pendingMessages };
+}
+
+/** Insert or replace one item by id. An update almost always targets the tail
+ *  (the streaming item, a tool row going running → done), so the search runs
+ *  from the end instead of walking a long transcript from the top. */
+export function upsertItem(list: Item[], item: Item): Item[] {
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]!.id !== item.id) continue;
+    const next = list.slice();
+    next[i] = item;
+    return next;
+  }
+  return [...list, item];
+}
+
 /** Drop every transcript that isn't `keepId` and isn't still on a nav stack.
  *
  *  A nav-stack entry is a chat the user can return to with one keystroke, and
@@ -611,7 +720,7 @@ export async function openTask(id: string) {
 export function evictTranscripts(s: State, keepId: string): Partial<State> {
   // A nav entry's `task` is null for the Home screen — nothing to keep there,
   // and a null key would never match a chat id anyway.
-  const pinned = new Set<string>([keepId, ...s.hist.map((h) => h.task), ...s.fwd.map((h) => h.task)].filter((id): id is string => !!id));
+  const pinned = pinnedChats(s, keepId);
   // Dropped one map at a time, and only rebuilt if something went: a plain
   // `delete` mutates in place, which zustand can't see, so the copy has to be
   // made only when there is something to remove.
@@ -622,7 +731,12 @@ export function evictTranscripts(s: State, keepId: string): Partial<State> {
     for (const k of doomed) delete next[k];
     return { next, n: doomed.length };
   };
-  const items = drop(s.items);
+  // Items are trimmed to their tail, not deleted: that is what lets the next
+  // open of a background chat show its latest messages before the fetch lands.
+  const itemsDoomed = Object.keys(s.items).filter((k) => !pinned.has(k) && s.items[k]!.length > TAIL_ITEMS);
+  const items = itemsDoomed.length
+    ? { next: { ...s.items, ...Object.fromEntries(itemsDoomed.map((k) => [k, tail(s.items[k]!)])) }, n: itemsDoomed.length }
+    : { next: s.items, n: 0 };
   const subItems = drop(s.subItems);
   const bg = drop(s.bg);
   const artificts = drop(s.artificts);
@@ -635,10 +749,12 @@ export function evictTranscripts(s: State, keepId: string): Partial<State> {
   };
 }
 
-export async function loadProject(path: string) {
+export async function loadProject(path: string, prefetched?: Awaited<ReturnType<typeof api.project>>) {
   if (!path) return set({ projectInfo: null, catalogError: null });
   try {
-    const info = await api.project(path);
+    // `openProject` has just asked for exactly this inventory; asking again
+    // ran the git and instruction-file scan a second time, back to back.
+    const info = prefetched ?? await api.project(path);
     // Guard against a stale answer: two project switches in flight can resolve
     // out of order, and the settings panel turns this inventory into per-file
     // switches whose writes go to the *current* project. Rendering one folder's
@@ -684,6 +800,25 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings |
   set({ settings });
   return settings;
 }
+
+  /** Fetch the scheduled runs into the store. Live changes arrive on
+ *  `ol://schedules`; this is the first read and a manual refresh. */
+export async function loadSchedules(): Promise<void> {
+  try {
+    receiveSchedules(await api.schedulesList());
+  } catch (e) {
+    flash(`Couldn't load schedules · ${String(e)}`);
+  }
+}
+
+/** Every schedule state source uses the same revision gate. A list request or
+ *  pause reply can finish after a newer event; applying it unconditionally would
+ *  undo that event indefinitely. Individual Schedule command replies have no
+ *  global revision and must only trigger a versioned refresh, never patch rows. */
+export function receiveSchedules(snapshot: SchedulesState) {
+  set((s) => !s.schedules || snapshot.revision >= s.schedules.revision ? { schedules: snapshot } : {});
+}
+
 
 // One Tauri listener set for the life of the app. React StrictMode (dev)
 // mounts, unmounts and remounts <App/>, so its boot effect runs twice; without
@@ -919,6 +1054,13 @@ export async function loadPreviousHistory(id: string, timeline: HTMLElement) {
   historyBusy.add(id);
   const oldHeight = timeline.scrollHeight;
   const oldTop = timeline.scrollTop;
+  // A reader at the bottom — or a transcript short enough to fit, where the top
+  // *is* the bottom — is following the live end of the chat, and older history
+  // arriving above must not move them. Keeping the distance from the top is only
+  // right for someone who scrolled up to read it: applied to the short case it
+  // threw the view up to the old messages every time a chat opened before it had
+  // pinned, or a finished turn folded its work away and left the feed short.
+  const atBottom = oldHeight - oldTop - timeline.clientHeight < 80;
   try {
     const page = await api.taskHistory(id, cursor, 100);
     // An empty page means this cursor is exhausted; asking again would spin.
@@ -932,7 +1074,14 @@ export async function loadPreviousHistory(id: string, timeline: HTMLElement) {
     });
     requestAnimationFrame(() => {
       if (!timeline.isConnected) return;
-      timeline.scrollTop = oldTop + Math.max(0, timeline.scrollHeight - oldHeight);
+      // The reader may have scrolled while the page was in flight. Holding the
+      // offset from before the request would yank them back to where they were
+      // when they asked, so keep the rows they are on now, moved down by the
+      // height added above them. A reader who was following the live end and
+      // has not moved stays pinned to it.
+      const growth = Math.max(0, timeline.scrollHeight - oldHeight);
+      const moved = timeline.scrollTop !== oldTop;
+      timeline.scrollTop = atBottom && !moved ? timeline.scrollHeight : timeline.scrollTop + growth;
     });
   } catch {
     // The next upward scroll can retry; never block the already-loaded history.
@@ -1177,7 +1326,31 @@ type TaskEvent =
   | { task_id: string; kind: "drop"; payload: { sub_id: string | null; ids: string[] } }
   | { task_id: string; kind: "itemgone"; payload: { id: string } }
   | { task_id: string; kind: "bg"; payload: Bg[] }
-  | { task_id: string; kind: "artifict"; payload: { artifict_id: string; version_id: string } };
+  | { task_id: string; kind: "artifict"; payload: { artifict_id: string; version_id: string } }
+  | { task_id: string; kind: "bisect"; payload: BisectEvent };
+
+/** A bisect run as the UI shows it. `current` is the step being probed (the
+ *  file state after edit `state`), `probes` every verdict so far in order. */
+export interface BisectProgress { generation: number; running: boolean; from: number; to: number; total: number; current: { state: number; step: number } | null; probes: BisectProbe[]; report: BisectReport | null }
+
+// Monotonic even if a refused optimistic run restores an older record. A
+// component-local counter would reset when Review remounts, letting its old IPC
+// completion overwrite a newer run with the same counter.
+let bisectGeneration = 0;
+
+/** Fold one bisect event into the progress held for that chat. A `start`
+ *  begins a fresh generation; the rest attach to whatever is held, so a panel
+ *  that mounted mid-run still shows what arrives from then on. The event stream
+ *  owns progress once its start arrives; IPC is only a no-event fallback. */
+export function foldBisect(prev: BisectProgress | undefined, e: BisectEvent): BisectProgress {
+  const base: BisectProgress = prev ?? { generation: ++bisectGeneration, running: true, from: 0, to: 0, total: 0, current: null, probes: [], report: null };
+  switch (e.phase) {
+    case "start": return { generation: ++bisectGeneration, running: true, from: e.from, to: e.to, total: e.total, current: null, probes: [], report: null };
+    case "probe": return { ...base, running: true, current: { state: e.state, step: e.step } };
+    case "probed": return { ...base, probes: [...base.probes, e.probe] };
+    case "done": return { generation: base.generation, running: false, from: e.report.from, to: e.report.to, total: e.report.total, current: null, probes: e.report.probes, report: e.report };
+  }
+}
 
 /** The whole Tauri listener set, as one detachable function. */
 async function attachListeners(): Promise<() => void> {
@@ -1206,21 +1379,18 @@ async function attachListeners(): Promise<() => void> {
       });
     } else if (e.kind === "item") {
       set((s) => {
-        const list = s.items[id] ? [...s.items[id]] : [];
-        const i = list.findIndex((x) => x.id === e.payload.id);
-        if (i >= 0) list[i] = e.payload;
-        else list.push(e.payload);
-        return { items: { ...s.items, [id]: list } };
+        // A chat nobody is looking at keeps only its newest items (`TAIL_ITEMS`),
+        // so opening it is instant. A notice card is the exception: it is drawn
+        // from any chat, so it - and its later dismissal - is never trimmed away.
+        const next = upsertItem(s.items[id] ?? [], e.payload);
+        return { items: { ...s.items, [id]: keepsTranscript(s, id) || e.payload.kind === "user_notice" ? next : tail(next) }, ...settleNewChatEcho(s, id, [e.payload]) };
       });
     } else if (e.kind === "sitem") {
       const sub: string = e.payload.sub_id, item: Item = e.payload.item;
       set((s) => {
+        if (!keepsTranscript(s, id)) return {};
         const task = s.subItems[id] ?? {};
-        const list = task[sub] ? [...task[sub]] : [];
-        const i = list.findIndex((x) => x.id === item.id);
-        if (i >= 0) list[i] = item;
-        else list.push(item);
-        return { subItems: { ...s.subItems, [id]: { ...task, [sub]: list } } };
+        return { subItems: { ...s.subItems, [id]: { ...task, [sub]: upsertItem(task[sub] ?? [], item) } } };
       });
     } else if (e.kind === "delta") {
       // Streamed text arrives in many small chunks per token. Each one used to
@@ -1250,10 +1420,12 @@ async function attachListeners(): Promise<() => void> {
       // be overwritten.
       set((s) => {
         const list = s.items[id];
-        return list ? { items: { ...s.items, [id]: list.filter((x) => x.id !== e.payload.id) } } : {};
+        // The startup notice going away means startup is over either way.
+        const echo = settleNewChatEcho(s, id, null);
+        return list ? { items: { ...s.items, [id]: list.filter((x) => x.id !== e.payload.id) }, ...echo } : echo;
       });
     } else if (e.kind === "bg") {
-      set((s) => ({ bg: { ...s.bg, [id]: e.payload } }));
+      set((s) => (keepsTranscript(s, id) ? { bg: { ...s.bg, [id]: e.payload } } : {}));
     } else if (e.kind === "artifict") {
       // Latest version per artifict, so a mounted Artificts view (or an inline
       // card) reloads exactly when the agent writes one. Ids only: the content
@@ -1261,6 +1433,10 @@ async function attachListeners(): Promise<() => void> {
       set((s) => ({
         artificts: { ...s.artificts, [id]: { ...s.artificts[id], [e.payload.artifict_id]: e.payload.version_id } },
       }));
+    } else if (e.kind === "bisect") {
+      const ev = e.payload;
+      set((s) => ({ bisect: { ...s.bisect, [id]: foldBisect(s.bisect[id], ev) } }));
+
     }
     }));
     add(listen<{ month: number }>("ol://usage", ({ payload }) => set({ monthSpend: payload.month })));
@@ -1272,11 +1448,18 @@ async function attachListeners(): Promise<() => void> {
     add(listen<Settings>("ol://settings", ({ payload }) => set({ settings: payload })));
     add(listen<AccountView[]>("ol://accounts", ({ payload }) => set({ accounts: payload })));
     add(listen<ModelInfo[]>("ol://models", ({ payload }) => set({ models: payload })));
+    add(listen<SchedulesState>("ol://schedules", ({ payload }) => receiveSchedules(payload)));
+    add(listenRaces());
     add(listen<Attention>("ol://attention", ({ payload }) => {
       const s = get();
       const task = s.tasks[payload.task_id];
       const viewing = s.task === payload.task_id && (s.view === "session" || s.view === "diff");
       if (!task) return;
+      // The chat is on screen, so this is already read. The backend marked it
+      // unread as it published the event, and the sidebar hides the dot while
+      // you are looking; only opening a chat clears the mark, so without this
+      // the dot comes back as soon as you switch to another chat.
+      if (viewing) void api.taskSeen(payload.task_id).catch(() => { /* the dot is hidden while it is on screen */ });
       // Where it goes is one decision: a focused window gets the in-app notice
       // alone (a toast would cover the chat you're reading), an unfocused one
       // gets the toast *and* the notice, so the event is still there when you
@@ -1533,7 +1716,7 @@ export async function openProject(path: string): Promise<boolean> {
   // Ask only when opening a folder, never during boot or metadata refresh.
   // Both trust and refusal are persisted by the dialog.
   set({ trustPrompt: !info.decided });
-  await loadProject(path);
+  await loadProject(path, info);
   return true;
 }
 

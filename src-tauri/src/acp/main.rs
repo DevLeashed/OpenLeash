@@ -835,7 +835,7 @@ fn tool_kind(name: &str) -> &'static str {
         "read_file" | "view_image" | "list_dir" | "glob" | "grep" => "read",
         "write_file" | "edit_file" | "multi_edit" => "edit",
         "bash" | "shell" => "execute",
-        "web_search" | "web_fetch" | "browser" => "fetch",
+        "web_search" | "web_fetch" | "http_request" | "browser" => "fetch",
         _ => "other",
     }
 }

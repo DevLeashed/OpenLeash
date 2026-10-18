@@ -2,10 +2,44 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ContainerState, DockerEnv, WorkspaceMode } from "./workspaces";
 
-export type BrowserPanelAction = { kind: "snapshot" | "back" | "refresh" } | { kind: "navigate"; url: string } | { kind: "click"; x: number; y: number } | { kind: "type"; text: string } | { kind: "key"; key: "Enter" | "Tab" } | { kind: "scroll"; delta_y: number };
-export interface BrowserPanelFrame { url: string; title: string; png: string; width: number; height: number; viewport_width: number; viewport_height: number }
+/** Keys the Browser view forwards on their own. Mirrors Rust `browser_panel::PanelKey`; printable text goes through `type`. */
+export type BrowserKey = "Enter" | "Tab" | "Backspace" | "Delete" | "Escape" | "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End" | "PageUp" | "PageDown" | "Space";
+export interface BrowserModifiers { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean }
+export interface BrowserStyleChange { property: string; value: string }
+/** Mirrors Rust `browser_panel::PanelAction` (closed: unknown kinds and fields are rejected). */
+export type BrowserPanelAction =
+  | { kind: "snapshot" | "back" | "forward" | "refresh" | "clear_preview" }
+  | { kind: "navigate"; url: string }
+  | { kind: "click"; x: number; y: number; button?: "left" | "middle" | "right"; click_count?: number }
+  | { kind: "type"; text: string }
+  | { kind: "key"; key: BrowserKey; modifiers?: BrowserModifiers }
+  | { kind: "scroll"; delta_y: number; delta_x?: number; x?: number; y?: number }
+  | { kind: "tab_new"; url?: string }
+  | { kind: "tab_switch" | "tab_close"; id: string }
+  | { kind: "dialog"; accept: boolean; text?: string }
+  | { kind: "inspect"; x: number; y: number }
+  | { kind: "preview_style"; selector: string; styles: BrowserStyleChange[] };
+export interface BrowserTab { id: string; url: string; title: string; active: boolean }
+export interface BrowserRect { x: number; y: number; width: number; height: number }
+export interface BrowserElement { ref: string; selector: string; tag: string; role: string; name: string; bbox: BrowserRect; styles: Record<string, string> }
+export interface BrowserDialog { kind: string; message: string; default_prompt: string }
+/** Mirrors Rust `browser_panel::PanelFrame`. `png` is empty while a page dialog blocks the renderer: keep the last picture. */
+export interface BrowserPanelFrame {
+  url: string; title: string; png: string; width: number; height: number; viewport_width: number; viewport_height: number;
+  tabs?: BrowserTab[]; can_back?: boolean; can_forward?: boolean; history?: string[]; dialog?: BrowserDialog | null; element?: BrowserElement | null;
+}
 export function browserPanel(taskId: string, action: BrowserPanelAction) {
   return invoke<BrowserPanelFrame>("browser_panel", { taskId, action });
+}
+/** Mirrors Rust `browser_annotate::Annotation`. `element` is absent for a dragged region. */
+export interface BrowserAnnotation {
+  comment: string; bbox: BrowserRect;
+  element?: { ref: string; selector: string; tag: string; role: string; name: string };
+  styles?: { property: string; before: string; after: string }[];
+}
+/** Send annotations made in the Browser view to the agent as one chat turn (screenshot crops attached). */
+export function browserAnnotate(taskId: string, annotations: BrowserAnnotation[]) {
+  return invoke<void>("browser_annotate", { taskId, annotations });
 }
 
 
@@ -20,7 +54,72 @@ export type Assist = "guide" | "default" | "necessary";
 export type ToolGroup = string | { name: string; file_regex?: string; description?: string };
 export interface AgentDef { id: string; name: string; description: string; prompt: string; model: string; tools: "all" | "read_only" | "no_shell"; color: string; builtin: boolean; source: string; inject_instructions?: boolean; effort?: number | null; groups?: ToolGroup[] }
 export interface SkillDef { name: string; description: string; source: string; path: string; enabled: boolean; files: number; disable_model_invocation?: boolean; user_invocable?: boolean }
-export interface Route { id: string; name: string; heads: string[]; all: boolean; steps: string[]; on_exhausted: "pause" | "fail" }
+/** "Save as skill…": a SKILL.md the model drafted from one chat, for the user
+ *  to edit before anything is written (`skill_draft_from_chat`). */
+export interface SkillDraft {
+  /** Suggested folder-safe name; "" when the model gave nothing usable. */
+  name: string; description: string;
+  /** Markdown body without frontmatter. */
+  body: string;
+  /** Notes to show prominently, e.g. what was redacted. */
+  warnings: string[]; model: string;
+  /** The chat's project folder; "" when it has none or is remote. */
+  project: string;
+  /** Project skills only load in trusted folders. */
+  project_trusted: boolean;
+  user_dir: string; project_dir: string;
+}
+export type SkillScope = "user" | "project";
+export interface SkillSaveReq { id: string; name: string; description: string; body: string; scope: SkillScope; overwrite: boolean; allow_secrets: boolean }
+/** `saved` false means nothing was written: `exists` and `secrets` say what
+ *  needs the user's confirmation before resending. */
+export interface SkillSaveResult { saved: boolean; exists: boolean; secrets: string[]; path: string; note: string }
+export interface Route { id: string; name: string; heads: string[]; all: boolean; steps: string[]; on_exhausted: "pause" | "fail";
+  description?: string;
+  /** Models ordered weakest → strongest, for escalate / de-escalate. */
+  ladder?: string[];
+  rules?: RouteRule[] }
+/** One ordered rule of a router; the first enabled match acts. */
+export interface RouteRule { id: string; name: string; enabled: boolean; match: "all" | "any"; when: RouteCondition[]; then: RouteAction; note?: string }
+export type RouteConditionKind = "stuck" | "errors_in_row" | "no_progress" | "agent" | "context" | "images" | "plan" | "keyword" | "headroom" | "budget" | "time" | "model" | "turns" | "always";
+/** Which fields are read depends on `kind` (a string, so a kind written by a
+ *  newer build survives a round trip); the backend ignores the rest. */
+export interface RouteCondition { kind: string; not?: boolean;
+  /** stuck: same failing call N× (default 2); errors_in_row: N failing calls in a row (3); no_progress: N rounds without a successful edit (5); turns: at least N turns (1). */
+  count?: number;
+  /** stuck / errors_in_row: only these tools count (empty = any). */
+  tools?: string[];
+  /** agent: "main", "subagent", subagent type ids, or system kinds (`ROUTER_SYSTEM_AGENTS`). */
+  agents?: string[];
+  /** context: estimated prompt tokens, inclusive bounds (0 = unbounded); min_pct = percent of the base model's window. */
+  min_tokens?: number; max_tokens?: number; min_pct?: number;
+  /** keyword: searched in the latest user message. */
+  pattern?: string; regex?: boolean; case_sensitive?: boolean;
+  /** headroom: pool kind (empty = the base model's provider) has less than below_pct % left. */
+  provider?: string; below_pct?: number;
+  /** budget: at least above_pct % of the monthly budget spent. */
+  above_pct?: number;
+  /** time: local "HH:MM" window (from > to wraps midnight); days 0 = Mon … 6 = Sun, empty = every day. */
+  from?: string; to?: string; days?: number[];
+  /** model: the base model is one of these ("prefix*" = prefix match). */
+  models?: string[];
+}
+export interface RouteAction { kind: "use" | "escalate" | "deescalate" | "effort" | "stay" | (string & {});
+  model?: string;
+  /** escalate / deescalate: ladder steps (default 1). */
+  steps?: number;
+  /** 0 = Max … 4 = Low (`EFFORTS`); null = unchanged. */
+  effort?: number | null;
+  /** 0 = this request only; K = hold for K turns, then revert. */
+  turns?: number }
+export interface RouteHold { model: string; effort: number | null; turns_left: number; rule_id: string; rule_name: string; reason: string; from_model: string; action: string }
+/** Everything a rule can look at, for one request. */
+export interface RouteSituation { agent: string; sub: boolean; turn: boolean; base_model: string; base_effort: number; base_context: number; plan: boolean; images: boolean; context_tokens: number; user_text: string; repeat_failures: number; failing_tool: string; errors_in_row: number; last_error_tool: string; no_progress_turns: number; turns: number; headroom: Record<string, number>; budget_used_pct: number | null; minute_of_day: number; weekday: number; hold: RouteHold | null }
+export interface RouteCondTrace { kind: string; matched: boolean; detail: string }
+export interface RouteRuleTrace { rule_id: string; rule_name: string; enabled: boolean; matched: boolean; skipped: string; conditions: RouteCondTrace[] }
+export interface RouteDecision { model: string; effort: number; action: "base" | "use" | "escalate" | "deescalate" | "effort" | "stay" | "hold" | "revert" | (string & {}); rule_id: string; rule_name: string; reason: string; hold: RouteHold | null; consume_stuck: boolean; trace: RouteRuleTrace[] }
+/** One switch the router made in a chat, for the audit view. `at` is unix seconds. */
+export interface RouteEvent { at: number; agent: string; agent_kind: string; from: string; to: string; effort_from: number; effort_to: number; action: string; rule_id: string; rule_name: string; reason: string }
 export interface Window { label: string; used: number; resets_at: number }
 /** A ceiling the user put on one usage window: the harness stops using that
  *  account once the window reaches `used` percent.
@@ -117,6 +216,8 @@ export interface ToolInput {
   path?: string; pattern?: string; glob?: string; to?: string; message?: string;
   ids?: string[]; mode?: string; edits?: unknown[]; command?: string; id?: string;
   url?: string; query?: string; queries?: string[]; urls?: string[]; action?: string;
+  /** `http_request`: url/headers/body arrive already redacted by the backend. */
+  method?: string; headers?: Record<string, string>; body?: string; json?: unknown;
   name?: string; kind?: string; summary?: string; file?: string; monitor?: number | string;
   selector?: string; text?: string; js?: string; number?: number; title?: string;
   repo?: string; actions?: ToolAction[]; run_in_background?: boolean; content?: string;
@@ -201,6 +302,19 @@ export interface SavedPrompt {
 
 export interface CustomCommand { name: string; description: string; prompt: string }
 
+/** One low-priority prompt waiting for spare subscription quota. `model` empty =
+ *  any subscription provider; `perm` empty = the default mode, and never
+ *  stronger than it (the backend clamps). `error` = why the last start failed. */
+export interface BacklogItem { id: string; project: string; prompt: string; model: string; perm: string; created_at: number; error: string }
+export interface BurnerCfg { enabled: boolean; reset_within_min: number; min_headroom: number; spend_cap: number; queue: BacklogItem[] }
+export const BURNER_DEFAULTS: BurnerCfg = { enabled: false, reset_within_min: 30, min_headroom: 20, spend_cap: 90, queue: [] };
+/** A chat the quota burner started. `ended_at` 0 = still running. */
+export interface BurnRun { task_id: string; item_id: string; project: string; prompt: string; model: string; perm: string; account_id: string; account_label: string; kind: string; window: string; resets_at: number; started_at: number; ended_at: number; end_reason: string }
+export interface BurnerAccount { account_id: string; label: string; kind: string; head: boolean; window: Window | null; reason: string }
+export interface BurnerStatus { runs: BurnRun[]; accounts: BurnerAccount[] }
+
+/** One swap-dialog row: agents on `from` at level `from_effort` move to `to`, and onto `to_effort` when set. */
+export interface SwapRule { from: string; from_effort: number; to: string; to_effort: number | null }
 export interface Settings {
   model: string; effort: number; perm: Perm; worktree: boolean; subagents: boolean;
   /** Automatically rebuild Docker images when config changes; defaults on for old settings. */
@@ -225,6 +339,9 @@ export interface Settings {
   /** Sidebar lists chats from every project folder, not just the current one. */
   all_projects: boolean;
   /** Show the optional GitHub pull-request screen beside Saved prompts. */
+  show_schedules?: boolean;
+  /** Wizard for the first-run welcome; absent before the wizard existed. */
+  welcome_seen?: boolean;
   show_pull_requests?: boolean;
   /** Order of the Saved prompts list: "newest", "folder" or "az". */
   saved_sort?: string;
@@ -241,15 +358,18 @@ export interface Settings {
    *  telemetry on by another name: the user names a collector *they* run, and
    *  nothing is sent anywhere else. */
   trace_endpoint?: string;
+  /** "Spend quota before it resets" (Settings → Accounts). Absent on settings
+   *  saved before it existed, which reads as off with an empty queue. */
+  burner?: BurnerCfg;
   /** Keep chats ordered automatically by attention and recent activity, even after a manual drag. On by default. */
   automatic_chat_reorder?: boolean;
   /** Resume chats paused when provider accounts/keys were exhausted after one becomes available. On by default. */
   automatic_resume?: boolean;
-  /** Let the agent keep per-project notes across chats. Off by default. */
+  /** Long-term memory: global notes about the user plus per-project notes,
+   *  loaded into every new chat. On by default; absent reads as on. */
   memory?: boolean;
   /** Let an agent search the user's other chats, see what each is doing, and
-   *  send one of them a message. Off by default: this is the one capability
-   *  that reaches outside the chat the user opened. */
+   *  send one of them a message. On by default. */
   cross_chat?: boolean;
   /** State of the built-in `.env` read deny shown in Settings. */
   deny_env_files?: boolean;
@@ -277,6 +397,8 @@ export interface Settings {
   cache_keepalive?: boolean;
   /** Maximum number of keepalive pings per task. */
   cache_keepalive_pings?: number;
+  /** Keep a chat's row in Stats after the chat is deleted. On unless set false. */
+  keep_chat_stats?: boolean;
 }
 
 export type HookEvent =
@@ -319,7 +441,16 @@ export const ATTRIBUTIONS: { id: Attribution; label: string; hint: string }[] = 
   { id: "generated-with", label: "Generated with", hint: "Adds a “Generated with OpenLeash” line, as some CLI agents do" },
   { id: "none", label: "None", hint: "No attribution trailer on agent-made commits" },
 ];
-export interface Plugins { github: { enabled: boolean; client_id?: string }; computer: { enabled: boolean; settle_ms: number }; browser: { enabled: boolean; width: number; height: number } }
+export interface ServicePluginCfg { enabled: boolean; base_url?: string; email?: string }
+export type ServicePluginId = "linear" | "jira" | "slack" | "notion" | "gitlab";
+export interface ServiceTestResult { ok: boolean; identity?: string; source?: string; error?: string }
+export interface Plugins {
+  github: { enabled: boolean; client_id?: string }; computer: { enabled: boolean; settle_ms: number }; browser: BrowserPluginCfg;
+  /** Absent in settings written before these plugins existed; treat as off. */
+  linear?: ServicePluginCfg; jira?: ServicePluginCfg; slack?: ServicePluginCfg; notion?: ServicePluginCfg; gitlab?: ServicePluginCfg;
+}
+/** Mirrors Rust `plugins::BrowserCfg`. Per-site exceptions are permission rules (`browser:site <host>`, `browser:ask <host>`, `!browser:site <host>`, `browser:lan <host>`), not fields here. */
+export interface BrowserPluginCfg { enabled: boolean; width: number; height: number; persistent_profile: boolean; headed: boolean; developer_mode: boolean; interactions: "ask" | "allow" | "block"; download_dir: string }
 
 /** Folder trust. A folder with no decision is untrusted until the user says otherwise. */
 export type TrustKind = "folder" | "parent";
@@ -350,6 +481,8 @@ export interface PluginsStatus {
   github: { ok: boolean; source: string | null; login?: string; error?: string };
   computer: { ok: boolean; error?: string; monitors: { name: string; w: number; h: number; primary: boolean; /** Whether the agent may move the cursor on this display: the primary one, unrotated. The others can be looked at but not clicked. */ driveable: boolean; rotation: number; x: number; y: number }[] };
   browser: { ok: boolean; error?: string; browser?: string };
+  /** Whether each service-plugin credential is saved in settings, e.g. `secrets.slack.user_token`. */
+  secrets?: Partial<Record<ServicePluginId, Record<string, boolean>>>;
 }
 
 export interface Boot { settings: Settings; providers: ProviderView[]; provider_presets: ProviderPreset[]; models: ModelInfo[]; tasks: TaskSummary[]; accounts: AccountView[]; agents: AgentDef[]; skills: SkillDef[]; shell: string; data_dir: string; month_spend: number; user_notices?: Record<string, Item[]>; /** Whether a file named `ALLOW_CLAUDE` sits beside the executable, opting this install into the Claude subscription integration. Absent from an older backend, which reads as "not opted in". */ claude_allowed?: boolean }
@@ -358,7 +491,60 @@ export interface Boot { settings: Settings; providers: ProviderView[]; provider_
  *  backend keeps, plus the running token total. Survives a stats reset, so it
  *  is not derivable from `stats_get`. */
 export interface UsageView { month: number; spend: Record<string, number>; tokens: number; budget: number }
+/** One lane of a chat's run timeline (`task_run_timeline`): the main agent
+ *  (`id: "main"`), one per subagent (`id` = its sub id, nested by `parent`/
+ *  `depth`), and `"bg"` for background commands. `item` is the transcript row
+ *  that stands for the lane (a subagent's pill in the main transcript). */
+export interface RunLane { id: string; label: string; role: string; parent: string; depth: number; status: string; item: string; start_ms: number | null; end_ms: number | null; rows: number }
+/** One block on a lane. `kind`: `model` (one request attempt), `tool`, `wait`
+ *  (`name`: approval | question | pause | park | retry), or `bg`. `row` stacks
+ *  blocks that overlap on one lane (parallel tool calls). `estimated` = derived
+ *  from transcript timestamps because the chat predates recorded timings; `open`
+ *  = still running, and `end_ms` is then the backend's `now_ms`. `item` is the
+ *  transcript row to jump to (empty when none is known); a block on a subagent
+ *  lane names a row in that subagent's own transcript. */
+export interface RunBlock {
+  lane: string; row: number; kind: "model" | "tool" | "wait" | "bg"; name: string;
+  start_ms: number; end_ms: number; open: boolean; status: string; item: string; estimated: boolean;
+  account?: string; role?: string; ttft_ms?: number | null; input?: number; output?: number;
+  cache_read?: number; cache_write?: number; cost?: number; attempt?: number; fallback?: boolean; detail?: string;
+}
+export interface RunModelTotal { model: string; requests: number; failed: number; cost: number; ms: number; input: number; output: number; cache_read: number; cache_write: number }
+export interface RunSlowTool { name: string; ms: number; lane: string; item: string; start_ms: number }
+/** Exclusive wall-clock split: every instant of `wall_ms` is counted once, in
+ *  the first of you → paused → model → retry → tool → idle that was active on
+ *  any lane, so the parts add up to the wall time. */
+export interface RunTotals {
+  wall_ms: number; you_ms: number; paused_ms: number; model_ms: number; retry_ms: number; tool_ms: number; idle_ms: number; bg_ms: number;
+  requests: number; failed_requests: number; retries: number; fallbacks: number; tool_calls: number; tool_errors: number;
+  cost: number; task_cost: number; by_model: RunModelTotal[]; slowest_tools: RunSlowTool[];
+}
+export interface RunTimeline { task_id: string; start_ms: number | null; end_ms: number | null; now_ms: number; recorded: boolean; partial: boolean; lanes: RunLane[]; blocks: RunBlock[]; totals: RunTotals }
 export interface FileDiff { path: string; status: string; add: number; del: number; lines: { k: "a" | "d" | "c" | "h"; t: string }[] }
+/** One before/after screenshot pair of a URL the agent asked to compare.
+ *  `before`/`after` are absolute local PNG paths; `*_at` are RFC3339. */
+export interface VisualEntry { url: string; before: string; after: string | null; before_at: string; after_at: string | null }
+export interface VisualDiff { entries: VisualEntry[] }
+/** One numbered step of a chat's edit history, as checkpoint bisect walks it.
+ *  `index` is 1-based. Most steps are agent file edits; `tool === "external"`
+ *  is the files that changed between two agent edits by something else (a shell
+ *  command, the user): `item_id` is then empty and `path` a short summary. */
+export interface BisectEdit { index: number; item_id: string; sub_id: string | null; msg_index: number; tool: string; path: string; add: number; del: number; lines: { k: "a" | "d" | "c" | "h"; t: string }[] }
+export type BisectVerdict = "good" | "bad" | "timeout" | "flaky" | "error";
+/** One run of the test command against the file state after step `state`
+ *  (`from - 1` is the state before the range). */
+export interface BisectProbe { state: number; verdict: BisectVerdict; code: number | null; ms: number; output: string }
+export type BisectOutcome = "found" | "all_good" | "already_bad" | "inconclusive" | "cancelled";
+export interface BisectReport { outcome: BisectOutcome; culprit: BisectEdit | null; candidates: BisectEdit[]; probes: BisectProbe[]; from: number; to: number; total: number; message: string }
+/** The steps a bisect could walk. Their `lines` are empty here (no diffs);
+ *  `available: false` comes with the `reason` a bisect cannot run. */
+export interface BisectEditsInfo { edits: BisectEdit[]; available: boolean; reason: string }
+/** Live progress of a bisect, on `ol://event` with `kind: "bisect"`. */
+export type BisectEvent =
+  | { phase: "start"; from: number; to: number; total: number }
+  | { phase: "probe"; state: number; step: number }
+  | { phase: "probed"; probe: BisectProbe }
+  | { phase: "done"; report: BisectReport };
 
 /** One file a checkpoint changed, measured from the shadow-git snapshot. */
 export interface CheckpointFile { path: string; status: string; add: number; del: number }
@@ -417,6 +603,26 @@ export type ResumeMode = "continue" | "summarise" | "wrap";
  *  app can learn a real path: the browser `File` object deliberately has none. */
 export interface FileRef { path: string; name: string; size: number; isDir: boolean; image: boolean }
 
+/** Scheduled / recurring agent runs (`~/.openleash/schedules.json`). Each fire
+ *  starts a normal chat titled "⏰ <name>". */
+export type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+export type ScheduleTiming =
+  | { kind: "interval"; every: number; unit: "minutes" | "hours" }
+  | { kind: "daily"; time: string }
+  | { kind: "weekly"; days: Weekday[]; time: string };
+export interface ScheduleRun { at: string; status: "started" | "skipped" | "failed"; message: string; task_id: string | null }
+export interface Schedule {
+  id: string; name: string; enabled: boolean; prompt: string; project: string;
+  model: string; effort: number; perm: Perm; plan: boolean;
+  workspace: "local" | "worktree"; base_branch: string;
+  timing: ScheduleTiming; catch_up: boolean; created_at: string;
+  next_run_at: string | null; last_run_at: string | null;
+  last_status: "" | "started" | "skipped" | "failed"; last_message: string;
+  last_task_id: string | null; history: ScheduleRun[];
+}
+export interface SchedulesState { revision: number; paused: boolean; schedules: Schedule[] }
+export type ScheduleDraft = Omit<Schedule, "id" | "created_at" | "next_run_at" | "last_run_at" | "last_status" | "last_message" | "last_task_id" | "history"> & { id?: string };
+
 export interface AppUpdateStatus {
   status: "idle" | "checking" | "available" | "downloading" | "ready" | "error" | "current";
   version: string | null;
@@ -439,6 +645,8 @@ export const api = {
   tasks: () => invoke<TaskSummary[]>("tasks_list"),
   task: (id: string) => invoke<{ summary: TaskSummary; items: Item[]; sub_items: Record<string, Item[]>; bg: Bg[] }>("task_get", { id }),
   taskOpen: (id: string) => invoke<TaskOpenPage>("task_open", { id }),
+  /** The chat is on screen and got attention, so it is already read: clears the backend's unread mark. */
+  taskSeen: (id: string) => invoke<void>("task_seen", { id }),
   taskHistory: (id: string, cursor: string | null, limit = 100) => invoke<TaskHistoryPage>("task_history", { id, cursor, limit }),
   /** A subagent's report, fetched when its panel opens: the live `task` event
    *  leaves reports out, because they are large and rarely change. */
@@ -458,6 +666,8 @@ export const api = {
   update: (id: string, patch: TaskPatch) => invoke<TaskSummary>("task_update", { id, patch }),
   stats: () => invoke<import("./ui/Stats").StatsData>("stats_get"),
   statsReset: () => invoke<void>("stats_reset"),
+  /** Drop the per-chat stats rows of deleted and archived chats; returns how many. */
+  statsPruneChats: () => invoke<number>("stats_prune_chats"),
   /** One chat's stats, by id — the panel behind "Stats…" in a chat's context
    *  menu. Its own command because `stats_get` returns the whole ledger and
    *  opening one chat's numbers does not need the rest of it.
@@ -466,6 +676,10 @@ export const api = {
    *  out of the cap the backend keeps. An empty title means the chat itself is
    *  gone — its numbers are kept after deletion on purpose. */
   statsChat: (id: string) => invoke<[string, import("./ui/Stats").ChatStat] | null>("stats_chat", { id }),
+  /** Where one chat's run spent its time and money, assembled from the timings
+   *  recorded with the task (`agent/spans.rs`). A chat from before those were
+   *  recorded comes back `partial`, with blocks estimated from its transcript. */
+  runTimeline: (id: string) => invoke<RunTimeline>("task_run_timeline", { id }),
   draftGet: (key: string) => invoke<string>("draft_get", { key }),
   draftSet: (key: string, text: string) => invoke<void>("draft_set", { key, text }),
   /** Resolve picked/dropped absolute paths into attachments. `cwd` is the
@@ -500,6 +714,7 @@ export const api = {
   tasksDismissPause: (ids: string[]) => invoke<number>("tasks_dismiss_pause", { ids }),
   tasksMessage: (ids: string[], text: string, later = false) => invoke<number>("tasks_message", { ids, text, later }),
   accounts: () => invoke<AccountView[]>("accounts_list"),
+  burnerStatus: () => invoke<BurnerStatus>("burner_status"),
   accountImport: (kind: string, text: string) => invoke<AccountView[]>("account_import", { kind, text }),
   accountImportLocal: (kind: string, path?: string) => invoke<AccountView[]>("account_import_local", { kind, path: path || null }),
   accountUpdate: (id: string, patch: { label?: string; priority?: number; enabled?: boolean; move?: number }) => invoke<AccountView[]>("account_update", { id, patch }),
@@ -518,7 +733,12 @@ export const api = {
    * Returns how many went in. */
   exportTasks: (ids: string[], path: string) => invoke<number>("tasks_export", { ids, path }),
   exportAll: (path: string, includeArchived: boolean) => invoke<number>("tasks_export_all", { path, includeArchived }),
-  importTasks: (path: string) => invoke<TaskSummary[]>("tasks_import", { path }),
+  /** Open an exported chat file as new chats. The chats are sanitised like a transfer from
+   * another machine; `project` forces a folder, else each lands in the matching project here
+   * (or the home folder, with an entry in `warnings`). */
+  importTasks: (path: string, project: string | null = null) => invoke<{ chats: TaskSummary[]; warnings: string[] }>("tasks_import", { path, project }),
+  /** Point a stopped chat at another existing folder on this machine. */
+  changeFolder: (id: string, folder: string) => invoke<void>("task_change_folder", { id, folder }),
   deleteArchived: () => invoke<number>("tasks_delete_archived"),
   /** Put the ticked chats away at once. The bulk half of `update(id,
    * {archived: true})`; returns how many were actually archived, so a tick that
@@ -534,6 +754,9 @@ export const api = {
   skillRemove: (name: string) => invoke<SkillDef[]>("skill_remove", { name }),
   skillSetEnabled: (name: string, enabled: boolean) => invoke<SkillDef[]>("skill_set_enabled", { name, enabled }),
   skillRead: (name: string, project?: string) => invoke<{ skill: SkillDef; content: string; files: string[] }>("skill_read", { name, project: project || null }),
+  skillDraftFromChat: (id: string, model?: string) => invoke<SkillDraft>("skill_draft_from_chat", { id, model: model || null }),
+  skillDraftCancel: (id: string) => invoke<void>("skill_draft_cancel", { id }),
+  skillSaveFromChat: (req: SkillSaveReq) => invoke<SkillSaveResult>("skill_save_from_chat", { req }),
   providerInsist: (id: string, insist: boolean) => invoke<ProviderView[]>("provider_insist", { id, insist }),
   remove: (id: string, removeWorktree: boolean) => invoke<void>("task_delete", { id, removeWorktree }),
   rewind: (id: string, itemId: string) => invoke<string>("task_rewind", { id, itemId }),
@@ -554,7 +777,23 @@ export const api = {
   queueSendNow: (id: string, itemId: string) => invoke<void>("task_queue_send_now", { id, itemId }),
   queueSendAll: (id: string) => invoke<void>("task_queue_send_all", { id }),
   review: (id: string) => invoke<{ git: boolean; files: FileDiff[] }>("task_review", { id }),
+  /** Just the totals of `review` (files changed, lines added/removed), without the diff lines. */
+
+  visualDiff: (id: string) => invoke<VisualDiff>("task_visual_diff", { id }),
+  /** Re-capture every entry's "after" shot in a headless browser. Rejects with
+   *  a readable reason (e.g. the browser plugin is off). */
+  visualRecapture: (id: string) => invoke<VisualDiff>("task_visual_recapture", { id }),
+  /** Discard this chat's visual diff and its files. */
+  visualClear: (id: string) => invoke<null>("task_visual_clear", { id }),
+
+  reviewStats: (id: string) => invoke<{ files: number; add: number; del: number }>("task_review_stats", { id }),
   revertFile: (id: string, path: string) => invoke<void>("task_revert_file", { id, path }),
+  bisectEdits: (id: string) => invoke<BisectEditsInfo>("task_bisect_edits", { id }),
+  /** Resolves with the final report; rejects with the refusal (a Deny rule,
+   *  plan mode, another bisect running, a bad range). `timeout` is in ms. */
+  bisectRun: (id: string, opts: { command: string; from?: number | null; to?: number | null; timeout?: number | null; runs?: number | null; share?: string[] | null }) =>
+    invoke<BisectReport>("task_bisect_run", { id, command: opts.command, from: opts.from ?? null, to: opts.to ?? null, timeout: opts.timeout ?? null, runs: opts.runs ?? null, share: opts.share ?? null }),
+  bisectCancel: (id: string) => invoke<boolean>("task_bisect_cancel", { id }),
   commit: (id: string, message: string) => invoke<string>("task_commit", { id, message }),
   /** Draft a Conventional Commits message for the current change.
    *  `source` is "model" when a model wrote it and "fallback" when there was no
@@ -585,22 +824,30 @@ export const api = {
   mcpOauthWait: (flowId: string) => invoke<void>("mcp_oauth_wait", { flowId }),
   mcpOauthCancel: (flowId: string) => invoke<void>("mcp_oauth_cancel", { flowId }),
   mcpOauthDisconnect: (name: string) => invoke<void>("mcp_oauth_disconnect", { name }),
+
   /** What the swap dialog lists. `rows` is one entry per model actually in use.
    *  `agents` names the subagent types a `spread` would reach — only the global
    *  dialog gets them, and only so the opt-in can say what it is about to touch. */
+  /** The switches the router has made in a chat, oldest first. */
+  routeLog: (id: string) => invoke<RouteEvent[]>("route_log", { id }),
   modelsInUse: (id?: string) => invoke<{ rows: { model: string; effort: number; uses: string[] }[]; agents: { id: string; name: string }[] }>("models_in_use", { id: id ?? null }),
   /** `effort` is keyed by the model being swapped *away from*, like `map`: the
    *  reasoning level picked for the destination travels with that row. `spread`
    *  is the separate "and the subagent types too" opt-in: without it nothing a
    *  future spawn of an agent type would read is touched. */
-  modelsSwap: (map: Record<string, string>, id?: string, effort?: Record<string, number>, spread?: boolean) => invoke<Settings>("models_swap", { id: id ?? null, map, effort: effort ?? null, spread: spread ?? false }),
+  modelsSwap: (map: Record<string, string>, id?: string, effort?: Record<string, number>, spread?: boolean, rules?: SwapRule[]) => invoke<Settings>("models_swap", { id: id ?? null, map, effort: effort ?? null, spread: spread ?? false, rules: rules ?? null }),
   githubPrs: (project: string, state: "open" | "closed" | "all" = "open") => invoke<{ repo: string; prs: { number: number; title: string; state: string; draft: boolean; html_url: string; user: string; head: string; base: string; updated_at: string }[] }>("github_list_prs", { project, state }),
   pluginsStatus: () => invoke<PluginsStatus>("plugins_status"),
   githubLoginStart: () => invoke<{ user_code: string; verification_uri: string; device_code: string; interval: number; expires_in: number }>("github_login_start"),
   githubLoginWait: (deviceCode: string, interval: number, expiresIn: number) => invoke<string>("github_login_wait", { deviceCode, interval, expiresIn }),
   githubLoginCancel: () => invoke<void>("github_login_cancel"),
   githubToken: (token: string) => invoke<void>("plugin_github_token", { token }),
+  /** Save (or, with "", remove) a service-plugin credential such as (`slack`, `user_token`). */
+  pluginSecretSet: (plugin: ServicePluginId, field: string, value: string) => invoke<void>("plugin_secret_set", { plugin, field, value }),
+  /** "Test connection": who the credentials authenticate as. Never returns a token. */
+  pluginServiceTest: (plugin: ServicePluginId) => invoke<ServiceTestResult>("plugin_service_test", { plugin }),
   project: (path: string) => invoke<{ path: string; exists: boolean; git: boolean; branch: string; branches: string[]; memory: string[]; docs: string[]; disabled_docs: string[]; trusted: boolean; decided: boolean }>("project_info", { path }),
+  projectBranchCreate: (path: string, name: string, base: string) => invoke<string[]>("project_branch_create", { path, name, base }),
   /** Installed WSL distros (Windows only; empty elsewhere or without WSL). */
   wslList: () => invoke<WslDistro[]>("wsl_list"),
   /** Where the folder dialog should start inside a distro: its one user's home, else `/home`. */
@@ -622,15 +869,24 @@ export const api = {
   /** Forget a folder's decisions, so it reads as never-decided (untrusted). */
   trustClear: (path: string) => invoke<Settings>("trust_clear", { path }),
   usage: () => invoke<UsageView>("usage_get"),
+
   /** Raise a desktop toast that opens `taskId` when clicked. The backend builds
    *  the toast document itself so it can carry the chat id as the `launch`
    *  argument — the plugin's own toast path has nowhere to put one, which is why
    *  its toasts could be delivered but never clicked. */
   toast: (taskId: string, title: string, body: string) => invoke<void>("toast_show", { taskId, title, body }),
+  routeDryRun: (route: Route, situation: RouteSituation) => invoke<RouteDecision>("route_dry_run", { route, situation }),
+  routeSituation: (id: string, agent: string | null = null) => invoke<RouteSituation>("route_situation", { id, agent }),
   /** The chat a toast click asked for before the window was listening, or null.
    *  Call once the `ol://toast-click` listener is attached: the call is what
    *  tells the backend clicks may be emitted from now on. */
   takeToastClick: () => invoke<string | null>("take_toast_click"),
+  schedulesList: () => invoke<SchedulesState>("schedules_list"),
+  scheduleSave: (schedule: ScheduleDraft) => invoke<Schedule>("schedule_save", { schedule }),
+  scheduleDelete: (id: string) => invoke<void>("schedule_delete", { id }),
+  scheduleSetEnabled: (id: string, enabled: boolean) => invoke<Schedule>("schedule_set_enabled", { id, enabled }),
+  scheduleRunNow: (id: string) => invoke<Schedule>("schedule_run_now", { id }),
+  schedulesSetPaused: (paused: boolean) => invoke<SchedulesState>("schedules_set_paused", { paused }),
 };
 
 export const EFFORTS = ["Max", "Extra High", "High", "Medium", "Low"];
@@ -807,3 +1063,56 @@ export function withRequiredAgents(ids: string[]): string[] {
   for (const r of REQUIRED_AGENTS) if (!out.includes(r)) out.push(r);
   return out;
 }
+
+// ── Best-of-N race ─────────────────────────────────────────────────────────
+// One prompt, N independent attempts (each its own chat in its own git
+// worktree), then project checks and a read-only judge rank them. Mirrors the
+// Rust `race` module's serialized types; keep the field names aligned.
+
+/** One attempt's model and effort (0 = max … 4 = low, as on a task). */
+export interface RaceAttemptSpec { model: string; effort: number }
+export interface NewRace {
+  prompt: string; project: string; base_branch: string; perm: Perm; plan: boolean; assist: Assist; agents: string[]; route?: string;
+  attempts: RaceAttemptSpec[]; judge_model: string; judge_effort: number;
+  images?: string[]; image_names?: string[]; files?: string[];
+}
+export interface RaceCheck { label: string; cmd: string; ok: boolean; output: string }
+export interface RaceAttempt { task_id: string; model: string; effort: number; checks: RaceCheck[]; checked: boolean }
+export interface RaceRank { task_id: string; rank: number; score: number | null; reason: string }
+export interface RaceJudge { model: string; ranking: RaceRank[]; summary: string; at: string; cost: number; error: string | null }
+export type RaceState = "running" | "checking" | "judging" | "judged" | "failed";
+export interface Race {
+  id: string; prompt: string; project: string; base_branch: string; created_at: string; attempts: RaceAttempt[];
+  judge_model: string; judge_effort: number; state: RaceState; judge: RaceJudge | null;
+  winner: string | null; merged: string | null; error: string | null;
+  /** Put away with its attempt chats; `archived_chats` is what archiving moved, which a restore brings back. */
+  archived: boolean; archived_chats: string[];
+}
+export interface RaceAttemptStats { task_id: string; files: number; add: number; del: number; error: string | null }
+export interface RaceDetail { race: Race; stats: RaceAttemptStats[] }
+/** The `ol://race` payload: a race as it is now, or the id of one that was forgotten. */
+export type RaceEvent = Race | { id: string; removed: true };
+
+export const MIN_RACE_ATTEMPTS = 2;
+export const MAX_RACE_ATTEMPTS = 6;
+
+export const raceApi = {
+  /** Start N attempts at once. Rejects unless 2–6 attempts and a git project. */
+  create: (req: NewRace) => invoke<{ race: Race; tasks: TaskSummary[] }>("race_create", { req }),
+  list: () => invoke<Race[]>("race_list"),
+  /** The race plus live diff stats per attempt. Slow-ish: on open and refresh only. */
+  detail: (id: string) => invoke<RaceDetail>("race_detail", { id }),
+  /** Run the checks and the judge in the background. Rejects with "budget:…"
+   *  when the monthly cap is reached; `force` is the user's go-ahead past it. */
+  judge: (id: string, model: string | null, force = false) => invoke<Race>("race_judge", { id, model, force }),
+  /** Mark (or with null clear) the winner. Does not merge. */
+  pick: (id: string, taskId: string | null) => invoke<Race>("race_pick", { id, taskId }),
+  /** Commit the winner worktree's pending changes and merge its branch into the project's current branch. */
+  merge: (id: string) => invoke<{ race: Race; message: string }>("race_merge", { id }),
+  /** Archive the race and its attempt chats, or restore exactly the chats archiving moved. */
+  archive: (id: string, archived: boolean) => invoke<Race>("race_archive", { id, archived }),
+  /** Open a worktree folder in the file manager. Confined to that folder by the backend. */
+  openFolder: (cwd: string) => invoke<void>("open_path", { cwd, path: "." }),
+  /** Drop the race record; the chats are untouched. */
+  forget: (id: string) => invoke<void>("race_forget", { id }),
+};

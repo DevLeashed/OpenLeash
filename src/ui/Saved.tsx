@@ -40,7 +40,7 @@ function More({ p }: { p: SavedPrompt }) {
  *  appended as they are parked, so it reads oldest first. */
 type SavedSort = "" | "newest" | "folder" | "az";
 
-const SORT_OPTIONS: Opt[] = [
+export const SAVED_SORT_OPTIONS: Opt[] = [
   { value: "", label: "As saved", hint: "oldest first" },
   { value: "newest", label: "Newest first" },
   { value: "folder", label: "By folder", hint: "this project first" },
@@ -201,7 +201,7 @@ export function Saved() {
         {allProjects && list.length > 0 && (
           <div className="savedsort">
             <span className="savedsort-label">Sort</span>
-            <Dropdown value={sort} options={SORT_OPTIONS} onChange={(v) => void saveSettings({ saved_sort: v })} search={false} placeholder="Sort saved prompts" style={{ width: 232 }} />
+            <Dropdown value={sort} options={SAVED_SORT_OPTIONS} onChange={(v) => void saveSettings({ saved_sort: v })} search={false} placeholder="Sort saved prompts" style={{ width: 232 }} />
           </div>
         )}
         {/* The switch lives in the sidebar, so the way to the hidden ones has to be

@@ -3,13 +3,15 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { Check, MonitorUp } from "lucide-react";
+import { Check, MonitorUp, Sparkles } from "lucide-react";
 import { ago, api, baseName, normPath, TaskSummary } from "../api";
 import { back, chatModel, flash, forgetTask, forward, get, go, isNarrow, loadProject, modelColor, openProject, requestPause, saveSettings, set, shownAccounts, shownProviders, type State, useNow, useStore, zoom } from "../store";
 import { capsOf, netWindows } from "./Accounts";
 import { I, chatStatus, isParked, statusOf } from "./icons";
 import { openChatStats } from "./ChatStats";
-import { openTransfer } from "./SendToMachine";
+import { openRunTimeline } from "./RunTimeline";
+import { openMove } from "./MoveChat";
+import { openSaveAsSkill } from "./SaveAsSkill";
 import { useRowDrag, type RowDrag } from "./drag";
 import { pickFolder } from "./Home";
 import { useOpenSources } from "./OpenProject";
@@ -22,6 +24,8 @@ import { RemoteIndicator } from "./Remote";
 import { isRemoteClient } from "../remote";
 import { AnchoredPanel, Tooltip, IconButton, Input, MenuRow, MenuScrim, ctxPlace, menuLayer, Pressable, Switch, useAnchoredPanel, useEscapeClose, WindowButton, Kbd } from "./primitives";
 import { settingsTabDef, type SettingsTab } from "./settingsTabs";
+import { groupRaceRows, useRaces } from "../race";
+import { RaceGroup } from "./RaceGroup";
 
 const win = () => getCurrentWindow();
 
@@ -29,7 +33,7 @@ const win = () => getCurrentWindow();
  * Open the Settings page the sidebar footer's shortcut button points at.
  *
  * The button sits beside the usage bar, which is about accounts, so Accounts is
- * the default it has always had — but Settings → General can aim it at any page.
+ * the default it has always had — but Settings → Tabs can aim it at any page.
  * An id this build has no page for resolves to Accounts rather than opening a
  * blank settings screen; see `settingsTabDef`.
  */
@@ -263,8 +267,13 @@ function ChatProject() {
 export function Titlebar() {
   const canBack = useStore((s) => s.hist.length > 0);
   const canFwd = useStore((s) => s.fwd.length > 0);
+  // On a chat's Artificts surface the bar tucks up to a thin strip, so the
+  // design gets the height; hovering or focusing the strip slides the whole bar
+  // back down over the content. It stays mounted throughout: it is the window's
+  // drag region and holds the window controls of a frameless window.
+  const tucked = useStore((s) => (s.view === "session" && !!s.task && (s.tasks[s.task]?.artifict_open ?? false)) || (s.view === "home" && !!s.home.artificts));
   return (
-    <div className="titlebar" data-tauri-drag-region>
+    <div className={tucked ? "titlebar tucked" : "titlebar"} data-tauri-drag-region>
       <IconButton className="corner" label="Toggle sidebar · Ctrl B" onClick={() => set((s) => ({ sidebar: !s.sidebar }))}>{I.sidebar()}</IconButton>
       <IconButton label="Back" disabled={!canBack} onClick={back}>{I.back()}</IconButton>
       <IconButton label="Forward" disabled={!canFwd} onClick={forward}>{I.fwd()}</IconButton>
@@ -478,9 +487,14 @@ export async function deleteArchivedTasks() {
 
 export const SIDEBAR_CHAT_LIMIT = 100;
 
-/** Oldest eligible chats beyond the sidebar cap, preserving pinned, active, paused, unread and current chats. */
-export function excessSidebarChats(tasks: Record<string, TaskSummary>, limit = SIDEBAR_CHAT_LIMIT, current: string | null = null, pausedAll = false): TaskSummary[] {
-  const unarchived = Object.values(tasks).filter((t) => !t.archived);
+/** Scheduled run chats have a stable, backend-locked title prefix. */
+export function isScheduledChat(task: Pick<TaskSummary, "title">): boolean {
+  return typeof task.title === "string" && task.title.startsWith("⏰ ");
+}
+
+/** Oldest eligible chats beyond their list cap, preserving pinned, active, paused, unread and current chats. */
+export function excessSidebarChats(tasks: Record<string, TaskSummary>, limit = SIDEBAR_CHAT_LIMIT, current: string | null = null, pausedAll = false, scheduled = false): TaskSummary[] {
+  const unarchived = Object.values(tasks).filter((t) => !t.archived && isScheduledChat(t) === scheduled);
   const excess = Math.max(0, unarchived.length - limit);
   if (!excess) return [];
   const eligible = unarchived.filter((t) => !t.pinned && t.id !== current && !t.unread
@@ -491,7 +505,8 @@ export function excessSidebarChats(tasks: Record<string, TaskSummary>, limit = S
   // The flag is read explicitly because `bySortKey` takes it as an argument
   // where the old call let `sortKey` read its own default.
   const automatic = get().settings?.automatic_chat_reorder !== false;
-  return bySortKey(eligible, automatic, 1).slice(0, excess);
+  const archiveCount = Math.min(excess, eligible.length);
+  return bySortKey(eligible, automatic, 1).slice(0, archiveCount);
 }
 
 export async function archiveExcessSidebarChats(ids: string[]) {
@@ -625,9 +640,22 @@ export async function importTasks() {
   const path = await open({ multiple: false, filters: [{ name: "OpenLeash chats", extensions: ["json"] }] }).catch((e) => { flash(String(e)); return null; });
   if (typeof path !== "string") return;
   try {
-    const list = await api.importTasks(path);
+    const { chats: list, warnings } = await api.importTasks(path);
     set((s) => ({ tasks: { ...s.tasks, ...Object.fromEntries(list.map((t) => [t.id, t])) } }));
-    flash(`Imported ${list.length} chat${list.length === 1 ? "" : "s"}`);
+    flash(`Imported ${list.length} chat${list.length === 1 ? "" : "s"}${warnings.length ? `. ${warnings[0]}${warnings.length > 1 ? ` (and ${warnings.length - 1} more)` : ""}` : ""}`);
+  } catch (e) {
+    flash(String(e));
+  }
+}
+
+/** Point a chat at another folder on this machine. Only the chat's working location changes:
+ * no files are copied or deleted. The backend refuses while the chat is working. */
+export async function changeChatFolder(id: string) {
+  const folder = await open({ directory: true, multiple: false, title: "Choose this chat's work folder" }).catch((e) => { flash(String(e)); return null; });
+  if (typeof folder !== "string") return;
+  try {
+    await api.changeFolder(id, folder);
+    flash(`Chat moved to ${baseName(folder)}`);
   } catch (e) {
     flash(String(e));
   }
@@ -808,11 +836,14 @@ function CtxMenu({ ctx, close }: { ctx: NonNullable<Ctx>; close: () => void }) {
     ...(t.titled ? [{ icon: I.edit(12), label: "Let the agent name it", run: run(() => patchTask(t.id, { untitled: true })) }] : []),
     { icon: I.copy(12), label: "Duplicate", run: run(() => api.duplicate(t.id).then((d) => set((s) => ({ tasks: { ...s.tasks, [d.id]: d } }))).catch((e) => flash(String(e)))) },
     { icon: I.download(12), label: "Export…", run: run(() => exportTasks([t.id])) },
-    { icon: <MonitorUp size={12} strokeWidth={1.7} aria-hidden="true" />, label: "Send to another machine…", run: run(() => openTransfer(t.id)) },
+    // Only opens the box; drafting is a second, deliberate click inside it.
+    { icon: <Sparkles size={12} strokeWidth={1.7} aria-hidden="true" />, label: "Save as skill…", run: run(() => openSaveAsSkill(t.id)) },
+    { icon: <MonitorUp size={12} strokeWidth={1.7} aria-hidden="true" />, label: "Move to…", run: run(() => openMove(t.id)) },
     // Above Archive and Delete, and below Export: it reads the chat rather than
     // changing it, so it belongs with the other "look at this" rows rather than
     // with the ones that alter the sidebar.
     { icon: I.chart(12), label: "Stats…", run: run(() => openChatStats(t.id)) },
+    { icon: I.gantt(12), label: "Run timeline…", run: run(() => openRunTimeline(t.id)) },
     ...((t.status === "running" || t.status === "waiting") ? [t.paused
       ? { icon: I.play(10), label: "Resume", run: run(() => api.resume(t.id).catch((e) => flash(String(e)))) }
       : { icon: I.pause(10), label: "Pause", run: run(() => requestPause(t.id)?.catch((e) => flash(String(e)))) }] : []),
@@ -941,6 +972,8 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   const tasks = useStore((s) => s.tasks);
   const cur = useStore((s) => ((s.view === "session" || s.view === "diff") ? s.task : null));
   const view = useStore((s) => s.view);
+  // Race attempts are drawn under one header per race (`groupRaceRows`).
+  const races = useRaces((s) => s.races);
   const [ctx, setCtx] = useState<Ctx>(null);
   const selecting = useStore((s) => s.selecting);
   // The header's "Chats · N picked" suffix, counted the way the selection bar
@@ -957,11 +990,12 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   const project = useStore((s) => s.settings?.project ?? "");
   const savedN = useStore((s) => s.settings?.saved_prompts?.length ?? 0);
   const showPullRequests = useStore((s) => s.settings?.show_pull_requests ?? false);
+  const showSchedules = useStore((s) => s.settings?.show_schedules ?? false);
   const showNeedsYou = useStore((s) => s.settings?.needs_you ?? false);
   // Saved in settings, so closing or reopening the sidebar keeps the choice.
   const allProjects = useStore((s) => s.settings?.all_projects ?? false);
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
-  // The footer shortcut button follows Settings → General. Subscribed rather
+  // The footer shortcut button follows Settings → Tabs. Subscribed rather
   // than read through `get()`: the label, the glyph and the lit state all come
   // off the page it points at, so changing the choice has to repaint the footer.
   const shortcut = settingsTabDef(useStore((s) => s.settings?.sidebar_button_tab));
@@ -974,7 +1008,7 @@ function SidebarBody({ peek }: { peek?: boolean }) {
   const { hiddenN, visible, pinned, rest } = useMemo(() => {
     const unarchived = Object.values(tasks).filter((t) => !t.archived);
     const inProject = (t: TaskSummary) => chatInProject(t, project, allProjects, cur);
-    const visible = bySortKey(unarchived.filter(inProject), automaticReorder);
+    const visible = bySortKey(unarchived.filter((t) => !isScheduledChat(t) && inProject(t)), automaticReorder);
     const pinned = visible.filter((t) => t.pinned);
     // Attention first, then this group's own order. Decorate-sort-undecorate for
     // the same reason as `bySortKey`: `compareChats` reads two sort keys per
@@ -993,10 +1027,12 @@ function SidebarBody({ peek }: { peek?: boolean }) {
     };
   }, [tasks, project, allProjects, cur, pausedAll, automaticReorder]);
 
-  // The sidebar cap applies to chats in this project's visible list only. Chats
-  // from other folders stay in the project's own list and are never auto-archived here.
+  // The normal chat cap applies to this project's visible list only. Scheduled
+  // chats have their own 100-chat cap, counted across every project.
   const sidebarTasks = useMemo(() => Object.fromEntries(visible.map((task) => [task.id, task])), [visible]);
+  const scheduledTasks = useMemo(() => Object.fromEntries(Object.values(tasks).filter((task) => !task.archived && isScheduledChat(task)).map((task) => [task.id, task])), [tasks]);
   const archiveInFlight = useRef(false);
+  const scheduledArchiveInFlight = useRef(false);
   useEffect(() => {
     if (archiveInFlight.current) return;
     // The sweep reads the chats' own `unread` marks (`excessSidebarChats`), so a
@@ -1007,6 +1043,13 @@ function SidebarBody({ peek }: { peek?: boolean }) {
     archiveInFlight.current = true;
     void archiveExcessSidebarChats(excess.map((task) => task.id)).finally(() => { archiveInFlight.current = false; });
   }, [sidebarTasks, currentTask, pausedAll]);
+  useEffect(() => {
+    if (scheduledArchiveInFlight.current) return;
+    const excess = excessSidebarChats(scheduledTasks, SIDEBAR_CHAT_LIMIT, currentTask, pausedAll, true);
+    if (!excess.length) return;
+    scheduledArchiveInFlight.current = true;
+    void archiveExcessSidebarChats(excess.map((task) => task.id)).finally(() => { scheduledArchiveInFlight.current = false; });
+  }, [scheduledTasks, currentTask, pausedAll]);
 
   // Memoized, and so is every row's `onCtx`. These were rebuilt on each render,
   // so they were new props on all 80 chat rows every time the sidebar rendered
@@ -1052,9 +1095,9 @@ function SidebarBody({ peek }: { peek?: boolean }) {
     }
     return fn;
   };
-  const section = (list: TaskSummary[]) => list.map((t) => (
-    <Row key={t.id} t={t} active={t.id === cur} drag={drag} onCtx={onCtx(t)} />
-  ));
+  const section = (list: TaskSummary[]) => groupRaceRows(list, races).map((e) => e.kind === "task"
+    ? <Row key={e.t.id} t={e.t} active={e.t.id === cur} drag={drag} onCtx={onCtx(e.t)} />
+    : <RaceGroup key={"race:" + e.race.id} race={e.race}>{e.tasks.map((t) => <Row key={t.id} t={t} active={t.id === cur} drag={drag} onCtx={onCtx(t)} />)}</RaceGroup>);
   return (
     <div className={"sidebar-in" + (peek ? " peek" : "")}>
       <div style={{ padding: "2px 6px 4px 0" }}>
@@ -1069,6 +1112,9 @@ function SidebarBody({ peek }: { peek?: boolean }) {
         )}
         {showPullRequests && <Pressable className={"srow" + (view === "pulls" ? " on" : "")} style={{ color: "var(--mut)" }} onClick={() => go("pulls")}>
           {I.branch()}<span className="t">Pull requests</span>
+        </Pressable>}
+        {showSchedules && <Pressable className={"srow" + (view === "schedules" ? " on" : "")} style={{ color: "var(--mut)" }} onClick={() => go("schedules")}>
+          {I.clock()}<span className="t">Schedules</span>
         </Pressable>}
       </div>
       {/* Both sections live inside this one element, so a row dragged out of
@@ -1124,7 +1170,10 @@ export function Sidebar() {
   // so it comes back the moment that chat's surface closes, and the closed state
   // is already the one that keeps the left-edge peek available.
   const sidebarOpen = useStore((s) => s.sidebar);
-  const artifictMode = useStore((s) => (s.task ? s.tasks[s.task]?.artifict_open ?? false : false));
+  // Only while that chat is actually on screen: `task` outlives a trip to the
+  // new-task screen, and keying on it alone left the rail stuck collapsed after
+  // pressing New chat from a studio.
+  const artifictMode = useStore((s) => (s.view === "session" && s.task ? s.tasks[s.task]?.artifict_open ?? false : s.view === "home" && !!s.home.artificts));
   const open = sidebarOpen && !artifictMode;
   const [peek, setPeek] = useState(false);
   const timer = useRef<number | undefined>(undefined);
@@ -1168,7 +1217,7 @@ function UsageBar() {
   const [menu, setMenu] = useState(false);
   const shown = settings?.home_usage ?? providers.filter((p) => p.account).map((p) => p.id);
   const kinds = providers.filter((p) => p.account && accts.some((a) => a.kind === p.id));
-  const segs = kinds.filter((p) => shown.includes(p.id)).map((p) => {
+  const meters = kinds.map((p) => {
     const list = accts.filter((a) => a.kind === p.id);
     const w = netWindows(list)[0];
     const avail = list.filter((a) => a.available).length;
@@ -1177,18 +1226,25 @@ function UsageBar() {
     // amber, the way the lines in Settings → Accounts are, and one that is only
     // partly capped says how many in its tooltip.
     const capped = list.filter((a) => capsOf(a).some((c) => c.holding)).length;
-    return { p, left: avail ? Math.max(0, 100 - (w?.used ?? 0)) : 0, avail, n: list.length, label: w?.label ?? "", capped };
+    // Routable is not the same as measured: a missing reading must never look
+    // like a fresh, full allowance. Unavailable accounts still show 0% left.
+    const left = !avail ? 0 : w ? Math.max(0, 100 - w.used) : null;
+    const text = left === null ? "Usage unavailable" : `${Math.round(left)}% left`;
+    return { p, left, text, avail, n: list.length, label: w?.label ?? "", capped, on: shown.includes(p.id) };
   });
+  const segs = meters.filter((m) => m.on);
   const toggle = (k: string) => saveSettings({ home_usage: shown.includes(k) ? shown.filter((x) => x !== k) : [...shown, k] });
   return (
     <>
-      <Tooltip content={segs.length ? segs.map((s) => `${s.p.account!.short_name}: ${Math.round(s.left)}% left${s.label ? ` (${s.label})` : ""} · ${s.avail}/${s.n} accounts${s.capped ? ` · ${s.capped} held by a cap` : ""}`).join(" · ") + " · click to choose" : accts.length ? "No accounts in this bar · click to choose" : "No subscription accounts"}><Pressable className="sbar" aria-label="Usage in this bar" aria-disabled={!accts.length} onClick={(e) => { if (accts.length) { e.stopPropagation(); setMenu(!menu); } }}>
+      <Tooltip content={segs.length ? segs.map((s) => `${s.p.account!.short_name}: ${s.text}${s.label ? ` (${s.label})` : ""} · ${s.avail}/${s.n} accounts${s.capped ? ` · ${s.capped} held by a cap` : ""}`).join(" · ") + " · click to choose" : accts.length ? "No accounts in this bar · click to choose" : "No subscription accounts"}><Pressable className="sbar" aria-label="Usage in this bar" aria-disabled={!accts.length} onClick={(e) => { if (accts.length) { e.stopPropagation(); setMenu(!menu); } }}>
         {/* Empty renders nothing rather than a "No usage to show" line: the bar
             is a footer affordance, and a dead label there reads as an error.
             The click target stays because it is also the only way back into the
             picker when every account has been toggled off. */}
-        {segs.map((s) => (
-          <div key={s.p.id} className={"useg" + (s.capped > 0 && s.capped === s.n ? " capped" : "")} style={{ flex: 1 }}><div style={{ width: s.left + "%", background: USAGE_COLOR[s.p.id] ?? "#33d6ff" }} /></div>
+        {/* Hidden segments stay mounted and collapse to nothing (App.css .useg.off),
+            so toggling one in the menu slides the bar apart instead of snapping. */}
+        {meters.map((s) => (
+          <div key={s.p.id} aria-hidden={!s.on || undefined} className={"useg" + (s.on ? "" : " off") + (s.capped > 0 && s.capped === s.n ? " capped" : "")}><div style={{ width: (s.left ?? 0) + "%", background: USAGE_COLOR[s.p.id] ?? "#33d6ff" }} /></div>
         ))}
       </Pressable></Tooltip>
       {menu && (
@@ -1202,7 +1258,7 @@ function UsageBar() {
                 <MenuRow key={p.id} onClick={() => toggle(p.id)}>
                   <ProviderIcon provider={p.id} size={14} />
                   <span style={{ flex: 1 }}>{p.account!.display_name}</span>
-                  {sg && <span style={{ fontSize: 11, color: "var(--mut3)" }}>{Math.round(sg.left)}% left</span>}
+                  {sg && <span className="umenu-left">{sg.text}</span>}
                   <Switch label={`Show ${p.account!.display_name}`} checked={shown.includes(p.id)} small />
                 </MenuRow>
               );

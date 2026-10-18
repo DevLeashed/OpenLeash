@@ -1,6 +1,6 @@
 //! Path-scoped instruction rules.
 //!
-//! OpenLeash's four flat instruction files ([`super::MEMORY_FILES`]) are all or
+//! OpenLeash's five flat instruction files ([`super::MEMORY_FILES`]) are all or
 //! nothing per project: `AGENTS.md` is injected whole or not at all, and there is
 //! no way to say "this rule applies only to `src/**/*.ts`". Every comparable tool
 //! has that knob — Claude Code's `.claude/rules/*.md` with `paths:` frontmatter,

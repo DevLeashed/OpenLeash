@@ -1,0 +1,66 @@
+/* Run timeline: rides on the chat-stats dialog's frame (`modal-chat-stats`) and
+   adds the lane view. Block colours are by kind; model blocks take the model's
+   own colour inline so a fallback reads as a change of hue along the lane. */
+.modal-run-timeline { width: min(1240px, calc(100vw - 48px)); }
+.modal-run-timeline .stiles { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.modal-run-timeline .rt-banner { padding: 9px 12px; border: 1px solid rgba(251, 191, 36, 0.28); border-radius: 9px; background: rgba(251, 191, 36, 0.07); color: #fcd34d; font-size: 12px; }
+.modal-run-timeline .rt-empty { padding: 36px 12px; text-align: center; }
+.rt-split { display: flex; height: 10px; border-radius: 5px; overflow: hidden; gap: 1px; }
+
+.rt-chart .chead { flex-wrap: wrap; }
+.rt-chart .rt-hint { margin-left: 0; flex: 1; min-width: 0; }
+.rt-tools { display: inline-flex; gap: 2px; margin-left: auto; }
+.rt-lanes { display: flex; min-width: 0; border-top: 1px solid var(--ov-40); }
+.rt-labels { flex: 0 0 210px; min-width: 0; border-right: 1px solid var(--ov-40); }
+.rt-label { display: flex; align-items: center; gap: 7px; min-width: 0; padding-right: 8px; box-sizing: border-box; font-size: 11.5px; color: var(--fg2); }
+.rt-label.sub { cursor: pointer; }
+.rt-label.sub:hover { color: var(--fg); background: var(--ov-20); }
+.rt-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; }
+.rt-lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rt-area { position: relative; flex: 1; min-width: 0; overflow: hidden; cursor: grab; touch-action: none; user-select: none; }
+.rt-area:active { cursor: grabbing; }
+.rt-area svg { display: block; }
+.rt-lanebg { fill: transparent; }
+.rt-lanebg.odd { fill: var(--ov-15); }
+.rt-tick line { stroke: var(--ov-40); stroke-width: 1; }
+.rt-tick text { fill: var(--mut3); font-size: 10px; font-variant-numeric: tabular-nums; }
+
+.rt-b { cursor: pointer; stroke-width: 0; }
+.rt-b:hover { stroke: var(--fg); stroke-width: 1; }
+.rt-b.model { opacity: 0.88; }
+.rt-b.model.fail { fill-opacity: 0.3; stroke: #ff6b6b; stroke-width: 1.5; }
+.rt-b.tool { fill: #9ca3af; }
+.rt-b.tool.err { fill: #f87171; }
+.rt-b.tool.cancel { fill: #6b6a73; }
+.rt-b.wait.you { fill: #fbbf24; }
+.rt-b.wait.retry { fill: #fb923c; }
+.rt-b.wait.hold { fill: url(#rt-hatch); }
+.rt-b.bg { fill: #55545c; }
+/* Estimated from transcript timestamps: still there, plainly not measured. */
+.rt-b.est { opacity: 0.45; stroke: var(--fg2); stroke-width: 1; stroke-dasharray: 3 2; }
+.rt-b.open { stroke: var(--fg); stroke-width: 1; stroke-dasharray: 2 2; }
+
+.rt-tip { position: absolute; z-index: 5; width: max-content; max-width: 260px; padding: 8px 10px; border: 1px solid var(--ov-50); border-radius: 8px; background: var(--raise, #1c1c20); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); font-size: 11.5px; pointer-events: none; }
+.rt-tip-title { margin-bottom: 4px; color: var(--fg); font-weight: 600; overflow-wrap: anywhere; }
+.rt-tip-line { display: flex; gap: 10px; justify-content: space-between; color: var(--fg2); }
+.rt-tip-line > span:first-child { flex: none; color: var(--mut3); }
+.rt-tip-line > span:last-child { text-align: right; overflow-wrap: anywhere; }
+
+.rt-row { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 32px; padding: 3px 4px; border: 0; border-radius: 7px; background: none; color: inherit; font: inherit; text-align: left; }
+.rt-row .tdotc { flex: none; }
+.rt-rname { display: flex; flex-direction: column; flex: 1; min-width: 0; overflow: hidden; color: var(--fg2); font-size: 12px; white-space: nowrap; text-overflow: ellipsis; }
+.rt-rname .bsub { color: var(--mut3); font-size: 11px; font-family: var(--sans, inherit); }
+.rt-jump { cursor: pointer; }
+.rt-jump:hover, .rt-jump:focus-visible { background: var(--ov-20); }
+/* The row a jump landed on, briefly, so the eye finds it after the scroll. */
+.it.rt-flash { animation: rtFlash 1.6s ease-out; }
+@keyframes rtFlash { 0%, 30% { background: rgba(167, 139, 250, 0.16); } 100% { background: transparent; } }
+
+@media (max-width: 980px) {
+  .modal-run-timeline .stiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .rt-labels { flex-basis: 150px; }
+}
+@media (max-width: 560px) {
+  .modal-run-timeline .stiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rt-labels { flex-basis: 110px; }
+}

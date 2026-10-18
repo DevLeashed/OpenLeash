@@ -335,6 +335,7 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
     Task {
         id: id.into(),
         title: "t".into(),
+        route_log: vec![],
         titled: false,
         status: "running".into(),
         waiting_kind: None,
@@ -346,6 +347,7 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
         base_commit: None,
         worktree: false,
         model: model.into(),
+        burner: None,
         effort: 2,
         perm: "auto".into(),
         plan: false,
@@ -386,6 +388,7 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
         usage: Default::default(),
         read_files: Default::default(),
         read_hashes: Default::default(),
+        spans: vec![],
         checkpoints: vec![],
         touched: Default::default(),
         hidden: false,
@@ -4907,10 +4910,7 @@ async fn force_pause_all_freezes_chats_and_owes_the_agent_a_rerun() {
         "the spinner is closed, not left turning"
     );
     assert_eq!(b.items[0].data["meta"], json!("cut off by quit"));
-    assert_eq!(
-        b.subs[0].status, "stopped",
-        "a subagent is stopped as well"
-    );
+    assert_eq!(b.subs[0].status, "stopped", "a subagent is stopped as well");
     let sub = b.sub_msgs.get("s1").unwrap();
     assert_eq!(
         sub.last().unwrap().content[0]["tool_use_id"],

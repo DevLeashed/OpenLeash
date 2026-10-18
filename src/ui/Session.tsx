@@ -1,5 +1,5 @@
 
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ContainerChip } from "./Workspaces";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -7,15 +7,16 @@ import ReactMarkdown from "react-markdown";
 import { copyText, mdComponents, MD_PLUGINS as MD_PLUGINS_SHARED, MdInline, replyUrlTransform } from "./mdx";
 import { RecoverySummary } from "./RecoverySummary";
 import { AssistantMarkdown } from "./Visualization";
-import { ArtifictWorkspace } from "./ArtifictWorkspace";
+import { ArtifictWorkspace, studioHandoff } from "./ArtifictWorkspace";
 import { InlineArtifictCard, hasArtifictCardSlot, type ArtifictWorkspaceSelection } from "./InlineArtifictCard";
 import { BrowserPanel } from "./BrowserPanel";
 import { FindBar } from "./Find";
+import { openRunTimeline } from "./RunTimeline";
 import { api, ago, effortLabel, fmt$, Bg, FileRef, Item, ItemData, ToolAction, ToolInput, SubInfo, TaskSummary, xDepth, xOn } from "../api";
 import { flash, get, go, isPhoneClient, loadPreviousHistory, loadSubTranscript, chatModel, modelColor, modelInfo, newerSummary, openTask, requestPause, set, subModel, useStore, useThrottled, zoom } from "../store";
 import { Composer, humanBytes, MAX_FILES, MAX_IMAGE, PendingStar } from "./Composer";
 import { openSwap } from "./ModelSwap";
-import { Annotations, AttachmentChips, SentAnnotationMessage, stripHarnessBlocks } from "./SelectionNote";
+import { Annotations, AttachmentChips, SentAnnotationMessage, splitContextBlocks, stripHarnessBlocks } from "./SelectionNote";
 import { heldByGlobal, isPaused } from "./Paused";
 import { enterSendsMessage, messageSendKey } from "../keys";
 import { I, StatusIcon, chatStatus } from "./icons";
@@ -104,6 +105,29 @@ function rel(p: string, cwd: string) {
   return a.toLowerCase().startsWith(b.toLowerCase() + "/") ? a.slice(b.length + 1) : a;
 }
 
+/** Where an `http_request` went, short enough for a row: host and path, with
+ *  a query string folded to `?…`. The backend has already redacted secrets in
+ *  the stored url, but the query is still mostly noise in a one-line label —
+ *  the full request is in the row's output. A url that does not parse (the
+ *  model can send anything) is shown as it came. */
+function httpTarget(url: string | undefined): string {
+  const raw = String(url ?? "").trim();
+  if (!raw) return "";
+  try {
+    const u = new URL(raw);
+    const path = u.pathname === "/" ? "" : u.pathname;
+    return `${u.host}${path}${u.search ? "?…" : ""}`;
+  } catch {
+    return raw;
+  }
+}
+
+/** The status code an `http_request` result opens with (`HTTP 201 Created · …`). */
+function httpStatus(d: ItemData): string | undefined {
+  if (d.name !== "http_request") return undefined;
+  return String(d.output ?? "").match(/^HTTP (\d{3})\b/)?.[1];
+}
+
 function toolView(d: ItemData, cwd: string) {
   const name: string = d.name ?? "";
   const inp: ToolInput = d.input ?? {};
@@ -111,6 +135,11 @@ function toolView(d: ItemData, cwd: string) {
     case "read_file": return { icon: li(FileText), color: G, verb: "Read", target: inp.path ? rel(inp.path, cwd) : "" };
     case "glob": return { icon: li(Search), color: G, verb: "Find", target: inp.pattern ?? "" };
     case "grep": return { icon: li(Search), color: G, verb: "Search", target: (inp.pattern ?? "") + (inp.glob ? `  in ${inp.glob}` : "") };
+    // Code intelligence: the operation, then where (`src/a.rs:12 · foo`) or what (a workspace query).
+    case "lsp": {
+      const where = inp.path ? rel(String(inp.path), cwd) + (inp.line ? `:${String(inp.line)}` : "") : String(inp.query ?? "");
+      return { icon: li(Network), color: G, verb: String(inp.operation ?? "lsp").replace(/_/g, " "), target: where + (inp.symbol ? ` · ${String(inp.symbol)}` : "") };
+    }
     case "list_agents": return { icon: li(Bot), color: G, verb: "Agents", target: "list" };
     case "send_message": return { icon: li(Send), color: G, verb: "Message", target: `→ ${inp.to ?? ""}  ${String(inp.message ?? "").slice(0, 80)}` };
     // The two cross-chat tools. Kept as their own rows rather than folded into
@@ -125,9 +154,9 @@ function toolView(d: ItemData, cwd: string) {
     case "bash_output": return { icon: li(Terminal), color: G, verb: "Check", target: inp.id ?? "" };
     case "kill_bash": return { icon: I.close(13), color: G, verb: "Stop", target: inp.id ?? "" };
     case "web_fetch": return { icon: li(Webhook), color: G, verb: "Fetch", target: inp.url ?? "" };
-    case "web_search": return { icon: li(Search), color: G, verb: "Search", target: inp.query ?? "" };
-    case "web_search_deep": return { icon: li(Search), color: G, verb: "Deep search", target: (Array.isArray(inp.queries) ? inp.queries.join(" · ") : (inp.query ?? "")) };
+    case "web_search": return { icon: li(Search), color: G, verb: "Search", target: Array.isArray(inp.queries) ? inp.queries.join(" · ") : (inp.query ?? "") };
     case "web_read_many": return { icon: li(Webhook), color: G, verb: "Read pages", target: (Array.isArray(inp.urls) ? `${inp.urls.length} links` : "") };
+    case "http_request": return { icon: li(Globe), color: G, verb: (String(inp.method ?? "").trim() || "GET").toUpperCase(), target: httpTarget(inp.url) };
     case "memory": {
       const act = String(inp.action ?? "");
       if (act === "save") return { icon: li(Brain), color: G, verb: "Remember", target: inp.name ? `${inp.kind ?? ""} · ${inp.name}` : (inp.summary ?? "") };
@@ -151,6 +180,15 @@ function toolView(d: ItemData, cwd: string) {
       const ref = inp.number != null ? `#${inp.number}` : inp.id != null ? `run ${inp.id}` : inp.title ?? inp.query ?? inp.path ?? "";
       return { icon: li(GitBranch), color: G, verb: "GitHub", target: [a, ref, inp.repo ? `· ${inp.repo}` : ""].filter(Boolean).join(" ") };
     }
+    case "linear": case "jira": case "slack": case "notion": case "gitlab": {
+      // The service plugins: name the service, the action and whatever the
+      // call is about (an issue key, a channel, a query, a page).
+      const svc: Record<string, string> = { linear: "Linear", jira: "Jira", slack: "Slack", notion: "Notion", gitlab: "GitLab" };
+      const a = String(inp.action ?? "").replace(/_/g, " ");
+      const about = [inp.id, inp.key, inp.issue, inp.iid != null ? `!${String(inp.iid)}` : undefined, inp.channel, inp.page_id, inp.database_id, inp.query, inp.jql, inp.title, inp.path, inp.project]
+        .find((v) => typeof v === "string" || typeof v === "number");
+      return { icon: li(name === "slack" ? MessagesSquare : name === "gitlab" ? GitBranch : Plug), color: G, verb: svc[name] ?? name, target: [a, about != null ? String(about).slice(0, 80) : ""].filter(Boolean).join(" ") };
+    }
     case "computer": {
       const acts: ToolAction[] = Array.isArray(inp.actions) ? inp.actions : [];
       const one = (a: ToolAction) => {
@@ -173,6 +211,9 @@ function toolView(d: ItemData, cwd: string) {
   }
 }
 
+/** Opens the chat's shared Browser view; `null` while the browser plugin is off. */
+const OpenBrowserView = createContext<(() => void) | null>(null);
+
 /** The page a `browser` call ended on, from the result line, or the one it was
  *  pointed at. Only real web urls: a `file://` is a path on this machine and
  *  belongs in a file manager, not a browser tab. */
@@ -191,6 +232,7 @@ function browserPage(d: ItemData): string | null {
  *  Exported so a render test can pin the glyph, which `FeedRows` cannot reach:
  *  a folded group does not mount its rows at all. */
 export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cwd: string; held?: boolean }) {
+  const openBrowserView = useContext(OpenBrowserView);
   const d = it.data ?? {};
   const v = toolView(d, cwd);
   const hasDiff = Array.isArray(d.diff) && d.diff.length > 0;
@@ -211,7 +253,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
   const autoOpen = images.length > 0;
   const open = manual ?? (autoOpen && d.status !== "denied");
   const status = d.status;
-  const meta = status === "running" ? "" : status === "denied" ? "denied" : d.meta ?? (status === "error" ? "error" : "");
+  const meta = status === "running" ? "" : status === "denied" ? "denied" : d.meta ?? httpStatus(d) ?? (status === "error" ? "error" : "");
   const diffCounts = hasDiff ? meta.match(/^\+(\d+)\s+−(\d+)$/) : null;
   // The page a browser call ended on, so the user can follow the agent into
   // whatever it just looked at. Their choice: nothing opens unless they click.
@@ -252,6 +294,7 @@ export const ToolItem = memo(function ToolItem({ it, cwd, held }: { it: Item; cw
                   <Tooltip content="Open in your browser · it opens there, not in the agent's headless one">
                     <IconButton label="Open this page" onClick={() => openUrl(page).catch(() => flash("Couldn't open the browser"))}><ExternalLink size={12} strokeWidth={1.7} /></IconButton>
                   </Tooltip>
+                  {openBrowserView && <Tooltip content="Watch and take over the main agent's page beside the chat"><IconButton label="Open Browser view" onClick={openBrowserView}><Globe size={12} strokeWidth={1.7} /></IconButton></Tooltip>}
                 </div>
               )}
               {images.map((src, i) => <Thumb key={i} src={src} items={imgs} index={i} alt={`${v.verb} image ${i + 1}`} style={{ maxWidth: "100%", maxHeight: 260, borderRadius: 8, margin: "4px 0", border: "1px solid rgba(255,255,255,0.1)", objectFit: "contain" }} />)}
@@ -323,7 +366,7 @@ function Approval({ it, task, onOpenArtifict }: { it: Item; task: TaskSummary; o
       </div>
       {plan ? <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: 9, padding: "8px 12px", maxHeight: 420, overflow: "auto" }}><Md text={d.detail ?? ""} /></div>
         : d.kind === "command" ? <div className="cmdbox">$ {d.detail}</div>
-        : <div className="cmdbox">{d.title}{d.kind === "mcp" ? "\n" + d.detail : ""}</div>}
+        : <div className="cmdbox">{d.title}{(d.kind === "mcp" || d.kind === "http") && d.detail ? "\n" + d.detail : ""}</div>}
       {/* Approving a plan is not the only thing the user does with it: it is
           filed in the project's artificts, so point at the record they will
           come back to instead of leaving it to be found in a list. */}
@@ -428,7 +471,7 @@ function MsgNotice({ it }: { it: Item }) {
   const [open, setOpen] = useState(false);
   const chat = useStore((s) => (it.data?.chat_id ? s.tasks[it.data.chat_id as string] : null));
   const chatId = typeof it.data?.chat_id === "string" ? it.data.chat_id : "";
-  const openChat = () => { if (chatId) { void openTask(chatId).then(() => go("session", { task: chatId })); } };
+  const openChat = () => { if (chatId) { go("session", { task: chatId }); } };
   const m = it.text.match(/^(?:Message from )?([\w.-]+)\s*(?:→\s*([\w.-]+)\s*)?:\s*([\s\S]*)$/);
   const who = (it.data?.from as string | undefined) ?? m?.[1] ?? "An agent";
   const body = m ? m[3] : it.text;
@@ -458,7 +501,7 @@ function ForkNotice({ it }: { it: Item }) {
   const from = it.data?.from as string | undefined;
   const parent = useStore((s) => (from ? s.tasks[from] : null));
   const summary = (it.data?.summary as string | undefined)?.trim();
-  const openParent = () => { if (from) { void openTask(from).then(() => go("session", { task: from })); } };
+  const openParent = () => { if (from) { go("session", { task: from }); } };
   return (
     <div className="resolved" style={{ alignItems: "flex-start", cursor: summary ? "pointer" : "default" }} onClick={() => summary && setOpen(!open)} title={summary ? (open ? undefined : "Show what carried over") : undefined}>
       <span style={{ color: "var(--mut2)", display: "flex" }}>{li(GitFork, 13)}</span>
@@ -547,11 +590,17 @@ export function WorktreeNotice({ it }: { it: Item }) {
   );
 }
 
+export function RouterNotice({ it }: { it: Item }) {
+  const text = it.text.replace(/^Router:\s*/, "");
+  return <div className="resolved route router-note"><span className="router-chip">{li(Network, 11)}Router</span><span className="sel">{text}</span></div>;
+}
+
 function Notice({ it }: { it: Item }) {
   const lv = it.data?.level;
   if (it.data?.goal) return <GoalNotice it={it} />;
   if (lv === "fork") return <ForkNotice it={it} />;
   if (lv === "btw") return <AsideNotice it={it} />;
+  if (lv === "router") return <RouterNotice it={it} />;
   if (lv === "route" || lv === "event") return <div className="resolved route"><span style={{ color: "var(--mut2)", display: "flex" }}>{li(Network, 13)}</span><span className="sel">{it.text}</span></div>;
   if (lv === "subq" || lv === "ask") return <AskNotice it={it} />;
   if (lv === "msg") return it.data?.global ? <BroadcastNotice text={it.text} replied={it.data?.replied ?? []} /> : <MsgNotice it={it} />;
@@ -612,9 +661,13 @@ function stagedFiles(data: ItemData | undefined): FileRef[] {
 }
 
 /** One user message: the bubble, its attachments, and the editor it becomes when
- *  the user rewrites it (text and attachments both). Exported for a render test. */
-export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
-  const live = task.status === "running" || task.status === "waiting";
+ *  the user rewrites it (text and attachments both). Exported for a render test.
+ *
+ *  Memoized on what it reads off the chat — its id and whether it is working —
+ *  because the summary is replaced on every status, step and cost event, and a
+ *  bubble re-rendered for each one re-ran its attachment and annotation scans. */
+export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
+  const live = isLiveTask(task);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(it.text);
   const [busy, setBusy] = useState(false);
@@ -627,6 +680,8 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
   // own), so the editor holds its own copies and sends them with the text.
   const [imgs, setImgs] = useState<string[]>(() => (Array.isArray(it.data?.images) ? (it.data.images as string[]) : []));
   const [files, setFiles] = useState<FileRef[]>(() => stagedFiles(it.data));
+  // The agent-only context stays out of the editor and goes back on the message when it is resent.
+  const agentContext = splitContextBlocks(it.text).context;
   const box = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const el = box.current;
@@ -634,7 +689,7 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 360) + "px";
   }, [draft, editing]);
-  const startEdit = () => { setDraft(it.text); setImgs(Array.isArray(it.data?.images) ? (it.data.images as string[]) : []); setFiles(stagedFiles(it.data)); setEditing(true); setTimeout(() => { const el = box.current; if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 20); };
+  const startEdit = () => { setDraft(splitContextBlocks(it.text).body); setImgs(Array.isArray(it.data?.images) ? (it.data.images as string[]) : []); setFiles(stagedFiles(it.data)); setEditing(true); setTimeout(() => { const el = box.current; if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 20); };
   const addEditFiles = async (paths: string[]) => {
     if (!paths.length) return;
     const refs = await api.filesAttach(paths).catch((e) => { flash(String(e)); return [] as FileRef[]; });
@@ -648,8 +703,9 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
     if (inlined.length) setImgs((x) => [...x, ...inlined]);
   };
   const resend = async () => {
-    const text = draft.trim();
-    if (!text || busy) return;
+    const body = draft.trim();
+    if (!body || busy) return;
+    const text = [body, agentContext].filter(Boolean).join("\n\n");
     setBusy(true);
     try {
       await stopAndSettle(task.id);
@@ -728,18 +784,77 @@ export function UserMsg({ it, task }: { it: Item; task: TaskSummary }) {
       <div className="ucol">
       <div className="ubub">{Array.isArray(it.data?.images) && it.data.images.length > 0 && <div className="ubimgs">{it.data.images.map((src: string, i: number) => <Thumb key={i} src={src} items={(it.data.images as string[]).map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />)}</div>}<AttachmentChips text={it.text} /><SentAnnotationMessage text={stripHarnessBlocks(it.text, it.data)} /></div>
       <div className="msgacts">
-        <span onClick={() => copyText(it.text)}>Copy</span>
+        <span onClick={() => copyText(stripHarnessBlocks(it.text, it.data))}>Copy</span>
         <span onClick={startEdit}>Edit</span>
       </div>
       </div>
     </div>
   );
-}
+}, (a, b) => a.it === b.it && a.task.id === b.task.id && isLiveTask(a.task) === isLiveTask(b.task));
 
 type FeedEntry = { key: string; it: Item } | { key: string; tools: Item[] };
 
-/** Agent-to-agent messages, questions and route switches are background chatter: they ride along in tool groups. */
-const isChatter = (it: Item) => it.kind === "notice" && (it.data?.level === "msg" || it.data?.level === "route" || it.data?.level === "event" || it.data?.level === "ask" || it.data?.level === "subq") && !it.data?.goal;
+// ── What a transcript row actually reads off the chat ──
+//
+// The chat summary is a new object on every status, step, usage and subagent
+// event, and every row is handed it. Compared by identity, that meant one step
+// of the agent re-rendered every visible row of the transcript. These compare
+// only the parts the rows read, so a row re-renders when something it shows
+// changed. Item objects are replaced in the store only when they change, so
+// those compare by identity.
+
+/** Working: the agent is running, or waiting on the user. */
+function isLiveTask(t: TaskSummary): boolean {
+  return t.status === "running" || t.status === "waiting";
+}
+
+/** The summary fields every row reads: the chat it belongs to, its folder for
+ *  relative paths, whether it is working (rewind/edit buttons), and the inputs
+ *  of `isPaused` that come from the chat (the freeze glyphs). */
+function rowTaskEqual(a: TaskSummary, b: TaskSummary): boolean {
+  return a === b || (a.id === b.id && a.cwd === b.cwd && a.status === b.status && !!a.paused === !!b.paused && !!a.unpaused === !!b.unpaused);
+}
+
+/** What a subagent pill reads off the chat for one agent: its resolved model
+ *  (the pill's colour) and its live step line. */
+function subLook(t: TaskSummary, id: unknown): string {
+  const info = (t.subs ?? []).find((s) => s.id === id);
+  return `${info ? subModel(t, info) : chatModel(t)}\u0000${info?.meta ?? ""}`;
+}
+
+/** `rowTaskEqual`, plus the subagent fields any pill among `items` shows.
+ *  Exported for the comparator tests. */
+export function feedTaskEqual(a: TaskSummary, b: TaskSummary, items: readonly Item[]): boolean {
+  if (a === b) return true;
+  if (!rowTaskEqual(a, b)) return false;
+  for (const it of items) if (it.kind === "sub" && subLook(a, it.data?.sub_id) !== subLook(b, it.data?.sub_id)) return false;
+  return true;
+}
+
+/** Same length, same item objects. Exported for the comparator tests. */
+export function sameItems(a: readonly Item[], b: readonly Item[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** The background-job fields a tool group shows for its own commands. The job
+ *  list is replaced on every output line of any command, and only a group that
+ *  started one of them has anything to redraw. */
+function bgLook(bgs: Bg[], tools: readonly Item[]): string {
+  let out = "";
+  for (const t of tools) {
+    const id = t.data?.bg_id;
+    if (!id) continue;
+    const j = bgs.find((b) => b.id === id);
+    out += j ? `${j.id}\u0000${j.running}\u0000${j.exit ?? ""}\u0000${j.last_line}\u0001` : `${id}\u0001`;
+  }
+  return out;
+}
+
+/** Agent-to-agent messages, questions and route/router switches are background chatter: they ride along in tool groups. */
+const isChatter = (it: Item) => it.kind === "notice" && (it.data?.level === "msg" || it.data?.level === "route" || it.data?.level === "router" || it.data?.level === "event" || it.data?.level === "ask" || it.data?.level === "subq") && !it.data?.goal;
 
 /** Background work that has finished. A subagent settles when it reports back; a
  *  background command when its process exits. Both are read off the live job list,
@@ -813,15 +928,19 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   const from: string[] = [];
   let sent = 0;
   let routes = 0;
+  let routed = 0;
   let asks = 0;
   let answered = 0;
   let subagents = 0;
   const events: string[] = [];
+  // `http_request` rows are keyed by their method (GET, POST…), which is not a
+  // word the PAST table can conjugate — and lowercasing it reads as "post items".
+  const http = new Set<string>();
   for (const t of tools) {
     if (t.kind === "notice") {
       const ev = eventSum(t);
       if (ev) events.push(ev);
-      else if (t.data?.level === "route") routes++;
+      else if (t.data?.level === "router") routed++;
       else if (t.data?.level === "ask") asks++;
       else if (t.data?.level === "subq") answered++;
       // A message to another chat is the one agent-message that went *out*:
@@ -845,6 +964,7 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
     const settled = isSettledBg(t, bgs);
     const v = settled ? { ...view, verb: "Run" } : view;
     if (!by[v.verb]) { by[v.verb] = []; order.push(v.verb); }
+    if (d.name === "http_request" && !settled) http.add(v.verb);
     // Seeded above, and only re-seeded here when this is the verb's first entry,
     // so the read below always finds the list it just pushed onto.
     by[v.verb]!.push(String(v.target || ""));
@@ -856,6 +976,7 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   // shorter phrase, so there is no other reading to fall back to here.
   const parts = order.map((verb) => {
     const list = by[verb]!;
+    if (http.has(verb)) return list.length === 1 ? `sent ${verb} to ${clip(list[0]!) || "a url"}` : `sent ${list.length} ${verb} requests`;
     const [past, noun] = PAST[verb] ?? [verb.toLowerCase(), "times"];
     if (list.length === 1) {
       if (verb === "Run" || verb === "Start") return `${past} a command`;
@@ -871,6 +992,7 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   }
   if (sent) parts.push(sent === 1 ? "sent a message to another chat" : `sent ${sent} messages to other chats`);
   if (routes) parts.push(routes === 1 ? "switched model" : `switched model ${routes} times`);
+  if (routed) parts.push(routed === 1 ? "the router switched model" : `the router switched model ${routed} times`);
   if (asks) parts.push(asks === 1 ? "asked the main agent" : `asked the main agent ${asks} questions`);
   if (answered) parts.push(answered === 1 ? "answered a question" : `answered ${answered} questions`);
   if (subagents) parts.push(`${subagents} subagent${subagents === 1 ? "" : "s"} finished`);
@@ -896,6 +1018,7 @@ function endedBad(it: Item, bgs: Bg[]): boolean {
  *  still opens its transcript; a command gets the exit the transcript never got,
  *  because the tool call that started it only ever reported that it had started. */
 const DoneRow = memo(function DoneRow({ it, task, bgs }: { it: Item; task: TaskSummary; bgs: Bg[] }) {
+
   if (it.kind === "sub") return <Sub it={it} task={task} held={false} />;
   const job = bgs?.find((b) => b.id === it.data?.bg_id);
   return (
@@ -928,7 +1051,8 @@ const ToolGroup = memo(function ToolGroup({ tools, task, held, bgs }: { tools: I
   // `split("\n")` always yields at least one piece, so the head of a one-line
   // target is there to take.
   const tgt = String(lv.target || "").split("\n")[0]!;
-  const now = running ? `${ING[lv.verb] ?? lv.verb} ${["Read", "Edit", "Write", "View"].includes(lv.verb) ? short(tgt) : clip(tgt)}…` : "";
+  const ing = last.data?.name === "http_request" ? `Sending ${lv.verb} to` : ING[lv.verb] ?? lv.verb;
+  const now = running ? `${ing} ${["Read", "Edit", "Write", "View"].includes(lv.verb) ? short(tgt) : clip(tgt)}…` : "";
   return (
     <div className="toolgroup">
       <Pressable className="tg-line" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -943,7 +1067,11 @@ const ToolGroup = memo(function ToolGroup({ tools, task, held, bgs }: { tools: I
       </div>
     </div>
   );
-});
+// `groupFeed` builds a fresh `tools` array on every pass, so the group is
+// compared call by call: a streamed token elsewhere in the turn leaves every
+// call the same object, and without this every group in the live turn re-ran
+// `summarize` on every flush.
+}, (a, b) => sameItems(a.tools, b.tools) && a.held === b.held && feedTaskEqual(a.task, b.task, a.tools) && (a.bgs === b.bgs || bgLook(a.bgs, a.tools) === bgLook(b.bgs, b.tools)));
 
 /** Interactive items never fold away: the user may still need to act on them. */
 const KEEP = new Set(["user", "approval", "question"]);
@@ -958,6 +1086,15 @@ function fmtDur(ms: number) {
 }
 
 type Turn = { key: string; head: Item[]; work: Item[]; tail: Item[]; ms: number; actions: number };
+
+/** The quiet copy of a goal notice, one per notice object: a fresh copy on every
+ *  pass was a new item each time, so the row showing it never hit its memo. */
+const quietCopies = new WeakMap<Item, Item>();
+function quietCopy(i: Item): Item {
+  let q = quietCopies.get(i);
+  if (!q) quietCopies.set(i, (q = { ...i, data: { ...i.data, quiet: true } }));
+  return q;
+}
 
 /** Split a finished turn into: the user's message, the work in between, and the final answer. */
 function splitTurns(items: Item[], live: boolean): (Item | Turn)[] {
@@ -987,13 +1124,15 @@ function splitTurns(items: Item[], live: boolean): (Item | Turn)[] {
     const tail = t.slice(end);
     // Goal summary + the agent's own summary would say the same thing twice: keep the agent's.
     const hasText = tail.some((i) => i.kind === "text" && i.text.trim());
-    const quietTail = tail.map((i) => (hasText && i.kind === "notice" && i.data?.goal ? { ...i, data: { ...i.data, quiet: true } } : i));
+    const quietTail = tail.map((i) => (hasText && i.kind === "notice" && i.data?.goal ? quietCopy(i) : i));
     out.push({ key: "turn-" + t[0]!.id, head: t.slice(0, headN), work: mid, tail: quietTail, ms: stop - start, actions });
   });
   return out;
 }
 
-function Worked({ turn, task, showThinking, onOpenArtifict }: { turn: Turn; task: TaskSummary; showThinking: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
+/** `splitTurns` rebuilds every turn object on every pass, so a folded turn is
+ *  compared by what it shows and by the calls inside it. */
+const Worked = memo(function Worked({ turn, task, showThinking, onOpenArtifict }: { turn: Turn; task: TaskSummary; showThinking: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="it">
@@ -1006,7 +1145,7 @@ function Worked({ turn, task, showThinking, onOpenArtifict }: { turn: Turn; task
       </div>
     </div>
   );
-}
+}, (a, b) => a.turn.key === b.turn.key && a.turn.ms === b.turn.ms && a.turn.actions === b.turn.actions && sameItems(a.turn.work, b.turn.work) && a.showThinking === b.showThinking && a.onOpenArtifict === b.onOpenArtifict && feedTaskEqual(a.task, b.task, a.turn.work));
 
 /** The store is read ONCE per transcript, up here, and handed down: a subscription
  *  per feed row meant every streamed delta re-ran one selector per row. */
@@ -1015,8 +1154,11 @@ function isVisibleFeedItem(item: Item): boolean {
   return !(item.kind === "user" && item.data?.queued) && (item.kind !== "asklater" || !!item.data?.answers || !!item.data?.dismissed) && (item.kind !== "user_notice" || !!item.data?.dismissed);
 }
 
-/** Plain feed rows. Exported so a render test can pin what the transcript shows. */
-export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOpenArtifict }: { items: Item[]; task: TaskSummary; showThinking: boolean; bgs?: Bg[]; streamingItemId?: string; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
+/** Plain feed rows. Exported so a render test can pin what the transcript shows.
+ *
+ *  Memoized item by item: `Feed` slices a new array for every run and turn on
+ *  every pass, and a finished turn's rows are the same item objects each time. */
+export const FeedRows = memo(function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOpenArtifict }: { items: Item[]; task: TaskSummary; showThinking: boolean; bgs?: Bg[]; streamingItemId?: string; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   // A queued message hasn't been sent yet, so it has no place in the transcript
   // — it lives in the list above the composer until the agent reads it, and
   // rejoins the feed as an ordinary message the moment that happens. An
@@ -1041,7 +1183,7 @@ export function FeedRows({ items, task, showThinking, bgs, streamingItemId, onOp
           : <Row key={e.key} it={e.it} task={task} showThinking={showThinking} held={held} streaming={e.it.id === streamingItemId} onOpenArtifict={onOpenArtifict} />)}
     </>
   );
-}
+}, (a, b) => sameItems(a.items, b.items) && a.showThinking === b.showThinking && a.bgs === b.bgs && a.streamingItemId === b.streamingItemId && a.onOpenArtifict === b.onOpenArtifict && feedTaskEqual(a.task, b.task, a.items));
 
 function Feed({ items, task, live, showThinking, onOpenArtifict }: { items: Item[]; task: TaskSummary; live: boolean; showThinking: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   let latest: Item | undefined;
@@ -1059,9 +1201,12 @@ function Feed({ items, task, live, showThinking, onOpenArtifict }: { items: Item
   for (const p of parts) {
     if ("work" in p) {
       flush();
-      rows.push(<FeedRows key={"h-" + p.key} items={p.head} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifict={onOpenArtifict} />);
+      // A folded turn is a finished one, never the live turn the streaming
+      // reply is in, so its rows are not handed the id: when a new reply starts
+      // streaming, only the live run has anything to redraw.
+      rows.push(<FeedRows key={"h-" + p.key} items={p.head} task={task} showThinking={showThinking} onOpenArtifict={onOpenArtifict} />);
       rows.push(<Worked key={p.key} turn={p} task={task} showThinking={showThinking} onOpenArtifict={onOpenArtifict} />);
-      rows.push(<FeedRows key={"t-" + p.key} items={p.tail} task={task} showThinking={showThinking} streamingItemId={streamingItemId} onOpenArtifict={onOpenArtifict} />);
+      rows.push(<FeedRows key={"t-" + p.key} items={p.tail} task={task} showThinking={showThinking} onOpenArtifict={onOpenArtifict} />);
     } else run.push(p);
   }
   flush();
@@ -1089,7 +1234,9 @@ const Row = memo(function Row({ it, task, showThinking, held, streaming = false,
       {it.kind === "user_notice" && it.data?.dismissed && <div className="agent-notice-receipt"><Info size={13} aria-hidden="true" /><div><strong>{it.data?.title || "Agent notice"}</strong> · dismissed<div>{it.text}</div></div></div>}
     </div>
   );
-});
+// The chat summary is a new object on every agent step; a row compares only the
+// parts of it the row reads (see `feedTaskEqual`).
+}, (a, b) => a.it === b.it && a.showThinking === b.showThinking && a.held === b.held && a.streaming === b.streaming && a.onOpenArtifict === b.onOpenArtifict && feedTaskEqual(a.task, b.task, [a.it]));
 
 function useStick(dep: unknown) {
   const ref = useRef<HTMLDivElement>(null);
@@ -1356,6 +1503,49 @@ function Waiting({ tail }: { tail: string }) {
   );
 }
 
+/** How close to the end of the transcript counts as being back at it, so the
+ *  view follows new output again. Small on purpose: anything bigger swallows the
+ *  first steps of a scroll up, which is the bug `onScroll` explains. */
+const FOLLOW_SLACK = 24;
+
+/** Where each chat's transcript was left: whether the reader was following its
+ *  end, and the rows at the top of the view if not. Leaving a chat and coming
+ *  back used to start the view from whatever the previous chat left behind, so
+ *  it landed somewhere up the transcript instead of where the reader had been.
+ *  Bounded: one small entry per chat visited, oldest dropped first. */
+const leftAt = new Map<string, { stick: boolean; anchors: { id: string; top: number }[] }>();
+const LEFT_AT_CAP = 64;
+
+/** Scroll so the first of `anchors` still on the page sits where it was. */
+function restoreAnchors(el: HTMLElement, anchors: { id: string; top: number }[]): boolean {
+  const viewTop = el.getBoundingClientRect().top;
+  const rows = new Map<string, HTMLElement>();
+  for (const row of el.querySelectorAll<HTMLElement>("[data-item]")) rows.set(row.dataset.item!, row);
+  for (const anchor of anchors) {
+    const row = rows.get(anchor.id);
+    if (!row) continue;
+    el.scrollTop += row.getBoundingClientRect().top - viewTop - anchor.top;
+    return true;
+  }
+  return false;
+}
+
+/** Keep the view on the live end, and remember where that left it. */
+function pinToEnd(el: HTMLElement, lastTop: { current: number }) {
+  el.scrollTop = el.scrollHeight;
+  lastTop.current = el.scrollTop;
+}
+
+/** Whether an upward scroll from `target` goes to a scrollable block inside the
+ *  transcript (a long code block, a tool's output) rather than the transcript. A
+ *  wheel over one of those must not stop the chat following its live end. */
+function innerScrollTakes(target: EventTarget, scroller: HTMLElement) {
+  for (let n = target instanceof Element ? target : null; n && n !== scroller; n = n.parentElement) {
+    if (n.scrollTop > 0) return true;
+  }
+  return false;
+}
+
 /** The transcript. Exported so a render test can pin the scroll anchoring. */
 export function Timeline({ task, onOpenArtifict }: { task: TaskSummary; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   const items = useStore((s) => s.items[task.id]);
@@ -1363,7 +1553,15 @@ export function Timeline({ task, onOpenArtifict }: { task: TaskSummary; onOpenAr
   const visibleItems = useMemo(() => pending.length ? [...(items ?? []), ...pending] : items, [items, pending]);
   const showThinking = useStore((s) => s.settings?.show_thinking ?? false);
   const ref = useRef<HTMLDivElement>(null);
+  // Whether the reader is following the live end. Only the reader turns it off,
+  // by moving up, and only reaching the end again turns it back on. See onScroll.
   const stick = useRef(true);
+  // Where the view was last seen, by the scroll handler or by our own writes: how
+  // a scroll event tells which way the view moved.
+  const lastTop = useRef(0);
+  // The rows at the top of the view and where they sat (see the anchoring below).
+  const anchors = useRef<{ id: string; top: number }[]>([]);
+  const touchY = useRef<number | null>(null);
   const last = visibleItems?.[visibleItems.length - 1];
   // Pin to the bottom only when the transcript actually grew, not on every
   // render: reading scrollHeight forces a synchronous layout, and paying it per
@@ -1377,15 +1575,84 @@ export function Timeline({ task, onOpenArtifict }: { task: TaskSummary; onOpenAr
     }
     return "";
   }, [visibleItems]);
+  // Rows to put back at the top of the view once the chat being entered has
+  // rows to put there (its transcript can still be loading).
+  const restoring = useRef<{ id: string; top: number }[] | null>(null);
+  // Entering a chat. A layout effect, and declared before the pin below so it
+  // runs first: the pane is not remounted between chats, so until this runs the
+  // follow flag and scroll offset are the previous chat's. As a passive effect
+  // it ran after paint — one frame of the new chat at the old chat's offset,
+  // and a pin that skipped the new rows because the old chat was scrolled up.
+  useLayoutEffect(() => {
+    const saved = leftAt.get(task.id);
+    stick.current = saved?.stick ?? true;
+    restoring.current = saved && !saved.stick ? saved.anchors : null;
+    anchors.current = saved?.anchors ?? [];
+    const el = ref.current;
+    if (el && stick.current) pinToEnd(el, lastTop);
+    return () => {
+      leftAt.delete(task.id);
+      leftAt.set(task.id, { stick: stick.current, anchors: anchors.current });
+      if (leftAt.size > LEFT_AT_CAP) leftAt.delete(leftAt.keys().next().value!);
+    };
+  }, [task.id]);
   useLayoutEffect(() => {
     const el = ref.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [tail]);
-  useEffect(() => {
-    stick.current = true;
+    if (!el) return;
+    if (restoring.current) {
+      if (!items) return; // still loading: keep the place to restore for later
+      // The rows the reader was on may have been dropped while the chat was
+      // closed (only its newest rows are kept); then the end is the place.
+      if (restoreAnchors(el, restoring.current)) lastTop.current = el.scrollTop;
+      else stick.current = true;
+      restoring.current = null;
+    }
+    if (stick.current) pinToEnd(el, lastTop);
+  }, [tail, task.id, items]);
+  // Scroll anchoring, by hand. Rows change height above the reader all the
+  // time — a turn that finishes folds its work into one "Worked" row, a
+  // subagent card collapses when it is done, an off-screen row trades its
+  // `content-visibility` estimate for its real height — and every such change
+  // shifted what was on screen. The browser's own anchoring cannot help: the
+  // node it anchors to is the row that just got folded away. So remember where
+  // the rows at the top of the view sit; when the layout changes, find the
+  // first of them still on the page and scroll by however far it moved. A
+  // reader stuck to the bottom is simply kept there.
+  const recordAnchors = useCallback(() => {
     const el = ref.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [task.id]);
+    if (!el) return;
+    const viewTop = el.getBoundingClientRect().top;
+    const found: { id: string; top: number }[] = [];
+    for (const row of el.querySelectorAll<HTMLElement>("[data-item]")) {
+      const box = row.getBoundingClientRect();
+      if (box.bottom <= viewTop) continue;
+      found.push({ id: row.dataset.item!, top: box.top - viewTop });
+      // Several, so a row folded into "Worked" still leaves one that survived.
+      if (found.length >= 8) break;
+    }
+    anchors.current = found;
+  }, []);
+  useEffect(() => {
+    const el = ref.current;
+    const content = el?.querySelector(".timeline-in");
+    if (!el || !content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (stick.current) { pinToEnd(el, lastTop); return; }
+      const viewTop = el.getBoundingClientRect().top;
+      const rows = new Map<string, HTMLElement>();
+      for (const row of el.querySelectorAll<HTMLElement>("[data-item]")) rows.set(row.dataset.item!, row);
+      for (const anchor of anchors.current) {
+        const row = rows.get(anchor.id);
+        if (!row) continue;
+        const moved = row.getBoundingClientRect().top - viewTop - anchor.top;
+        if (Math.abs(moved) >= 1) { el.scrollTop += moved; lastTop.current = el.scrollTop; }
+        break;
+      }
+      recordAnchors();
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [task.id, recordAnchors]);
   const live = task.status === "running";
   const streaming = live && last && (last.kind === "text" || (last.kind === "thinking" && showThinking)) && Date.now() - new Date(last.ts).getTime() < 60_000;
   // `isPaused`, not `task.paused`: a chat frozen by "Pause all" carries no pause
@@ -1426,8 +1693,49 @@ export function Timeline({ task, onOpenArtifict }: { task: TaskSummary; onOpenAr
   return (
     <div ref={ref} className="timeline" onScroll={(e) => {
       const el = e.currentTarget;
-      stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-      if (el.scrollTop < 100) void loadPreviousHistory(task.id, el);
+      const top = el.scrollTop;
+      const fromEnd = el.scrollHeight - top - el.clientHeight;
+      // The view has not moved since it was last pinned, but the end has: the
+      // content grew under a follower between the pin and this event — rows
+      // trading their size estimate for their real height as a chat opens,
+      // the newest page of a reopened chat landing, output streaming in. That
+      // is not the reader leaving the end, and treating it as "far from the
+      // end" below is what left a chat you had just come back to stranded up
+      // the transcript while the agent kept working. Follow it instead.
+      if (stick.current && Math.abs(top - lastTop.current) <= 1 && fromEnd > FOLLOW_SLACK) {
+        pinToEnd(el, lastTop);
+        recordAnchors();
+        return;
+      }
+      // Any move up away from the end stops the follow, however small. This used
+      // to be "within 80px of the bottom" on every event, and the first frames of
+      // a wheel's smooth scroll, or each small touchpad step, are inside those
+      // 80px: the follow came straight back on, the next streamed token pinned
+      // the view to the bottom and cancelled the scroll, and the screen shook
+      // in place. A view pulled up by the content shrinking under it is still
+      // at the end (`fromEnd` is 0), so that does not count as the reader moving.
+      // Far from the end is never following, whichever way the view got there.
+      if ((top < lastTop.current - 1 && fromEnd > 2) || fromEnd > 80) stick.current = false;
+      else if (fromEnd <= FOLLOW_SLACK) stick.current = true;
+      lastTop.current = top;
+      recordAnchors();
+      if (top < 100) void loadPreviousHistory(task.id, el);
+    }}
+    // Also on the input, not only on the scroll event: that event is a frame
+    // behind, and a token that streams in between would pin the view back.
+    onWheel={(e) => {
+      const el = e.currentTarget;
+      if (e.deltaY < 0 && el.scrollTop > 0 && !innerScrollTakes(e.target, el)) stick.current = false;
+      else if (e.deltaY > 0 && el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK) stick.current = true;
+    }}
+    onTouchStart={(e) => { touchY.current = e.touches[0]?.clientY ?? null; }}
+    onTouchMove={(e) => {
+      const y = e.touches[0]?.clientY ?? null;
+      const previous = touchY.current;
+      touchY.current = y;
+      // A finger moving down the screen moves the content up.
+      const el = e.currentTarget;
+      if (y !== null && previous !== null && y > previous && el.scrollTop > 0 && !innerScrollTakes(e.target, el)) stick.current = false;
     }}>
       <LiveReply live={live} text={lastReply} />
       <div className="timeline-in">
@@ -1490,14 +1798,42 @@ const busy = (n: TreeNode): boolean => isLiveSub(n.sub) || n.kids.some(busy);
  *  children so the cap can only ever cut the quiet end of a list. A swarm
  *  spawns into insertion order, so without this a 300-agent ultrathread buries
  *  the twelve still working under everyone who already finished. */
-export function buildTree(subs: SubInfo[]): { live: TreeNode[]; quiet: TreeNode[] } {
+export function buildTree(subs: SubInfo[], prev?: Map<string, TreeNode>): { live: TreeNode[]; quiet: TreeNode[]; nodes: Map<string, TreeNode> } {
   const byId = new Map(subs.map((s) => [s.id, { sub: s, kids: [] as TreeNode[] }]));
   const roots: TreeNode[] = [];
   for (const n of byId.values()) {
     const p = n.sub.parent ? byId.get(n.sub.parent) : undefined;
     (p ? p.kids : roots).push(n);
   }
-  return { live: roots.filter(busy), quiet: roots.filter((r) => !busy(r)) };
+  // Hand back last pass's node for every agent whose row would draw the same:
+  // the backend republishes the whole list on every status event, so every
+  // `sub` is a fresh object each time, and `TreeRow`'s memo on the node could
+  // never hit. Bottom-up, so a parent is reused only when its children were.
+  const nodes = new Map<string, TreeNode>();
+  const reuse = (n: TreeNode, seen: Set<string>): TreeNode => {
+    // A parent cycle in a malformed list would recurse for ever; the plain
+    // build above already leaves a cycle out of `roots`, this only guards.
+    if (seen.has(n.sub.id)) return n;
+    seen.add(n.sub.id);
+    const kids = n.kids.map((k) => reuse(k, seen));
+    const old = prev?.get(n.sub.id);
+    const same = !!old && sameSub(old.sub, n.sub) && old.kids.length === kids.length && kids.every((k, i) => k === old.kids[i]);
+    const out = same ? old! : { sub: n.sub, kids };
+    nodes.set(n.sub.id, out);
+    return out;
+  };
+  const seen = new Set<string>();
+  const top = roots.map((r) => reuse(r, seen));
+  return { live: top.filter(busy), quiet: top.filter((r) => !busy(r)), nodes };
+}
+
+/** Every field of a `SubInfo` is a primitive, so a shallow pass is the whole
+ *  comparison. */
+function sameSub(a: SubInfo, b: SubInfo): boolean {
+  if (a === b) return true;
+  const ka = Object.keys(a) as (keyof SubInfo)[];
+  if (ka.length !== Object.keys(b).length) return false;
+  return ka.every((k) => a[k] === b[k]);
 }
 
 /** Every agent a tree shows, parents before children — what the cap spends. */
@@ -1520,9 +1856,11 @@ function elapsed(since: string | null) {
 /** One agent's row. Memoized on the node: the backend republishes the whole
  *  subagent list on every status event, so `task.subs` is a new array each
  *  time. Without this, one agent taking a step re-rendered all 80 mounted
- *  rows; now only its own does, because `node.sub` is the same object for
- *  every agent that didn't change. */
-const TreeRow = memo(function TreeRow({ node, depth, last, budget, task, held }: { node: TreeNode; depth: number; last: boolean; budget: number; task: TaskSummary; held: boolean }) {
+ *  rows; now only its own does, because `buildTree` hands back the same node
+ *  for every agent that didn't change. The chat summary is a new object on
+ *  every event too, so it is compared by `look` — the only part of it a row
+ *  reads, the model an agent resolves to — rather than by identity. */
+const TreeRow = memo(function TreeRow({ node, depth, last, budget, task, held, look }: { node: TreeNode; depth: number; last: boolean; budget: number; task: TaskSummary; held: boolean; look: string }) {
   const a = node.sub;
   const running = a.status === "running";
   // An agent's own status says `running` while it sits parked by a freeze, so
@@ -1551,17 +1889,27 @@ const TreeRow = memo(function TreeRow({ node, depth, last, budget, task, held }:
       </Pressable>
       {/* One long swarm can spawn hundreds of agents: once the budget runs out we stop
           descending rather than render every node, and the count below says so. */}
-      {node.kids.map((k, i) => budget > 0 || i === 0 ? <TreeRow key={k.sub.id} node={k} depth={depth + 1} last={i === node.kids.length - 1} budget={budget - 1} task={task} held={held} /> : null)}
+      {node.kids.map((k, i) => budget > 0 || i === 0 ? <TreeRow key={k.sub.id} node={k} depth={depth + 1} last={i === node.kids.length - 1} budget={budget - 1} task={task} held={held} look={look} /> : null)}
     </>
   );
-});
+}, treeRowEqual);
+
+function treeRowEqual(a: { node: TreeNode; depth: number; last: boolean; budget: number; held: boolean; look: string }, b: typeof a): boolean {
+  return a.node === b.node && a.depth === b.depth && a.last === b.last && a.budget === b.budget && a.held === b.held && a.look === b.look;
+}
+
+/** The part of the chat summary the tree's rows read: what `subModel` resolves
+ *  an agent's model from. */
+function treeLook(t: TaskSummary): string {
+  return `${chatModel(t)}\u0000${t.ultra_x ? JSON.stringify(t.ultra_x) : ""}`;
+}
 
 /** The agents that finished, folded behind one line. A fold and not a group
  *  because the work really is over: every row inside has a final status, so
  *  nothing is hidden behind the summary that you might still want to watch.
  *  Its count comes straight off the label, so the line can only ever claim what
  *  clicking it actually opens. */
-const DoneSection = memo(function DoneSection({ tree, budget, task, held }: { tree: TreeNode[]; budget: number; task: TaskSummary; held: boolean }) {
+const DoneSection = memo(function DoneSection({ tree, budget, task, held, look }: { tree: TreeNode[]; budget: number; task: TaskSummary; held: boolean; look: string }) {
   const [open, setOpen] = useState(false);
   const n = rowCount(tree);
   const shown = mountedRows(tree, budget);
@@ -1573,16 +1921,23 @@ const DoneSection = memo(function DoneSection({ tree, budget, task, held }: { tr
         <span className="tg-text">Done · {n} agent{n === 1 ? "" : "s"}</span>
       </Pressable>
       <div className="fold" style={{ gridTemplateRows: open ? "1fr" : "0fr" }}>
-        <div>{open && <div className="tree">{tree.map((x, i) => <TreeRow key={x.sub.id} node={x} depth={0} last={i === tree.length - 1} budget={budget} task={task} held={held} />)}</div>}</div>
+        <div>{open && <div className="tree">{tree.map((x, i) => <TreeRow key={x.sub.id} node={x} depth={0} last={i === tree.length - 1} budget={budget} task={task} held={held} look={look} />)}</div>}</div>
       </div>
       {shown < n && <div style={{ padding: "2px 6px", color: "var(--dim)" }}>Showing {shown} of {n}. Their reports are still on each agent's own page.</div>}
     </div>
   );
-});
+}, (a, b) => a.tree.length === b.tree.length && a.tree.every((n, i) => n === b.tree[i]) && a.budget === b.budget && a.held === b.held && a.look === b.look);
 
 export function SwarmTree({ task }: { task: TaskSummary }) {
   const held = isPaused(task, useStore((s) => s.settings?.paused_all ?? false));
-  const tree = useMemo(() => buildTree(task.subs), [task.subs]);
+  // Last pass's nodes, so `buildTree` can hand back the ones that did not change.
+  const prevNodes = useRef<Map<string, TreeNode> | undefined>(undefined);
+  const tree = useMemo(() => {
+    const t = buildTree(task.subs, prevNodes.current);
+    prevNodes.current = t.nodes;
+    return t;
+  }, [task.subs]);
+  const look = treeLook(task);
   const c = swarmCounts(task.subs);
   const total = task.subs.length || 1;
   // Same cap as the chat sidebar: enough rows to read, bounded so a 1000-agent
@@ -1610,8 +1965,8 @@ export function SwarmTree({ task }: { task: TaskSummary }) {
           {task.ultra && <div className="swarmstats"><span><b>{c.done}</b> done</span><span><b>{c.running}</b> live</span>{c.failed > 0 && <span className="bad"><b>{c.failed}</b> failed</span>}<span><b>{maxDepth}</b> level{maxDepth === 1 ? "" : "s"} deep</span></div>}
         </>
       )}
-      <div className="tree">{shownLive.map((n, i) => <TreeRow key={n.sub.id} node={n} depth={0} last={i === shownLive.length - 1} budget={spare} task={task} held={held} />)}</div>
-      <DoneSection tree={tree.quiet} budget={spare} task={task} held={held} />
+      <div className="tree">{shownLive.map((n, i) => <TreeRow key={n.sub.id} node={n} depth={0} last={i === shownLive.length - 1} budget={spare} task={task} held={held} look={look} />)}</div>
+      <DoneSection tree={tree.quiet} budget={spare} task={task} held={held} look={look} />
       {!task.subs.length && <div style={{ padding: "2px 6px", color: "var(--dim)" }}>{task.ultra ? "No subagents yet · the first wave launches after planning" : "None spawned"}</div>}
       {liveRows > shownLive.length && <div style={{ padding: "2px 6px", color: "var(--dim)" }}>{shownLive.length} live of {liveRows} shown · the rest are in the Done line below.</div>}
     </div>
@@ -1693,27 +2048,49 @@ export function BgCommands({ task, bgs }: { task: TaskSummary; bgs: Bg[] }) {
   );
 }
 
+/** How long the details rail keeps its contents after closing: its width and
+ *  opacity transitions (`.details`, `.details-in`) run for up to .28s, and
+ *  emptying it at once would blank the panel mid-slide. */
+const DETAILS_LINGER_MS = 320;
+
+/** `on`, held true for `ms` after it turns false. */
+function useLinger(on: boolean, ms: number): boolean {
+  const [kept, setKept] = useState(on);
+  useEffect(() => {
+    if (on) { setKept(true); return; }
+    const t = setTimeout(() => setKept(false), ms);
+    return () => clearTimeout(t);
+  }, [on, ms]);
+  return on || kept;
+}
+
 function Details({ task }: { task: TaskSummary }) {
   const open = useStore((s) => s.details);
+  // A closed rail is 0px wide and transparent, but its contents used to stay
+  // mounted: the swarm tree, the job list and an open subagent's transcript
+  // re-rendered on every chat event for a panel nobody could see. Only the
+  // frame stays, so the open and close transitions are unchanged.
+  const shown = useLinger(open, DETAILS_LINGER_MS);
   // Off by default, so the meter is the measured pair until the user asks for
   // the estimated split (Settings → General → Context breakdown).
   const breakdown = useStore((s) => s.settings?.ctx_breakdown ?? false);
   const subOpen = useStore((s) => s.subOpen);
-  const bgs = useStore((s) => s.bg[task.id] ?? NO_BG);
+  const bgs = useStore((s) => (shown ? s.bg[task.id] ?? NO_BG : NO_BG));
   const sub = subOpen ? task.subs.find((s) => s.id === subOpen) : null;
   if (sub) {
-    return <div className="details" style={{ width: open ? 400 : 0, maxWidth: "calc(100% - 360px)" }}><div className="details-in wide" style={{ opacity: open ? 1 : 0, padding: 0 }}><SubPanel key={sub.id} task={task} sub={sub} /></div></div>;
+    return <div className="details" style={{ width: open ? 400 : 0, maxWidth: "calc(100% - 360px)" }}><div className="details-in wide" style={{ opacity: open ? 1 : 0, padding: 0 }}>{shown && <SubPanel key={sub.id} task={task} sub={sub} />}</div></div>;
   }
   return (
     <div className="details" style={{ width: open ? 292 : 0, maxWidth: "calc(100% - 380px)" }}>
       <div className="details-in" style={{ opacity: open ? 1 : 0 }}>
-        {task.goal && (
+        {shown && task.goal && (
           <div className="dsec">
             <div className="dh"><span style={{ flex: 1 }}>Goal</span><span>{task.goal.status === "active" ? (task.goal.nudges ? `check ${task.goal.nudges}/25` : "active") : task.goal.status.replace("_", " ")}</span></div>
             <div style={{ padding: "0 6px", lineHeight: 1.5, color: task.goal.status === "achieved" ? "var(--mut2)" : "#e4e4e7" }}>{task.goal.text}</div>
             {task.goal.status === "active" && <Button variant="ghost" style={{ height: 22, padding: "0 6px", fontSize: 11, alignSelf: "flex-start", marginLeft: 2 }} onClick={() => api.send(task.id, "/goal clear")}>Clear goal</Button>}
           </div>
         )}
+        {shown && <>
         <SwarmTree task={task} />
         <BgCommands task={task} bgs={bgs} />
         <div className="dsec">
@@ -1722,6 +2099,7 @@ function Details({ task }: { task: TaskSummary }) {
           {task.serving && <div className="mono" style={{ padding: "0 6px", fontSize: 10.5, color: "var(--mut3)", wordBreak: "break-all" }}>via {task.serving}</div>}
           <div className="mono" style={{ fontSize: 10.5, color: "var(--dim2)", wordBreak: "break-all" }}>{task.cwd}</div>
         </div>
+        </>}
       </div>
     </div>
   );
@@ -1791,7 +2169,8 @@ export function Session() {
   // Subscribed, not read through get(): a global pause arrives as a settings
   // event, and this header has to re-render when it lands.
   const pausedAll = useStore((s) => s.settings?.paused_all ?? false);
-  const browserEnabled = useStore((s) => s.settings?.plugins?.browser.enabled ?? false);
+  // On by default, as in Rust `BrowserCfg::default`.
+  const browserEnabled = useStore((s) => s.settings?.plugins?.browser.enabled ?? true);
   // Whether this chat is on its Artificts surface is the chat's own answer,
   // saved with the chat like its name and its pin: switching to another chat
   // carries that chat's answer with it, so the record surface belongs to the
@@ -1802,6 +2181,9 @@ export function Session() {
   // dialog of its own; it is a view of this pane now, and the pane is the frame.
   const [workspaceTab, setWorkspaceTab] = useState<"artificts" | "browser">("artificts");
   const [workspaceExpanded, setWorkspaceExpanded] = useState(false);
+  // Where the studio renders its toolbar: a slot in this header, so the
+  // Artificts surface has one bar rather than the header plus its own.
+  const [studioSlot, setStudioSlot] = useState<HTMLDivElement | null>(null);
   const setWorkspaceOpen = useCallback((open: boolean) => {
     const id = get().task;
     if (!id) return;
@@ -1810,7 +2192,18 @@ export function Session() {
     set((s) => (s.tasks[id] ? { tasks: { ...s.tasks, [id]: { ...s.tasks[id]!, artifict_open: open } } } : {}));
     void api.update(id, { artifict_open: open }).catch(() => {});
   }, []);
+  // A chat started from another chat's studio opens on the artifict it was
+  // started from, so the studio stays put while the chat beside it changes.
   const [workspaceSelection, setWorkspaceSelection] = useState<ArtifictWorkspaceSelection | null>(null);
+  const handoffId = task?.id;
+  useEffect(() => {
+    if (!handoffId) return;
+    // A selection belongs to the chat it was made in: switching chats (or
+    // opening a new one) must not carry the last chat's open artifict along.
+    const handed = studioHandoff.get(handoffId) ?? null;
+    studioHandoff.delete(handoffId);
+    setWorkspaceSelection(handed);
+  }, [handoffId]);
   // Stable identity on purpose. This is handed to `Timeline` and passed down to
   // every row: as an inline arrow it was a new prop on every Session render, and
   // Session re-renders on every summary event for this chat (status, step, cost,
@@ -1818,6 +2211,12 @@ export function Session() {
   // the whole transcript re-rendered for one chat-level change. Every setter it
   // needs is stable — three state setters and the `useCallback` above — so this
   // never has to change.
+  // A browser row can open the shared Browser view beside the chat. Stable for
+  // the same reason as `openArtifict`: it reaches every row through context.
+  const openBrowserView = useCallback(() => {
+    setWorkspaceTab("browser");
+    setWorkspaceOpen(true);
+  }, [setWorkspaceOpen]);
   const openArtifict = useCallback((selection: ArtifictWorkspaceSelection) => {
     setWorkspaceSelection(selection);
     setWorkspaceTab("artificts");
@@ -1828,8 +2227,14 @@ export function Session() {
   const taskId = task?.id;
   const taskStatus = task?.status;
   useEffect(() => {
+    setStats(null);
     if (!taskId || taskStatus === "running") return;
-    api.review(taskId).then((r) => setStats({ n: r.files.length, add: r.files.reduce((a, f) => a + f.add, 0), del: r.files.reduce((a, f) => a + f.del, 0) })).catch(() => setStats(null));
+    let cancelled = false;
+    // The header only needs three totals, not the full text of every file diff.
+    void api.reviewStats(taskId).then((r) => {
+      if (!cancelled) setStats({ n: r.files, add: r.add, del: r.del });
+    }).catch(() => { if (!cancelled) setStats(null); });
+    return () => { cancelled = true; };
   }, [taskId, taskStatus]);
   if (!task) {
     // A failure the store recorded for *this* chat. Shows why, and offers the
@@ -1884,25 +2289,32 @@ export function Session() {
             </Tooltip>
           );
         })()}
-        {task.branch && <div className="branchtag shdr-optional">{task.branch}</div>}
-        <ContainerChip task={task} />
-        {task.goal && <Tooltip content={task.goal.text}><div className={"goalchip shdr-optional " + task.goal.status}>{task.goal.status === "active" ? "Goal" : task.goal.status === "achieved" ? "Goal met" : task.goal.status === "blocked" ? "Goal blocked" : "Goal stopped"}</div></Tooltip>}
-        {task.goal && <Button className="shdr-optional" variant="ghost" title="Remove the current goal" aria-label="Remove current goal" style={{ width: 24, height: 22, padding: 0, fontSize: 11 }} onClick={() => api.send(task.id, "/goal clear").catch((e) => flash(String(e)))}>{I.close(11)}</Button>}
-        {task.pending.model && <Tooltip content="Switches with your next message"><div className="goalchip shdr-optional">{modelInfo(task.pending.model).name}<PendingStar /></div></Tooltip>}
+        {task.branch && !workspaceOpen && <div className="branchtag shdr-optional">{task.branch}</div>}
+        {!workspaceOpen && <ContainerChip task={task} />}
+        {task.goal && !workspaceOpen && <Tooltip content={task.goal.text}><div className={"goalchip shdr-optional " + task.goal.status}>{task.goal.status === "active" ? "Goal" : task.goal.status === "achieved" ? "Goal met" : task.goal.status === "blocked" ? "Goal blocked" : "Goal stopped"}</div></Tooltip>}
+        {task.goal && !workspaceOpen && <Button className="shdr-optional" variant="ghost" title="Remove the current goal" aria-label="Remove current goal" style={{ width: 24, height: 22, padding: 0, fontSize: 11 }} onClick={() => api.send(task.id, "/goal clear").catch((e) => flash(String(e)))}>{I.close(11)}</Button>}
+        {task.pending.model && !workspaceOpen && <Tooltip content="Switches with your next message"><div className="goalchip shdr-optional">{modelInfo(task.pending.model).name}<PendingStar /></div></Tooltip>}
         <div className="shdr-spacer" />
         <Button className="shdr-control" variant={workspaceOpen ? "ghost" : "default"} aria-pressed={!workspaceOpen} onClick={() => setWorkspaceOpen(false)}>Chat</Button>
         <Button className="shdr-control" variant={workspaceOpen ? "primary" : "ghost"} aria-pressed={workspaceOpen} onClick={() => { setWorkspaceSelection(null); setWorkspaceTab("artificts"); setWorkspaceOpen(true); }}>Artificts</Button>
-        <div className="shdr-optional"><TodoChip todos={task.todos} /></div>
-        {task.ultra && task.subs.length > 0 && <div className="shdr-optional"><SwarmChip task={task} held={paused} /></div>}
+        {/* On the Artificts surface the header is the studio's toolbar: the
+            chat-only controls step aside and the studio renders its own tools
+            into this slot, so the surface has one bar instead of two. The
+            chat's status icon and title stay, and so does Resume on a paused
+            chat — that one is never safe to hide. */}
+        {workspaceOpen && workspaceTab === "artificts" && <div className="shdr-studio" ref={setStudioSlot} />}
+        {!workspaceOpen && <div className="shdr-optional"><TodoChip todos={task.todos} /></div>}
+        {task.ultra && task.subs.length > 0 && !workspaceOpen && <div className="shdr-optional"><SwarmChip task={task} held={paused} /></div>}
         {(live || paused) && (
           paused
             ? <Button className="shdr-optional" style={{ color: "#fbbf24", borderColor: "rgba(251,191,36,0.3)" }} title={pausedAll && !task.paused ? "Resume this chat only — everything else stays frozen" : undefined} onClick={() => api.resume(task.id).catch((e) => flash(String(e)))}>{I.play(10)}Resume</Button>
-            : <Tooltip content="Freeze this task and its subagents"><Button className="shdr-optional" variant="ghost" aria-label="Pause" onClick={() => requestPause(task.id)?.catch((e) => flash(String(e)))}>{I.pause(10)}</Button></Tooltip>
+            : !workspaceOpen && <Tooltip content="Freeze this task and its subagents"><Button className="shdr-optional" variant="ghost" aria-label="Pause" onClick={() => requestPause(task.id)?.catch((e) => flash(String(e)))}>{I.pause(10)}</Button></Tooltip>
         )}
-        {stats && stats.n > 0 && (
+        {stats && stats.n > 0 && !workspaceOpen && (
           <Button className="shdr-optional" onClick={() => go("diff")}>Review<span className="mono" style={{ fontSize: 10.5, color: "var(--diff-add)" }}>+{stats.add}</span><span className="mono" style={{ fontSize: 10.5, color: "var(--diff-del)" }}>−{stats.del}</span></Button>
         )}
-        <StatusButton task={task} />
+        {!workspaceOpen && <Tooltip content="Run timeline"><Button className="shdr-optional" variant="ghost" aria-label="Run timeline" onClick={() => openRunTimeline(task.id)}>{I.gantt(13)}</Button></Tooltip>}
+        {!workspaceOpen && <StatusButton task={task} />}
         {!workspaceOpen && <Tooltip content="Details · Ctrl J"><Button className="shdr-control" aria-label="Details" style={{ background: details ? "rgba(255,255,255,0.08)" : "transparent", borderColor: "transparent", color: details ? "#f4f4f5" : "var(--mut)" }} onClick={() => set({ details: !details })}>
           {I.panel()}
           {busy > 0 && <span style={{ minWidth: 16, height: 16, padding: "0 4px", borderRadius: 8, display: "grid", placeItems: "center", background: "rgba(167,139,250,0.14)", color: "var(--violet)", fontSize: 10, fontWeight: 600 }}>{busy}</span>}
@@ -1912,12 +2324,12 @@ export function Session() {
         {/* `data-task` is how the selection layer knows which chat a selection
             came from: the note it opens has to go to this chat's composer, and
             the pane is what identifies it. */}
-        <div className={workspaceOpen ? "session-pane collaboration-chat" : "session-pane"} data-task={task.id} style={{ flex: workspaceOpen ? (workspaceExpanded ? "0 0 0%" : "0 0 34%") : 1, minWidth: 300, position: "relative", display: workspaceOpen && workspaceExpanded ? "none" : undefined }}>
-          <Timeline task={task} onOpenArtifict={openArtifict} />
+        <div className={workspaceOpen ? "session-pane collaboration-chat" : "session-pane"} data-task={task.id} style={{ flex: workspaceOpen ? (workspaceExpanded ? "0 0 0%" : "0 0 26%") : 1, minWidth: workspaceOpen ? 280 : 300, position: "relative", display: workspaceOpen && workspaceExpanded ? "none" : undefined }}>
+          <OpenBrowserView.Provider value={browserEnabled ? openBrowserView : null}><Timeline task={task} onOpenArtifict={openArtifict} /></OpenBrowserView.Provider>
           {find && <FindBar onClose={() => set({ find: false })} />}
           <CFloat task={task} />
         </div>
-        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}>{browserEnabled && <div className="workspace-tabs" aria-label="Workspace views"><Button variant={workspaceTab === "artificts" ? "primary" : "ghost"} aria-pressed={workspaceTab === "artificts"} onClick={() => setWorkspaceTab("artificts")}>Artificts</Button><Button variant={workspaceTab === "browser" ? "primary" : "ghost"} aria-pressed={workspaceTab === "browser"} onClick={() => setWorkspaceTab("browser")}><Globe size={13} aria-hidden="true" />Browser</Button></div>}<div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div>{workspaceTab === "browser" && browserEnabled ? <BrowserPanel embedded key={task.id} taskId={task.id} onClose={() => setWorkspaceTab("artificts")} /> : <ArtifictWorkspace key={`${task.id}:${workspaceSelection?.artifictId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} onExpandedChange={setWorkspaceExpanded} />}</div>}
+        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}>{browserEnabled && <div className="workspace-tabs" aria-label="Workspace views"><Button variant={workspaceTab === "artificts" ? "primary" : "ghost"} aria-pressed={workspaceTab === "artificts"} onClick={() => setWorkspaceTab("artificts")}>Artificts</Button><Button variant={workspaceTab === "browser" ? "primary" : "ghost"} aria-pressed={workspaceTab === "browser"} onClick={() => setWorkspaceTab("browser")}><Globe size={13} aria-hidden="true" />Browser</Button></div>}<div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div>{workspaceTab === "browser" && browserEnabled ? <BrowserPanel embedded key={task.id} taskId={task.id} onClose={() => setWorkspaceTab("artificts")} onExpandedChange={setWorkspaceExpanded} /> : <ArtifictWorkspace key={`${task.id}:${workspaceSelection?.artifictId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} onExpandedChange={setWorkspaceExpanded} toolbarSlot={studioSlot} />}</div>}
         {/* The record surface owns the width while it is open, so the
             subagent/background rail stands down with its own toggle. */}
         {!workspaceOpen && <Details task={task} />}

@@ -5,9 +5,17 @@ import { copyText } from "./clipboard";
 import { Dropdown, Switch, Button } from "./primitives";
 import { flash, saveSettings, useStore } from "../store";
 import { AppConnectors } from "./Connectors";
+import { DiscordConnector } from "./DiscordConnector";
+import { SlackConnector } from "./SlackConnector";
+import { TelegramConnector } from "./TelegramConnector";
 import { McpServers } from "./McpServers";
+import { SERVICE_SPECS, ServicePluginCard } from "./ServicePlugins";
+import { BrowserSettings } from "./BrowserSettings";
 
-const OFF: Plugins = { github: { enabled: false }, computer: { enabled: false, settle_ms: 600 }, browser: { enabled: false, width: 1280, height: 800 } };
+// Mirrors the Rust defaults (`PluginsCfg::default`) for the frame before settings
+// arrive: everything off except the browser, which ships on and asks before it
+// interacts with a page.
+const OFF: Plugins = { github: { enabled: false }, computer: { enabled: false, settle_ms: 600 }, browser: { enabled: true, width: 1280, height: 800, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask", download_dir: "" } };
 
 function Details({ name, children }: { name: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -40,25 +48,18 @@ export function PluginsTab() {
   // Displays that can be looked at but not clicked: only the primary takes
   // input, and the switch has to say so rather than imply the whole desktop.
   const undriven = pc?.monitors.filter((m) => !m.driveable).length ?? 0;
-  const br = st?.browser;
-  // Match the backend's unset-dimension defaults, and retain custom saved sizes.
-  const width = p.browser.width > 0 ? p.browser.width : 1280;
-  const height = p.browser.height > 0 ? p.browser.height : 800;
-  const sizes = [[1024, 768], [1280, 800], [1440, 900], [1920, 1080]];
-  if (!sizes.some(([w, h]) => w === width && h === height)) sizes.push([width, height]);
   const settle = p.computer.settle_ms || 600;
   return <>
     <div className="settings-head"><div className="settings-head-main settings-title">Plugins</div><span className="exptag" title="Each plugin gives the agent real capabilities on this machine">Experimental</span><Button disabled={busy} onClick={check}>{busy ? "Checking…" : "Check again"}</Button></div>
     <div className="desc">Built-in tool sets for agents. Turning one on applies to new chats (and existing ones after <span className="mono">/compact</span>), so running chats keep their prompt cache.</div>
-    <div className="desc">Still finding its shape, and each one hands the agent real capabilities on this machine — every plugin below is off until you switch it on yourself. Availability below checks readiness, not whether a plugin is enabled.</div>
+    <div className="desc">Still finding its shape, and each one hands the agent real capabilities on this machine. Computer use is off until you switch it on yourself; the browser is on by default, runs in its own separate profile and asks before it interacts with a page. Availability below checks readiness, not whether a plugin is enabled.</div>
     <fieldset disabled={saving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} aria-busy={saving}>
       <div className="sgroup">
         <div className="srowx"><div style={{ flex: 1 }}><div>Computer use</div><div className="desc">{!pc ? "Checking…" : pc.ok && primary ? `Screen available · ${primary.name || "primary"} · ${primary.w}×${primary.h}${undriven > 0 ? ` · ${undriven} more can be looked at, not clicked` : ""}` : `Can't capture the screen: ${pc.error ?? "no monitors"}`}</div></div><Switch label="Computer use" checked={p.computer.enabled} onChange={(enabled) => void save({ ...p, computer: { ...p.computer, enabled } })} /></div>
         <Details name="Computer use"><div className="srowx desc">Agents see your screen and drive the mouse and keyboard. Every action returns a fresh screenshot of what they are working in, with the mouse marked, and they can zoom into a small region to read fine detail. Only the primary display takes clicks and keystrokes — another one can be looked at but not clicked. Clicks and typing ask first unless you always-allow them or use Full access. Press Esc while they are working to make them stop.</div><div className="srowx"><div style={{ flex: 1 }}>Settle time<div className="desc">Wait after an action before the screenshot. Raise it for slow apps.</div></div><Dropdown search={false} style={{ width: 120 }} value={String(settle)} onChange={(v) => void save({ ...p, computer: { ...p.computer, settle_ms: Number(v) } })} options={Array.from(new Set([300, 600, 1000, 1500, 2500, settle])).map((ms) => ({ value: String(ms), label: `${ms} ms` }))} /></div></Details>
       </div>
       <div className="sgroup" style={{ marginTop: 16 }}>
-        <div className="srowx"><div style={{ flex: 1 }}>Browser<div className="desc">{!br ? "Checking…" : br.ok ? `Browser available · ${br.browser} · headless` : `Can't start a browser: ${br.error ?? "no browser found"}. Install Chrome or Edge.`}</div></div><Switch label="Browser plugin" checked={p.browser.enabled} onChange={(enabled) => void save({ ...p, browser: { ...p.browser, enabled } })} /></div>
-        <Details name="Browser"><div className="srowx desc">Agents drive a real browser: open pages, follow links, fill in forms, read rendered pages and take screenshots. One browser per task, with a throwaway profile. It never touches your screen, mouse or keyboard. Reading needs no approval; clicking and typing do, since they can submit something.</div><div className="srowx"><div style={{ flex: 1 }}>Viewport<div className="desc">Page size. Wider layouts use more screenshot tokens.</div></div><Dropdown search={false} style={{ width: 150 }} value={`${width}x${height}`} onChange={(v) => { const [w, h] = v.split("x").map(Number); void save({ ...p, browser: { ...p.browser, width: w!, height: h! } }); }} options={sizes.map(([w, h]) => ({ value: `${w}x${h}`, label: `${w} × ${h}` }))} /></div></Details>
+        <BrowserSettings p={p} status={st?.browser} save={save} />
       </div>
     </fieldset>{saving && <div role="status">Saving…</div>}
     <McpServers custom />
@@ -97,6 +98,11 @@ export function ConnectorsTab() {
   return <>
     <div className="settings-head"><div className="settings-head-main settings-title">Connectors</div><Button disabled={busy} onClick={check}>{busy ? "Checking…" : "Check again"}</Button></div>
     <div className="desc">Connect accounts and apps. Connecting does not pre-approve tools. GitHub tools follow the switch below; GitHub device sign-in also enables it. Other app connections enable their MCP server. Changes to GitHub tools apply to new chats or after /compact.</div>
+    <div className="settings-section-label">Chat with your agent</div>
+    <DiscordConnector />
+    <TelegramConnector />
+    <SlackConnector />
+    <div className="settings-section-label">Accounts and apps</div>
     <div className="sgroup">
       <fieldset disabled={saving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} aria-busy={saving}>
         <div className="srowx"><div style={{ flex: 1 }}>GitHub<div className="desc">{!gh ? "Checking…" : gh.ok ? `Account available · ${gh.login} · token from ${gh.source}` : gh.source ? `Token from ${gh.source} doesn't work: ${gh.error}` : "No token · not connected"}</div></div><Switch label="GitHub plugin" checked={p.github.enabled} onChange={(enabled) => void save({ ...p, github: { ...p.github, enabled } })} /></div>
@@ -107,6 +113,7 @@ export function ConnectorsTab() {
           <div className="srowx"><Button aria-expanded={adv} onClick={() => setAdv(!adv)}>Advanced · OAuth app</Button></div>
           {adv && <><div className="srowx desc">Sign-in uses a GitHub OAuth App with Device Flow enabled. Create one in GitHub Settings → Developer settings → OAuth Apps, enable Device Flow, and paste its Client ID here. Any homepage/callback URL works; no secret needed.</div><div className="srowx"><input aria-label="GitHub OAuth Client ID" className="input mono" style={{ flex: 1 }} value={cid} onChange={(e) => setCid(e.currentTarget.value)} placeholder={st?.can_login ? "using the built-in app" : "Ov23li…"} /><Button onClick={() => void save({ ...p, github: { ...p.github, client_id: cid.trim() } }).then((saved) => { if (saved) { flash("Saved"); check(); } })}>Save client ID</Button></div></>}
         </Details>
+        {SERVICE_SPECS.map((spec) => <ServicePluginCard key={spec.id} spec={spec} p={p} st={st} save={save} busy={saving} />)}
       </fieldset>{saving && <div role="status">Saving…</div>}
     </div>
     <AppConnectors />

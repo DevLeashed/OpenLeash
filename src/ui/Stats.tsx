@@ -39,7 +39,11 @@ export interface ChatStat {
    *  file written before per-agent attribution existed has no such key. */
   by_agent?: Record<string, Counter>;
 }
+/** Time in the app. `background` is derived as `open_ms - focused_ms`. */
+export interface Presence { open_ms: number; focused_ms: number; working_ms: number; unattended_ms: number }
 export interface StatsData {
+  presence?: Presence; presence_daily?: Record<string, Presence>; presence_hourly?: Record<string, Presence>;
+  launches?: number; session_ms?: number; longest_session_ms?: number;
   since: string; models: Record<string, Counter>; accounts: Record<string, Counter>; daily: Record<string, Counter>; hourly: Record<string, Counter>;
   agents: Record<string, Counter>; tools: Record<string, ToolCount>; events: Record<string, number>;
   /** day -> model -> counter (recorded since per-model history was added). */
@@ -131,6 +135,21 @@ export function spendMonth(spend: Record<string, number>, month: string): { key:
     // The keys came out of `spend` itself, so the value is there; without the
     // `!` the ledger rows would type as `number | undefined` and print as NaN.
     .map((d) => ({ key: d.slice(month.length + 1), v: spend[d]! }));
+}
+
+/** Pure: a duration as `2d 3h`, `4h 05m`, `12m` or `30s`. Exported for tests. */
+export function dur(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 1) return Math.floor(ms / 1000) + "s";
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+const EMPTY_P: Presence = { open_ms: 0, focused_ms: 0, working_ms: 0, unattended_ms: 0 };
+/** Pure: sum presence buckets for the range. Exported for tests. */
+export function sumPresence(list: (Presence | undefined)[]): Presence {
+  return list.reduce<Presence>((a, p) => p ? ({ open_ms: a.open_ms + p.open_ms, focused_ms: a.focused_ms + p.focused_ms, working_ms: a.working_ms + p.working_ms, unattended_ms: a.unattended_ms + p.unattended_ms }) : a, { ...EMPTY_P });
 }
 
 type Range = "24h" | 7 | 30 | 90 | "all";
@@ -411,6 +430,7 @@ function ModelTable({ rows, sel, toggle }: { rows: { id: string; c: Counter }[];
 export function StatsTab() {
   const s = useStore((st) => st.settings)!;
   const month = useStore((st) => st.monthSpend);
+  const tasks = useStore((st) => st.tasks);
   const [data, setData] = useState<StatsData | null>(null);
   const [range, setRange] = useState<Range>(30);
   const [sel, setSel] = useState<string[]>([]);
@@ -482,7 +502,9 @@ export function StatsTab() {
     // history began. See `historyGap` for why the oldest key isn't the answer.
     const perSince = Object.keys(md).sort()[0] ?? data.since;
     const gap = historyGap(firstKey, data.since, range, sel.length > 0);
-    return { buckets, hourly, tot, rows, perSince, gap };
+    const presence = range === "all" ? (data.presence ?? EMPTY_P)
+      : sumPresence(buckets.map((b) => (range === "24h" ? data.presence_hourly : data.presence_daily)?.[b.key]));
+    return { buckets, hourly, tot, rows, perSince, gap, presence };
   }, [data, range, sel]);
 
   if (!data || !view) return <>
@@ -491,7 +513,8 @@ export function StatsTab() {
       ? <div className="empty" role="alert" style={{ color: "#ff8a8a" }}>Couldn't load stats · {err}</div>
       : <Loader className="loading-state" size={16} label="Loading stats…" />}
   </>;
-  const { buckets, hourly, tot, rows, perSince, gap } = view;
+  const { buckets, hourly, tot, rows, perSince, gap, presence } = view;
+  const away = Math.max(0, presence.open_ms - presence.focused_ms);
   const errRate = failureRate(tot);
   const known = Object.entries(data.models).sort((a, b) => tokens(b[1]) - tokens(a[1])).map(([id]) => id);
   const toggle = (id: string) => setSel((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
@@ -514,6 +537,7 @@ export function StatsTab() {
   const chatRows = Object.entries(data.chats ?? {}).map(([id, c]) => ({ id, c }))
     .filter((r) => r.c.total.requests || r.c.total.errors)
     .sort((a, b) => tokens(b.c.total) - tokens(a.c.total));
+  const staleChats = chatRows.filter((r) => !tasks[r.id] || tasks[r.id]?.archived).length;
   const ev = data.events;
   // The cap's own ledger for this calendar month, biggest day first.
   const spendDays = spendMonth(usage?.spend ?? {}, day(new Date()).slice(0, 7)).sort((a, b) => b.v - a.v)
@@ -553,6 +577,19 @@ export function StatsTab() {
       {gap && <div className="snote">Per-model history starts {new Date(perSince + "T00:00").toLocaleDateString()}; earlier days only have totals for all models, so this range undercounts. "All" is exact.</div>}
       {/* Numbers below are from the last poll that worked; say so rather than let them read as live. */}
       {err && <div className="snote" role="status">Not updating · {err}</div>}
+      <div className="settings-section-label">Time in OpenLeash</div>
+      <div className="stiles">
+        <Tile i={0} label="Open" value={dur(presence.open_ms)} sub={`${data.launches ?? 0} launches · all time`} />
+        <Tile i={1} label="Focused" value={dur(presence.focused_ms)} sub={`${pctOf(presence.focused_ms, presence.open_ms)} of open time`} />
+        <Tile i={2} label="In background" value={dur(away)} sub="minimised, hidden or another app in front" />
+        <Tile i={3} label="Agents working" value={dur(presence.working_ms)} sub={`${dur(presence.unattended_ms)} while you were away`} />
+      </div>
+      <div className="stiles small">
+        <Tile i={0} label="This session" value={dur(data.session_ms ?? 0)} sub="since the app started" />
+        <Tile i={1} label="Longest session" value={dur(data.longest_session_ms ?? 0)} sub="one run of the app" />
+        <Tile i={2} label="Avg per day" value={dur(Object.keys(data.presence_daily ?? {}).length ? Object.values(data.presence_daily ?? {}).reduce((a, p) => a + p.open_ms, 0) / Object.keys(data.presence_daily ?? {}).length : 0)} sub="over days the app was open" />
+        <Tile i={3} label="Tokens per focused hour" value={presence.focused_ms ? fmtK(Math.round(tokens(tot) / (presence.focused_ms / 3_600_000))) : "-"} sub={rangeLabel} />
+      </div>
       <div className="settings-section-label">Tokens</div>
       <div className="stiles">
         <Tile i={0} label="Total" value={fmtK(tokens(tot))} sub={`${fmtK(tot.requests)} requests`} />
@@ -576,6 +613,18 @@ export function StatsTab() {
       <HourlyChart pts={hourly} />
       <ModelTable rows={rows} sel={sel} toggle={toggle} />
       <CostByModel rows={rows} />
+      <div className="sgroup">
+        <div className="srowx">
+          <div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Keep stats for deleted chats</div><div className="desc">When off, deleting a chat also removes its row here. Totals by model and day are unaffected.</div></div>
+          <Switch label="Keep stats for deleted chats" hint="Off: a deleted chat's own stats row goes with it" checked={s.keep_chat_stats ?? true} onChange={(checked) => void saveSettings({ keep_chat_stats: checked })} />
+        </div>
+        <div className="srowx">
+          <div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Clear stats of deleted and archived chats</div><div className="desc">{staleChats} {staleChats === 1 ? "chat" : "chats"} no longer in your list. Chats you can still open are kept.</div></div>
+          <Button variant="ghost" disabled={staleChats === 0} onClick={async () => {
+            try { const n = await api.statsPruneChats(); flash(`Cleared stats of ${n} ${n === 1 ? "chat" : "chats"}`); setData(await api.stats()); } catch (e) { flash(String(e)); }
+          }}>Clear</Button>
+        </div>
+      </div>
       {chatRows.length > 0 && <ChatsPanel rows={chatRows} onOpen={openChatStats} />}
       <div className="settings-section-label">Everything else · all models</div>
       <div className="cgrid">
@@ -588,6 +637,7 @@ export function StatsTab() {
         <Tile i={1} label="Fallbacks" value={String(ev.fallbacks ?? 0)} sub="switched account or model" />
         <Tile i={2} label="Auto-pauses" value={String(ev.pauses ?? 0)} sub="everything was out" />
         <Tile i={3} label="Compactions" value={String(ev.compactions ?? 0)} sub="context summaries" />
+        <Tile i={4} label="Chats" value={String(Object.keys(tasks).length)} sub="in your list, archived included" />
       </div>
       <div className="settings-section-label">Budget</div>
       <div className="sgroup"><div className="srowx">

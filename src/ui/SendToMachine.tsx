@@ -8,7 +8,7 @@ import { Button, ChoiceRow, IconButton, Input, Loader, Modal, Segmented, TextBut
 
 const MODES = [
   { value: "copy" as const, label: "Copy", hint: "Leave this chat here and start an independent copy there" },
-  { value: "move" as const, label: "Move", hint: "Stop this chat, send it, and archive it here once the other machine confirms the import" },
+  { value: "move" as const, label: "Transfer", hint: "Stop this chat, send it, and archive it here once the other machine confirms the import" },
 ];
 
 export const openTransfer = (id: string) => set({ transfer: id, menu: null, pal: false });
@@ -148,7 +148,8 @@ export function SendDialog({ taskId, title, running }: { taskId: string; title: 
                 ? <>Connected to {machine}.</>
                 : <>OpenLeash isn't reachable on {link.host_name}{link.reason ? ` (${link.reason})` : ""}. The chat can still be left there; it opens the next time OpenLeash starts on that machine.</>}
             </div>
-            <Segmented label="Copy or move" options={MODES} value={mode} onChange={setMode} />
+            <Segmented label="Copy or transfer" options={MODES} value={mode} onChange={setMode} />
+            <div className="desc" style={{ fontSize: 11 }}>{MODES.find((m) => m.value === mode)?.hint}.</div>
             <label className="desc" htmlFor="xfer-project" style={{ fontSize: 11.5 }}>Project folder on {link.host_name}</label>
             <div style={{ display: "flex", gap: 6 }}>
               <Input id="xfer-project" className="input mono" style={{ flex: 1, minWidth: 0, fontSize: 12 }} spellCheck={false}
@@ -172,7 +173,7 @@ export function SendDialog({ taskId, title, running }: { taskId: string; title: 
         <Button variant="ghost" onClick={close}>{phase === "done" ? "Close" : "Cancel"}</Button>
         {phase !== "done" && (
           <Button variant="primary" disabled={phase !== "ready"} onClick={() => void send()}>
-            {phase === "sending" ? <><Loader size={12} /> Sending…</> : mode === "move" ? "Move" : "Copy"}
+            {phase === "sending" ? <><Loader size={12} /> Sending…</> : mode === "move" ? "Transfer" : "Copy"}
           </Button>
         )}
       </div>
@@ -181,7 +182,7 @@ export function SendDialog({ taskId, title, running }: { taskId: string; title: 
 }
 
 function Done({ result, mode, machine }: { result: TransferResult; mode: TransferMode; machine: string }) {
-  const verb = mode === "move" ? "Moved" : "Copied";
+  const verb = mode === "move" ? "Transferred" : "Copied";
   const r = result.remote;
   return (
     <div role="status" style={{ display: "flex", flexDirection: "column", gap: 8, lineHeight: 1.5 }}>

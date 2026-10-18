@@ -70,11 +70,19 @@ The tunnel closes when you press **Disconnect** or quit OpenLeash. `OPENLEASH_SS
 
 The remote session opens in your browser rather than an OpenLeash window. Tauri reserves the IPC slot in every page it displays, and the remote page needs that slot for its bridge.
 
+### Change a chat's folder
+
+Right-click a chat (or **+** in a chat) and choose **Change folder…** to point it at another existing folder on this machine. Only the chat's working location changes: no files are copied or deleted, the chat must be stopped, and its prompt, project instructions and worktree/docker state are rebuilt for the new folder.
+
+### Import a chat file
+
+Settings → Chats → **Import…** opens an exported `.json` (or a transfer bundle) as new, stopped chats. Each chat is sanitised exactly like one sent from another machine and lands in the project here with the same git `origin`, then the same path, then the home folder (with a warning). The agents are told the chat was imported from a file.
+
 ### Send a chat to another machine
 
 Right-click a chat in the sidebar (or use **+** in a chat) and choose **Send to another machine…**. Pick one of your saved SSH machines, then:
 
-- **Copy** leaves this chat here and creates an independent copy there. **Move** stops the chat, sends it, and archives it here once the other machine confirms the import. If the import isn't confirmed (OpenLeash isn't running there, or its answer was lost), the chat stays here, stopped and not archived, with a notice that the bundle is waiting on the other machine; archive it yourself once it shows up there. If sending fails, the chat stays here, stopped, with an error in its transcript.
+- **Copy** (the default) leaves this chat here and creates an independent copy there. **Transfer** stops the chat, sends it, and archives it here once the other machine confirms the import. If the import isn't confirmed (OpenLeash isn't running there, or its answer was lost), the chat stays here, stopped and not archived, with a notice that the bundle is waiting on the other machine; archive it yourself once it shows up there. If sending fails, the chat stays here, stopped, with an error in its transcript.
 - **Project folder** is where the chat runs on the other machine. The dialog suggests the project there whose git `origin` is the same repository, and **Browse…** lists that machine's folders. Leave it empty to let the other machine choose: the project with the same `origin`, then the same path, then its home folder (with a warning to the agent and to you).
 - **Continue running there** (only for a chat that is running) starts it again on the other machine right after the import. Off by default.
 - The dialog warns when the project has uncommitted changes or unpushed commits. **Only the conversation travels, not the code.** Push or sync the code first if the other machine needs it.
@@ -112,7 +120,7 @@ SSH projects are listed as `<folder> · <host name>` with a server icon. Saving 
 - **Long output** is cut to the usual size but not saved to a local spill file (the agent couldn't read it from the remote host); the agent is told to redirect output to a file and read that instead.
 - **Attachments:** images are attached as usual; other local files are refused for an SSH chat (copy them to the host). File links in replies open in VS Code Remote-SSH (`vscode://vscode-remote/ssh-remote+…`); reply images are read over SFTP with the usual extension, magic-byte and 8 MiB checks.
 
-Not available for SSH projects yet (each refuses with "… not yet supported for SSH projects" instead of falling back to a local folder): checkpoints and rewind of files, worktree and docker workspaces, artificts, opening project files in the browser tool, automatic post-edit diagnostics, and the project's own skills, agents, hooks and MCP servers (`.openleash/…`, `.claude/…`). The project's instruction files (`AGENTS.md`, `CLAUDE.md`, …) are read from the host and gated by folder trust as usual. fish/csh login shells and Windows OpenSSH servers are not supported.
+Not available for SSH projects yet (each refuses with "… not yet supported for SSH projects" instead of falling back to a local folder): checkpoints and rewind of files, worktree and docker workspaces, artificts, opening project files in the browser tool, automatic post-edit diagnostics, the `lsp` tool and `file` wake triggers, and the project's own skills, agents, hooks and MCP servers (`.openleash/…`, `.claude/…`). The project's instruction files (`AGENTS.md`, `CLAUDE.md`, …) are read from the host and gated by folder trust as usual. fish/csh login shells and Windows OpenSSH servers are not supported.
 
 ## WSL projects
 
@@ -124,3 +132,20 @@ Open a project at its WSL path, for example `\\wsl.localhost\Ubuntu\home\me\app`
 - tells the agent it is on Linux in WSL.
 
 Worktrees for a WSL repository are created from inside the distro. Cancelling a command stops the `wsl.exe` process; a program that detaches from its terminal inside the distro can outlive it.
+
+## Phone approvals with ntfy
+
+Remote control can send approvals and questions to a phone as [ntfy](https://ntfy.sh) push notifications, so a chat can wait for you while you are away from the computer.
+
+**Settings → Remote** has the shared ntfy settings: the **ntfy server** (`https://ntfy.sh` by default, or your own) and an optional **access token** for a protected server. The token is write-only. Each paired device then turns notifications on for itself in its own browser settings, and gets its own random topic. Those per-device options are:
+
+- **When a chat asks a question** (on by default).
+- **When a chat finishes or fails.**
+- **Show chat name and command summary in notifications** (off by default). Without it, the notification says only that something needs you.
+- **Require the confirm page for every action** (off by default). Without it, an approval notification has **Approve once** and **Deny** buttons that act directly, and **Always…** opens the confirm page. With it on, the only button is **Review…**, which opens the confirm page first.
+
+Each approval gets a one-use grant that expires after 15 minutes and is tied to the session the device was paired with. Once it has been used or has expired, it does nothing. Tapping the notification opens the remote app. The action buttons need the phone to reach the remote server, so this works with **Network** reachability or a private overlay such as Tailscale, not with **This computer** alone.
+
+The grant travels inside the notification's action, so **whoever can read the topic can approve, for those 15 minutes, any request it carries.** That is why the topic must stay private. **Require the confirm page for every action** changes which buttons appear; it does not change who can read the grant. Keep the topic private.
+
+Public ntfy.sh topics can be read by anyone who knows the topic name. OpenLeash generates an unguessable topic per device, but for privacy, use your own ntfy server or topic access controls that block public reads. A publish token alone does not hide the topic. See [Security](security-model.md#phone-approvals-ntfy) for what a notification discloses.

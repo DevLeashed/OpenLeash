@@ -3,7 +3,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { FileRef } from "./api";
 
-export interface RemoteSession { id: string; label: string; created: number; last_seen: number; connected: number }
+export interface RemoteSession {
+  id: string; label: string; created: number; last_seen: number; connected: number;
+  /** ntfy notifications are on for this device (only the device can turn them on). */
+  push: boolean;
+  /** Whether the device includes chat details in notifications. */
+  push_details: boolean;
+  /** Whether every notification button requires the confirm page. */
+  push_confirm_all: boolean;
+  /** Whether question and completion notifications are enabled. */
+  push_questions: boolean;
+  push_done: boolean;
+}
 export interface RemoteClient { session: string; label: string; ip: string; since: number }
 export interface RemoteStatus {
   enabled: boolean;
@@ -19,6 +30,10 @@ export interface RemoteStatus {
   sessions: RemoteSession[];
   clients: RemoteClient[];
   code: { code: string; expires_in: number } | null;
+  /** ntfy server notifications are sent through. */
+  ntfy_server: string;
+  /** Whether an ntfy token is stored. The token itself is write-only. */
+  ntfy_token_set: boolean;
 }
 export interface DirEntry { name: string; path: string; dir: boolean }
 export interface DirListing { path: string; parent: string | null; entries: DirEntry[]; roots: string[]; truncated: boolean }
@@ -43,6 +58,45 @@ export const remoteApi = {
   revoke: (id: string) => invoke<RemoteStatus>("remote_revoke", { id }),
   reset: () => invoke<RemoteStatus>("remote_reset"),
   listDir: (path: string | null, dirsOnly: boolean) => invoke<DirListing>("remote_list_dir", { path, dirsOnly }),
+  /** `token`: null keeps the stored one, "" removes it, otherwise replaces it. */
+  ntfyConfigure: (server: string, token: string | null) => invoke<RemoteStatus>("remote_ntfy_configure", { server, token }),
+  /** Only this paired device can disable its notifications; enabling is self-service. */
+  pushDisable: (id: string) => invoke<RemoteStatus>("remote_push_disable", { id }),
+};
+
+/** Notifications configured by this paired browser; authenticated by its session cookie. */
+export interface PushState {
+  enabled: boolean;
+  topic: string;
+  server: string;
+  subscribe_url: string;
+  app_url: string;
+  details: boolean;
+  confirm_all: boolean;
+  questions: boolean;
+  done: boolean;
+  base_url: string;
+  server_public: boolean;
+}
+export interface PushOptions { details: boolean; confirm_all: boolean; questions: boolean; done: boolean }
+async function pushFetch<T>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(`/__openleash/push/${path}`, body === undefined
+    ? { method: path === "state" ? "GET" : "POST", credentials: "same-origin" }
+    : { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  let value: unknown = null;
+  try { value = await response.json(); } catch { /* non-JSON error page */ }
+  if (!response.ok) {
+    const error = value && typeof value === "object" && "error" in value && typeof value.error === "string" ? value.error : `Request failed (${response.status})`;
+    throw new Error(error);
+  }
+  return value as T;
+}
+export const pushApi = {
+  state: () => pushFetch<PushState>("state"),
+  enable: (opts: PushOptions) => pushFetch<PushState>("enable", opts),
+  settings: (opts: PushOptions) => pushFetch<PushState>("settings", opts),
+  disable: () => pushFetch<PushState>("disable"),
+  test: () => pushFetch<{ ok: true }>("test"),
 };
 
 /** What `shim.js` publishes when the UI runs in a browser on another device. */

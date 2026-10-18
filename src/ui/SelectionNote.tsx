@@ -17,6 +17,7 @@ import { flash, get, set, useStore, zoom } from "../store";
 import { copyText } from "./mdx";
 import { Button, IconButton, MenuScrim, TextArea, Tooltip, useEscapeClose } from "./primitives";
 import { I } from "./icons";
+import { Quote } from "lucide-react";
 
 /** A selection that has become a note: where it was, what it says, and the chat
  *  it would go to. The comment lives in the pill, not here — it is only ever
@@ -140,6 +141,9 @@ export function AttachmentChips({ text }: { text: string }) {
   );
 }
 
+/** The agent-only context blocks. Global, so every occurrence is matched. */
+const CONTEXT_BLOCK = /\n*<openleash-context\b[^>]*>[\s\S]*?<\/openleash-context>\n*/g;
+
 /** Blocks the backend puts in a message for the model's benefit only, which the
  *  user never needs to see verbatim. The annotations are still available behind
  *  `SentAnnotationMessage`'s chip; a staged attachment's `<openleash-attachments>`
@@ -152,6 +156,10 @@ export function stripHarnessBlocks(text: string, data?: { attachments?: unknown 
   // Model text can put anything before or after a staged note, so the wrapper is
   // matched rather than assumed to be a suffix.
   body = body.replace(/\n*<openleash-attachments>[\s\S]*?<\/openleash-attachments>/g, "");
+  // Context the app adds for the agent alone — "started from the Artificts
+  // studio, looking at this artifict" — is for the model, not a line the user
+  // wrote, so the chat does not show it at all.
+  body = body.replace(CONTEXT_BLOCK, "\n\n");
   if (Array.isArray(data?.attachments) && data.attachments.length) {
     body = body
       .replace(/^\s*Attached files \(read these with your tools, they are not inlined\):\n(?:- .*\n?)+/, "")
@@ -160,7 +168,62 @@ export function stripHarnessBlocks(text: string, data?: { attachments?: unknown 
   return body.trim();
 }
 export const ANNOTATION_PREFIX = "Annotations the user added to your answers:\n\n";
+
+/** Wrap a note meant for the agent only. The transcript strips it from the
+ *  user's bubble (`stripHarnessBlocks`) and shows nothing in its place. */
+export function contextBlock(label: string, note: string): string {
+  return `<openleash-context label="${label.replace(/["<>\n]/g, "")}">\n${note.replace(/<\/?openleash-context[^>]*>/g, "")}\n</openleash-context>`;
+}
+/** Pulls the agent-only context out of a message: `body` is what the user wrote,
+ *  `context` is the block(s) to put back on the message when it is resent. */
+export function splitContextBlocks(text: string): { body: string; context: string } {
+  const context = (text.match(CONTEXT_BLOCK) ?? []).map((block) => block.trim()).join("\n\n");
+  return { body: text.replace(CONTEXT_BLOCK, "\n\n").trim(), context };
+}
 export const ANNOTATION_MARKER = "\n\n<!-- /openleash-annotations -->";
+const SAYS = "\n\nThe user says about it: ";
+
+/** A sent note, read back out of the block `annotationBlock` wrote. */
+export type SentNote = { text: string; body: string; mine: boolean };
+
+/**
+ * The inverse of `annotationBlock`, so a sent message can show its notes as
+ * cards rather than as the markdown the model was handed.
+ *
+ * A quote is copied verbatim and may itself contain a line like `### Note 2`, so
+ * a heading only starts a note when it carries the next expected number; a stray
+ * one stays part of the quote. The comment is the text after the *last*
+ * "The user says about it:" in a note, since the quote comes first. Returns null
+ * when the block does not have that shape, and the caller falls back to text.
+ */
+export function parseAnnotationBlock(block: string): SentNote[] | null {
+  const lines = block.split("\n");
+  const notes: { mine: boolean; lines: string[] }[] = [];
+  for (const line of lines) {
+    const head = /^### Note (\d+)( \(on your message\))?$/.exec(line);
+    if (head && Number(head[1]) === notes.length + 1) { notes.push({ mine: !!head[2], lines: [] }); continue; }
+    if (!notes.length) { if (line.trim()) return null; continue; }
+    notes.at(-1)!.lines.push(line);
+  }
+  if (!notes.length) return null;
+  return notes.map(({ mine, lines: body }) => {
+    const all = body.join("\n").replace(/^\n+/, "").replace(/\n+$/, "");
+    const at = ("\n\n" + all).lastIndexOf(SAYS);
+    return at < 0
+      ? { text: all, body: "", mine }
+      : { text: ("\n\n" + all).slice(2, at).trim(), body: ("\n\n" + all).slice(at + SAYS.length).trim(), mine };
+  });
+}
+
+/** One note as a card: the quoted passage, then what the user said about it. */
+function NoteCard({ text, body, mine, children }: { text: string; body: string; mine?: boolean; children?: React.ReactNode }) {
+  return <div className="anrow">
+    {mine && <div className="anfrom">On your message</div>}
+    <blockquote className="anquote sel">{text}</blockquote>
+    {body && <div className="anbody sel">{body}</div>}
+    {children}
+  </div>;
+}
 
 /** Keep the model's annotation context out of the visible message body. The
  * delimiter makes the boundary unambiguous even when quotes contain headings. */
@@ -172,16 +235,21 @@ export function SentAnnotationMessage({ text }: { text: string }) {
   const end = text.startsWith(prefix) ? text.indexOf(marker, prefix.length) : -1;
   if (end < 0) return <>{text}</>;
   const annotations = text.slice(prefix.length, end);
-  const count = annotations.match(/^### Note \d+(?: \(on your message\))?$/gm)?.length ?? 1;
+  const parsed = parseAnnotationBlock(annotations);
+  const count = parsed?.length ?? (annotations.match(/^### Note \d+(?: \(on your message\))?$/gm)?.length || 1);
   const message = text.slice(end + marker.length).replace(/^\n\n/, "");
   return <>
-    <div className="annots">
+    <div className="annots sent">
       <button type="button" className="anchip" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span className="an-lead" aria-hidden="true">{I.check(12)}</span>
+        <span className="an-lead" aria-hidden="true"><Quote size={12} strokeWidth={2} /></span>
         <span>{count} annotation{count === 1 ? "" : "s"}</span>
         <span className="an-chev" style={{ transform: `rotate(${open ? 90 : 0}deg)` }}>{I.chevR()}</span>
       </button>
-      {open && <div className="anlist sel" style={{ whiteSpace: "pre-wrap" }}>{annotations}</div>}
+      {open && <div className="anlist">
+        {parsed
+          ? parsed.map((n, i) => <NoteCard key={i} text={n.text} body={n.body} mine={n.mine} />)
+          : <div className="anrow"><div className="anbody sel" style={{ whiteSpace: "pre-wrap" }}>{annotations}</div></div>}
+      </div>}
     </div>
     {message}
   </>;
@@ -324,20 +392,18 @@ export function Annotations({ chat }: { chat: string }) {
   return (
     <div className="annots">
       <Pressableish onClick={() => setOpen(!open)}>
-        <span className="an-lead" aria-hidden="true">{I.check(12)}</span>
+        <span className="an-lead" aria-hidden="true"><Quote size={12} strokeWidth={2} /></span>
         <span>{notes.length} annotation{notes.length === 1 ? "" : "s"}</span>
         <span className="an-chev" style={{ transform: `rotate(${open ? 90 : 0}deg)` }}>{I.chevR()}</span>
       </Pressableish>
       {open && (
         <div className="anlist">
           {notes.map((n) => (
-            <div key={n.id} className="anrow">
-              <div className="anquote sel">{n.text}</div>
-              {n.body && <div className="anbody sel">{n.body}</div>}
+            <NoteCard key={n.id} text={n.text} body={n.body}>
               <Tooltip content="Remove this annotation before it is sent">
                 <IconButton label="Remove annotation" className="an-x" onClick={() => drop(n.id)}>{I.close(11)}</IconButton>
               </Tooltip>
-            </div>
+            </NoteCard>
           ))}
           {drop_ && <div className="anhint">No comment on any of them — these go as bare quotes.</div>}
         </div>

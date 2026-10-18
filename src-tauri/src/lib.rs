@@ -6,6 +6,7 @@
 // harness without a GUI. Nothing else about this module changes.
 pub mod agent;
 mod artificts;
+mod connectors;
 mod importer;
 mod remote;
 // Trace export is an agent-side concern, but the module is declared here rather
@@ -94,6 +95,7 @@ fn public_settings(s: &Settings) -> Settings {
         a.refresh_token = String::new();
     }
     s.plugins.github.token = String::new();
+    agent::plugin_services::redact_secrets(&mut s.plugins);
     // An MCP server's bearer token lives in `headers`, and its `env` is exactly
     // where people put `GITHUB_TOKEN` and friends, so both are credentials.
     // `McpServerCfg`'s own Debug impl already redacts them for this reason; the
@@ -514,7 +516,7 @@ fn reply_image_data(cwd: &str, path: &str) -> Result<String, String> {
     if agent::tools::sniff_media_type(&head[..n]).is_none() {
         return Err(format!("{p} isn't really an image"));
     }
-    let img = agent::tools::view_image(&full)?;
+    let img = agent::tools::display_image(&full)?;
     Ok(format!("data:{};base64,{}", img.media_type, img.data_b64))
 }
 
@@ -825,6 +827,23 @@ async fn app_boot(h: H<'_>) -> Result<Boot, String> {
 }
 
 #[tauri::command]
+async fn route_dry_run(route: store::Route, situation: agent::routerules::Situation) -> Result<agent::routerules::Decision, String> {
+    Ok(router::dry_run(&route, &situation))
+}
+
+#[tauri::command]
+async fn route_situation(h: H<'_>, id: String, agent: Option<String>) -> Result<agent::routerules::Situation, String> {
+    router::situation_for_task(h.inner(), &id, agent.as_deref()).await
+}
+
+#[tauri::command]
+async fn route_log(h: H<'_>, id: String) -> Result<Vec<router::RouteEvent>, String> {
+    let t = h.task(&id).await?;
+    let log = t.lock().await.route_log.clone();
+    Ok(log)
+}
+
+#[tauri::command]
 async fn tasks_list(h: H<'_>) -> Result<Vec<TaskSummary>, String> {
     Ok(summaries(&h).await)
 }
@@ -888,7 +907,7 @@ pub fn timeline_page<'a>(items: &'a [Item], cursor: Option<&str>, limit: usize) 
 /// is the oldest id this page returned; passing it back walks backwards safely.
 #[tauri::command]
 async fn task_open(h: H<'_>, id: String) -> Result<Value, String> {
-    const PAGE: usize = 100;
+    const PAGE: usize = 40;
     let task = h
         .tasks
         .read()
@@ -996,6 +1015,57 @@ async fn artifict_revise(
     let artifict = artificts::revise(&project, &artifict_id, &parent_version_id, input)?;
     h.emit_artifict(&task_id, &artifict);
     Ok(artifict)
+}
+
+/// Bring an earlier version back as the newest one, labelled as the user's.
+#[tauri::command]
+async fn artifict_restore(
+    h: H<'_>,
+    task_id: String,
+    artifict_id: String,
+    parent_version_id: String,
+    from_version_id: String,
+) -> Result<artificts::Artifict, String> {
+    let project = artifict_project(&h, &task_id).await?;
+    let artifict =
+        artificts::restore(&project, &artifict_id, &parent_version_id, &from_version_id)?;
+    h.emit_artifict(&task_id, &artifict);
+    Ok(artifict)
+}
+
+/// A content-only revision the user wrote in the studio (canvas or source).
+#[tauri::command]
+async fn artifict_edit(
+    h: H<'_>,
+    task_id: String,
+    artifict_id: String,
+    parent_version_id: String,
+    content: String,
+    note: String,
+) -> Result<artificts::Artifict, String> {
+    let project = artifict_project(&h, &task_id).await?;
+    let artifict =
+        artificts::edit_by_user(&project, &artifict_id, &parent_version_id, &content, &note)?;
+    h.emit_artifict(&task_id, &artifict);
+    Ok(artifict)
+}
+
+/// Save one version as a standalone file at the path the user picked in the
+/// native save dialog (like `task_export`). The artifict still comes from the
+/// task's own project; only the destination is an argument.
+#[tauri::command]
+async fn artifict_export(
+    h: H<'_>,
+    task_id: String,
+    artifict_id: String,
+    version_id: String,
+    path: String,
+    theme: Option<serde_json::Map<String, Value>>,
+) -> Result<String, String> {
+    let project = artifict_project(&h, &task_id).await?;
+    let artifict = artificts::get(&project, &artifict_id)?;
+    let bytes = artificts::export_document(&artifict, &version_id, theme.as_ref())?;
+    artificts::write_export(&path, &bytes)
 }
 
 #[tauri::command]
@@ -1163,29 +1233,85 @@ async fn artifict_feedback_respond(
 async fn browser_panel(
     h: H<'_>,
     task_id: String,
-    action: agent::browser::PanelAction,
-) -> Result<agent::browser::PanelFrame, String> {
+    action: agent::browser_panel::PanelAction,
+) -> Result<agent::browser_panel::PanelFrame, String> {
     browser_panel_for(&h, &task_id, action).await
 }
 
 async fn browser_panel_for(
     h: &Harness,
     task_id: &str,
-    action: agent::browser::PanelAction,
-) -> Result<agent::browser::PanelFrame, String> {
+    action: agent::browser_panel::PanelAction,
+) -> Result<agent::browser_panel::PanelFrame, String> {
     h.task(task_id).await?;
     action.validate()?;
+    let session = panel_session(h, task_id).await?;
+    agent::browser_panel::run(&session, action).await
+}
+
+/// The task's main browser session, for the user's own panel actions: the same
+/// page and cookies the main agent drives. Refused while the plugin is off.
+async fn panel_session(h: &Harness, task_id: &str) -> Result<Arc<agent::browser::Session>, String> {
     let cfg = h.settings.read().await.plugins.browser.clone();
     if !cfg.enabled {
         return Err("The browser plugin is turned off (Settings → Plugins).".into());
     }
-    let session = agent::browser::session_for(
-        &format!("{task_id}:main"),
-        if cfg.width == 0 { 1280 } else { cfg.width },
-        if cfg.height == 0 { 800 } else { cfg.height },
+    let mut opts = agent::browser::SessionOpts::from_cfg(&cfg);
+    let cwd = h.task(task_id).await?.lock().await.cwd_for(None).0;
+    if !agent::host::is_ssh(&cwd) {
+        opts.project = Some(std::path::PathBuf::from(cwd));
+    }
+    agent::browser::session_with(&format!("{task_id}:main"), opts).await
+}
+
+/// Annotations the user made in the Browser view, sent to the agent as one chat
+/// turn with the marked-up screenshot attached. The user's explicit send is the
+/// handoff, as with artifict feedback.
+#[tauri::command]
+async fn browser_annotate(
+    h: H<'_>,
+    task_id: String,
+    annotations: Vec<agent::browser_annotate::Annotation>,
+) -> Result<(), String> {
+    deliver_browser_annotations(h.inner(), &task_id, annotations).await
+}
+
+/// The body of `browser_annotate`, separate from the Tauri wrapper so a test can
+/// drive it without an app handle. Everything checkable without the page is
+/// checked before a browser is touched.
+async fn deliver_browser_annotations(
+    h: &Arc<Harness>,
+    task_id: &str,
+    annotations: Vec<agent::browser_annotate::Annotation>,
+) -> Result<(), String> {
+    h.task(task_id).await?;
+    agent::browser_annotate::validate(&annotations)?;
+    let session = panel_session(h, task_id).await?;
+    let capture = agent::browser_annotate::capture(&session, &annotations).await?;
+    let display = agent::browser_annotate::display(&capture.url, &annotations);
+    let prompt = agent::browser_annotate::prompt(&capture.url, &capture.title, &annotations);
+    let names = (0..capture.images.len())
+        .map(|i| {
+            if i == 0 {
+                "browser-annotations.png".to_string()
+            } else {
+                format!("browser-annotation-{i}.png")
+            }
+        })
+        .collect();
+    // The composer's own image path: a new run when the chat is idle, steering
+    // when it is working, so pause, plan mode and permissions apply as they do
+    // to any typed message with a picture.
+    runner::send_attachments_as(
+        h.clone(),
+        task_id.to_string(),
+        display,
+        prompt,
+        capture.images,
+        names,
+        false,
     )
-    .await?;
-    session.panel(action).await
+    .await
 }
 
 /// One subagent's own transcript, read when its panel opens. `task_open` sends
@@ -1790,39 +1916,64 @@ async fn container_remove(h: H<'_>, id: String) -> Result<(), String> {
 }
 
 /// Point a stopped chat at an existing folder. Workspace files are not copied
-/// or deleted; only the chat's execution location changes.
+/// or deleted; only the chat's execution location changes. Works for any chat,
+/// not just docker ones: it is the local counterpart of the folder choice a
+/// transfer to another machine makes.
 #[tauri::command]
 async fn task_change_folder(h: H<'_>, id: String, folder: String) -> Result<(), String> {
+    change_folder(h.inner(), &id, &folder).await
+}
+
+async fn change_folder(h: &Harness, id: &str, folder: &str) -> Result<(), String> {
     let folder = folder.trim().to_string();
     if !std::path::Path::new(&folder).is_dir() {
         return Err("Choose an existing folder.".into());
     }
-    let task = h.task(&id).await?;
+    let task = h.task(id).await?;
     let docker_env = {
         let t = task.lock().await;
-        if t.status == "running" || t.busy > 0 {
+        if t.status == "running" || t.status == "waiting" || t.busy > 0 {
             return Err("Stop the chat before changing its work folder.".into());
         }
         t.docker.clone()
     };
     if let Some(env) = docker_env {
-        h.bg.kill_task_with(&id, "the chat's workspace was changed");
-        agent::docker::remove(&id, &env).await?;
+        h.bg.kill_task_with(id, "the chat's workspace was changed");
+        agent::docker::remove(id, &env).await?;
     }
     {
         let mut t = task.lock().await;
         let old = t.cwd.clone();
         t.cwd = folder.clone();
         t.project = folder.clone();
-        t.branch = if git::is_repo(&folder) { git::current_branch(&folder) } else { String::new() };
+        t.branch = if git::is_repo(&folder) {
+            git::current_branch(&folder)
+        } else {
+            String::new()
+        };
         t.base_branch.clear();
         t.base_commit = None;
         t.worktree = false;
+        t.ultra_wt = false;
         t.docker = None;
-        t.stop_note = Some(format!("This chat moved its working folder from {old} to {folder}. Its previous files were left where they were; only the conversation and future work continue in the new folder."));
+        // The frozen prompt names the old folder and carries its project
+        // instructions, memory and project-scoped tools; left in place the
+        // agent would keep believing it was in `old`. Cleared, it is rebuilt
+        // from the new folder on the next request (`told` too, so the
+        // announcements are made again against it).
+        t.system.clear();
+        t.mcp_tools.clear();
+        t.plugins = Default::default();
+        t.told.clear();
+        // Worker checkouts belonged to the old repository.
+        for s in t.subs.iter_mut() {
+            s.cwd.clear();
+            s.branch.clear();
+        }
+        t.stop_note = Some(format!("<system-reminder>This chat's working folder was changed from {old} to {folder}. Its previous files were left where they were; only the conversation and future work continue in the new folder. Re-read any file before editing it, and check `git status` and the branch there: it is a different checkout from the one you were working in.</system-reminder>"));
     }
-    h.update_task(&id, |_| {}).await;
-    h.save_task(&id).await;
+    h.update_task(id, |_| {}).await;
+    h.save_task(id).await;
     Ok(())
 }
 
@@ -2070,10 +2221,14 @@ struct NewTaskStartup {
     worktree: bool,
     docker: bool,
     prompt: String,
+    /// What the transcript shows for the first message, when it differs from
+    /// what the model is sent. See `create_task`.
+    display: Option<String>,
     images: Vec<String>,
     files: Vec<String>,
     image_names: Vec<String>,
     guard: StartupGuard,
+    require_worktree: bool,
 }
 
 /// Dispatches the first prompt after workspace preparation. Hook checks and image
@@ -2088,10 +2243,12 @@ fn start_new_task_prompt(h: Arc<Harness>, startup: NewTaskStartup) {
         worktree,
         docker,
         prompt,
+        display,
         images,
         files,
         image_names,
         guard: startup,
+        require_worktree,
     } = startup;
     tauri::async_runtime::spawn(async move {
         prepare_task_workspace(
@@ -2104,6 +2261,21 @@ fn start_new_task_prompt(h: Arc<Harness>, startup: NewTaskStartup) {
             &prompt,
         )
         .await;
+        if require_worktree && !strict_task_worktree_ready(&h, &task_id).await {
+            h.patch_item(&task_id, &startup_item, |item| {
+                item.text = format!("Required worktree unavailable; no message was sent and the original checkout was not used.
+
+{prompt}");
+                item.data["working"] = json!(false);
+                item.data["level"] = json!("error");
+            }).await;
+            h.update_task(&task_id, |t| {
+                t.status = "failed".into();
+                t.step = "Required worktree unavailable".into();
+            }).await;
+            h.save_task_now(&task_id).await;
+            return;
+        }
         if startup.cancel.is_cancelled() || !startup.runtime.startup_pending.load(Ordering::SeqCst)
         {
             if startup.runtime.startup_pending.load(Ordering::SeqCst) {
@@ -2136,19 +2308,24 @@ fn start_new_task_prompt(h: Arc<Harness>, startup: NewTaskStartup) {
             .await;
             return;
         }
-        let result = if images.is_empty() && files.is_empty() {
-            dispatch(h.clone(), task_id.clone(), prompt.clone()).await
-        } else {
-            runner::send_attachments(
-                h.clone(),
-                task_id.clone(),
-                prompt.clone(),
-                images,
-                files,
-                image_names,
-                false,
-            )
-            .await
+        let plain = images.is_empty() && files.is_empty();
+        let result = match display {
+            Some(display) if plain => {
+                runner::send_as(h.clone(), task_id.clone(), display, prompt.clone()).await
+            }
+            _ if plain => dispatch(h.clone(), task_id.clone(), prompt.clone()).await,
+            _ => {
+                runner::send_attachments(
+                    h.clone(),
+                    task_id.clone(),
+                    prompt.clone(),
+                    images,
+                    files,
+                    image_names,
+                    false,
+                )
+                .await
+            }
         };
         drop(startup);
         h.remove_item(&task_id, &startup_item).await;
@@ -2167,6 +2344,216 @@ fn start_new_task_prompt(h: Arc<Harness>, startup: NewTaskStartup) {
 
 #[tauri::command]
 async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
+    create_task(h.inner().clone(), req, None).await
+}
+
+/// Best-of-N race: one prompt, N worktree chats (see `agent::race`). Every
+/// attempt goes through `create_task`, so it gets the same permission mode,
+/// workspace setup, budget gate and usage caps as a chat made by hand.
+#[tauri::command]
+async fn race_create(h: H<'_>, req: agent::race::NewRace) -> Result<Value, String> {
+    let h = h.inner().clone();
+    let (race, tasks) = agent::race::create(&req, |a| {
+        let h = h.clone();
+        let spec = req.clone();
+        async move {
+            let task = NewTask {
+                prompt: spec.prompt,
+                project: spec.project,
+                model: a.model,
+                effort: a.effort,
+                perm: spec.perm,
+                plan: spec.plan,
+                worktree: true,
+                workspace: Some("worktree".into()),
+                base_branch: spec.base_branch,
+                assist: spec.assist,
+                agents: spec.agents,
+                // Each attempt's own model gets its default route: the
+                // composer's route belongs to the composer's model, which an
+                // attempt may not use.
+                route: None,
+                images: spec.images,
+                files: spec.files,
+                image_names: spec.image_names,
+                ultra: false,
+                ultra_wt: false,
+                ultra_x: None,
+            };
+            let mut summary = create_task(h.clone(), task, None).await?;
+            let id = summary.id.clone();
+            // `titled` keeps the numbering: the agent's `set_title` is refused
+            // on a chat with a fixed name, and "Race 2/3" is how the group reads.
+            h.update_task(&id, |t| {
+                t.title = a.title.clone();
+                t.titled = true;
+            })
+            .await;
+            h.save_task(&id).await;
+            summary.title = a.title;
+            summary.titled = true;
+            Ok((id, summary))
+        }
+    })
+    .await?;
+    agent::race::emit(&h, &race);
+    agent::race::watch(h.clone(), race.id.clone());
+    Ok(json!({"race": race, "tasks": tasks}))
+}
+
+#[tauri::command]
+async fn race_list(h: H<'_>) -> Result<Vec<agent::race::Race>, String> {
+    let h = h.inner().clone();
+    tokio::task::spawn_blocking(move || agent::race::refresh(&h))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn race_detail(h: H<'_>, id: String) -> Result<Value, String> {
+    agent::race::detail(h.inner(), &id).await
+}
+
+#[tauri::command]
+async fn race_judge(
+    h: H<'_>,
+    id: String,
+    model: Option<String>,
+    force: Option<bool>,
+) -> Result<agent::race::Race, String> {
+    agent::race::judge(h.inner(), &id, model, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+async fn race_pick(
+    h: H<'_>,
+    id: String,
+    task_id: Option<String>,
+) -> Result<agent::race::Race, String> {
+    let race = agent::race::pick(&id, task_id)?;
+    agent::race::emit(h.inner(), &race);
+    Ok(race)
+}
+
+#[tauri::command]
+async fn race_merge(h: H<'_>, id: String) -> Result<Value, String> {
+    let (race, message) = agent::race::merge(h.inner(), &id).await?;
+    Ok(json!({"race": race, "message": message}))
+}
+
+/// Archive a race with its attempt chats, or bring it back. Archiving moves only
+/// the attempts that are not already archived and records which, so a restore
+/// brings back exactly those: a chat the user put away on its own stays away.
+#[tauri::command]
+async fn race_archive(h: H<'_>, id: String, archived: bool) -> Result<agent::race::Race, String> {
+    archive_race(h.inner(), &id, archived).await
+}
+
+async fn archive_race(h: &Harness, id: &str, archived: bool) -> Result<agent::race::Race, String> {
+    let id = id.to_string();
+    let race = agent::race::get(&id)?;
+    if archived == race.archived {
+        return Ok(race);
+    }
+    let chats = if archived {
+        let mut live = vec![];
+        for a in &race.attempts {
+            if let Ok(t) = h.task(&a.task_id).await {
+                if !t.lock().await.archived {
+                    live.push(a.task_id.clone());
+                }
+            }
+        }
+        archive_chats(h, &live).await?;
+        live
+    } else {
+        for tid in &race.archived_chats {
+            if h.task(tid).await.is_ok() {
+                apply_patch(h, tid, json!({"archived": false})).await?;
+            }
+        }
+        vec![]
+    };
+    let race = agent::race::set_archived(&id, archived, chats)?;
+    agent::race::emit(h, &race);
+    Ok(race)
+}
+
+#[tauri::command]
+async fn race_forget(h: H<'_>, id: String) -> Result<(), String> {
+    agent::race::remove(&id)?;
+    agent::race::emit_removed(h.inner(), &id);
+    Ok(())
+}
+
+/// Create a chat and start its first prompt. `display`, when given, is what the
+/// transcript shows (and the title is drawn from) while `req.prompt` is what the
+/// model receives: a connector frames a chat message with where it came from,
+/// and the user should see their own words, not the framing.
+#[derive(Default)]
+pub(crate) struct TaskCreationPolicy {
+    pub require_worktree: bool,
+    pub burner: Option<agent::burner_policy::BurnPolicy>,
+}
+
+fn strict_worktree_ready(required: bool, is_worktree: bool, cwd: &str, project: &str) -> bool {
+    !required || (is_worktree && agent::trust::norm_path(cwd) != agent::trust::norm_path(project))
+}
+
+async fn strict_task_worktree_ready(h: &Harness, id: &str) -> bool {
+    let Ok(task) = h.task(id).await else { return false; };
+    let task = task.lock().await;
+    strict_worktree_ready(true, task.worktree, &task.cwd, &task.project)
+}
+
+async fn create_task(h: Arc<Harness>, req: NewTask, display: Option<String>) -> Result<TaskSummary, String> {
+    create_task_with_policy(h, req, display, TaskCreationPolicy::default()).await
+}
+
+pub(crate) async fn create_task_with_policy(
+    h: Arc<Harness>, req: NewTask, display: Option<String>, policy: TaskCreationPolicy,
+) -> Result<TaskSummary, String> {
+    create_task_with_options(h, req, display, CreateTaskOptions::Interactive, policy).await
+}
+
+#[derive(Clone, Copy)]
+enum CreateTaskOptions {
+    Interactive,
+    Background,
+}
+
+async fn remember_task_creation(
+    h: &Harness,
+    project: &str,
+    model: &str,
+    options: CreateTaskOptions,
+) {
+    // Background creation must never write interactive choices, even briefly:
+    // snapshot/restore would erase a user choice made while creation awaited.
+    if matches!(options, CreateTaskOptions::Background) {
+        return;
+    }
+    let mut s = h.settings.write().await;
+    s.recent_models.retain(|m| m != model);
+    s.recent_models.insert(0, model.to_string());
+    s.recent_models.truncate(5);
+    if !s.projects.iter().any(|p| p == project) {
+        s.projects.insert(0, project.to_string());
+    }
+    s.project = project.to_string();
+    // Coalesce writes rather than serializing every provider credential while
+    // the settings lock is held on the interactive Send path.
+    drop(s);
+    h.save_settings_debounced().await;
+}
+
+async fn create_task_with_options(
+    h: Arc<Harness>,
+    req: NewTask,
+    display: Option<String>,
+    options: CreateTaskOptions,
+    policy: TaskCreationPolicy,
+) -> Result<TaskSummary, String> {
     let project = req.project.trim().to_string();
     if project.is_empty() || !project_dir_exists(&project).await {
         return Err("Pick a project folder first.".into());
@@ -2186,8 +2573,9 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
         check_docker_allowed(&project)?;
     }
     let id = agent::new_id();
-    let title: String = req
-        .prompt
+    let title: String = display
+        .as_deref()
+        .unwrap_or(&req.prompt)
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("New task")
@@ -2212,6 +2600,7 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
     let mut task = Task {
         id: id.clone(),
         title,
+        route_log: vec![],
         titled: false,
         status: "idle".into(),
         waiting_kind: None,
@@ -2223,6 +2612,7 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
         base_branch,
         worktree,
         model: req.model.clone(),
+        burner: policy.burner,
         effort: req.effort.min(4),
         perm: req.perm,
         plan: req.plan,
@@ -2282,6 +2672,7 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
         usage: Default::default(),
         read_files: HashMap::new(),
         read_hashes: HashMap::new(),
+        spans: vec![],
         checkpoints: vec![],
         touched: HashMap::new(),
         created_at: now,
@@ -2310,27 +2701,9 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
         .await
         .insert(id.clone(), Arc::new(Mutex::new(task)));
     h.save_task(&id).await;
-    {
-        let mut s = h.settings.write().await;
-        s.recent_models.retain(|m| m != &req.model);
-        s.recent_models.insert(0, req.model.clone());
-        s.recent_models.truncate(5);
-        if !s.projects.contains(&project) {
-            s.projects.insert(0, project.clone());
-        }
-        s.project = project.clone();
-        // The debounced writer, not an inline `store::save_settings`: this is the
-        // user clicking Send on a new chat, and `Settings` holds every account
-        // token plus every provider config, so serializing it prettily and then
-        // taking two fsyncs puts a multi-millisecond stall on the create call
-        // itself, while holding the lock the whole agent loop reads settings
-        // through. The coalescing writer turns that into one write that also
-        // absorbs anything else these same fields got in the same instant.
-        drop(s);
-        h.save_settings_debounced().await;
-    }
+    remember_task_creation(&h, &project, &req.model, options).await;
     start_new_task_prompt(
-        h.inner().clone(),
+        h.clone(),
         NewTaskStartup {
             task_id: id,
             startup_item: startup_id,
@@ -2339,10 +2712,12 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
             worktree: mode == "worktree",
             docker: mode == "docker",
             prompt: req.prompt.trim().to_string(),
+            display,
             images: req.images,
             files: req.files,
             image_names: req.image_names,
             guard: startup_guard,
+            require_worktree: policy.require_worktree,
         },
     );
     Ok(summary)
@@ -2538,6 +2913,17 @@ async fn task_interrupt(h: H<'_>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// The window has this chat on screen and it just got attention, so the user
+/// has already seen it. The backend marked the chat unread as it published the
+/// event, and only opening a chat clears that mark: without this, a chat that
+/// finished under you would show its dot again the moment you switched away.
+/// Blocking waits stay marked (`Task::mark_seen`), so a question is not lost.
+#[tauri::command]
+async fn task_seen(h: H<'_>, id: String) -> Result<(), String> {
+    h.seen(&id).await;
+    Ok(())
+}
+
 /// Current PC-control banner state. The frontend calls this on open and then
 /// follows `ol://pcguard` for changes; it never has to guess whether an agent
 /// has the user's screen right now.
@@ -2564,17 +2950,7 @@ async fn task_respond(
     item_id: String,
     response: Value,
 ) -> Result<(), String> {
-    let rt = h.runtime(&id);
-    let tx = rt.pending.lock().await.remove(&item_id);
-    match tx {
-        Some(tx) => {
-            // Answering is the user acting on this chat, so it comes to the top.
-            h.touch(&id).await;
-            let _ = tx.send(response);
-            Ok(())
-        }
-        None => Err("That request is no longer pending.".into()),
-    }
+    h.respond_pending(&id, &item_id, response).await
 }
 
 /// The user answered a question the agent asked with `ask_nonblocking` — the kind it
@@ -2863,6 +3239,17 @@ async fn stats_chat(
         Err(_) => String::new(),
     };
     Ok(h.stats.chat(&id).map(|c| (title, c)))
+}
+
+/// One chat's run timeline: lanes, timed blocks and totals, assembled from the
+/// spans recorded with the task (see `agent/spans.rs`). Built on request rather
+/// than kept up to date, since nothing reads it until the panel is open.
+#[tauri::command]
+async fn task_run_timeline(h: H<'_>, id: String) -> Result<agent::spans::RunTimeline, String> {
+    let live = h.bg.list(&id);
+    let t = h.task(&id).await?;
+    let t = t.lock().await;
+    Ok(agent::spans::assemble(&t, &live, chrono::Utc::now()))
 }
 
 #[tauri::command]
@@ -3639,6 +4026,52 @@ async fn skill_read(h: H<'_>, name: String, project: Option<String>) -> Result<V
     }
 }
 
+/// "Save as skill…" (see `agent::skillgen`). These three commands are the only
+/// way in, and they are UI commands: no agent tool, slash command or connector
+/// reaches them. The window check keeps the PC-control guard webview (which
+/// shares the default command ACL) out; remote control invokes as the main
+/// window, and a paired device is the user.
+fn main_window_only(w: &tauri::Window) -> Result<(), String> {
+    if w.label() != "main" {
+        return Err("Saving a chat as a skill is only available from the main window.".into());
+    }
+    Ok(())
+}
+
+/// Ask a model to distil chat `id` into a SKILL.md draft for the user to edit.
+/// Writes nothing.
+#[tauri::command]
+async fn skill_draft_from_chat(
+    h: H<'_>,
+    window: tauri::Window,
+    id: String,
+    model: Option<String>,
+) -> Result<agent::skillgen::SkillDraft, String> {
+    main_window_only(&window)?;
+    let h = h.inner().clone();
+    agent::skillgen::draft(&h, &id, model.as_deref()).await
+}
+
+#[tauri::command]
+async fn skill_draft_cancel(window: tauri::Window, id: String) -> Result<(), String> {
+    main_window_only(&window)?;
+    agent::skillgen::cancel_draft(&id);
+    Ok(())
+}
+
+/// Write the draft the user approved. Asks back (without writing) when the
+/// skill exists or secrets remain, until the user confirms.
+#[tauri::command]
+async fn skill_save_from_chat(
+    h: H<'_>,
+    window: tauri::Window,
+    req: agent::skillgen::SkillSaveReq,
+) -> Result<agent::skillgen::SkillSaveResult, String> {
+    main_window_only(&window)?;
+    let h = h.inner().clone();
+    agent::skillgen::save(&h, &req).await
+}
+
 const EXPORT_FORMAT: &str = "openleash-chats";
 
 /// Chats as a portable JSON file (full history, timeline, subagent transcripts).
@@ -3762,36 +4195,6 @@ fn clone_as_new(mut t: Task) -> Task {
     // Paths from another machine may not exist here; the task still opens and can be read.
     t.worktree = t.worktree && std::path::Path::new(&t.cwd).is_dir();
     t
-}
-
-#[tauri::command]
-async fn tasks_import(h: H<'_>, path: String) -> Result<Vec<TaskSummary>, String> {
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read {path}: {e}"))?;
-    let v: Value =
-        serde_json::from_str(&text).map_err(|_| "That file isn't valid JSON.".to_string())?;
-    let list = if v["format"] == EXPORT_FORMAT {
-        v["tasks"].clone()
-    } else if v.is_array() {
-        v
-    } else {
-        json!([v])
-    };
-    let tasks: Vec<Task> =
-        serde_json::from_value(list).map_err(|e| format!("Not an OpenLeash chat export: {e}"))?;
-    if tasks.is_empty() {
-        return Err("No chats in that file.".into());
-    }
-    let mut out = vec![];
-    for t in tasks {
-        let t = clone_as_new(t);
-        store::save_task(&t);
-        out.push(t.summary());
-        h.tasks
-            .write()
-            .await
-            .insert(t.id.clone(), Arc::new(Mutex::new(t)));
-    }
-    Ok(out)
 }
 
 #[tauri::command]
@@ -3946,6 +4349,11 @@ fn purge_task(h: &Harness, id: &str, remove_worktree: bool) -> Result<(), String
         runtime.startup_ready.notify_waiters();
     }
     h.bg.kill_task(id);
+    // A checkpoint job still running would recreate the shadow store after
+    // `checkpoint::purge` below, leaving a copy of the deleted chat's files on
+    // disk. Drain work already queued before removing a worktree; deletion
+    // can still fail below, so do not permanently close its queue yet.
+    tauri::async_runtime::block_on(runtime.checkpoints_settled());
     let task = h.tasks.blocking_read().get(id).cloned();
     if let Some(task) = task {
         let (worktree, project, cwd, docker, worker_wts) = {
@@ -4013,6 +4421,11 @@ fn purge_task(h: &Harness, id: &str, remove_worktree: bool) -> Result<(), String
         let _ = agent::attachments::remove_task(&project, id);
         tauri::async_runtime::block_on(agent::attachments::remove_remote_task(&project, id));
     }
+    // Cleanup succeeded: fence out late end-of-run captures and drain again
+    // before removing the checkpoint store. A failed worktree removal above
+    // leaves the task retryable, including its ability to take checkpoints.
+    runtime.close_checkpoints();
+    tauri::async_runtime::block_on(runtime.checkpoints_settled());
     h.tasks.blocking_write().remove(id);
     // Safe now and only now: the tokens are cancelled and the background
     // processes are dead, so nothing can still be holding this chat's runtime.
@@ -4022,7 +4435,37 @@ fn purge_task(h: &Harness, id: &str, remove_worktree: bool) -> Result<(), String
     // The shadow store holds a full copy of that chat's files; leaving it would
     // keep a deleted chat's contents on disk indefinitely.
     checkpoint::purge(id);
+    // Its proof clips and visual-diff screenshots are pictures of that chat's
+    // work; they go with it.
+    agent::proof::forget_task(id);
+    // Kept by default (the spend is real); dropped only when the user opted out.
+    // `try_read` is fine here: the setting changes rarely and a missed read
+    // errs on the side of keeping the numbers.
+    if h.settings
+        .try_read()
+        .map(|s| !s.keep_chat_stats)
+        .unwrap_or(false)
+    {
+        h.stats.forget_chat(id);
+    }
     Ok(())
+}
+
+/// Drop the per-chat stats rows of chats that were deleted or archived.
+///
+/// Only the per-chat rows go; the tokens and cost stay in the model, day and
+/// account totals. A chat still in the list and not archived is never touched.
+#[tauri::command]
+async fn stats_prune_chats(h: H<'_>) -> Result<usize, String> {
+    let mut live = std::collections::HashSet::new();
+    let refs: Vec<_> = h.tasks.read().await.values().cloned().collect();
+    for r in refs {
+        let t = r.lock().await;
+        if !t.archived {
+            live.insert(t.id.clone());
+        }
+    }
+    Ok(h.stats.retain_chats(|id| live.contains(id)))
 }
 
 #[tauri::command]
@@ -4049,6 +4492,7 @@ fn delete_archived(h: &Harness) -> Result<usize, String> {
         ids
     };
     let mut removed = 0usize;
+    let mut purged = std::collections::HashSet::new();
     for id in &ids {
         // This cleanup has no interactive confirmation; preserve the files by
         // detaching the chat but leaving its worktree registered on disk.
@@ -4057,8 +4501,17 @@ fn delete_archived(h: &Harness) -> Result<usize, String> {
         // leaves the chat in place, and the caller puts this number in front of
         // the user ("Deleted 3 archived chats"), so it has to mean "gone".
         match purge_task(h, id, false) {
-            Ok(()) => removed += 1,
+            Ok(()) => {
+                removed += 1;
+                purged.insert(id.clone());
+            }
             Err(error) => eprintln!("[openleash] could not delete archived chat {id}: {error}"),
+        }
+    }
+    // An archived race whose chats are all gone has nothing left to restore.
+    if let Ok(dropped) = agent::race::prune_gone(&purged) {
+        for rid in dropped {
+            agent::race::emit_removed(h, &rid);
         }
     }
     Ok(removed)
@@ -4344,6 +4797,9 @@ async fn task_rewind(h: H<'_>, id: String, item_id: String) -> Result<String, St
 #[tauri::command]
 async fn task_rewind_info(h: H<'_>, id: String) -> Result<Value, String> {
     let t = h.task(&id).await?;
+    // The send's user snapshot may still be committing in the background; the
+    // ledger read below is only complete once it has.
+    h.runtime(&id).checkpoints_settled().await;
     let (cwd, marks, in_worktree, tools) = {
         let t = t.lock().await;
         let marks: Vec<(String, usize, usize)> = t
@@ -4447,6 +4903,9 @@ pub(crate) async fn rewind_to(
     {
         return Err("Stop the agent before rewinding.".into());
     }
+    // A user snapshot still committing in the background would land after the
+    // truncation below, putting a marker from the abandoned branch back.
+    h.runtime(&id).checkpoints_settled().await;
     let t = h.task(&id).await?;
     let (chat, cwd, k, text) = {
         let t = t.lock().await;
@@ -4506,7 +4965,12 @@ pub(crate) async fn rewind_to(
             checkpoint::Snapshot::of(&t, enabled)
         };
         if let Some(snap) = snap {
-            let _ = tokio::task::spawn_blocking(move || snap.user().take()).await;
+            // Through the chain, so a send that raced this rewind cannot have
+            // its own snapshot recorded ahead of this one.
+            let mut done = h.runtime(&id).queue_checkpoint(move || {
+                snap.user().take();
+            });
+            let _ = done.wait_for(|d| *d).await;
         }
     }
     let t = h.task(&id).await?;
@@ -4544,6 +5008,9 @@ pub(crate) async fn fork_at(
     item_id: String,
 ) -> Result<TaskSummary, String> {
     let t = h.task(&id).await?;
+    // The ledger `target` reads below is complete only once any background
+    // user snapshot has committed.
+    h.runtime(&id).checkpoints_settled().await;
     let mut src = t.lock().await.clone();
     let idx = src
         .items
@@ -4619,6 +5086,11 @@ pub(crate) async fn fork_at(
     // The conversation up to — and not including — the message being branched
     // at, exactly like a rewind of the transcript, so the fork starts where the
     // user asked rather than repeating a prompt that already has a reply.
+    // The run timeline is cut at the same moment, so the fork's does not show
+    // work from the part of the conversation it never had.
+    if let Some(cut) = src.items.get(idx).map(|i| i.ts) {
+        src.spans.retain(|s| s.start < cut);
+    }
     src.items.truncate(idx);
     src.messages.truncate(msg_index);
     src.checkpoints.truncate(k);
@@ -4783,6 +5255,71 @@ fn rewind_task(t: &mut Task, item_id: String) -> Result<String, String> {
     Ok(text)
 }
 
+/// The chat's before/after screenshots for Review. Empty unless the agent took
+/// a `baseline`: nothing here launches a browser.
+#[tauri::command]
+async fn task_visual_diff(h: H<'_>, id: String) -> Result<agent::proof::VisualDiff, String> {
+    h.task(&id).await?;
+    Ok(agent::proof::load_visual(&id))
+}
+
+/// Re-take every "after" picture, on the user's click in Review.
+#[tauri::command]
+async fn task_visual_recapture(h: H<'_>, id: String) -> Result<agent::proof::VisualDiff, String> {
+    visual_recapture_for(&h, &id).await
+}
+
+/// A fresh headless browser of its own rather than the agent's session: the
+/// user pressing a button in Review must not navigate a page the agent is in
+/// the middle of using. Same plugin toggle and same throwaway-profile browser
+/// as the agent's, and only the http(s) URLs the store already validated.
+async fn visual_recapture_for(h: &Harness, id: &str) -> Result<agent::proof::VisualDiff, String> {
+    h.task(id).await?;
+    let cfg = h.settings.read().await.plugins.browser.clone();
+    if !cfg.enabled {
+        return Err("The browser plugin is turned off (Settings → Plugins), so the after pictures can't be retaken.".into());
+    }
+    let entries = agent::proof::load_visual(id).entries;
+    if entries.is_empty() {
+        return Ok(agent::proof::VisualDiff::default());
+    }
+    let owner = format!("visual-recapture:{id}:{}", uuid::Uuid::new_v4());
+    let session = agent::browser::session_for(
+        &owner,
+        if cfg.width == 0 { 1280 } else { cfg.width },
+        if cfg.height == 0 { 800 } else { cfg.height },
+    )
+    .await?;
+    let mut failed = vec![];
+    for e in entries {
+        let shot = async {
+            // The manifest is a file on disk: re-check what it names before
+            // pointing a browser at it.
+            let url = agent::proof::validate_visual_url(&e.url)?;
+            session.goto(&url).await?;
+            let png = session.screenshot(false).await?;
+            agent::proof::save_after(id, &e.url, &png)
+        }
+        .await;
+        if let Err(err) = shot {
+            failed.push(format!("{}: {err}", e.url));
+        }
+    }
+    drop(session);
+    agent::browser::close(&owner);
+    if !failed.is_empty() {
+        return Err(format!("Couldn't recapture {}", failed.join("; ")));
+    }
+    Ok(agent::proof::load_visual(id))
+}
+
+#[tauri::command]
+async fn task_visual_clear(h: H<'_>, id: String) -> Result<(), String> {
+    h.task(&id).await?;
+    agent::proof::clear_visual(&id);
+    Ok(())
+}
+
 #[tauri::command]
 async fn task_review(h: H<'_>, id: String) -> Result<Value, String> {
     let t = h.task(&id).await?;
@@ -4790,21 +5327,87 @@ async fn task_review(h: H<'_>, id: String) -> Result<Value, String> {
         let t = t.lock().await;
         (t.cwd.clone(), t.base_commit.clone(), t.touched.clone())
     };
-    if let Some(base) = base.filter(|_| git::is_repo(&cwd)) {
-        let files = git::review(&cwd, &base)?;
-        return Ok(json!({"git": true, "files": files}));
+    // `git diff` of the whole change set plus every untracked file's text: on
+    // the blocking pool, never a runtime worker.
+    if let Some(base) = base {
+        let c = cwd.clone();
+        let files = tokio::task::spawn_blocking(move || {
+            git::is_repo(&c).then(|| git::review(&c, &base)).transpose()
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if let Some(files) = files {
+            return Ok(json!({"git": true, "files": files}));
+        }
     }
-    // No git: diff against the snapshots taken before the agent's first edit.
+    Ok(json!({"git": false, "files": snapshot_review(&cwd, touched).await}))
+}
+
+/// Just the totals of `task_review` — files changed, lines added and removed —
+/// for the session header, which shows nothing else. The full review builds
+/// and ships every diff line; this is `git diff --numstat` against the same
+/// base (see `git::review_stats`), off the async runtime.
+#[tauri::command]
+async fn task_review_stats(h: H<'_>, id: String) -> Result<git::ReviewStats, String> {
+    review_stats(h.inner(), &id).await
+}
+
+/// The body of `task_review_stats`, on a plain `&Harness` for tests.
+pub(crate) async fn review_stats(h: &Harness, id: &str) -> Result<git::ReviewStats, String> {
+    let t = h.task(id).await?;
+    let (cwd, base, touched) = {
+        let t = t.lock().await;
+        (t.cwd.clone(), t.base_commit.clone(), t.touched.clone())
+    };
+    if let Some(base) = base {
+        let c = cwd.clone();
+        let stats = tokio::task::spawn_blocking(move || {
+            git::is_repo(&c)
+                .then(|| git::review_stats(&c, &base))
+                .transpose()
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if let Some(stats) = stats {
+            return Ok(stats);
+        }
+    }
+    // No git: the same per-file snapshot diff the review screen shows, summed.
+    let files = snapshot_review(&cwd, touched).await;
+    Ok(git::ReviewStats {
+        files: files.len(),
+        add: files.iter().filter_map(|f| f["add"].as_u64()).sum::<u64>() as usize,
+        del: files.iter().filter_map(|f| f["del"].as_u64()).sum::<u64>() as usize,
+    })
+}
+
+/// No git: diff against the snapshots taken before the agent's first edit.
+async fn snapshot_review(
+    cwd: &str,
+    touched: std::collections::HashMap<String, Option<String>>,
+) -> Vec<Value> {
+    let cwd = cwd.to_string();
+    tokio::task::spawn_blocking(move || snapshot_review_blocking(&cwd, touched))
+        .await
+        .expect("snapshot review worker failed")
+}
+
+fn snapshot_review_blocking(
+    cwd: &str,
+    touched: std::collections::HashMap<String, Option<String>>,
+) -> Vec<Value> {
     let mut files = vec![];
     for (path, original) in touched {
         let now = match agent::host::parse_ssh(&path) {
-            // A remote chat's snapshot keys are `ssh://` realpaths.
-            Some(p) => {
-                agent::ssh_session::read(&p.host, &p.path, agent::tools_remote::MAX_TEXT_BYTES)
-                    .await
-                    .ok()
-                    .and_then(|(b, _)| String::from_utf8(b).ok())
-            }
+            // A remote chat's snapshot keys are `ssh://` realpaths. The bridge
+            // drives the shared SSH runtime from this blocking worker.
+            Some(p) => agent::ssh_session::block_on(agent::ssh_session::read(
+                &p.host,
+                &p.path,
+                agent::tools_remote::MAX_TEXT_BYTES,
+            ))
+            .ok()
+            .and_then(|(b, _)| String::from_utf8(b).ok()),
             None if agent::host::is_ssh(&path) => None,
             None => std::fs::read_to_string(&path).ok(),
         };
@@ -4820,9 +5423,9 @@ async fn task_review(h: H<'_>, id: String) -> Result<Value, String> {
             (_, None) => "D",
             _ => "M",
         };
-        files.push(json!({"path": agent::permissions::short(&path, &cwd), "abs": path, "status": status, "add": add, "del": del, "lines": lines}));
+        files.push(json!({"path": agent::permissions::short(&path, cwd), "abs": path, "status": status, "add": add, "del": del, "lines": lines}));
     }
-    Ok(json!({"git": false, "files": files}))
+    files
 }
 
 #[tauri::command]
@@ -4856,6 +5459,143 @@ async fn task_revert_file(h: H<'_>, id: String, path: String) -> Result<(), Stri
         Some(None) => std::fs::remove_file(&abs).map_err(|e| e.to_string()),
         None => Err("No snapshot for this file.".into()),
     }
+}
+
+/// The chat's bisect timeline, for the Review view's "Find breaking edit…"
+/// dialog, and whether a bisect can run here at all.
+#[tauri::command]
+async fn task_bisect_edits(h: H<'_>, id: String) -> Result<Value, String> {
+    bisect_edits_info(h.inner(), &id).await
+}
+
+pub(crate) async fn bisect_edits_info(h: &Harness, id: &str) -> Result<Value, String> {
+    let t = h.task(id).await?;
+    let (cwd, count, docker) = {
+        let t = t.lock().await;
+        (t.cwd.clone(), t.checkpoints.len(), t.docker.is_some())
+    };
+    let enabled = h.settings.read().await.checkpoints;
+    let chat = id.to_string();
+    let edits = tokio::task::spawn_blocking(move || agent::bisect::timeline(&chat, count))
+        .await
+        .map_err(|e| e.to_string())?;
+    let reason = agent::bisect::unavailable(enabled, &cwd, docker)
+        .map(String::from)
+        .or_else(|| {
+            edits
+                .is_empty()
+                .then(|| "This chat has no recorded file edits yet.".to_string())
+        });
+    Ok(json!({
+        "available": reason.is_none(),
+        "reason": reason.unwrap_or_default(),
+        "edits": edits,
+    }))
+}
+
+/// Run a bisect the user asked for from the Review view. Progress streams as
+/// `bisect` events; the final report is also the return value.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn task_bisect_run(
+    h: H<'_>,
+    id: String,
+    command: String,
+    from: Option<usize>,
+    to: Option<usize>,
+    timeout: Option<u64>,
+    runs: Option<u32>,
+    share: Option<Vec<String>>,
+) -> Result<agent::bisect::Report, String> {
+    let req = agent::bisect::Request::new(command, from, to, timeout, runs, share);
+    bisect_run(h.inner(), &id, req).await
+}
+
+/// The body of `task_bisect_run`, on a plain `&Harness` so it can be tested.
+///
+/// The command is the user's, typed into a dialog that shows it and asks for
+/// confirmation, but it is still judged by the same `permissions::check` the
+/// agent's `bash` goes through: a deny rule, plan mode or the Disabled rung
+/// refuses it here too (see `bisect::check_user_command`).
+pub(crate) async fn bisect_run(
+    h: &Arc<Harness>,
+    id: &str,
+    req: agent::bisect::Request,
+) -> Result<agent::bisect::Report, String> {
+    let t = h.task(id).await?;
+    let (cwd, project, plan, perm, count, docker) = {
+        let t = t.lock().await;
+        (
+            t.cwd.clone(),
+            t.project.clone(),
+            t.plan,
+            t.perm.clone(),
+            t.checkpoints.len(),
+            t.docker.is_some(),
+        )
+    };
+    let (enabled, allow) = {
+        let s = h.settings.read().await;
+        (s.checkpoints, s.allow.clone())
+    };
+    if let Some(why) = agent::bisect::unavailable(enabled, &cwd, docker) {
+        return Err(why.into());
+    }
+    let ctx = agent::permissions::Ctx {
+        perm: &perm,
+        plan,
+        cwd: &cwd,
+        project: &project,
+        allow: &allow,
+    };
+    agent::bisect::check_user_command(&req.command, &ctx)?;
+    let chat = id.to_string();
+    let steps = tokio::task::spawn_blocking(move || agent::bisect::timeline(&chat, count))
+        .await
+        .map_err(|e| e.to_string())?;
+    let rt = h.runtime(id);
+    // Unlike a runner turn, the Review action has no guaranteed run token. Use
+    // the runtime-wide stop parent plus any active turn token, and snapshot the
+    // force token before registering so force-pause/quit can interrupt it too.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stop = rt.bg_cancel.lock().unwrap().child_token();
+    let turn = rt.cancel.lock().unwrap().as_ref().map(|t| t.child_token());
+    let force = rt.force.lock().unwrap().clone();
+    let active = agent::bisect::begin(id, cancel.clone())?;
+    let fg_guard = agent::runner::FgGuard::new(h.clone(), id);
+    h.refresh_busy(id).await;
+    tokio::select! {
+        biased;
+        unpaused = h.wait_unpaused(id, &cancel) => {
+            if !unpaused { cancel.cancel(); }
+        }
+        _ = stop.cancelled() => cancel.cancel(),
+        _ = force.cancelled() => cancel.cancel(),
+        _ = cancel.cancelled() => {},
+        _ = async { if let Some(turn) = turn.clone() { turn.cancelled().await } else { std::future::pending::<()>().await } } => cancel.cancel(),
+    }
+    let emit = |v: Value| h.emit(id, "bisect", v);
+    let run = agent::bisect::run(id, &cwd, &steps, &req, &cancel, &emit);
+    tokio::pin!(run);
+    let report = tokio::select! {
+        biased;
+        result = &mut run => result,
+        _ = stop.cancelled() => { cancel.cancel(); run.await },
+        _ = force.cancelled() => { cancel.cancel(); run.await },
+        _ = async { if let Some(turn) = turn { turn.cancelled().await } else { std::future::pending::<()>().await } } => {
+            cancel.cancel();
+            run.await
+        }
+    };
+    drop(active);
+    fg_guard.release().await;
+    report
+}
+
+/// Stop the chat's running bisect (the user's or the agent's).
+#[tauri::command]
+async fn task_bisect_cancel(id: String) -> Result<bool, String> {
+    Ok(agent::bisect::cancel(&id))
 }
 
 #[tauri::command]
@@ -4942,6 +5682,7 @@ async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
     let spend = s.spend.clone();
     let accts = s.accounts.clone();
     let gh_token = s.plugins.github.token.clone();
+    let plugins_stored = s.plugins.clone();
     let mcp_stored = s.mcp.clone();
     let mut next: Settings = serde_json::from_value(cur).map_err(|e| e.to_string())?;
     // Store doc-selection paths normalized, like a trust decision's: the UI
@@ -4955,6 +5696,8 @@ async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
     next.accounts = accts;
     // The UI never sees the token; it's set through plugin_github_token.
     next.plugins.github.token = gh_token;
+    // Same for the service plugins' tokens: set through plugin_secret_set only.
+    agent::plugin_services::restore_secrets(&mut next.plugins, &plugins_stored);
     // Same deal for MCP bearer tokens: the UI only ever saw a masked copy, so a
     // masked entry coming back means "unchanged", not "cleared".
     restore_mcp_secrets(&mut next, &mcp_stored);
@@ -5154,27 +5897,45 @@ fn update_hook_trust(
 #[tauri::command]
 async fn github_list_prs(h: H<'_>, project: String, state: String) -> Result<Value, String> {
     let remote = git::remote_url(&project).ok_or("This project has no Git remote.")?;
-    let repo = agent::plugins::parse_repo(&remote).ok_or("This project's origin is not a GitHub repository.")?;
+    let repo = agent::plugins::parse_repo(&remote)
+        .ok_or("This project's origin is not a GitHub repository.")?;
     let mut parts = repo.split('/');
     let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err("This project's GitHub remote is invalid.".into());
     };
-    let state = match state.as_str() { "closed" => "closed", "all" => "all", _ => "open" };
+    let state = match state.as_str() {
+        "closed" => "closed",
+        "all" => "all",
+        _ => "open",
+    };
     let cfg = h.settings.read().await.plugins.github.clone();
     let token = tauri::async_runtime::spawn_blocking(move || agent::plugins::github_token(&cfg))
-        .await.map_err(|e| e.to_string())?
-        .map(|(token, _)| token).ok_or("Sign in to GitHub in Settings → Connectors first.")?;
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|(token, _)| token)
+        .ok_or("Sign in to GitHub in Settings → Connectors first.")?;
     let path = format!("/repos/{owner}/{name}/pulls?per_page=100&state={state}");
-    let value = h.http.get(format!("https://api.github.com{}", path))
+    let value = h
+        .http
+        .get(format!("https://api.github.com{}", path))
         .bearer_auth(token)
         .header("accept", "application/vnd.github+json")
         .header("x-github-api-version", "2022-11-28")
         .header("user-agent", "OpenLeash")
-        .send().await.map_err(|e| format!("GitHub request failed: {e}"))?;
+        .send()
+        .await
+        .map_err(|e| format!("GitHub request failed: {e}"))?;
     let status_code = value.status();
-    let result: Value = value.json().await.map_err(|e| format!("GitHub returned an invalid response: {e}"))?;
+    let result: Value = value
+        .json()
+        .await
+        .map_err(|e| format!("GitHub returned an invalid response: {e}"))?;
     if !status_code.is_success() {
-        return Err(format!("GitHub returned {}: {}", status_code.as_u16(), result["message"].as_str().unwrap_or("request failed")));
+        return Err(format!(
+            "GitHub returned {}: {}",
+            status_code.as_u16(),
+            result["message"].as_str().unwrap_or("request failed")
+        ));
     }
     let prs = result.as_array().into_iter().flatten().map(|p| json!({
         "number": p["number"], "title": p["title"], "state": p["state"], "draft": p["draft"],
@@ -5247,7 +6008,7 @@ async fn plugins_status(h: H<'_>) -> Result<Value, String> {
         .await
         .map_err(|e| e.to_string())?;
     Ok(
-        json!({"github": github, "computer": computer, "browser": browser, "has_token": !cfg.github.token.is_empty(), "can_login": agent::plugins::gh_client_id(&cfg.github).is_some()}),
+        json!({"github": github, "computer": computer, "browser": browser, "has_token": !cfg.github.token.is_empty(), "can_login": agent::plugins::gh_client_id(&cfg.github).is_some(), "secrets": agent::plugin_services::secret_flags(&cfg)}),
     )
 }
 
@@ -5336,6 +6097,49 @@ async fn plugin_github_token(h: H<'_>, token: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Is any chat running its agent right now? Used by the time-in-app sampler.
+///
+/// `try_*` locks only: a chat mid-update holds its lock for an instant, and the
+/// sampler must never queue behind the work it is measuring. A chat it cannot
+/// read this tick is counted as running, since the lock is held by a running
+/// agent far more often than by anything else.
+fn any_chat_running(h: &Harness) -> bool {
+    let Ok(tasks) = h.tasks.try_read() else {
+        return false;
+    };
+    tasks.values().any(|r| match r.try_lock() {
+        Ok(t) => !t.archived && t.status == "running",
+        Err(_) => true,
+    })
+}
+
+/// Save (or, empty, remove) a service plugin credential, e.g. (`slack`,
+/// `user_token`). Settings saves never carry tokens; see `plugin_services`.
+#[tauri::command]
+async fn plugin_secret_set(
+    h: H<'_>,
+    plugin: String,
+    field: String,
+    value: String,
+) -> Result<(), String> {
+    let mut s = h.settings.write().await;
+    agent::plugin_services::set_secret(&mut s.plugins, &plugin, &field, &value)?;
+    store::save_settings(&s);
+    Ok(())
+}
+
+/// "Test connection" for a service plugin: `{ok, identity, source}` or
+/// `{ok: false, error}`. Works whether or not the plugin is switched on, so
+/// the user can check a token before handing the tool to an agent.
+#[tauri::command]
+async fn plugin_service_test(h: H<'_>, plugin: String) -> Result<Value, String> {
+    if !agent::plugin_services::is_service(&plugin) {
+        return Err(format!("Unknown plugin `{plugin}`."));
+    }
+    let cfg = h.settings.read().await.plugins.clone();
+    Ok(agent::plugin_services::test_connection(&h.http, &cfg, &plugin).await)
+}
+
 /// Chats that count as "in use" for a global model swap: live or paused.
 fn swap_active(t: &Task) -> bool {
     !t.archived && (t.status == "running" || t.status == "waiting" || t.paused.is_some())
@@ -5343,11 +6147,9 @@ fn swap_active(t: &Task) -> bool {
 
 /// Where each model is used in one chat: main agent, its subagents, subagents it may spawn.
 ///
-/// One row per *model*, not per (model, effort): a swap moves everything on that
-/// model onto one destination with one reasoning level, so two agents on one model
-/// at different levels are not two independent choices. The level reported is the
-/// first use recorded — the main agent's, since it is added first — which is the
-/// one a swap of that model rewrites.
+/// Each use is reported with the level it runs at; the dialog makes one row per
+/// (model, level), so agents on one model at different levels can be changed
+/// independently.
 fn uses_in(t: &Task, defs: &[AgentDef], add: &mut dyn FnMut(String, String, usize)) {
     add(
         t.pending
@@ -5409,25 +6211,28 @@ fn uses_in(t: &Task, defs: &[AgentDef], add: &mut dyn FnMut(String, String, usiz
 #[tauri::command]
 async fn models_in_use(h: H<'_>, id: Option<String>) -> Result<Value, String> {
     let s = h.settings.read().await.clone();
-    let mut order: Vec<String> = vec![];
-    // One row per model. A swap moves everything on a model to one destination and
-    // one reasoning level, so agents on one model at different levels are not
-    // independent choices — and the map the dialog sends is keyed by model, so a
-    // second row for the same model would have nowhere to go.
-    let mut uses: HashMap<String, Vec<(String, u32)>> = HashMap::new();
-    // The level this model is on, kept from the first use recorded. The main agent
-    // is added first, so a model's row reports the chat's level for it — which is
-    // the one `swap_task` rewrites.
-    let mut efforts: HashMap<String, usize> = HashMap::new();
+    let mut order: Vec<(String, usize)> = vec![];
+    // One row per (model, reasoning level). Agents on one model at different
+    // levels are separate rows, because "just change the level of those" is a
+    // real edit: the swap is keyed the same way (`SwapRule`), so each row only
+    // reaches the agents it lists.
+    let mut uses: HashMap<(String, usize), Vec<(String, u32)>> = HashMap::new();
     let mut add = |m: String, label: String, effort: usize| {
         if m.is_empty() {
             return;
         }
-        if !order.contains(&m) {
-            order.push(m.clone());
-            efforts.insert(m.clone(), effort);
+        // A model with no reasoning control has no levels to tell apart; whatever
+        // stale level is stored on it must not split it into identical-looking rows.
+        let effort = if providers::model_info(&m).reasoning_levels.is_empty() {
+            0
+        } else {
+            effort.min(4)
+        };
+        let key = (m, effort);
+        if !order.contains(&key) {
+            order.push(key.clone());
         }
-        let l = uses.entry(m).or_default();
+        let l = uses.entry(key).or_default();
         match l.iter_mut().find(|x| x.0 == label) {
             Some(x) => x.1 += 1,
             None => l.push((label, 1)),
@@ -5441,8 +6246,18 @@ async fn models_in_use(h: H<'_>, id: Option<String>) -> Result<Value, String> {
             uses_in(&t, &defs, &mut add);
         }
         None => {
-            add(s.model.clone(), "default for new chats".into(), s.effort);
-            for d in s.agents.iter().filter(|d| !d.model.is_empty()) {
+            // A disabled model is not something the user can run on, and a default
+            // that merely names one is not traffic: listing it offered to "swap"
+            // a model that is switched off and is not running anywhere.
+            let usable = |m: &str| providers::model_info(m).enabled;
+            if usable(&s.model) {
+                add(s.model.clone(), "default for new chats".into(), s.effort);
+            }
+            for d in s
+                .agents
+                .iter()
+                .filter(|d| !d.model.is_empty() && usable(&d.model))
+            {
                 add(
                     d.model.clone(),
                     format!("{} subagent default", d.name),
@@ -5473,10 +6288,9 @@ async fn models_in_use(h: H<'_>, id: Option<String>) -> Result<Value, String> {
     };
     let rows: Vec<Value> = order
         .into_iter()
-        .map(|m| {
-            let effort = efforts.get(&m).copied().unwrap_or(0);
+        .map(|(m, effort)| {
             let u: Vec<String> = uses
-                .remove(&m)
+                .remove(&(m.clone(), effort))
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(l, n)| if n > 1 { format!("{l} ×{n}") } else { l })
@@ -5585,6 +6399,11 @@ pub(crate) fn swap_task(
     // swap moves is carried along to the new destination, and an entry whose key
     // this swap names is dropped first: the new pair about to be inserted already
     // says where that id goes, and a no-op swap is not worth a record.
+    update_model_map(t, map, future);
+}
+
+/// The `future` half of a swap: see the comment in `swap_task`.
+fn update_model_map(t: &mut Task, map: &HashMap<String, String>, future: bool) {
     if future {
         for v in t.model_map.values_mut() {
             if let Some(to) = map.get(v.as_str()) {
@@ -5597,6 +6416,144 @@ pub(crate) fn swap_task(
             t.model_map.insert(from.clone(), to.clone());
         }
     }
+}
+
+/// One row of the swap dialog, as sent back: agents on `from` at level
+/// `from_effort` move to `to` (which may be `from`) and, when `to_effort` is set,
+/// onto that level. Matching on both is what lets two rows of the same model be
+/// edited independently.
+#[derive(Deserialize, Clone, Debug)]
+pub(crate) struct SwapRule {
+    from: String,
+    from_effort: usize,
+    to: String,
+    #[serde(default)]
+    to_effort: Option<usize>,
+}
+
+fn find_rule<'a>(rules: &'a [SwapRule], model: &str, effort: usize) -> Option<&'a SwapRule> {
+    // Same normalization as the dialog's rows (`models_in_use`).
+    let norm = |m: &str, e: usize| {
+        if providers::model_info(m).reasoning_levels.is_empty() {
+            0
+        } else {
+            e.min(4)
+        }
+    };
+    rules
+        .iter()
+        .find(|r| r.from == model && norm(model, r.from_effort) == norm(model, effort))
+}
+
+/// `swap_task` for per-(model, level) rows. Every agent is matched against its
+/// state *before* anything is rewritten, so chained rules (A->B, B->C) do not
+/// cascade.
+pub(crate) fn swap_task_rules(t: &mut Task, defs: &[AgentDef], rules: &[SwapRule], future: bool) {
+    if rules.is_empty() {
+        return;
+    }
+    let chat_effort = t.effort;
+    // (index, model, effort) per subagent that has a model of its own; the ones
+    // without follow the chat and move with it, exactly as in `swap_task`.
+    let mut subs: Vec<(usize, String, Option<usize>)> = vec![];
+    for (i, sub) in t.subs.iter().enumerate() {
+        if sub.model.is_empty() {
+            continue;
+        }
+        let def = defs.iter().find(|d| d.id == sub.role);
+        let eff = agent::resolve_effort(
+            t,
+            Some(sub),
+            def.and_then(|d| d.effort),
+            def.is_some_and(|d| d.tools == "read_only"),
+        );
+        if let Some(r) = find_rule(rules, &sub.model, eff) {
+            subs.push((i, r.to.clone(), r.to_effort.map(|e| e.min(4))));
+        }
+    }
+    let layers: Vec<(usize, String, Option<usize>)> = t
+        .ultra_x
+        .as_ref()
+        .map(|x| {
+            x.layers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    find_rule(rules, &l.model, l.effort.unwrap_or(chat_effort))
+                        .map(|r| (i, r.to.clone(), r.to_effort.map(|e| e.min(4))))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pending = t
+        .pending
+        .get("model")
+        .and_then(|v| v.as_str())
+        .and_then(|m| find_rule(rules, m, chat_effort))
+        .map(|r| r.to.clone());
+    let main = find_rule(rules, &t.model, chat_effort).cloned();
+
+    if let Some(r) = main {
+        if r.to != t.model {
+            t.model = r.to.clone();
+            t.route = router::default_route(&r.to);
+        }
+        if let Some(e) = r.to_effort {
+            t.effort = e.min(4);
+        }
+    }
+    if let Some(to) = pending {
+        t.pending.insert("model".into(), json!(to));
+    }
+    for (i, to, e) in subs {
+        if let Some(sub) = t.subs.get_mut(i) {
+            sub.model = to;
+            if let Some(e) = e {
+                sub.effort = Some(e);
+            }
+        }
+    }
+    if let Some(x) = t.ultra_x.as_mut() {
+        for (i, to, e) in layers {
+            if let Some(l) = x.layers.get_mut(i) {
+                l.model = to;
+                if let Some(e) = e {
+                    l.effort = Some(e);
+                }
+            }
+        }
+    }
+    let map: HashMap<String, String> = rules
+        .iter()
+        .filter(|r| r.to != r.from)
+        .map(|r| (r.from.clone(), r.to.clone()))
+        .collect();
+    update_model_map(t, &map, future);
+}
+
+/// `swap_defaults` for per-(model, level) rows.
+fn swap_defaults_rules(s: &mut Settings, rules: &[SwapRule], spread: bool) {
+    if rules.is_empty() {
+        return;
+    }
+    let base_effort = s.effort;
+    if let Some(r) = find_rule(rules, &s.model, base_effort).cloned() {
+        s.model = r.to;
+        if let Some(e) = r.to_effort {
+            s.effort = e.min(4);
+        }
+    }
+    if spread {
+        for d in s.agents.iter_mut().filter(|d| !d.model.is_empty()) {
+            if let Some(r) = find_rule(rules, &d.model, d.effort.unwrap_or(base_effort)) {
+                d.model = r.to.clone();
+                if let Some(e) = r.to_effort {
+                    d.effort = Some(e.min(4));
+                }
+            }
+        }
+    }
+    store::save_settings(s);
 }
 
 /// Apply old -> new model swaps right away: in one chat, or (no id) defaults + every live chat.
@@ -5620,8 +6577,15 @@ async fn models_swap(
     map: HashMap<String, String>,
     effort: Option<HashMap<String, usize>>,
     spread: Option<bool>,
+    rules: Option<Vec<SwapRule>>,
 ) -> Result<Settings, String> {
     let spread = spread.unwrap_or(false);
+    let rules: Vec<SwapRule> = rules
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| !r.from.is_empty() && !r.to.is_empty())
+        .collect();
+    let s0 = h.settings.read().await.clone();
     let map: HashMap<String, String> = map
         .into_iter()
         .filter(|(f, t)| !t.is_empty() && f != t)
@@ -5654,10 +6618,14 @@ async fn models_swap(
     // Both halves, independently: `map` can be empty for a reasoning-only change
     // and `effort` can be empty for a pure swap, and each has to run or the
     // button the user pressed does nothing at all.
-    if !map.is_empty() || !effort.is_empty() {
+    if !map.is_empty() || !effort.is_empty() || !rules.is_empty() {
         for tid in &ids {
-            h.update_task(tid, |t| swap_task(t, &map, &effort, spread))
-                .await;
+            h.update_task(tid, |t| {
+                swap_task(t, &map, &effort, spread);
+                let defs = store::all_agents(&s0, &t.project);
+                swap_task_rules(t, &defs, &rules, spread);
+            })
+            .await;
             h.save_task(tid).await;
         }
     }
@@ -5667,6 +6635,7 @@ async fn models_swap(
     // model may not even have, on every chat started from here on.
     if id.is_none() {
         swap_defaults(&mut s, &map, &effort, spread);
+        swap_defaults_rules(&mut s, &rules, spread);
     }
     Ok(public_settings(&s))
 }
@@ -6068,7 +7037,19 @@ async fn project_dir_exists(path: &str) -> bool {
 
 #[tauri::command]
 async fn project_info(h: H<'_>, path: String) -> Result<Value, String> {
-    let is_git = git::is_repo(&path);
+    // Several `git` child processes and a scan of instruction files: run off the
+    // async workers so switching projects doesn't stall every other command.
+    let git_path = path.clone();
+    let (is_git, branch, branches) = tokio::task::spawn_blocking(move || {
+        let is_git = git::is_repo(&git_path);
+        if is_git {
+            (true, git::current_branch(&git_path), git::branches(&git_path))
+        } else {
+            (false, String::new(), vec![])
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let (inject_global_claude, disabled_docs) = {
         let s = h.settings.read().await;
         (
@@ -6084,8 +7065,8 @@ async fn project_info(h: H<'_>, path: String) -> Result<Value, String> {
         "path": path,
         "exists": project_dir_exists(&path).await,
         "git": is_git,
-        "branch": if is_git { git::current_branch(&path) } else { String::new() },
-        "branches": if is_git { git::branches(&path) } else { vec![] },
+        "branch": branch,
+        "branches": branches,
         // What actually reaches the prompt, not the raw inventory: for an
         // untrusted folder this is the globals alone.
         "memory": agent::prompt::memory_for_prompt(&path, inject_global_claude, &disabled_docs).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
@@ -6102,6 +7083,23 @@ async fn project_info(h: H<'_>, path: String) -> Result<Value, String> {
 /// What a folder would inject, whether or not it is trusted, for the trust
 /// dialog and the manifest panel. Computed live so the answer is what the next
 /// prompt would actually contain.
+#[tauri::command]
+async fn project_branch_create(
+    path: String,
+    name: String,
+    base: String,
+) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        git::create_branch(&path, &name, &base)?;
+        let mut branches = git::branches(&path);
+        branches.retain(|branch| branch != name.trim());
+        branches.insert(0, name.trim().to_string());
+        Ok(branches)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn trust_manifest(h: H<'_>, path: String) -> Result<Value, String> {
     let s = h.settings.read().await.clone();
@@ -6357,6 +7355,14 @@ async fn usage_get(h: H<'_>) -> Result<Value, String> {
     Ok(
         json!({"month": s.month_spend(), "spend": s.spend, "tokens": s.tokens_month, "budget": s.budget}),
     )
+}
+
+/// What the quota burner would do right now, per account, and the chats it
+/// started. Read-only; the queue and thresholds are edited through
+/// `settings_update` like every other setting.
+#[tauri::command]
+async fn burner_status(h: H<'_>) -> Result<agent::burner::Status, String> {
+    Ok(agent::burner::status(&h).await)
 }
 
 /// Keeps account usage fresh for the UI, and wakes tasks that auto-paused
@@ -6843,7 +7849,28 @@ pub fn run() {
                 }
             });
             tauri::async_runtime::spawn(watch_accounts(h.clone()));
+            // Off unless Settings → Accounts → Spend quota before it resets is on;
+            // with it off and no live burner chat a pass returns at once.
+            tauri::async_runtime::spawn(agent::burner::watch(h.clone()));
+            // Time in the app: sampled, not event-driven, so a hidden or
+            // minimised window and a missed focus event both just read as
+            // "not focused" instead of leaving a counter running.
+            let h_presence = h.clone();
+            let app_presence = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let focused = app_presence
+                        .get_webview_window("main")
+                        .map(|w| w.is_focused().unwrap_or(false) && w.is_visible().unwrap_or(false))
+                        .unwrap_or(false);
+                    h_presence
+                        .stats
+                        .tick(focused, any_chat_running(&h_presence));
+                }
+            });
             tauri::async_runtime::spawn(docker_reaper(h.clone()));
+            tauri::async_runtime::spawn(agent::lsp::reaper());
             // Chats sent from another machine while this app wasn't running.
             tauri::async_runtime::spawn(agent::transfer::import_pending(h.clone()));
             // A global pause left on by a quit finds nothing to hold once the tasks
@@ -6862,6 +7889,12 @@ pub fn run() {
                     }
                 });
             }
+            // Chat-platform connectors (Discord, Telegram, Slack): off until configured, and
+            // back with the app when they are, like remote control.
+            app.manage(connectors::Connectors::start(h.clone()));
+            // Scheduled runs: loads schedules.json and starts the loop, which
+            // fires enabled schedules whether or not their screen is shown.
+            app.manage(agent::schedule::Scheduler::start(h.clone()));
             // The PC-control guard needs the harness (to tell the agent about
             // an objection) and its own always-on-top window.
             agent::pcguard::set_harness(h);
@@ -6895,6 +7928,7 @@ pub fn run() {
             // it comes back with the app so a paired phone keeps working.
             let remote = remote::Remote::load();
             app.manage(remote.clone());
+            remote.listen_attention(app.handle());
             if remote.enabled() {
                 remote.apply(app.handle());
             }
@@ -6916,11 +7950,33 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            connectors::discord_status,
+            connectors::discord_configure,
+            connectors::discord_set_token,
+            connectors::discord_forget_chats,
+            agent::schedule::schedules_list,
+            agent::schedule::schedule_save,
+            agent::schedule::schedule_delete,
+            agent::schedule::schedule_set_enabled,
+            agent::schedule::schedule_run_now,
+            agent::schedule::schedules_set_paused,
+            connectors::telegram_status,
+            connectors::telegram_configure,
+            connectors::telegram_set_token,
+            connectors::telegram_test,
+            connectors::telegram_forget_chats,
+            connectors::slack_status,
+            connectors::slack_configure,
+            connectors::slack_set_token,
+            connectors::slack_test,
+            connectors::slack_forget_chats,
             remote::remote_status,
             remote::remote_configure,
             remote::remote_new_code,
             remote::remote_revoke,
             remote::remote_reset,
+            remote::remote_ntfy_configure,
+            remote::remote_push_disable,
             remote::remote_list_dir,
             remote::ssh_hosts_list,
             remote::ssh_host_save,
@@ -6957,6 +8013,9 @@ pub fn run() {
             artifict_get,
             artifict_create,
             artifict_revise,
+            artifict_restore,
+            artifict_edit,
+            artifict_export,
             artifict_annotate,
             artifict_annotate_remove,
             artifict_feedback_submit,
@@ -6967,10 +8026,22 @@ pub fn run() {
             tasks_list,
             task_get,
             task_open,
+            task_seen,
             task_history,
             sub_report,
             sub_transcript,
             task_create,
+            race_create,
+            race_list,
+            race_detail,
+            race_judge,
+            race_pick,
+            race_merge,
+            race_archive,
+            race_forget,
+            route_dry_run,
+            route_situation,
+            route_log,
             task_send,
             task_interrupt,
             pcguard_state,
@@ -6981,6 +8052,7 @@ pub fn run() {
             task_update,
             task_delete,
             tasks_delete_archived,
+            stats_prune_chats,
             tasks_archive,
             tasks_export,
             task_rewind,
@@ -6993,7 +8065,14 @@ pub fn run() {
             task_queue_send_now,
             task_queue_send_all,
             task_review,
+            task_visual_diff,
+            task_visual_recapture,
+            task_visual_clear,
+            task_review_stats,
             task_revert_file,
+            task_bisect_edits,
+            task_bisect_run,
+            task_bisect_cancel,
             task_commit,
             task_commit_message,
             bg_kill,
@@ -7005,6 +8084,7 @@ pub fn run() {
             stats_get,
             stats_reset,
             stats_chat,
+            task_run_timeline,
             draft_set,
             task_pause,
             task_status_summary,
@@ -7037,10 +8117,13 @@ pub fn run() {
             skill_remove,
             skill_set_enabled,
             skill_read,
+            skill_draft_from_chat,
+            skill_draft_cancel,
+            skill_save_from_chat,
             pool_models_refresh,
             task_export,
             tasks_export_all,
-            tasks_import,
+            agent::transfer::tasks_import,
             task_duplicate,
             task_fork,
             provider_insist,
@@ -7066,7 +8149,10 @@ pub fn run() {
             mcp_reconnect,
             plugins_status,
             browser_panel,
+            browser_annotate,
             plugin_github_token,
+            plugin_secret_set,
+            plugin_service_test,
             github_list_prs,
             github_login_start,
             github_login_wait,
@@ -7074,6 +8160,7 @@ pub fn run() {
             models_in_use,
             models_swap,
             project_info,
+            project_branch_create,
             agent::projects::wsl_list,
             agent::projects::wsl_start_dir,
             agent::projects::clone_preview,
@@ -7084,6 +8171,7 @@ pub fn run() {
             import_scan,
             import_apply,
             usage_get,
+            burner_status,
             toast_show,
             take_toast_click
         ])
@@ -7096,16 +8184,33 @@ pub fn run() {
                 if let Some(r) = app.try_state::<Arc<remote::Remote>>() {
                     r.shutdown();
                 }
+                if let Some(c) = app.try_state::<Arc<connectors::Connectors>>() {
+                    c.shutdown();
+                }
+                // Language servers live in a process-wide static, which is never
+                // dropped, so `kill_on_drop` cannot end them: shut them down
+                // here, bounded so a hung server cannot hold the exit.
+                tauri::async_runtime::block_on(async {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        agent::lsp::global().shutdown_all(),
+                    )
+                    .await;
+                });
             }
         });
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
-    // The `test_home` guard must span the whole test to serialize
-    // `OPENLEASH_HOME` across tokio tests, so it is deliberately held across
-    // `.await` points. See AGENTS.md: do not drop the lock to quiet the lint.
-    #![allow(clippy::await_holding_lock)]
+    #[test]
+    fn strict_worktree_requirement_cannot_fall_back_to_the_project() {
+        assert!(strict_worktree_ready(false, false, "C:/repo", "C:/repo"));
+        assert!(!strict_worktree_ready(true, false, "C:/repo", "C:/repo"));
+        assert!(!strict_worktree_ready(true, true, "C:/repo", "C:/repo"));
+        assert!(strict_worktree_ready(true, true, "C:/repo/.openleash-worktree/task", "C:/repo"));
+    }
 
     use super::*;
     use crate::agent::runner;
@@ -7114,7 +8219,9 @@ mod tests {
 
     /// A timeline with `n` items named `m0..m{n}`, oldest first.
     fn timeline(n: usize) -> Vec<Item> {
-        (0..n).map(|i| Item::new("text", format!("m{i}"), json!({}))).collect()
+        (0..n)
+            .map(|i| Item::new("text", format!("m{i}"), json!({})))
+            .collect()
     }
 
     fn ids(items: &[Item]) -> Vec<String> {
@@ -7139,7 +8246,11 @@ mod tests {
         items.retain(|i| i.id != oldest);
 
         let page = timeline_page(&items, Some(&cursor), 6);
-        assert_eq!(ids(page.items), ids(&items), "the page must be the rows before the cursor, exactly");
+        assert_eq!(
+            ids(page.items),
+            ids(&items),
+            "the page must be the rows before the cursor, exactly"
+        );
     }
 
     /// Walking the cursors back to the end yields the whole timeline, once each,
@@ -7162,7 +8273,11 @@ mod tests {
             pages += 1;
             assert!(pages < 50, "paging must terminate");
         }
-        assert_eq!(held, ids(&items), "the walk must rebuild the timeline exactly, in order");
+        assert_eq!(
+            held,
+            ids(&items),
+            "the walk must rebuild the timeline exactly, in order"
+        );
     }
 
     /// A cursor naming a row a live event already removed must fall back to the
@@ -7172,7 +8287,11 @@ mod tests {
         let items = timeline(5);
         let gone = format!("gone-{}", uuid::Uuid::new_v4());
         let page = timeline_page(&items, Some(&gone), 10);
-        assert_eq!(ids(page.items), ids(&items), "an unknown cursor is the newest page");
+        assert_eq!(
+            ids(page.items),
+            ids(&items),
+            "an unknown cursor is the newest page"
+        );
     }
 
     /// Every page is bounded, so one long chat can never be shipped in a single
@@ -7181,11 +8300,13 @@ mod tests {
     fn a_page_is_always_bounded() {
         let items = timeline(1000);
         let page = timeline_page(&items, None, 1_000_000);
-        assert_eq!(page.items.len(), 200, "the page clamp caps what one call returns");
+        assert_eq!(
+            page.items.len(),
+            200,
+            "the page clamp caps what one call returns"
+        );
         assert_eq!(page.total, 1000, "the total is still reported in full");
     }
-
-
 
     #[tokio::test]
     async fn resume_all_does_not_refresh_chats_that_were_not_paused() {
@@ -7641,6 +8762,8 @@ mod tests {
             },
         );
         s.plugins.github.token = "ghp_secret".into();
+        s.plugins.slack.user_token = "xoxp-user-secret".into();
+        s.plugins.gitlab.token = "glpat-secret".into();
         s.mcp.push(McpServerCfg {
             name: "ctx7".into(),
             url: "https://mcp.context7.com".into(),
@@ -7659,6 +8782,8 @@ mod tests {
         // The rest of the redaction still holds, and nothing else leaked.
         assert!(view.providers["anthropic"].api_key.is_empty());
         assert!(view.plugins.github.token.is_empty());
+        assert!(view.plugins.slack.user_token.is_empty());
+        assert!(view.plugins.gitlab.token.is_empty());
         // The stored copy is untouched — masking is a view, not a mutation.
         assert_eq!(s.mcp[0].headers["Authorization"], "Bearer tok_secret");
 
@@ -7777,6 +8902,31 @@ mod tests {
             "and nothing a future spawn would read is touched without the opt-in: {:?}",
             t.model_map
         );
+    }
+
+    /// Two agents on one model at different levels are separate rows, and a rule
+    /// for one must not touch the other.
+    #[test]
+    fn swap_rules_reach_only_the_matching_level() {
+        let mut t: Task = serde_json::from_value(json!({
+            "id": "a", "title": "", "status": "running", "step": "", "project": "", "cwd": "", "branch": "", "worktree": false,
+            "model": "openai/gpt-5", "effort": 2, "perm": "auto", "plan": false, "items": [], "messages": [], "todos": [],
+            "subs": [{"id": "s1", "role": "general", "task": "", "status": "running", "meta": "", "model": "openai/gpt-5", "effort": 4},
+                     {"id": "s2", "role": "general", "task": "", "status": "running", "meta": "", "model": "openai/gpt-5", "effort": 1}],
+            "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "last_context": 0},
+            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        let rules = vec![SwapRule {
+            from: "openai/gpt-5".into(),
+            from_effort: 4,
+            to: "openai/gpt-5".into(),
+            to_effort: Some(0),
+        }];
+        swap_task_rules(&mut t, &[], &rules, false);
+        assert_eq!(t.effort, 2, "the main agent is on another level");
+        assert_eq!(t.subs[0].effort, Some(0));
+        assert_eq!(t.subs[1].effort, Some(1));
     }
 
     /// The load-bearing one for `future`. A chat swap used to write `model_map`
@@ -8923,11 +10073,19 @@ mod tests {
 
         // The staged copy exists under OpenLeash's temp folder, with the bytes.
         let staged = super::agent::attachments::task_dir(".", "q");
-        assert!(staged.exists(), "the temp copy lives under the task's folder");
+        assert!(
+            staged.exists(),
+            "the temp copy lives under the task's folder"
+        );
         let file = std::fs::read_dir(&staged)
             .unwrap()
             .filter_map(|e| e.ok())
-            .flat_map(|b| std::fs::read_dir(b.path()).into_iter().flatten().filter_map(|e| e.ok()))
+            .flat_map(|b| {
+                std::fs::read_dir(b.path())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+            })
             .find(|e| e.file_name().to_string_lossy().contains("report"))
             .expect("the attachment was copied");
         assert_eq!(std::fs::read(file.path()).unwrap(), b"attached bytes");
@@ -8959,7 +10117,10 @@ mod tests {
             row.text, "here is the file",
             "the visible text has no path note in it"
         );
-        let atts = row.data["attachments"].as_array().cloned().unwrap_or_default();
+        let atts = row.data["attachments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(atts.len(), 1, "the staged copy is recorded on the item");
         assert_eq!(atts[0]["name"], "report.txt");
 
@@ -9554,15 +10715,86 @@ mod tests {
     }
 
     /// A harness holding `tasks` in memory, with UI events dropped.
+    /// The Review button never launches a browser the user has turned off, and
+    /// never for a chat that doesn't exist.
+    #[tokio::test]
+    async fn visual_recapture_rejects_unknown_tasks_and_disabled_plugin_before_launch() {
+        let h = harness(vec![chat("visual-test")]);
+        assert!(visual_recapture_for(&h, "missing").await.is_err());
+        let disabled = visual_recapture_for(&h, "visual-test").await;
+        assert!(disabled.err().unwrap().contains("turned off"));
+    }
+
     #[tokio::test]
     async fn browser_panel_rejects_unknown_tasks_and_disabled_plugin_before_launch() {
         let h = harness(vec![chat("browser-test")]);
-        let unknown =
-            browser_panel_for(&h, "missing", agent::browser::PanelAction::Snapshot {}).await;
+        // The plugin is on by default now; the disabled half has to say so.
+        h.settings.write().await.plugins.browser.enabled = false;
+        let unknown = browser_panel_for(
+            &h,
+            "missing",
+            agent::browser_panel::PanelAction::Snapshot {},
+        )
+        .await;
         assert!(unknown.is_err());
-        let disabled =
-            browser_panel_for(&h, "browser-test", agent::browser::PanelAction::Snapshot {}).await;
+        let disabled = browser_panel_for(
+            &h,
+            "browser-test",
+            agent::browser_panel::PanelAction::Snapshot {},
+        )
+        .await;
         assert!(disabled.err().unwrap().contains("turned off"));
+        // A malformed action is refused before the plugin or a browser is consulted.
+        let invalid = browser_panel_for(
+            &h,
+            "browser-test",
+            agent::browser_panel::PanelAction::Navigate {
+                url: "file:///etc/passwd".into(),
+            },
+        )
+        .await;
+        assert!(invalid.err().unwrap().contains("HTTP"));
+    }
+
+    #[tokio::test]
+    async fn browser_annotations_are_refused_before_launch_and_never_delivered() {
+        let h = Arc::new(harness(vec![chat("annotate-test")]));
+        let note = || agent::browser_annotate::Annotation {
+            comment: "Make the heading larger".into(),
+            bbox: agent::browser::Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 20.0,
+            },
+            element: None,
+            styles: vec![],
+        };
+        let unknown = deliver_browser_annotations(&h, "missing", vec![note()]).await;
+        assert!(unknown.is_err());
+        // Validation runs before the plugin check, so these fail on their own merits.
+        let empty = deliver_browser_annotations(&h, "annotate-test", vec![]).await;
+        assert!(empty.err().unwrap().contains("no annotations"));
+        let blank = deliver_browser_annotations(
+            &h,
+            "annotate-test",
+            vec![agent::browser_annotate::Annotation {
+                comment: "  ".into(),
+                ..note()
+            }],
+        )
+        .await;
+        assert!(blank.err().unwrap().contains("comment"));
+        let too_many = deliver_browser_annotations(&h, "annotate-test", vec![note(); 11]).await;
+        assert!(too_many.err().unwrap().contains("at most 10"));
+        h.settings.write().await.plugins.browser.enabled = false;
+        let disabled = deliver_browser_annotations(&h, "annotate-test", vec![note()]).await;
+        assert!(disabled.err().unwrap().contains("turned off"));
+        // Nothing reached the chat on any refused path.
+        let task = h.task("annotate-test").await.unwrap();
+        let task = task.lock().await;
+        assert!(task.items.iter().all(|i| i.kind != "user"));
+        assert!(task.messages.is_empty());
     }
 
     fn harness(tasks: Vec<Task>) -> Harness {
@@ -9600,7 +10832,7 @@ mod tests {
         let mut t: Task = serde_json::from_value(json!({
             "id": id, "title": id, "status": "stopped", "step": "", "project": ".", "cwd": ".", "branch": "",
             "worktree": false, "model": "m", "effort": 2, "perm": "auto", "plan": false,
-            "items": [], "messages": [], "todos": [], "subs": [],
+            "items": [], "messages": [], "todos": [], "subs": [], "touched": {},
             "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "last_context": 0},
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         }))
@@ -9825,6 +11057,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Archiving a race moves its attempt chats, and a restore brings back only
+    /// those: a chat the user had archived on its own must stay put.
+    #[tokio::test]
+    async fn archiving_a_race_restores_only_the_chats_it_moved() {
+        let dir =
+            std::env::temp_dir().join(format!("openleash-race-archive-{}", std::process::id()));
+        let _home = store::test_home(&dir);
+        let mut own = chat("own");
+        own.archived = true;
+        let h = harness(vec![chat("a"), chat("b"), own]);
+        let attempt = |t: &str| agent::race::RaceAttempt {
+            task_id: t.into(),
+            model: "m".into(),
+            effort: 2,
+            checks: vec![],
+            checked: false,
+        };
+        let race = agent::race::Race {
+            id: "rA".into(),
+            prompt: "p".into(),
+            project: ".".into(),
+            base_branch: String::new(),
+            created_at: chrono::Utc::now(),
+            attempts: vec![
+                attempt("a"),
+                attempt("b"),
+                attempt("own"),
+                attempt("deleted"),
+            ],
+            judge_model: "m".into(),
+            judge_effort: 2,
+            state: "judged".into(),
+            judge: None,
+            winner: None,
+            merged: None,
+            error: None,
+            archived: false,
+            archived_chats: vec![],
+        };
+        agent::race::upsert(&race).unwrap();
+
+        let r = archive_race(&h, "rA", true).await.unwrap();
+        assert!(r.archived);
+        assert_eq!(
+            r.archived_chats,
+            vec!["a".to_string(), "b".to_string()],
+            "a deleted chat and an already-archived one are not claimed"
+        );
+        let mut now = archived_ids(&h).await;
+        now.sort();
+        assert_eq!(
+            now,
+            vec!["a".to_string(), "b".to_string(), "own".to_string()]
+        );
+        assert!(
+            archive_race(&h, "rA", true).await.unwrap().archived,
+            "archiving twice is a no-op"
+        );
+
+        let r = archive_race(&h, "rA", false).await.unwrap();
+        assert!(!r.archived && r.archived_chats.is_empty());
+        assert_eq!(
+            archived_ids(&h).await,
+            vec!["own".to_string()],
+            "the chat archived on its own stays archived"
+        );
+        assert!(archive_race(&h, "nope", true).await.is_err());
+        agent::race::remove("rA").unwrap();
+    }
+
     /// A bulk archive is the one command that hides a screenful of chats at
     /// once, so the two ways it can go wrong are checked here: reaching a chat
     /// nobody ticked, and reporting a chat it did nothing to as work done. Both
@@ -9958,6 +11260,96 @@ mod tests {
             "nothing to write is an error, not an empty file"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Changing a chat's folder has to re-home it, not just rewrite two path
+    /// fields: the frozen system prompt names the old folder and holds its
+    /// project instructions, so a chat left with it would go on believing it
+    /// was working in the old place. A running chat is refused, and so is a
+    /// folder that isn't there.
+    #[tokio::test]
+    async fn changing_a_chats_folder_rehomes_it() {
+        let dir = std::env::temp_dir().join(format!("openleash-chgdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _home = store::test_home(&dir.join("home"));
+        let new = dir.join("elsewhere");
+        std::fs::create_dir_all(&new).unwrap();
+        let mut t = chat("a");
+        t.project = "/old/proj".into();
+        t.cwd = "/old/proj/.wt".into();
+        t.worktree = true;
+        t.base_commit = Some("abc".into());
+        t.system = "Working directory: /old/proj".into();
+        t.mcp_tools = vec![json!({"name": "mcp__x__y"})];
+        t.told.insert("assist".into(), json!("guide"));
+        t.subs = vec![serde_json::from_value(json!({
+            "id": "s1", "role": "general", "task": "", "status": "done", "meta": "",
+            "model": "m", "cwd": "/old/proj/.wt-s1", "branch": "s1"
+        }))
+        .unwrap()];
+        let mut running = chat("r");
+        running.status = "running".into();
+        let h = harness(vec![t, running]);
+
+        let new_s = new.to_string_lossy().to_string();
+        assert!(
+            change_folder(&h, "a", &dir.join("missing").to_string_lossy())
+                .await
+                .is_err()
+        );
+        assert!(
+            change_folder(&h, "r", &new_s).await.is_err(),
+            "a running chat is refused"
+        );
+        change_folder(&h, "a", &format!("  {new_s}  "))
+            .await
+            .unwrap();
+        let t = h.task("a").await.unwrap();
+        let t = t.lock().await;
+        assert_eq!(
+            (t.project.as_str(), t.cwd.as_str()),
+            (new_s.as_str(), new_s.as_str())
+        );
+        assert!(!t.worktree && t.base_commit.is_none());
+        assert!(
+            t.system.is_empty(),
+            "the prompt naming the old folder is rebuilt"
+        );
+        assert!(t.mcp_tools.is_empty() && t.told.is_empty());
+        assert!(t.subs[0].cwd.is_empty() && t.subs[0].branch.is_empty());
+        assert!(t.stop_note.as_deref().unwrap().contains("/old/proj/.wt"));
+        drop(t);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Without git the header's totals are the snapshot review's own, summed:
+    /// the header and the review screen never disagree.
+    #[tokio::test]
+    async fn review_stats_without_git_sum_the_snapshot_review() {
+        let dir = std::env::temp_dir().join(format!("openleash-rstats-{}", std::process::id()));
+        let _home = store::test_home(&dir);
+        let work = dir.join("nogit");
+        std::fs::create_dir_all(&work).unwrap();
+        let (a, b) = (work.join("a.txt"), work.join("b.txt"));
+        std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+        std::fs::write(&b, "new\n").unwrap();
+        let mut t = chat("rs");
+        t.cwd = work.to_string_lossy().to_string();
+        t.base_commit = None;
+        t.touched
+            .insert(a.to_string_lossy().to_string(), Some("one\n".into()));
+        t.touched.insert(b.to_string_lossy().to_string(), None);
+        let h = harness(vec![t]);
+        let stats = review_stats(&h, "rs").await.unwrap();
+        assert_eq!(
+            stats,
+            agent::git::ReviewStats {
+                files: 2,
+                add: 3,
+                del: 0
+            }
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

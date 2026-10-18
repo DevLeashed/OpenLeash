@@ -21,9 +21,11 @@ import { Loader, LightboxProvider } from "./ui/primitives";
 const loadReview = () => import("./ui/Review");
 const loadSaved = () => import("./ui/Saved");
 const loadSettings = () => import("./ui/Settings");
+const loadSchedulesView = () => import("./ui/Schedules");
 const Review = lazy(() => loadReview().then((m) => ({ default: m.Review })));
 const Saved = lazy(() => loadSaved().then((m) => ({ default: m.Saved })));
 const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.SettingsView })));
+const Schedules = lazy(() => loadSchedulesView().then((m) => ({ default: m.Schedules })));
 
 function pendingApproval(): string | null {
   const s = get();
@@ -51,6 +53,9 @@ function onKey(e: KeyboardEvent) {
       const ap = pendingApproval();
       if (ap) { api.respond(s.task, ap, { decision: "deny" }).catch(() => {}); return; }
       const t = s.tasks[s.task];
+      // With the Artificts studio open, Esc belongs to the canvas (leaving comment/edit
+      // mode); pausing or stopping the agent from there is too easy to hit by accident.
+      if (s.studioView[s.task]) return;
       // First Esc pauses (commands finish, nothing is lost); Esc again while paused stops.
       const paused = !!t?.paused || (!!s.settings?.paused_all && !t?.unpaused);
       if (t && (t.status === "running" || t.status === "waiting")) {
@@ -126,11 +131,11 @@ export default function App() {
 
   return (
     <LightboxProvider>
-    // A phone browser's `vh` is the height with its toolbars hidden, so the
-    // bottom of the app (the composer) would sit under them; `dvh` follows the
-    // toolbars and, with `interactive-widget` in index.html, the keyboard. Only
-    // in a remote browser: the desktop webview has neither, and an engine without
-    // `dvh` drops the value and falls back to `.app`'s own `inset: 0`.
+    {/* A phone browser's `vh` is the height with its toolbars hidden, so the
+        bottom of the app (the composer) would sit under them; `dvh` follows the
+        toolbars and, with `interactive-widget` in index.html, the keyboard. Only
+        in a remote browser: the desktop webview has neither, and an engine without
+        `dvh` drops the value and falls back to `.app`'s own `inset: 0`. */}
     <div className="app" style={{ zoom: z, width: `${100 / z}vw`, height: `${100 / z}${isRemoteClient() ? "dvh" : "vh"}` }}>
       <Titlebar />
       <AppUpdateBanner />
@@ -146,6 +151,7 @@ export default function App() {
               {view === "saved" && <Saved />}
               {view === "paused" && <Paused />}
               {view === "settings" && <SettingsView />}
+              {view === "schedules" && <Schedules />}
               </Suspense>
             </div>
           )}

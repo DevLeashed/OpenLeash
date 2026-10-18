@@ -282,3 +282,54 @@ describe("the option extension pencil", () => {
     expect((response as { answers: unknown[] }).answers[0]).toEqual(["Redis"]);
   });
 });
+
+// The agent's count or range is a limit on the answer, and the user can waive it
+// for their own answer alone. Waiving it lifts the check; the question is unchanged.
+describe("removing a count or range limit for one answer", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    draftSet.mockClear();
+    respond.mockClear();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  const item = (questions: unknown[]) =>
+    ({ id: "q1", kind: "question", text: "", ts: "2026-09-01T00:00:00Z", data: { questions } }) as unknown as Item;
+
+  it("refuses a third pick, then sends it once the user removes the limit", () => {
+    render(<Question it={item([{ question: "Which databases?", type: "multi", max: 2, options: [{ label: "Postgres" }, { label: "SQLite" }, { label: "Redis" }] }])} task={task} />);
+    fireEvent.click(screen.getByText("Postgres"));
+    fireEvent.click(screen.getByText("SQLite"));
+    fireEvent.click(screen.getByText("Redis"));
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(respond).not.toHaveBeenCalled();
+    expect(screen.getByText("Pick at most 2")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove limits" }));
+    expect(screen.getByText("Pick any · limits removed")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Restore limits" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(respond).toHaveBeenCalledTimes(1);
+    const [, , response] = respond.mock.calls[0]!;
+    expect((response as { answers: unknown[] }).answers[0]).toEqual(["Postgres", "SQLite", "Redis"]);
+  });
+
+  it("drops a number range for this answer, and the input stops enforcing it", () => {
+    render(<Question it={item([{ question: "How many replicas?", type: "number", min: 3, max: 10 }])} task={task} />);
+    expect(screen.getByPlaceholderText("3-10")).toBeTruthy();
+    fireEvent.change(screen.getByRole("spinbutton"), { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(respond).not.toHaveBeenCalled();
+    expect(screen.getByText("Max 10")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove limits" }));
+    expect(screen.getByRole("spinbutton").getAttribute("max")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(respond).toHaveBeenCalledTimes(1);
+    const [, , response] = respond.mock.calls[0]!;
+    expect((response as { answers: unknown[] }).answers[0]).toBe(12);
+  });
+});

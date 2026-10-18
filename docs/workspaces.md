@@ -43,6 +43,8 @@ The image needs `/bin/sh`. If it has `bash`, commands run in bash. You can also 
 | `ports` | Container ports published on `127.0.0.1` only. |
 | `idle_minutes` | Overrides the idle timeout for this project. `0` never stops the container. |
 | `user` | `"host"` (default: your uid:gid on Linux, so files stay yours), `"root"`, or a user from the image. Docker Desktop on Windows and macOS maps ownership itself. |
+| `memory` | Memory cap, e.g. `"512m"` or `"4g"`. Invalid values are rejected. |
+| `cpus` | CPU cap, e.g. `2` or `0.5` (up to 256). |
 
 Unknown keys are rejected. In particular, raw `docker run` flags can't be passed: the file comes from the repository, and flags like `--privileged` or `-v /:/host` would give the repository the whole machine.
 

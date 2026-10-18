@@ -54,21 +54,14 @@ describe("inline artifict cards", () => {
     expect(screen.queryByRole("region", { name: /Artifict:/ })).toBeNull();
   });
 
-  it("warns that an inline card is a draft, naming a collaboration record's stage", () => {
+  it("shows no work-in-progress banner over a card", () => {
     const record = JSON.stringify({ schema: "openleash.collaboration.v1", title: "Architecture", purpose: "Explain real code", stage: "verified", nodes: [], edges: [], evidence: [], limitations: [] });
-    const item = toolItem("artifict_create", "ok", { artifict_card: { title: "Architecture", kind: "json", persistence: "project", artifict_id: "art-1", version_id: "v1" }, input: { title: "Architecture", kind: "json", content: record } });
-    render(<InlineArtifictCard item={item} onOpenArtifict={vi.fn()} />);
-    const notice = screen.getByRole("note");
-    expect(notice.textContent).toContain("Work in progress");
-    expect(notice.textContent).toContain("Recorded stage: verified · author-reported, not independently certified");
-  });
-
-  it("warns on a one-off preview too, without inventing a stage for its format", () => {
-    const item = toolItem("artifict_preview", "ok", { artifict_card: { title: "Quarterly chart", kind: "html", persistence: "session" } });
-    render(<InlineArtifictCard item={item} />);
-    const notice = screen.getByRole("note");
-    expect(notice.textContent).toContain("Work in progress");
-    expect(notice.textContent).not.toContain("Recorded stage");
+    const saved = toolItem("artifict_create", "ok", { artifict_card: { title: "Architecture", kind: "json", persistence: "project", artifict_id: "art-1", version_id: "v1" }, input: { title: "Architecture", kind: "json", content: record } });
+    const { unmount } = render(<InlineArtifictCard item={saved} onOpenArtifict={vi.fn()} />);
+    expect(screen.queryByText(/Work in progress/)).toBeNull();
+    unmount();
+    render(<InlineArtifictCard item={toolItem("artifict_preview", "ok", { artifict_card: { title: "Quarterly chart", kind: "html", persistence: "session" } })} />);
+    expect(screen.queryByText(/Work in progress/)).toBeNull();
   });
 
   it("treats text and image artificts as first-class previews", () => {
@@ -81,5 +74,30 @@ describe("inline artifict cards", () => {
     const image = toolItem("artifict_preview", "ok", { artifict_card: { title: "Plot", kind: "image", persistence: "session" }, input: { title: "Plot", kind: "image", content: "https://example.org/plot.png" } });
     render(<InlineArtifictCard item={image} />);
     expect(screen.getByText("https://example.org/plot.png").getAttribute("data-format")).toBe("image");
+  });
+});
+
+describe("beside an open studio", () => {
+  it("collapses a saved artifict to one row, and keeps one-off previews and other chats full", async () => {
+    const { set } = await import("../store");
+    const saved = toolItem("artifict_revise", "ok", { artifict_card: { title: "Quarterly chart", kind: "html", persistence: "project", artifict_id: "a1", version_id: "v2" } });
+    set({ view: "session", task: "t1", tasks: { t1: { id: "t1", artifict_open: true } as never } });
+    const onOpen = vi.fn();
+    const first = render(<InlineArtifictCard item={saved} taskId="t1" onOpenArtifict={onOpen} />);
+    // The design is next door in the studio, so the chat does not draw it again.
+    expect(screen.queryByText("<h1>Sales</h1>")).toBeNull();
+    expect(screen.getByText("Revised · in the studio")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Show Quarterly chart in the studio" }));
+    expect(onOpen).toHaveBeenCalledWith({ artifictId: "a1", versionId: "v2" });
+    first.unmount();
+    // A one-off preview is not in the studio, so it still shows in full.
+    const oneOff = toolItem("artifict_preview", "ok", { artifict_card: { title: "Quarterly chart", kind: "html", persistence: "session" } });
+    const second = render(<InlineArtifictCard item={oneOff} taskId="t1" />);
+    expect(screen.getByText("<h1>Sales</h1>")).toBeTruthy();
+    second.unmount();
+    // On the chat view the saved card is the full preview again.
+    set({ tasks: { t1: { id: "t1", artifict_open: false } as never } });
+    render(<InlineArtifictCard item={saved} taskId="t1" />);
+    expect(screen.getByText("<h1>Sales</h1>")).toBeTruthy();
   });
 });

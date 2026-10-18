@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, FileDiff, ATTRIBUTIONS, Attribution } from "../api";
+import { api, FileDiff, ATTRIBUTIONS, Attribution, BisectEditsInfo, VisualEntry } from "../api";
+import { ImageExplanation } from "./ImageExplanation";
 import { flash, go, saveSettings, useStore } from "../store";
 import { Tooltip } from "./primitives";
-import { Check, ChevronLeft, Sparkles, X } from "lucide-react";
+import { Check, ChevronLeft, SearchCode, Sparkles, X } from "lucide-react";
 import { Loader, Button, ConfirmDialog, Dropdown, Input, Kbd, Pressable, Switch } from "./primitives";
+import { BisectDialog } from "./Bisect";
+import { diffRows, safeName } from "./diffRows";
 
 /** How many changed files / diff lines the view mounts at once. A review either
  *  walks the list with the arrow keys (bounded, and it only reads what's on
@@ -11,14 +14,73 @@ import { Loader, Button, ConfirmDialog, Dropdown, Input, Kbd, Pressable, Switch 
 const FILE_CAP = 500;
 const LINE_CAP = 4000;
 
-/** Unicode bidi overrides let a filename lie about its own name: `evil\u202Efdp.exe`
- *  renders as `evilepx.d` — a trojan renaming itself. A repo that ships one gets
- *  a user to revert the wrong file on the one screen meant to catch that, so the
- *  control characters are dropped and the override shown as the escape it is.
- *  The character classes are written as `\u` escapes, which is why this needs no
- *  `no-control-regex` disable — the rule does not fire on an escaped range. */
-function safeName(s: string): string {
-  return s.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+/** RFC3339 → a short local time; the raw text if it doesn't parse. */
+function when(at: string | null): string {
+  if (!at) return "";
+  const d = new Date(at);
+  return Number.isNaN(d.getTime()) ? at : d.toLocaleString();
+}
+
+/** Before/after screenshots of the URLs the agent compared. Rendered only when
+ *  there is at least one entry, so a chat that never captured any shows nothing. */
+function VisualChanges({ taskId, entries, onEntries, onCleared }: { taskId: string; entries: VisualEntry[]; onEntries: (e: VisualEntry[]) => void; onCleared: () => void }) {
+  const [busy, setBusy] = useState<"" | "recapture" | "discard">("");
+  const [err, setErr] = useState("");
+  const recapture = async () => {
+    if (busy) return;
+    setBusy("recapture");
+    setErr("");
+    try {
+      const d = await api.visualRecapture(taskId);
+      // Every capture is a new file name (the backend never overwrites one),
+      // so the path-keyed image cache can't show a stale picture here.
+      onEntries(d.entries);
+    } catch (e) {
+      setErr(String(e));
+      flash(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+  const discard = async () => {
+    if (busy) return;
+    setBusy("discard");
+    setErr("");
+    try {
+      await api.visualClear(taskId);
+      onCleared();
+    } catch (e) {
+      setErr(String(e));
+      flash(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+  return (
+    <details className="review-visual" open>
+      <summary>Visual changes ({entries.length})</summary>
+      {err && <div className="review-visual-err" role="alert">{err}</div>}
+      <div className="review-visual-body">
+        <div className="review-visual-actions">
+          <Button variant="ghost" style={{ height: 24 }} disabled={!!busy} onClick={() => void recapture()}>
+            {busy === "recapture" && <Loader size={12} />}Recapture after
+          </Button>
+          <Button variant="ghost" style={{ height: 24 }} disabled={!!busy} onClick={() => void discard()}>
+            {busy === "discard" && <Loader size={12} />}Discard
+          </Button>
+        </div>
+        {entries.map((entry, i) => (
+          <div key={`${i}:${entry.before_at}:${entry.after_at ?? ""}`} className="review-visual-entry">
+            <ImageExplanation source={JSON.stringify({ title: safeName(entry.url), src: entry.before, ...(entry.after ? { after: entry.after } : {}) })} />
+            <div className="review-visual-meta">
+              Before {when(entry.before_at)}{entry.after_at ? ` · after ${when(entry.after_at)}` : ""}
+            </div>
+            {!entry.after && <div className="review-visual-note" role="status">No after capture yet — Recapture to compare.</div>}
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }
 
 export function Review() {
@@ -32,13 +94,29 @@ export function Review() {
   const [genning, setGenning] = useState(false);
   const [genErr, setGenErr] = useState("");
   const [confirmReplace, setConfirmReplace] = useState(false);
+  const [bisectInfo, setBisectInfo] = useState<BisectEditsInfo | null>(null);
+  const [bisectOpen, setBisectOpen] = useState(false);
   const taskId = task?.id;
+  const bisectRunning = useStore((s) => (taskId ? s.bisect[taskId]?.running === true : false));
   const load = useCallback(() => {
     if (!taskId) return;
     setErr("");
     api.review(taskId).then(setData).catch((e) => { setData(null); setErr(String(e)); flash(String(e)); });
+    // The edit list decides whether "Find breaking edit" can run at all. A
+    // failure here only disables that button: it must not take the diff down.
+    api.bisectEdits(taskId).then((i) => setBisectInfo(i ?? null)).catch((e) => setBisectInfo({ edits: [], available: false, reason: String(e) }));
   }, [taskId]);
   useEffect(load, [load]);
+  // The visual diff is optional: a backend without the command (or any other
+  // failure) just means no section, never a broken Review.
+  const [visual, setVisual] = useState<VisualEntry[]>([]);
+  useEffect(() => {
+    setVisual([]);
+    if (!taskId) return;
+    let live = true;
+    api.visualDiff(taskId).then((d) => { if (live) setVisual(Array.isArray(d?.entries) ? d.entries : []); }).catch(() => {});
+    return () => { live = false; };
+  }, [taskId]);
   // The newest title, for the seed effect: it must seed the box when the chat
   // changes, not on every title change the user makes while editing.
   const titleRef = useRef(task?.title);
@@ -115,6 +193,8 @@ export function Review() {
 
   useEffect(() => {
     const kd = (e: KeyboardEvent) => {
+      // The bisect panel is a dialog over this view: its keys are its own.
+      if (bisectOpen) return;
       if (/TEXTAREA|INPUT/.test((document.activeElement as HTMLElement)?.tagName)) return;
       const k = e.key.toLowerCase();
       if (k === "a" && !e.ctrlKey) accept();
@@ -131,27 +211,19 @@ export function Review() {
   // changes the hook count between renders, which React does not allow.
   const shownFiles = useMemo(() => files.slice(0, FILE_CAP), [files]);
   const n = Object.keys(reviewed).length;
-  const lines = useMemo(() => {
-    // Line numbers come from the diff's own hunk headers, so they have to be
-    // counted in order — a skip that started at zero would renumber every line.
-    // Same shape and same tokens as the transcript's diff rows: the sign and the
-    // bar carry the hue, the code text stays in a readable body colour, and the
-    // band is a 10% tint rather than a slab the text has to fight.
-    let a = 0, b = 0;
-    return (cur?.lines ?? []).map((l) => {
-      if (l.k === "h") {
-        const m = l.t.match(/-(\d+)(?:,\d+)? \+(\d+)/);
-        if (m) { a = +m[1]! - 1; b = +m[2]! - 1; }
-        return { a: "", b: "", sign: "", signColor: "var(--diff-hunk)", t: l.t, color: "var(--diff-hunk)", bg: "var(--diff-hunk-bg)", bar: "transparent" };
-      }
-      if (l.k === "a") { b++; return { a: "", b: String(b), sign: "+", signColor: "var(--diff-add)", t: l.t, color: "var(--fg2)", bg: "var(--diff-add-bg)", bar: "var(--diff-add)" }; }
-      if (l.k === "d") { a++; return { a: String(a), b: "", sign: "−", signColor: "var(--diff-del)", t: l.t, color: "var(--fg2)", bg: "var(--diff-del-bg)", bar: "var(--diff-del)" }; }
-      a++; b++;
-      return { a: String(a), b: String(b), sign: "", signColor: "", t: l.t, color: "var(--mut)", bg: "transparent", bar: "transparent" };
-    });
-  }, [cur]);
+  const lines = useMemo(() => diffRows(cur?.lines ?? []), [cur]);
 
   if (!task) return null;
+  // A run already going (the agent's, through its tool, or one started before
+  // this view remounted) can always be opened to watch or cancel it.
+  const canBisect = bisectRunning || (bisectInfo?.available === true && bisectInfo.edits.length > 0);
+  const bisectWhy = bisectRunning
+    ? "A bisect is running for this chat — open it to watch or cancel"
+    : !bisectInfo
+      ? "Reading this chat's edit history…"
+      : canBisect
+        ? "Run a test command against each step of this chat's edit history to find the edit that broke it"
+        : bisectInfo.reason || "This chat has no file edits to search";
 
   return (
     <>
@@ -164,6 +236,15 @@ export function Review() {
             <div>{n} of {files.length} reviewed</div>
             <div className="bar3" style={{ width: 64 }}><div style={{ width: files.length ? (n / files.length) * 100 + "%" : 0, background: "var(--violet)" }} /></div>
           </div>
+          {/* The span carries the tooltip: a disabled button gets no pointer
+              events, and a disabled button is exactly when the reason matters. */}
+          <Tooltip content={bisectWhy}>
+            <span style={{ display: "inline-flex", flex: "none" }}>
+              <Button variant="ghost" disabled={!canBisect} onClick={() => setBisectOpen(true)}>
+                {bisectRunning ? <Loader size={12} /> : <SearchCode size={13} />}{bisectRunning ? "Bisect running…" : "Find breaking edit…"}
+              </Button>
+            </span>
+          </Tooltip>
         </div>
         {data?.git && (
           <div className="review-commit">
@@ -184,6 +265,7 @@ export function Review() {
       {genErr && data?.git && (
         <div className="desc" role="status" style={{ padding: "0 14px 6px", color: "var(--st-pause, #fbbf24)", fontSize: 11.5 }}>{genErr}</div>
       )}
+      {visual.length > 0 && <VisualChanges taskId={task.id} entries={visual} onEntries={setVisual} onCleared={() => setVisual([])} />}
       {err ? (
         <div className="empty" style={{ paddingTop: 80, color: "#ff8a8a" }} role="alert">
           Couldn't load the diff · {err}
@@ -225,6 +307,7 @@ export function Review() {
           </div>
         </div>
       )}
+      {bisectOpen && <BisectDialog task={task} edits={bisectInfo?.edits ?? []} onClose={() => setBisectOpen(false)} onReverted={load} />}
       {confirmReplace && <ConfirmDialog
         title="Replace your commit message?"
         body="Generating a message will overwrite what you typed."

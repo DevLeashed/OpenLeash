@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCw, Code2, Square, Copy, Maximize2, Minimize2 } from "lucide-react";
+import { RefreshCw, Code2, Square, Copy, Maximize2, Minimize2, Ellipsis } from "lucide-react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import ReactMarkdown from "react-markdown";
-import { copyText, MD_PLUGINS, mdComponents, replyUrlTransform } from "./mdx";
-import { Button, Thumb, useEscapeClose } from "./primitives";
+import { copyText } from "./mdx";
+import { Button, Dropdown, Thumb, useEscapeClose } from "./primitives";
 import { ImageExplanation } from "./ImageExplanation";
 import { svgImageUrl } from "./hostTheme";
 import { buildVisualizationDocument, captureTheme } from "./vizDocument";
 import { listenForVisualizationDraft, type VisualizationFeedbackDraft } from "./visualizationFeedback";
+import { buildChartBody, parseChartSpec } from "./chartDocument";
+import { MarkdownBlocks } from "./mdBlocks";
 
 // Re-exported for callers and tests that treat the viewer as the home of the
 // document builder; the implementation lives beside the frame that runs it.
@@ -16,7 +17,10 @@ export { buildVisualizationDocument, captureTheme };
 export const MAX_VIZ_BYTES = 240 * 1024; // leave space for the document wrapper
 export const MAX_VIZ_COUNT = 8;
 const toolbarButtonStyle = { height: 27, padding: "0 9px", borderRadius: 7, fontSize: 11.5, gap: 6 } as const;
-export type VizPart = { kind: "markdown"; source: string } | { kind: "visualization" | "diagram" | "image"; source: string } | { kind: "placeholder"; source: string; message?: string };
+const toolbarPickerStyle = { height: 27, padding: "0 8px", fontSize: 11.5 } as const;
+const PREVIEW_WIDTHS = [{ value: "100%", label: "Responsive" }, { value: "375px", label: "Phone" }, { value: "768px", label: "Tablet" }];
+export type VizPart = { kind: "markdown"; source: string } | { kind: "visualization" | "diagram" | "image" | "chart"; source: string } | { kind: "placeholder"; source: string; message?: string };
+const FENCES: Record<string, "visualization" | "diagram" | "image" | "chart"> = { "openleash-viz": "visualization", "openleash-svg": "diagram", "openleash-image": "image", "openleash-chart": "chart" };
 /** Parse fences before rendering: Markdown accepts unclosed fences while streaming.
  *
  *  Two syntaxes qualify, and both are read here rather than in Markdown, which
@@ -28,7 +32,7 @@ export function visualizationParts(text: string): VizPart[] {
   /** One diagram/visualization, whichever syntax named it. The bounds are the
    *  reply's, not the fence's: an unfenced SVG shares them, so it cannot smuggle
    *  a block past the count or the size limit. */
-  const emit = (kind: "visualization" | "diagram" | "image", source: string, closed: boolean) => {
+  const emit = (kind: "visualization" | "diagram" | "image" | "chart", source: string, closed: boolean) => {
     if (plain.length) out.push({ kind: "markdown", source: plain.join("\n") });
     plain = [];
     if (!closed) out.push({ kind: "placeholder", source });
@@ -55,9 +59,10 @@ export function visualizationParts(text: string): VizPart[] {
     const closing = new RegExp(`^ {0,3}${marker[0]}{${marker.length},}\\s*$`);
     while (end < lines.length && !closing.test(lines[end] ?? "")) end++;
     const source = lines.slice(i + 1, end).join("\n");
-    const tag = opening[3];
-    if (tag !== "openleash-viz" && tag !== "openleash-svg" && tag !== "openleash-image") plain.push(...lines.slice(i, Math.min(end + 1, lines.length)));
-    else emit(tag === "openleash-svg" ? "diagram" : tag === "openleash-image" ? "image" : "visualization", source, end < lines.length);
+    const tag = opening[3] ?? "";
+    const kind = Object.prototype.hasOwnProperty.call(FENCES, tag) ? FENCES[tag] : undefined;
+    if (!kind) plain.push(...lines.slice(i, Math.min(end + 1, lines.length)));
+    else emit(kind, source, end < lines.length);
     i = end;
   }
   if (plain.length) out.push({ kind: "markdown", source: plain.join("\n") });
@@ -114,27 +119,47 @@ function VisualizationPlaceholder({ source, message }: { source: string; message
 /** CSS values are host-owned, but escape structural characters defensively. The
  *  wrapper precedes any supplied head/body so tokens exist when scripts run. */
 /** CSS values are host-owned, but escape structural characters defensively. The
- * wrapper precedes any supplied head/body so tokens exist when scripts run. */
-export function Visualization({ source, autoStart = false, label, onFeedbackDraft }: { source: string; autoStart?: boolean; label?: string; onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void }) {
+ * wrapper precedes any supplied head/body so tokens exist when scripts run.
+ *
+ * `source` is what the reader sees and copies; `documentSource`, when given, is
+ * what actually runs — a chart shows its JSON spec but runs the generated page. */
+export function Visualization({ source, documentSource, initialHeight, autoStart = false, label, onFeedbackDraft }: { source: string; documentSource?: string; initialHeight?: number; autoStart?: boolean; label?: string; onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void }) {
   const title = label?.trim() || "Interactive visualization";
   const frame = useRef<HTMLIFrameElement>(null);
   const viewer = useRef<HTMLDivElement>(null);
   const returnFocus = useRef<HTMLButtonElement | null>(null);
-  const [height, setHeight] = useState(420);
+  const [height, setHeight] = useState(initialHeight ?? 420);
   const [width, setWidth] = useState("100%");
   const [expanded, setExpanded] = useState(false);
-  const collapse = useCallback(() => setExpanded(false), []);
+  // Less-used controls live behind a "..." toggle. The menu is an in-flow row, not
+  // an overlay: `.viz-frame` clips overflow, so a floating menu would be cut off.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const moreButton = useRef<HTMLButtonElement>(null);
+  // Escape closes an open height or width menu before it collapses the preview.
+  // Both listen on window and this one registers first, so it still sees the menu
+  // in the DOM when it runs.
+  const collapse = useCallback(() => { if (!document.querySelector(".ddpop")) setExpanded(false); }, []);
   useEscapeClose(expanded, collapse);
+  useEffect(() => {
+    if (!menuOpen) return;
+    // A dropdown open inside the menu takes this Escape, as it does for the preview.
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && !document.querySelector(".ddpop")) setMenuOpen(false); };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [menuOpen]);
   useEffect(() => {
     if (!expanded) return;
     const opener = returnFocus.current;
     opener?.focus();
     const onFocus = (event: FocusEvent) => {
-      if (event.target instanceof Node && !viewer.current?.contains(event.target)) opener?.focus();
+      // A height or width menu is portalled to the body, outside the viewer, but it
+      // belongs to the dialog: focus moving into it must not be sent back.
+      const inMenu = event.target instanceof Element && !!event.target.closest(".ddpop");
+      if (event.target instanceof Node && !viewer.current?.contains(event.target) && !inMenu) opener?.focus();
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Tab" || !viewer.current) return;
-      const stops = [...viewer.current.querySelectorAll<HTMLElement>("button:not([disabled]), select, iframe")];
+      const stops = [...viewer.current.querySelectorAll<HTMLElement>("button:not([disabled]), [role=combobox]:not([aria-disabled]), iframe")];
       const first = stops[0], last = stops[stops.length - 1];
       if (event.shiftKey ? document.activeElement === first : document.activeElement === last) {
         event.preventDefault(); (event.shiftKey ? last : first)?.focus();
@@ -162,12 +187,12 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
     if (current.current) release(current.current);
     current.current = null; setId(null); setBusy(true); setError("");
     try {
-      const token = await invoke<string>("visualization_publish", { source: buildVisualizationDocument(source, captureTheme()) });
+      const token = await invoke<string>("visualization_publish", { source: buildVisualizationDocument(documentSource ?? source, captureTheme()) });
       if (generation.current !== gen) { release(token); return; }
       current.current = token; setId(token);
     } catch (e) { if (generation.current === gen) setError(String(e)); }
     finally { if (generation.current === gen) setBusy(false); }
-  }, [source]);
+  }, [source, documentSource]);
   useEffect(() => {
     if (autoStart) void publish();
   }, [autoStart, publish, attempt]);
@@ -175,7 +200,7 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
     generation.current++;
     if (current.current) release(current.current);
     current.current = null;
-  }, [source]);
+  }, [source, documentSource]);
   const stop = () => {
     generation.current++;
     if (current.current) release(current.current);
@@ -187,14 +212,17 @@ export function Visualization({ source, autoStart = false, label, onFeedbackDraf
     <div ref={viewer} className={expanded ? "viz-expanded-viewer" : undefined} role={expanded ? "dialog" : undefined} aria-modal={expanded ? true : undefined} aria-label={expanded ? `${title} preview` : undefined} style={expanded ? { position: "fixed", inset: 16, zIndex: 960, display: "flex", flexDirection: "column", background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden", boxShadow: "0 24px 80px rgba(0,0,0,.5)" } : undefined}>
     <div role="toolbar" aria-label={`${title} controls`} style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "9px 12px", alignItems: "center", flexShrink: 0, borderBottom: "1px solid var(--line)", background: "var(--panel)" }}>
       <strong title={title} style={{ flex: 1, minWidth: 160, fontSize: 13 }}>{title}</strong>
-      {(id || expanded) && <Button variant="ghost" style={toolbarButtonStyle} aria-expanded={expanded} aria-haspopup="dialog" onClick={(event) => { returnFocus.current = event.currentTarget; setExpanded(value => !value); }}>{expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}{expanded ? "Collapse preview" : "Expand preview"}</Button>}
       {!busy && !id && !error && <Button variant="primary" style={toolbarButtonStyle} onClick={() => void publish()}><RefreshCw size={13} />{autoStart ? "Restart preview" : "Preview"}</Button>}
-      <label style={{ fontSize: 12 }}>Height <select aria-label="Preview height" value={height} onChange={e => setHeight(Number(e.target.value))}><option value={280}>Compact</option><option value={420}>Standard</option><option value={720}>Tall</option></select></label>
-      <label style={{ fontSize: 12 }}>Width <select aria-label="Preview width" value={width} onChange={e => setWidth(e.target.value)}><option value="100%">Responsive</option><option value="375px">Phone</option><option value="768px">Tablet</option></select></label>
-      <Button variant="ghost" style={toolbarButtonStyle} aria-expanded={showSource} onClick={() => setShowSource(!showSource)}><Code2 size={13} />{showSource ? "Hide source" : "Source"}</Button>
-      <Button variant="ghost" style={toolbarButtonStyle} onClick={() => copyText(source, "Visualization source copied")}><Copy size={13} />Copy source</Button>
-      {(busy || id) && <Button variant="ghost" style={{ ...toolbarButtonStyle, color: "var(--red)" }} onClick={stop}><Square size={12} />Stop</Button>}
+      <Button variant="ghost" style={toolbarButtonStyle} ref={moreButton} aria-label="More" title="More" aria-expanded={menuOpen} onClick={() => setMenuOpen(value => !value)}><Ellipsis size={13} /></Button>
     </div>
+    {menuOpen && <div role="group" aria-label={`${title} more options`} style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "8px 12px", alignItems: "center", flexShrink: 0, borderBottom: "1px solid var(--line)", background: "var(--panel)" }}>
+      {(id || expanded) && <Button variant="ghost" style={toolbarButtonStyle} aria-expanded={expanded} aria-haspopup="dialog" onClick={() => { returnFocus.current = moreButton.current; setMenuOpen(false); setExpanded(value => !value); }}>{expanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}{expanded ? "Collapse preview" : "Expand preview"}</Button>}
+      <span style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>Height<Dropdown placeholder="Preview height" search={false} value={String(height)} onChange={(v) => setHeight(Number(v))} options={[{ value: "280", label: "Compact" }, { value: "420", label: "Standard" }, { value: "720", label: "Tall" }, ...([280, 420, 720].includes(height) ? [] : [{ value: String(height), label: `Custom (${height}px)` }])]} style={toolbarPickerStyle} /></span>
+      <span style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>Width<Dropdown placeholder="Preview width" search={false} value={width} onChange={setWidth} options={PREVIEW_WIDTHS} style={toolbarPickerStyle} /></span>
+      <Button variant="ghost" style={toolbarButtonStyle} aria-expanded={showSource} onClick={() => setShowSource(!showSource)}><Code2 size={13} />{showSource ? "Hide source" : "Source"}</Button>
+      <Button variant="ghost" style={toolbarButtonStyle} onClick={() => { setMenuOpen(false); copyText(source, "Visualization source copied"); }}><Copy size={13} />Copy source</Button>
+      {(busy || id) && <Button variant="ghost" style={{ ...toolbarButtonStyle, color: "var(--red)" }} onClick={() => { setMenuOpen(false); stop(); }}><Square size={12} />Stop</Button>}
+    </div>}
     {busy && <p role="status" aria-live="polite" style={{ padding: "0 10px", color: "var(--mut)" }}>Starting interactive preview…</p>}
     {error && <p role="alert" style={{ padding: 10 }}>{error} <Button variant="ghost" style={toolbarButtonStyle} onClick={() => autoStart ? setAttempt(value => value + 1) : void publish()}><RefreshCw size={13} />Retry preview</Button></p>}
     {id && <iframe ref={frame} key={id} title={`${title} preview`} sandbox="allow-scripts" referrerPolicy="no-referrer" src={convertFileSrc(id, "openleash-viz")} style={{ display: "block", width, maxWidth: "100%", height: expanded ? "100%" : height, flex: expanded ? 1 : undefined, minHeight: expanded ? 0 : undefined, border: 0, background: "var(--bg)" }} />}
@@ -226,6 +254,16 @@ function InlineDiagram({ source }: { source: string }) {
   </section>;
 }
 
+/** A declarative chart: the spec is validated here, and only a spec that parses
+ *  is handed to the isolated frame. The reader's Source is the JSON they would
+ *  edit, not the generated page around it. */
+function ChartView({ source }: { source: string }) {
+  const spec = useMemo(() => parseChartSpec(source), [source]);
+  const body = useMemo(() => "error" in spec ? "" : buildChartBody(spec), [spec]);
+  if ("error" in spec) return <VisualizationPlaceholder source={source} message={spec.error} />;
+  return <Visualization source={source} documentSource={body} initialHeight={spec.height} label={spec.title} autoStart />;
+}
+
 export function AssistantMarkdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
   // Memoized on the text alone. Splitting the reply into lines and building a
   // matcher per fence is O(reply length), and this component re-renders on every
@@ -236,12 +274,16 @@ export function AssistantMarkdown({ text, streaming = false }: { text: string; s
   const parts = useMemo(() => visualizationParts(text), [text]);
   const mapped = parts.map((part, i) => part.kind === "visualization"
     ? <Visualization key={`${i}:${part.source}`} source={part.source} autoStart />
+    : part.kind === "chart"
+      ? <ChartView key={`${i}:${part.source}`} source={part.source} />
     : part.kind === "image"
       ? <ImageExplanation key={`${i}:${part.source}`} source={part.source} />
     : part.kind === "diagram"
       ? <InlineDiagram key={`${i}:${part.source}`} source={part.source} />
     : part.kind === "placeholder"
       ? <VisualizationPlaceholder key={i} source={part.source} message={part.message ?? (streaming ? "Working on the interactive preview…" : "This interactive visualization is incomplete.")} />
-      : <ReactMarkdown key={i} remarkPlugins={MD_PLUGINS} components={mdComponents} urlTransform={replyUrlTransform}>{part.source}</ReactMarkdown>);
+      // Per block while streaming, so a long reply re-parses only its growing
+      // tail each tick; whole once finished. See `mdBlocks`.
+      : <MarkdownBlocks key={i} source={part.source} split={streaming} />);
   return mapped;
 }

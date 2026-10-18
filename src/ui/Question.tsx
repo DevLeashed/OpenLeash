@@ -1,11 +1,14 @@
-// The agent-designed question form: 1-20 questions, one per page, each with
+// The agent-designed question form: 1-20 questions (up to 30 options each;
+// long lists get a filter, see QuestionFilter.tsx), one per page, each with
 // its own type (single / multi / text / number / confirm).
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { api, Item, TaskSummary } from "../api";
 import { flash } from "../store";
 import { Check, Minus, Pencil, X } from "lucide-react";
 import { Button, ChoiceRow, IconButton, Input, Kbd, Pressable, TextArea } from "./primitives";
 import { MdInline } from "./mdx";
+import { digitCount, digitTarget, filterEnter, filterOptions, focusRow, isLong, NoMatch, OptionFilter, revealRow } from "./QuestionFilter";
 
 type QType = "single" | "multi" | "text" | "number" | "confirm";
 export interface Opt { label: string; description?: string; recommended?: boolean }
@@ -23,7 +26,7 @@ type AnsNote = { on: boolean; text: string };
  * same and a label can be edited out from under a saved form.
  */
 type OptNotes = Record<number, string>;
-export type Ans = { sel: number[]; other: string; otherOn: boolean; text: string; bool: boolean | null; skipped: boolean; note: AnsNote; optNotes: OptNotes; multi?: boolean };
+export type Ans = { sel: number[]; other: string; otherOn: boolean; text: string; bool: boolean | null; skipped: boolean; note: AnsNote; optNotes: OptNotes; multi?: boolean; unlimited?: boolean };
 /** Everything about a form in flight, saved to disk so it survives a close or a chat switch. */
 interface Draft { page: number; ans: Ans[]; dismissing: boolean; note: string }
 
@@ -68,8 +71,9 @@ export function valid(q: Q, a: Ans): string | null {
     case "multi": {
       const n = a.sel.length + (a.otherOn && a.other.trim() ? 1 : 0);
       if (req && n === 0) return "Pick at least one";
-      if (q.min && n < q.min) return `Pick at least ${q.min}`;
-      if (q.max && n > q.max) return `Pick at most ${q.max}`;
+      // A removed limit is not checked; the question itself keeps its limits.
+      if (!a.unlimited && q.min && n < q.min) return `Pick at least ${q.min}`;
+      if (!a.unlimited && q.max && n > q.max) return `Pick at most ${q.max}`;
       return null;
     }
     case "text":
@@ -78,13 +82,38 @@ export function valid(q: Q, a: Ans): string | null {
       if (!a.text.trim()) return req ? "Required" : null;
       const n = Number(a.text);
       if (Number.isNaN(n)) return "Not a number";
-      if (q.min !== undefined && n < q.min) return `Min ${q.min}`;
-      if (q.max !== undefined && n > q.max) return `Max ${q.max}`;
+      if (!a.unlimited && q.min !== undefined && n < q.min) return `Min ${q.min}`;
+      if (!a.unlimited && q.max !== undefined && n > q.max) return `Max ${q.max}`;
       return null;
     }
     case "confirm":
       return a.bool !== null || !req ? null : "Yes or no";
   }
+}
+
+/**
+ * Whether the question sets a count or range the user can drop for one answer.
+ * Only those have a limit to remove: a required question stays required.
+ */
+export const hasLimit = (q: Q) => (q.type === "multi" ? !!(q.min || q.max) : q.type === "number" && (q.min !== undefined || q.max !== undefined));
+
+/** The hint line under a multi question: the count it asks for, or that the limits were removed. */
+export function pickHint(q: Q, a: Ans): string {
+  if (a.unlimited) return hasLimit(q) ? "Pick any · limits removed" : "Pick any";
+  return `Pick any${q.min ? ` · at least ${q.min}` : ""}${q.max ? ` · at most ${q.max}` : ""}`;
+}
+
+/**
+ * "Remove limits" for this answer alone: drops the count or range the agent set
+ * ("at most 2", "Max 10") without changing the question or any other page. It is
+ * the same per-answer switch as "Allow multiple", and only shown where a limit exists.
+ */
+export function LimitToggle({ a, onToggle, className = "", style }: { a: Ans; onToggle: () => void; className?: string; style?: CSSProperties }) {
+  return (
+    <Button variant="ghost" className={className} style={style} aria-pressed={!!a.unlimited} onClick={onToggle}>
+      {a.unlimited ? "Restore limits" : "Remove limits"}
+    </Button>
+  );
 }
 
 export function value(q: Q, a: Ans): unknown {
@@ -138,7 +167,7 @@ export const wasSkipped = (it: Item, i: number) => {
 /** `null` when the user set nothing to save. */
 export function draftOf(d: Draft): string | null {
   if (d.dismissing || d.note.trim()) return JSON.stringify(d);
-  if (d.ans.some((a) => a.sel.length || a.otherOn || a.text.trim() || a.bool !== null || a.skipped || a.note.text || hasOptNote(a) || a.multi)) return JSON.stringify(d);
+  if (d.ans.some((a) => a.sel.length || a.otherOn || a.text.trim() || a.bool !== null || a.skipped || a.note.text || hasOptNote(a) || a.multi || a.unlimited)) return JSON.stringify(d);
   return null;
 }
 
@@ -163,6 +192,7 @@ export function restore(raw: string, qs: Q[]): Draft | null {
         // is dropped rather than pasted onto whichever one took its place.
         optNotes: optNotesOf(s.optNotes, q.options?.length ?? 0),
         multi: !!s.multi,
+        unlimited: !!s.unlimited,
       };
     });
     return {
@@ -323,6 +353,11 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   // note itself is what says so.
   const [optOpen, setOptOpen] = useState<number[]>([]);
   const otherRef = useRef<HTMLInputElement>(null);
+  // The filter over a long option list. Per page, so it never hides the options
+  // of a question the user has not even looked at yet.
+  const [query, setQuery] = useState("");
+  const filterRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   // The last body handed to the backend, so we only write real changes.
   const saved = useRef<string | null>(null);
   // `ans` is built from `qs` (`qs.map(initial)`, and `restore` maps over the
@@ -347,7 +382,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
     api.draftGet(it.id).then((raw) => {
       const d = raw && restore(raw, qs);
       if (!live || !d) return;
-      setAns((x) => d.ans.map((a, i) => (a.sel.length || a.otherOn || a.multi || a.text || a.bool !== null || a.skipped || a.note.text || hasOptNote(a) ? a : x[i] ?? a)));
+      setAns((x) => d.ans.map((a, i) => (a.sel.length || a.otherOn || a.multi || a.unlimited || a.text || a.bool !== null || a.skipped || a.note.text || hasOptNote(a) ? a : x[i] ?? a)));
       setPage(d.page);
       setDismissing(d.dismissing);
       setNote(d.note);
@@ -389,7 +424,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   // Moving to another question drops the open extension boxes: they belonged to
   // the page just left, and their text is in the draft either way. Above the
   // early returns below, because it is a hook and they are not.
-  useEffect(() => { setOptOpen([]); }, [page]);
+  useEffect(() => { setOptOpen([]); setQuery(""); }, [page]);
 
   if (done) return <Resolved it={it} />;
   const sourceQ = qs[page];
@@ -401,10 +436,17 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   // A single-choice question can be widened for this answer without changing
   // the agent's stored question or affecting any other page.
   const q: Q = sourceQ.type === "single" && a.multi ? { ...sourceQ, type: "multi" } : sourceQ;
+  // The bounds in force for this answer: none once the limits are removed.
+  const lo = a.unlimited ? undefined : q.min;
+  const hi = a.unlimited ? undefined : q.max;
   const opts = q.options ?? [];
   // A choice question always offers a free-text box: someone with a fourth
   // option shouldn't need a second form to say so.
   const other = q.type === "single" || q.type === "multi";
+  // A long list gets the filter; `shown` is what it left, in the agent's order.
+  const long = other && isLong(opts);
+  const shown = long ? filterOptions(opts, query) : opts.map((_, i) => i);
+  const hiddenPicks = a.sel.filter((i) => !shown.includes(i)).length;
   const upd = (patch: Partial<Ans>) => { setErr(null); setAns((x) => x.map((v, j) => (j === page ? { ...v, ...patch, skipped: false } : v))); };
   const pick = (i: number) => {
     if (q.type === "single") upd({ sel: [i], otherOn: false });
@@ -414,6 +456,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
     upd(q.type === "single" ? { otherOn: true, sel: [] } : { otherOn: !a.otherOn });
     setTimeout(() => otherRef.current?.focus(), 20);
   };
+  const ownAnswer = (text: string) => upd({ other: text, otherOn: true, ...(q.type === "single" ? { sel: [] } : {}) });
   const setNoteText = (text: string) => upd({ note: { on: true, text } });
   const setOptNote = (i: number, text: string) => upd({ optNotes: { ...a.optNotes, [i]: text } });
   const clearNote = () => { setErr(null); setAns((x) => x.map((v, j) => (j === page ? { ...v, note: blankNote() } : v))); };
@@ -447,10 +490,11 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   // is a real answer. `S` leaves the page the same way the button does.
   const canSkip = !a.skipped;
   const many = qs.length > 8;
-  const choiceKeys = q.type === "single" || q.type === "multi" ? opts.length + (other ? 1 : 0) : q.type === "confirm" ? 2 : 0;
+  // The digits reach the rows as shown, so a filtered list renumbers from 1.
+  const choiceKeys = other ? digitCount(shown, true) : q.type === "confirm" ? 2 : 0;
   // Every question can take a note, even without asking: it saves a followup.
   const noteField = <Note key={page} q={q} a={a} showAll={!!q.note} onChange={setNoteText} onCommit={() => next()} hideAll={clearNote} />;
-  const footHint = [choiceKeys ? `1-${Math.min(9, choiceKeys)} to choose` : null, "Enter to continue", "S to skip"].filter(Boolean).join(" · ");
+  const footHint = [choiceKeys ? `1-${Math.min(9, choiceKeys)} to choose` : null, long ? "/ to filter" : null, "Enter to continue", "S to skip"].filter(Boolean).join(" · ");
 
   return (
     <div
@@ -462,9 +506,13 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
         if (n >= 1 && n <= Math.min(9, choiceKeys)) {
           e.preventDefault();
           if (q.type === "confirm") upd({ bool: n === 1 });
-          else if (n === opts.length + 1 && other) toggleOther();
-          else pick(n - 1);
+          else {
+            const t = digitTarget(shown, n, other);
+            if (t && "other" in t) toggleOther();
+            else if (t) { pick(t.option); revealRow(listRef.current, t.option); }
+          }
         }
+        if (e.key === "/" && long) { e.preventDefault(); filterRef.current?.focus(); }
         if (e.key === "Enter") { e.preventDefault(); next(); }
         if ((e.key === "s" || e.key === "S") && canSkip) { e.preventDefault(); skip(); }
         if (e.key === "ArrowLeft" && page > 0) setPage(page - 1);
@@ -500,35 +548,53 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
 
         {(q.type === "single" || q.type === "multi") && (
           <>
-            {/* No cap of its own, and no inner scrolling: a choice is read before it
-                is picked, and the descriptions are the half that says what the label
-                cannot. Capping this list at a fixed height cut a description off
-                mid-sentence with nothing to show it continued — it looked like the
-                card was hiding text rather than offering more. The card grows to fit
-                and the transcript scrolls, which it already does, with the floating
-                composer's height kept clear of the end of it. */}
+            {/* A short list has no cap of its own and no inner scrolling: a choice
+                is read before it is picked, and the descriptions are the half that
+                says what the label cannot. Capping it at a fixed height cut a
+                description off mid-sentence with nothing to show it continued — it
+                looked like the card was hiding text rather than offering more. The
+                card grows to fit and the transcript scrolls. A long list (more than
+                FILTER_AT options) is the exception, below: there the filter box and
+                its "N options" count say up front that there is more to scroll to. */}
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               {sourceQ.type === "single" && <Button variant="ghost" style={{ height: 24, alignSelf: "flex-start", fontSize: 11 }} aria-pressed={!!a.multi} onClick={() => upd({ multi: !a.multi, ...(a.multi ? { sel: a.sel.slice(0, 1) } : {}) })}>{a.multi ? "Use single choice" : "Allow multiple"}</Button>}
-              {q.type === "multi" && <div style={{ fontSize: 11, color: "var(--dim)", padding: "0 2px" }}>Pick any{q.min ? ` · at least ${q.min}` : ""}{q.max ? ` · at most ${q.max}` : ""}</div>}
-              {opts.map((o, j) => {
+              {q.type === "multi" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 2px" }}>
+                  <span style={{ fontSize: 11, color: "var(--dim)" }}>{pickHint(q, a)}</span>
+                  {hasLimit(q) && <LimitToggle a={a} onToggle={() => upd({ unlimited: !a.unlimited })} style={{ height: 24, fontSize: 11 }} />}
+                </div>
+              )}
+              {long && (
+                <OptionFilter ref={filterRef} query={query} onChange={setQuery} shown={shown.length} total={opts.length} hiddenPicks={hiddenPicks}
+                  onDown={() => { const first = shown[0]; if (first !== undefined) focusRow(listRef.current, first); }}
+                  onEnter={() => filterEnter({ query, shown, selected: a.sel, pick, ownAnswer, next: () => next() })} />
+              )}
+              {/* A long list is bounded and scrolls: thirty rows would otherwise
+                  push the answer buttons a screen away. The free-text row stays
+                  outside it, so your own answer is always one glance away. */}
+              <div ref={listRef} className={long ? "opt-scroll" : undefined} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {long && !shown.length && <NoMatch query={query} />}
+              {shown.map((j, p) => {
+                const o = opts[j]!;
                 const on = a.sel.includes(j);
                 // The extension box is open when its pencil was pressed, or when
                 // the draft came back with something in it.
                 const ext = on && (optOpen.includes(j) || !!a.optNotes?.[j]?.trim());
                 return (
                   <ChoiceRow key={j} variant={q.type === "multi" ? "check" : "radio"} selected={on} style={on ? { flexDirection: "column", alignItems: "stretch", gap: 6 } : undefined} onClick={() => pick(j)}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 7, width: "100%" }}>
+                    <div data-opt={j} style={{ display: "flex", alignItems: "center", gap: 7, width: "100%" }}>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 7, fontWeight: 500 }}><MdInline text={clean(o.label)} />{isRec(o) && <span style={{ fontSize: 10.5, color: "var(--mut2)" }}>Recommended</span>}</div>
                         {o.description && <div className="md qtext" style={{ fontSize: 11.5, color: "var(--mut2)", marginTop: 2, lineHeight: 1.45 }}><MdInline text={o.description} /></div>}
                       </div>
                       {on && !ext && <OptNotePencil label={`Extend “${clean(o.label)}”`} onOpen={() => setOptOpen((x) => (x.includes(j) ? x : [...x, j]))} />}
-                      {j < 9 && <Kbd className="dim">{`${j + 1}`}</Kbd>}
+                      {p < 9 && <Kbd className="dim">{`${p + 1}`}</Kbd>}
                     </div>
                     {ext && <OptNoteBox i={j} a={a} onChange={setOptNote} />}
                   </ChoiceRow>
                 );
               })}
+              </div>
               {other && (
                 <>
                   <ChoiceRow variant={q.type === "multi" ? "check" : "radio"} selected={a.otherOn} style={{ alignItems: "center", padding: "0 10px", height: 36 }} onClick={toggleOther}>
@@ -536,7 +602,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
                     {/* No pencil here: the user writes the choice themselves, so a
                         box beside it would only repeat what they already said. The
                         question's own note is where that goes. */}
-                    {opts.length < 9 && <Kbd className="dim">{`${opts.length + 1}`}</Kbd>}
+                    {shown.length < 9 && <Kbd className="dim">{`${shown.length + 1}`}</Kbd>}
                   </ChoiceRow>
                 </>
               )}
@@ -552,8 +618,11 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
         )}
 
         {q.type === "number" && (
-          <Input autoFocus type="number" min={q.min} max={q.max} value={a.text} placeholder={q.placeholder ?? (q.min !== undefined && q.max !== undefined ? `${q.min}-${q.max}` : "0")} onChange={(e) => upd({ text: e.currentTarget.value })}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); next(); } }} style={{ width: 180 }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Input autoFocus type="number" min={lo} max={hi} value={a.text} placeholder={q.placeholder ?? (lo !== undefined && hi !== undefined ? `${lo}-${hi}` : "0")} onChange={(e) => upd({ text: e.currentTarget.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); next(); } }} style={{ width: 180 }} />
+            {hasLimit(q) && <LimitToggle a={a} onToggle={() => upd({ unlimited: !a.unlimited })} style={{ height: 24, fontSize: 11 }} />}
+          </div>
         )}
 
         {q.type === "confirm" && (

@@ -196,6 +196,17 @@ impl AccountRt {
         usable_with(a, &st.get(&a.id).cloned().unwrap_or_default())
     }
 
+    /// The latest usage reading for one account, if any has arrived. Read-only:
+    /// the quota burner (`agent::burner`) decides from the same reading the
+    /// router and the settings page use, rather than keeping a second copy.
+    pub fn usage_of(&self, id: &str) -> Option<AcctUsage> {
+        self.state
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|s| s.usage.clone())
+    }
+
     /// Free-named models may have a separate allowance from the account's paid
     /// usage windows, so let them try an account benched only for usage limits.
     /// Explicit account disables and credential failures still apply.
@@ -349,10 +360,22 @@ impl AccountRt {
         let mut limited = false;
         if kind == "codex" {
             for (p, label) in [("primary", "5h"), ("secondary", "Week")] {
-                if let Some(used) = num(&format!("x-codex-{p}-used-percent")) {
+                if let Some(used) = num(&format!("x-codex-{p}-used-percent"))
+                    .filter(|u| u.is_finite() && (0.0..=100.0).contains(u))
+                {
                     let after =
                         num(&format!("x-codex-{p}-reset-after-seconds")).unwrap_or(0.0) as i64;
+                    let reset = num(&format!("x-codex-{p}-reset-at"))
+                        .filter(|t| t.is_finite() && *t > 0.0)
+                        .map(|t| t as i64)
+                        .unwrap_or_else(|| if after > 0 { now() + after } else { 0 });
                     let mins = num(&format!("x-codex-{p}-window-minutes")).unwrap_or(0.0);
+                    // Codex can send a zero-filled header family with no window
+                    // metadata. Like the official client, treat it as absent,
+                    // not a real reset to 0% used (100% left in the UI).
+                    if used == 0.0 && mins <= 0.0 && reset == 0 {
+                        continue;
+                    }
                     let label = if mins > 0.0 {
                         window_label(mins as i64 * 60)
                     } else {
@@ -361,7 +384,7 @@ impl AccountRt {
                     windows.push(Window {
                         label,
                         used,
-                        resets_at: if after > 0 { now() + after } else { 0 },
+                        resets_at: reset,
                     });
                 }
             }
@@ -844,12 +867,23 @@ fn write_back(a: &Account) {
 
 // ───────────────────────────── refresh ─────────────────────────────
 
+/// Persist a refreshed account.
+///
+/// Written now, not through the debounced writer: providers rotate refresh
+/// tokens, so the one just used is dead, and a crash inside the debounce
+/// window would leave only that dead token on disk — the user logged out for
+/// no reason. Update and clone under the lock, then release it before the
+/// serialization/fsync work on the blocking pool. Every model request reads
+/// settings, so holding the write lock across disk I/O stalled unrelated chats.
 async fn save_account(h: &Harness, a: &Account) {
-    let mut s = h.settings.write().await;
-    if let Some(x) = s.accounts.iter_mut().find(|x| x.id == a.id) {
-        *x = a.clone();
-    }
-    store::save_settings(&s);
+    let snapshot = {
+        let mut s = h.settings.write().await;
+        if let Some(x) = s.accounts.iter_mut().find(|x| x.id == a.id) {
+            *x = a.clone();
+        }
+        s.clone()
+    };
+    let _ = tokio::task::spawn_blocking(move || store::save_settings(&snapshot)).await;
 }
 
 /// A usable access token for this account, refreshing first if it's about to expire.
@@ -1367,6 +1401,37 @@ pub async fn refresh_all(h: &Harness) {
 mod tests {
     use super::*;
 
+    /// A rotated refresh token is on disk by the time `save_account` returns
+    /// (a crash a moment later must not strand the user on a dead token), and
+    /// the settings lock is free again afterwards.
+    #[tokio::test]
+    // The `test_home` guard serializes `OPENLEASH_HOME` for the whole test.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_refreshed_account_is_on_disk_when_save_returns() {
+        let home =
+            std::env::temp_dir().join(format!("ol-acct-save-{}", uuid::Uuid::new_v4().simple()));
+        let _home = store::test_home(&home);
+        let old = Account {
+            id: "a1".into(),
+            kind: "claude".into(),
+            refresh_token: "dummy-refresh-old".into(),
+            ..Default::default()
+        };
+        let mut settings = store::Settings::default();
+        settings.accounts.push(old.clone());
+        let (h, _) = crate::agent::tests::harness(settings, vec![]);
+        let new = Account {
+            refresh_token: "dummy-refresh-rotated".into(),
+            ..old
+        };
+        save_account(&h, &new).await;
+        let disk = std::fs::read_to_string(store::data_dir().join("settings.json")).unwrap();
+        assert!(disk.contains("dummy-refresh-rotated"));
+        assert!(!disk.contains("dummy-refresh-old"));
+        assert!(h.settings.try_write().is_ok(), "no guard outlives the save");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn account_views_only_expose_masked_opencode_workspace_keys() {
         let key = format!("sk-{}AB12", "x".repeat(60));
@@ -1406,6 +1471,113 @@ mod tests {
         for view in value.as_array().unwrap() {
             assert!(view.get("access_token").is_none());
             assert!(view.get("refresh_token").is_none());
+        }
+    }
+
+    #[test]
+    fn codex_placeholder_headers_do_not_replace_real_usage() {
+        let rt = AccountRt::default();
+        rt.set_usage(
+            "codex",
+            usage_of(&[("5h", 42.0, 1_900_000_000), ("Week", 25.0, 1_900_100_000)]),
+        );
+        let headers = reqwest::header::HeaderMap::from_iter([
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-used-percent"),
+                "0".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-window-minutes"),
+                "0".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-secondary-used-percent"),
+                "0".parse().unwrap(),
+            ),
+        ]);
+        rt.update_from_headers("codex", "codex", &headers);
+        let u = rt.usage_of("codex").unwrap();
+        assert_eq!(u.windows[0].used, 42.0);
+        assert_eq!(u.windows[1].used, 25.0);
+        assert_eq!(u.windows[0].resets_at, 1_900_000_000);
+    }
+
+    #[test]
+    fn codex_partial_headers_update_only_the_reported_window() {
+        let rt = AccountRt::default();
+        rt.set_usage(
+            "codex",
+            usage_of(&[("5h", 42.0, 1_900_000_000), ("Week", 25.0, 1_900_100_000)]),
+        );
+        let headers = reqwest::header::HeaderMap::from_iter([
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-used-percent"),
+                "0".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-secondary-used-percent"),
+                "26".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-secondary-reset-after-seconds"),
+                "600".parse().unwrap(),
+            ),
+        ]);
+        rt.update_from_headers("codex", "codex", &headers);
+        let u = rt.usage_of("codex").unwrap();
+        assert_eq!(u.windows[0].used, 42.0);
+        assert_eq!(u.windows[1].used, 26.0);
+        assert!((now() + 599..=now() + 601).contains(&u.windows[1].resets_at));
+    }
+
+    #[test]
+    fn codex_real_zero_usage_and_absolute_reset_headers_are_accepted() {
+        let rt = AccountRt::default();
+        rt.set_usage("codex", usage_of(&[("5h", 42.0, 1_900_000_000)]));
+        let headers = reqwest::header::HeaderMap::from_iter([
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-used-percent"),
+                "0".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-window-minutes"),
+                "300".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-reset-at"),
+                "1900000100".parse().unwrap(),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("x-codex-primary-reset-after-seconds"),
+                "600".parse().unwrap(),
+            ),
+        ]);
+        rt.update_from_headers("codex", "codex", &headers);
+        let u = rt.usage_of("codex").unwrap();
+        assert_eq!(
+            u.windows[0].used, 0.0,
+            "a genuine reset must still lower usage"
+        );
+        assert_eq!(
+            u.windows[0].resets_at, 1_900_000_100,
+            "absolute timestamp takes precedence"
+        );
+    }
+
+    #[test]
+    fn codex_invalid_header_percentages_leave_the_last_reading_intact() {
+        let rt = AccountRt::default();
+        rt.set_usage("codex", usage_of(&[("5h", 42.0, 1_900_000_000)]));
+        for value in ["NaN", "inf", "-1", "101"] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-codex-primary-used-percent", value.parse().unwrap());
+            headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+            rt.update_from_headers("codex", "codex", &headers);
+            assert_eq!(
+                rt.usage_of("codex").unwrap().windows[0].used,
+                42.0,
+                "{value}"
+            );
         }
     }
 

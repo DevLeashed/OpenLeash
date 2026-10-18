@@ -13,7 +13,7 @@ export interface Opt { value: string; label: string; hint?: string; group?: stri
  *  hide the row someone is typing to reach. */
 const ROW_CAP = 300;
 
-export function Dropdown({ value, options, onChange, placeholder = "Select…", search = true, showHint = true, style }: { value: string; options: Opt[]; onChange: (v: string) => void; placeholder?: string; search?: boolean; showHint?: boolean; style?: React.CSSProperties }) {
+export function Dropdown({ value, options, onChange, placeholder = "Select…", search = true, showHint = true, disabled = false, style }: { value: string; options: Opt[]; onChange: (v: string) => void; placeholder?: string; search?: boolean; showHint?: boolean; disabled?: boolean; style?: React.CSSProperties }) {
   const listId = useId();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
@@ -52,6 +52,9 @@ export function Dropdown({ value, options, onChange, placeholder = "Select…", 
   }, [open]);
   useEffect(() => { if (scrolled) list.current?.querySelector(".hi")?.scrollIntoView({ block: "nearest" }); }, [hi, open, scrolled]);
   useEscapeClose(open, () => setOpen(false));
+  // A menu left open when its control becomes disabled (the studio does this while
+  // a version is being saved) must not keep accepting picks.
+  useEffect(() => { if (disabled) setOpen(false); }, [disabled]);
 
   const pick = (o: Opt | undefined) => { if (!o) return; onChange(o.value); setOpen(false); };
   const onKey = (e: React.KeyboardEvent) => {
@@ -81,14 +84,14 @@ export function Dropdown({ value, options, onChange, placeholder = "Select…", 
   };
   return (
     <>
-      <div ref={btn} className={"dd" + (open ? " open" : "")} style={style} role="combobox" aria-label={placeholder} aria-expanded={open} aria-haspopup="listbox" aria-controls={open ? listId : undefined} tabIndex={0} onClick={() => setOpen(!open)} onKeyDown={(e) => { if (!open && (e.key === "Enter" || e.key === "ArrowDown")) { e.preventDefault(); setOpen(true); } }}>
+      <div ref={btn} className={"dd" + (open ? " open" : "")} style={disabled ? { ...style, opacity: 0.5 } : style} role="combobox" aria-label={placeholder} aria-expanded={open} aria-haspopup="listbox" aria-controls={open ? listId : undefined} aria-disabled={disabled || undefined} tabIndex={disabled ? -1 : 0} onClick={() => { if (!disabled) setOpen(!open); }} onKeyDown={(e) => { if (!disabled && !open && (e.key === "Enter" || e.key === "ArrowDown")) { e.preventDefault(); setOpen(true); } }}>
         {cur?.icon}
         <span className="ddv">{cur ? cur.label : <span style={{ color: "var(--dim)" }}>{value || placeholder}</span>}</span>
         {showHint && cur?.hint && <span className="ddh">{cur.hint}</span>}
         <span className="ddc">{I.chev()}</span>
       </div>
       {open && createPortal(
-        <div style={{ position: "fixed", inset: 0, zoom: zoom(), zIndex: btn.current?.closest(".modal") ? 950 : 80 }}>
+        <div style={{ position: "fixed", inset: 0, zoom: zoom(), zIndex: btn.current?.closest(".viz-expanded-viewer") ? 961 : btn.current?.closest(".modal") ? 950 : 80 }}>
           <div style={{ position: "absolute", inset: 0 }} onMouseDown={() => setOpen(false)} />
           <div className={"ddpop" + (pos.up ? " up" : "")} style={{ left: pos.left, width: pos.width, ...(pos.up ? { bottom: `calc(100% - ${pos.top}px)` } : { top: pos.top }) }} onKeyDown={onKey}>
             {search && <Input autoFocus placeholder="Search…" value={q} onChange={(e) => { setQ(e.currentTarget.value); setHi(0); }} style={{ width: "100%", height: 28, marginBottom: 4 }} />}

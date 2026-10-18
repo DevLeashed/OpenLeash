@@ -47,7 +47,7 @@ it("warns when the code won't travel with the chat", () => {
   expect(codeWarning({ git: false, branch: "", dirty: 3, ahead: null })).toBe("");
 });
 
-it("connects, suggests the matching folder, and moves the chat", async () => {
+it("connects, suggests the matching folder, and transfers the chat", async () => {
   render(<SendDialog taskId="t1" title="Port the parser" running />);
   const host = await screen.findByText("Desk");
   expect((await screen.findByRole("note")).textContent).toMatch(/uncommitted/);
@@ -56,10 +56,10 @@ it("connects, suggests the matching folder, and moves the chat", async () => {
   fireEvent.click(host);
   await screen.findByText(/Connected to Desk \(desk, Linux\)/);
   expect((screen.getByLabelText(/Project folder on Desk/) as HTMLInputElement).value).toBe("/home/me/proj");
-  fireEvent.click(screen.getByRole("radio", { name: "Move" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Transfer" }));
   fireEvent.click(screen.getByRole("checkbox"));
-  fireEvent.click(screen.getByRole("button", { name: "Move" }));
-  await screen.findByText("Moved to Desk");
+  fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+  await screen.findByText("Transferred to Desk");
   expect(screen.getByText(/archived here/)).toBeTruthy();
   expect(calls.find(([c]) => c === "transfer_send")?.[1]).toEqual({ link: "L1", taskId: "t1", mode: "move", project: "/home/me/proj", resume: true });
 });
@@ -76,13 +76,13 @@ it("offers to leave the chat when OpenLeash isn't running there", async () => {
   expect(screen.getByText(/waiting in the imports folder/)).toBeTruthy();
 });
 
-it("keeps a moved chat unarchived when the import isn't confirmed", async () => {
+it("keeps a transferred chat unarchived when the import isn't confirmed", async () => {
   online = false;
   render(<SendDialog taskId="t1" title="x" running={false} />);
   fireEvent.click(await screen.findByText("Desk"));
   await screen.findByText(/isn't reachable on Desk/);
-  fireEvent.click(screen.getByRole("radio", { name: "Move" }));
-  fireEvent.click(screen.getByRole("button", { name: "Move" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Transfer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
   await screen.findByText("Sent to Desk");
   expect(screen.queryByText(/was archived here/)).toBeNull();
   expect(screen.getByText(/not archived here/).textContent).toMatch(/archive it yourself/);

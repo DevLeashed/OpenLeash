@@ -38,11 +38,32 @@ describe("visual and receipt upgrades", () => {
   it("resizes previews without replacing the iframe", async () => {
     render(<Visualization source="<p>Hi</p>" autoStart />);
     const frame = await screen.findByTitle("Interactive visualization preview");
-    fireEvent.change(screen.getByRole("combobox", { name: "Preview height" }), { target: { value: "720" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "Preview width" }), { target: { value: "375px" } });
+    fireEvent.click(screen.getByRole("button", { name: "More" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Preview height" }));
+    fireEvent.click(screen.getByRole("option", { name: "Tall" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Preview width" }));
+    fireEvent.click(screen.getByRole("option", { name: "Phone" }));
     expect(screen.getByTitle("Interactive visualization preview")).toBe(frame);
     expect(frame.getAttribute("style")).toContain("720px");
     expect(frame.getAttribute("style")).toContain("375px");
+  });
+  // The pickers are themed menus portalled to the body. In the expanded preview
+  // the menu has to sit above the dialog, and Escape closes the menu, not the dialog.
+  it("keeps a picker usable inside the expanded preview", async () => {
+    render(<Visualization source="<p>Hi</p>" autoStart />);
+    await screen.findByTitle("Interactive visualization preview");
+    fireEvent.click(screen.getByRole("button", { name: "More" }));
+    fireEvent.click(screen.getByRole("button", { name: "Expand preview" }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "More" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Preview width" }));
+    const layer = document.querySelector(".ddpop")!.parentElement as HTMLElement;
+    expect(Number(layer.style.zIndex)).toBeGreaterThan(960);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(document.querySelector(".ddpop")).toBeNull();
+    expect(screen.getByRole("dialog"), "the first Escape only closes the menu").toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
   it("focuses and traps the lightbox then restores the opener", () => {
     render(<LightboxProvider><Thumb src="https://example.org/a.png" alt="Picture" /></LightboxProvider>);

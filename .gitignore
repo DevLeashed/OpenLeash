@@ -46,3 +46,6 @@ lcov-report/
 .scratch/
 .research/
 .openleash/
+.openleash_docker
+tmp
+temp

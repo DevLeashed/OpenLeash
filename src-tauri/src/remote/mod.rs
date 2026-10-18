@@ -19,6 +19,7 @@
 
 pub mod auth;
 pub mod http;
+pub mod push;
 pub mod ssh;
 pub mod ssh_projects;
 pub mod transfer;
@@ -42,6 +43,9 @@ use tokio_util::sync::CancellationToken;
 const SHIM_JS: &str = include_str!("shim.js");
 const LOGIN_HTML: &str = include_str!("login.html");
 const LOGIN_JS: &str = include_str!("login.js");
+const APPROVE_HTML: &str = include_str!("approve.html");
+const APPROVE_JS: &str = include_str!("approve.js");
+const LOGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 /// Event the desktop UI listens to so it can show who is connected. Carries a
 /// count only: the full status includes the pairing link.
 pub const EVENT: &str = "ol://remote";
@@ -51,6 +55,7 @@ const MAX_WS_MESSAGE: usize = 32 * 1024 * 1024;
 pub struct Remote {
     inner: Mutex<Inner>,
     tunnels: ssh::Tunnels,
+    attention_listener: std::sync::atomic::AtomicBool,
 }
 
 struct Inner {
@@ -62,6 +67,8 @@ struct Inner {
     next_client: u64,
     /// Why the server is not running although it is enabled.
     error: String,
+    /// Outstanding notification action tokens are memory-only.
+    grants: push::Grants,
 }
 
 struct Server {
@@ -84,6 +91,11 @@ pub struct SessionView {
     pub created: i64,
     pub last_seen: i64,
     pub connected: usize,
+    pub push: bool,
+    pub push_details: bool,
+    pub push_confirm_all: bool,
+    pub push_questions: bool,
+    pub push_done: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -116,6 +128,8 @@ pub struct Status {
     pub sessions: Vec<SessionView>,
     pub clients: Vec<ClientView>,
     pub code: Option<CodeView>,
+    pub ntfy_server: String,
+    pub ntfy_token_set: bool,
 }
 
 fn now() -> i64 {
@@ -142,8 +156,10 @@ impl Remote {
                 clients: HashMap::new(),
                 next_client: 1,
                 error: String::new(),
+                grants: Default::default(),
             }),
             tunnels: Default::default(),
+            attention_listener: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -160,6 +176,7 @@ impl Remote {
 
     /// Start (or restart) the server to match the saved configuration.
     pub fn apply(self: &Arc<Self>, app: &AppHandle) {
+        self.listen_attention(app);
         self.stop_server();
         let (enabled, lan, port) = {
             let i = self.inner.lock().unwrap();
@@ -217,6 +234,104 @@ impl Remote {
         });
     }
 
+    /// Register the approval/completion notification listener once per Remote.
+    /// `apply` calls this even when the server is disabled, allowing later toggles.
+    pub fn listen_attention(self: &Arc<Self>, app: &AppHandle) {
+        use std::sync::atomic::Ordering;
+        if self.attention_listener.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        let handle = app.clone();
+        app.listen_any("ol://attention", move |event| {
+            let Ok(payload) = serde_json::from_str::<Value>(event.payload()) else {
+                return;
+            };
+            let task = payload["task_id"].as_str().unwrap_or("").to_string();
+            let item = payload["item_id"].as_str().map(str::to_string);
+            let kind = payload["kind"].as_str().unwrap_or("").to_string();
+            if task.is_empty() {
+                return;
+            }
+            let Some(me) = me.upgrade() else {
+                return;
+            };
+            let app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let Some(h) = app.try_state::<Arc<crate::agent::Harness>>() else {
+                    return;
+                };
+                me.push_attention(&h, &task, item.as_deref(), &kind).await;
+            });
+        });
+    }
+
+    async fn push_attention(
+        &self,
+        h: &crate::agent::Harness,
+        task: &str,
+        item: Option<&str>,
+        kind: &str,
+    ) {
+        let wants = |cfg: &auth::PushCfg| match kind {
+            "approval" => true,
+            "question" | "nonblocking" => cfg.questions,
+            "done" | "failed" => cfg.done,
+            _ => false,
+        };
+        let (chat, current) = match item {
+            Some(item) => match push_find_item(h, task, item).await {
+                Some((chat, value)) => (chat, Some(value)),
+                None => return,
+            },
+            None => match h.task(task).await {
+                Ok(t) => (t.lock().await.title.clone(), None),
+                Err(_) => return,
+            },
+        };
+        let (server, token, messages) = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.server.is_none() {
+                return;
+            }
+            let server = push::server_of(&inner.vault);
+            let token = inner.vault.ntfy.token.clone();
+            let devices: Vec<(String, auth::PushCfg)> = inner
+                .vault
+                .sessions
+                .iter()
+                .filter_map(|s| s.push.clone().map(|cfg| (s.id.clone(), cfg)))
+                .filter(|(_, cfg)| wants(cfg))
+                .collect();
+            let now = Instant::now();
+            let messages = devices
+                .into_iter()
+                .map(|(sid, cfg)| {
+                    let grant = if kind == "approval" {
+                        item.map(|item| inner.grants.mint(&sid, &cfg.r#gen, task, item, now))
+                    } else {
+                        None
+                    };
+                    push::message(
+                        &cfg,
+                        task,
+                        item.unwrap_or(""),
+                        kind,
+                        &chat,
+                        current.as_ref(),
+                        grant.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (server, token, messages)
+        };
+        for message in messages {
+            if let Err(error) = push::publish(&server, &token, &message).await {
+                eprintln!("[remote] ntfy notification failed: {error}");
+            }
+        }
+    }
+
     fn stop_server(&self) {
         let mut i = self.inner.lock().unwrap();
         if let Some(s) = i.server.take() {
@@ -254,6 +369,11 @@ impl Remote {
                 created: s.created,
                 last_seen: s.last_seen,
                 connected: i.clients.values().filter(|c| c.session == s.id).count(),
+                push: s.push.is_some(),
+                push_details: s.push.as_ref().is_some_and(|p| p.details),
+                push_confirm_all: s.push.as_ref().is_some_and(|p| p.confirm_all),
+                push_questions: s.push.as_ref().is_some_and(|p| p.questions),
+                push_done: s.push.as_ref().is_some_and(|p| p.done),
             })
             .collect();
         let mut clients: Vec<ClientView> = i
@@ -286,6 +406,8 @@ impl Remote {
             sessions,
             clients,
             code,
+            ntfy_server: push::server_of(v),
+            ntfy_token_set: !v.ntfy.token.is_empty(),
         }
     }
 
@@ -297,6 +419,7 @@ impl Remote {
         i.vault.enabled = enabled;
         i.vault.lan = lan;
         i.vault.port = if port == 0 { auth::DEFAULT_PORT } else { port };
+        i.grants.forget_session(None);
         i.vault.save();
         Ok(())
     }
@@ -316,6 +439,7 @@ impl Remote {
     pub fn revoke(&self, id: &str) -> bool {
         let mut i = self.inner.lock().unwrap();
         let ok = i.vault.revoke(id);
+        i.grants.forget_session(Some(id));
         i.vault.save();
         Self::kill_session_clients(&i, Some(id));
         ok
@@ -325,8 +449,29 @@ impl Remote {
         let mut i = self.inner.lock().unwrap();
         i.vault.reset();
         i.code = None;
+        i.grants.forget_session(None);
         i.vault.save();
         Self::kill_session_clients(&i, None);
+    }
+
+    /// Configure ntfy publishing. A server change without a replacement token
+    /// clears the old bearer credential rather than sending it to a new origin.
+    pub fn configure_ntfy(&self, server: &str, token: Option<&str>) -> Result<(), String> {
+        let mut i = self.inner.lock().unwrap();
+        push::configure_ntfy(&mut i.vault, server, token)?;
+        i.grants.forget_session(None);
+        i.vault.save();
+        Ok(())
+    }
+
+    pub fn push_disable(&self, id: &str) -> bool {
+        let mut i = self.inner.lock().unwrap();
+        let ok = {
+            let Inner { vault, grants, .. } = &mut *i;
+            push::disable(vault, id, grants)
+        };
+        i.vault.save();
+        ok
     }
 
     fn session_for(&self, req: &http::Request, port: u16) -> Option<String> {
@@ -410,10 +555,10 @@ impl Remote {
             return;
         }
         let len = req.content_length();
-        let body_limit = if req.path == "/__openleash/upload" {
-            http::MAX_UPLOAD_BODY
-        } else {
-            http::MAX_BODY
+        let body_limit = match req.path.as_str() {
+            "/__openleash/upload" => http::MAX_UPLOAD_BODY,
+            "/__openleash/push/act" | "/__openleash/push/approval" => 16 * 1024,
+            _ => http::MAX_BODY,
         };
         if len > body_limit {
             let _ = stream
@@ -449,6 +594,35 @@ impl Remote {
                 return http::Response::new(200)
                     .header("Content-Type", http::mime("x.js"))
                     .body(LOGIN_JS)
+            }
+            // Before the session check on purpose: see `library_response`.
+            p if p == format!("/__openleash/viz/{}", crate::visualization::LIBRARY_PATH) => {
+                return viz_library(req);
+            }
+            "/__openleash/push/approve" => {
+                return http::Response::new(200)
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Content-Security-Policy", LOGIN_CSP)
+                    .body(APPROVE_HTML)
+            }
+            "/__openleash/push/approve.js" => {
+                return http::Response::new(200)
+                    .header("Content-Type", http::mime("x.js"))
+                    .body(APPROVE_JS)
+            }
+            "/__openleash/push/act" => {
+                if req.method != "POST" {
+                    return http::Response::text(405, "POST only");
+                }
+                let Some(h) = app.try_state::<Arc<crate::agent::Harness>>() else {
+                    return http::Response::text(503, "Not ready");
+                };
+                let body = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+                let caller = self.push_caller(req, port);
+                return match self.push_act(&h, caller, &body).await {
+                    Ok(d) => http::Response::json(200, &json!({"ok": true, "decision": d})),
+                    Err(r) => push_refusal_response(r),
+                };
             }
             "/pair" => {
                 let token = req.query.get("t").cloned().unwrap_or_default();
@@ -577,6 +751,9 @@ impl Remote {
             "/__openleash/remote.js" => http::Response::new(200)
                 .header("Content-Type", http::mime("x.js"))
                 .body(SHIM_JS),
+            p if p.starts_with("/__openleash/push/") => {
+                self.push_route(app, req, body, &session).await
+            }
             "/__openleash/logout" => {
                 if req.method != "POST" || !origin_matches(req.header("origin"), req.header("host"))
                 {
@@ -601,6 +778,17 @@ impl Remote {
                         let res = crate::visualization::respond(app, request);
                         let mut out = http::Response::new(res.status().as_u16());
                         for (k, v) in res.headers() {
+                            // The native policy names the native scheme's library
+                            // directory; this frame loads it from our own origin.
+                            if k == "content-security-policy" {
+                                out = out.header(
+                                    k.as_str(),
+                                    crate::visualization::csp(&remote_library_sources(
+                                        req.header("host"),
+                                    )),
+                                );
+                                continue;
+                            }
                             out = out.header(k.as_str(), v.to_str().unwrap_or(""));
                         }
                         // The preview is framed by the app itself.
@@ -838,6 +1026,256 @@ fn handle_invoke(
     }
 }
 
+async fn push_find_item(
+    h: &crate::agent::Harness,
+    task: &str,
+    item: &str,
+) -> Option<(String, crate::agent::Item)> {
+    let task_ref = h.task(task).await.ok()?;
+    let task_ref = task_ref.lock().await;
+    let item = task_ref
+        .items
+        .iter()
+        .find(|entry| entry.id == item)?
+        .clone();
+    Some((task_ref.title.clone(), item))
+}
+
+fn push_refusal_response(refusal: push::Refusal) -> http::Response {
+    use push::Refusal;
+    let (status, code, error) = match refusal {
+        Refusal::BadToken => (403, "bad_token", "This link isn't valid for this request."),
+        Refusal::Revoked => (
+            403,
+            "revoked",
+            "This device can no longer answer from notifications.",
+        ),
+        Refusal::Expired => (410, "expired", "This notification has expired."),
+        Refusal::Answered(_) => (409, "answered", "This request was already answered."),
+        Refusal::ConfirmRequired => (
+            403,
+            "confirm_required",
+            "This answer needs the confirm page.",
+        ),
+        Refusal::BadDecision => (
+            400,
+            "bad_decision",
+            "That answer isn't offered for this request.",
+        ),
+    };
+    http::Response::json(status, &json!({"code": code, "error": error}))
+}
+
+impl Remote {
+    fn push_caller(&self, req: &http::Request, port: u16) -> push::Caller {
+        match self.session_for(req, port) {
+            Some(session) if origin_matches(req.header("origin"), req.header("host")) => {
+                push::Caller::Session(session)
+            }
+            _ => push::Caller::Token,
+        }
+    }
+
+    async fn push_act(
+        &self,
+        h: &crate::agent::Harness,
+        caller: push::Caller,
+        body: &Value,
+    ) -> Result<String, push::Refusal> {
+        let field = |name: &str| body[name].as_str().unwrap_or("").to_string();
+        let (task, item, token, decision) = (
+            field("task"),
+            field("item"),
+            field("token"),
+            field("decision"),
+        );
+        if !matches!(decision.as_str(), "once" | "always" | "deny") {
+            return Err(push::Refusal::BadDecision);
+        }
+        let cfg = {
+            let inner = self.inner.lock().unwrap();
+            push::check(
+                &inner.vault,
+                &inner.grants,
+                &caller,
+                &task,
+                &item,
+                &token,
+                Instant::now(),
+            )?
+        };
+        if caller == push::Caller::Token && (decision == "always" || cfg.confirm_all) {
+            return Err(push::Refusal::ConfirmRequired);
+        }
+        let Some((_, current)) = push_find_item(h, &task, &item).await else {
+            return Err(push::Refusal::Answered(None));
+        };
+        if current.kind != "approval" {
+            return Err(push::Refusal::BadToken);
+        }
+        if decision == "always" && push::always_label(&current.data).is_none() {
+            return Err(push::Refusal::BadDecision);
+        }
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let cfg = {
+                let Inner { vault, grants, .. } = &mut *inner;
+                push::consume(vault, grants, &caller, &task, &item, &token, Instant::now())?
+            };
+            if caller == push::Caller::Token && (decision == "always" || cfg.confirm_all) {
+                return Err(push::Refusal::ConfirmRequired);
+            }
+        }
+        if current.data["resolved"].is_string() {
+            return Err(push::Refusal::Answered(
+                current.data["resolved"].as_str().map(str::to_string),
+            ));
+        }
+        h.respond_pending(&task, &item, json!({"decision": decision}))
+            .await
+            .map_err(|_| push::Refusal::Answered(None))?;
+        Ok(decision)
+    }
+
+    async fn push_approval(
+        &self,
+        h: &crate::agent::Harness,
+        session: &str,
+        body: &Value,
+    ) -> http::Response {
+        let task = body["task"].as_str().unwrap_or("");
+        let item = body["item"].as_str().unwrap_or("");
+        let token = body["token"].as_str().unwrap_or("");
+        let status = {
+            let inner = self.inner.lock().unwrap();
+            match push::check(
+                &inner.vault,
+                &inner.grants,
+                &push::Caller::Session(session.to_string()),
+                task,
+                item,
+                token,
+                Instant::now(),
+            ) {
+                Ok(_) => "pending",
+                Err(push::Refusal::Answered(_)) => "answered",
+                Err(push::Refusal::Expired) => "expired",
+                Err(r) => return push_refusal_response(r),
+            }
+        };
+        let Some((chat, current)) = push_find_item(h, task, item).await else {
+            return http::Response::json(
+                200,
+                &json!({"status":"answered","chat":"","title":"","detail":"","kind":"","always":null,"resolved":null}),
+            );
+        };
+        let pending = h.runtime(task).pending.lock().await.contains_key(item);
+        let status = if status == "pending" && !pending {
+            "answered"
+        } else {
+            status
+        };
+        http::Response::json(
+            200,
+            &json!({"status":status,"chat":chat,"title":current.data["title"].as_str().unwrap_or(&current.text),"detail":current.data["detail"].as_str().unwrap_or(""),"kind":current.data["kind"].as_str().unwrap_or(""),"always":push::always_label(&current.data),"resolved":current.data["resolved"]}),
+        )
+    }
+
+    async fn push_route(
+        &self,
+        app: &AppHandle,
+        req: &http::Request,
+        body: &[u8],
+        session: &str,
+    ) -> http::Response {
+        if req.method != "GET" && req.method != "POST" {
+            return http::Response::text(405, "GET or POST only");
+        }
+        if req.method == "POST" && !origin_matches(req.header("origin"), req.header("host")) {
+            return http::Response::text(403, "Forbidden");
+        }
+        let body = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+        if req.path == "/__openleash/push/state" && req.method == "GET" {
+            return http::Response::json(
+                200,
+                &push::state_json(&self.inner.lock().unwrap().vault, session),
+            );
+        }
+        match req.path.as_str() {
+            "/__openleash/push/enable" if req.method == "POST" => {
+                let mut inner = self.inner.lock().unwrap();
+                let ok = {
+                    let Inner { vault, grants, .. } = &mut *inner;
+                    push::enable(
+                        vault,
+                        session,
+                        req.header("origin"),
+                        push::Options::from_json(&body),
+                        now(),
+                        Some(grants),
+                    )
+                };
+                if !ok {
+                    return http::Response::text(401, "Not paired");
+                }
+                inner.vault.save();
+                http::Response::json(200, &push::state_json(&inner.vault, session))
+            }
+            "/__openleash/push/settings" if req.method == "POST" => {
+                let mut inner = self.inner.lock().unwrap();
+                let ok = {
+                    let Inner { vault, grants, .. } = &mut *inner;
+                    push::set_options(vault, session, push::Options::from_json(&body), grants)
+                };
+                if !ok {
+                    return http::Response::json(
+                        409,
+                        &json!({"error":"Notifications are off on this device."}),
+                    );
+                }
+                inner.vault.save();
+                http::Response::json(200, &push::state_json(&inner.vault, session))
+            }
+            "/__openleash/push/disable" if req.method == "POST" => {
+                self.push_disable(session);
+                let inner = self.inner.lock().unwrap();
+                http::Response::json(200, &push::state_json(&inner.vault, session))
+            }
+            "/__openleash/push/test" if req.method == "POST" => match self.push_test(session).await
+            {
+                Ok(()) => http::Response::json(200, &json!({"ok":true})),
+                Err(error) => http::Response::json(502, &json!({"error":error})),
+            },
+            "/__openleash/push/approval" if req.method == "POST" => {
+                let Some(h) = app.try_state::<Arc<crate::agent::Harness>>() else {
+                    return http::Response::text(503, "Not ready");
+                };
+                self.push_approval(&h, session, &body).await
+            }
+            _ => http::Response::text(404, "Not found"),
+        }
+    }
+
+    async fn push_test(&self, session: &str) -> Result<(), String> {
+        let (server, token, cfg) = {
+            let inner = self.inner.lock().unwrap();
+            let cfg = inner
+                .vault
+                .sessions
+                .iter()
+                .find(|s| s.id == session)
+                .and_then(|s| s.push.clone())
+                .ok_or("Notifications are off on this device.")?;
+            (
+                push::server_of(&inner.vault),
+                inner.vault.ntfy.token.clone(),
+                cfg,
+            )
+        };
+        push::publish(&server, &token, &json!({"topic":cfg.topic,"title":"OpenLeash","message":"Test notification. Approvals will arrive like this.","tags":["white_check_mark"],"click":format!("{}/",cfg.base_url)})).await
+    }
+}
+
 /// Tell the desktop UI the set of paired/connected devices changed.
 fn notify(app: &AppHandle) {
     let n = app
@@ -878,6 +1316,49 @@ async fn read_head(stream: &TcpStream) -> Result<http::Request, u16> {
             Err(http::Parse::Bad) => return Err(400),
         }
     }
+}
+
+/// The bundled chart library for remote preview frames.
+fn viz_library(req: &http::Request) -> http::Response {
+    if req.method != "GET" && req.method != "HEAD" {
+        return http::Response::text(405, "GET only");
+    }
+    let request = tauri::http::Request::builder()
+        .uri(format!(
+            "http://openleash-viz.localhost/{}",
+            crate::visualization::LIBRARY_PATH
+        ))
+        .body(vec![])
+        .ok();
+    match request
+        .as_ref()
+        .and_then(crate::visualization::library_response)
+    {
+        Some(res) => {
+            let mut out = http::Response::new(200);
+            for (k, v) in res.headers() {
+                out = out.header(k.as_str(), v.to_str().unwrap_or(""));
+            }
+            out.body(res.into_body())
+        }
+        None => http::Response::text(404, "Not found"),
+    }
+}
+
+/// Script sources a remote preview frame may load the chart library from: this
+/// server's own library directory, over either scheme (a TLS proxy may front
+/// it). The Host header is client-supplied and lands inside a policy, so
+/// anything but a plain host[:port] yields no extra source at all.
+fn remote_library_sources(host: &str) -> String {
+    let plain = !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
+    if !plain {
+        return String::new();
+    }
+    format!("http://{host}/__openleash/viz/lib/ https://{host}/__openleash/viz/lib/")
 }
 
 fn login_page(status: u16, message: &str) -> http::Response {
@@ -1067,6 +1548,23 @@ pub fn remote_reset(app: AppHandle, r: R<'_>) -> Status {
     r.status()
 }
 
+#[tauri::command]
+pub fn remote_ntfy_configure(
+    r: R<'_>,
+    server: String,
+    token: Option<String>,
+) -> Result<Status, String> {
+    r.configure_ntfy(&server, token.as_deref())?;
+    Ok(r.status())
+}
+
+#[tauri::command]
+pub fn remote_push_disable(app: AppHandle, r: R<'_>, id: String) -> Status {
+    r.push_disable(&id);
+    notify(&app);
+    r.status()
+}
+
 fn ssh_hosts(r: &Remote) -> Vec<ssh::SshHost> {
     r.inner.lock().unwrap().vault.ssh_hosts.clone()
 }
@@ -1246,6 +1744,44 @@ fn list_dir(path: Option<String>, dirs_only: bool) -> Result<DirListing, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_preview_policy_names_only_this_hosts_library() {
+        assert_eq!(
+            remote_library_sources("box.tail1234.ts.net:7777"),
+            "http://box.tail1234.ts.net:7777/__openleash/viz/lib/ https://box.tail1234.ts.net:7777/__openleash/viz/lib/"
+        );
+        assert_eq!(
+            remote_library_sources("[::1]:80"),
+            "http://[::1]:80/__openleash/viz/lib/ https://[::1]:80/__openleash/viz/lib/"
+        );
+        // A Host header that tries to add its own sources or directives adds nothing.
+        for hostile in [
+            "",
+            "a.example; script-src *",
+            "a.example *",
+            "evil/x",
+            "a'b",
+            "a,b",
+        ] {
+            assert_eq!(remote_library_sources(hostile), "", "{hostile}");
+        }
+    }
+
+    #[test]
+    fn remote_chart_library_is_served_without_a_session() {
+        let get = |method: &str| http::Request {
+            method: method.into(),
+            path: format!("/__openleash/viz/{}", crate::visualization::LIBRARY_PATH),
+            query: Default::default(),
+            headers: Default::default(),
+            head_len: 0,
+        };
+        let res = viz_library(&get("GET"));
+        assert_eq!(res.status, 200);
+        assert!(String::from_utf8_lossy(&res.body).contains("registerTheme(\"openleash\""));
+        assert_eq!(viz_library(&get("POST")).status, 405);
+    }
 
     #[test]
     fn shim_goes_first_in_head() {

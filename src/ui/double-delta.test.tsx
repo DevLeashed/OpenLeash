@@ -137,3 +137,30 @@ describe("one boot attaches one event listener", () => {
     expect(get().items.t1?.map((x) => x.text)).toEqual(["The wait-and-refuse branch works."]);
   });
 });
+// A chat running in the background must not rebuild the transcript the store
+// dropped when another chat was opened: every `item` event used to re-create it,
+// so N working chats meant N transcripts growing and N store writes per event.
+describe("background chats", () => {
+  it("keeps only the newest items of a chat that is not open, and streams into them", async () => {
+    await boot();
+    for (let i = 0; i < 60; i++) fire({ task_id: "other", kind: "item", payload: { ...replyItem(`m${i}`), id: `m${i}` } });
+    expect(get().items.other).toHaveLength(40);
+    expect(get().items.other?.at(-1)?.text).toBe("m59");
+    fire({ task_id: "other", kind: "delta", payload: { item_id: "m59", text: "+" } });
+    flushDeltas();
+    expect(get().items.other?.at(-1)?.text).toBe("m59+");
+    fire({ task_id: "other", kind: "sitem", payload: { sub_id: "s", item: replyItem("sub") } });
+    fire({ task_id: "other", kind: "bg", payload: [] });
+    expect(get().subItems.other).toBeUndefined();
+    expect(get().bg.other).toBeUndefined();
+
+    fire({ kind: "item", payload: replyItem("open") });
+    expect(get().items.t1?.map((x) => x.text)).toEqual(["open"]);
+  });
+
+  it("still lands an agent notice from a chat that is not open", async () => {
+    await boot();
+    fire({ task_id: "other", kind: "item", payload: { ...replyItem("heads up"), id: "n", kind: "user_notice" } });
+    expect(get().items.other?.map((x) => x.id)).toEqual(["n"]);
+  });
+});

@@ -93,7 +93,7 @@ pub async fn view_image(p: &SshPath) -> Result<tools::ImageData, String> {
     let (bytes, _) = ss::read(&p.host, &p.path, tools::MAX_IMAGE_BYTES + 1)
         .await
         .map_err(|e| format!("Cannot read {}: {e}", p.path))?;
-    tools::image_from_bytes(&p.path, &ext_of(&p.path), bytes)
+    tools::model_image_from_bytes(&p.path, &ext_of(&p.path), bytes)
 }
 
 /// The extension of a POSIX path's file name, without the dot.

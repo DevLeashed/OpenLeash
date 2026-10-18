@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke, convertFileSrc: (id: string) =>
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 const source = "<button onclick='this.textContent++'>1</button><script>window.foo=1</script>";
 const fence = (s = source) => `\`\`\`openleash-viz\n${s}\n\`\`\``;
+const more = () => fireEvent.click(screen.getByRole("button", { name: "More" }));
 describe("interactive visualizations", () => {
   it("requires exact fences and hides exact-tagged source when bounds reject execution", () => {
     for (const text of ["```html\n<script>1</script>\n```", "```openleash-viz extra\na\n```", "```openleash-viz \na\n```", "```js\n" + fence() + "\n```"]) expect(visualizationParts(text).every(p => p.kind === "markdown")).toBe(true);
@@ -29,7 +30,8 @@ describe("interactive visualizations", () => {
     cleanup(); render(<AssistantMarkdown text={nine} />);
     expect(screen.queryByText("piece-8")).toBeNull();
     expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();
-    fireEvent.click(screen.getAllByRole("button", { name: "Source" })[8]!);
+    // The eight running previews keep their Source behind "More", so the only one left is the placeholder's.
+    fireEvent.click(screen.getByRole("button", { name: "Source" }));
     await waitFor(() => expect(screen.getByText("<p>piece-8</p>")).toBeTruthy());
   });
   it("ordinary/user Markdown and raw html never offer a runtime", () => {
@@ -44,6 +46,7 @@ describe("interactive visualizations", () => {
     render(<AssistantMarkdown text={fence()} />);
     await waitFor(() => expect(document.querySelector("iframe")?.getAttribute("src")).toContain("one"));
     expect(invoke).toHaveBeenCalledWith("visualization_publish", expect.objectContaining({ source: expect.stringContaining(source) }));
+    more();
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(document.querySelector("iframe")?.getAttribute("sandbox")).toBe("allow-scripts");
     expect(document.querySelector("iframe")?.getAttribute("srcdoc")).toBeNull();
@@ -71,6 +74,7 @@ describe("interactive visualizations", () => {
     invoke.mockResolvedValueOnce("one").mockResolvedValue(undefined);
     render(<Visualization source={source} />);
     expect(invoke).not.toHaveBeenCalled(); expect(document.querySelector("iframe")).toBeNull();
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Source" })); expect(screen.getByText(source)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Preview" }));
     await waitFor(() => expect(document.querySelector("iframe")?.getAttribute("src")).toContain("one"));
@@ -85,6 +89,8 @@ describe("interactive visualizations", () => {
     const iframe = await screen.findByTitle("Interactive visualization preview");
     const previewWindow = (iframe as HTMLIFrameElement).contentWindow;
     const previewUrl = iframe.getAttribute("src");
+    const moreButton = screen.getByRole("button", { name: "More" });
+    more();
     const expand = screen.getByRole("button", { name: "Expand preview" });
     expand.focus(); fireEvent.click(expand);
     expect(screen.getByRole("dialog", { name: "Interactive visualization preview" })).toBeTruthy();
@@ -94,10 +100,11 @@ describe("interactive visualizations", () => {
     expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
     expect(iframe.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(iframe.getAttribute("srcdoc")).toBeNull();
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Collapse preview" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.querySelector("iframe")).toBe(iframe);
-    expect(document.activeElement).toBe(expand);
+    expect(document.activeElement).toBe(moreButton);
     expect(invoke.mock.calls.filter(([command]) => command === "visualization_publish")).toHaveLength(1);
     expect(invoke.mock.calls.filter(([command]) => command === "visualization_release")).toHaveLength(0);
   });
@@ -105,8 +112,11 @@ describe("interactive visualizations", () => {
     invoke.mockResolvedValueOnce("one").mockResolvedValue(undefined);
     render(<Visualization source={source} autoStart />);
     await screen.findByTitle("Interactive visualization preview");
+    const moreButton = screen.getByRole("button", { name: "More" });
+    more();
     const expand = screen.getByRole("button", { name: "Expand preview" });
     expand.focus(); fireEvent.click(expand);
+    more();
     const globalKey = vi.fn();
     window.addEventListener("keydown", globalKey);
     try {
@@ -115,7 +125,7 @@ describe("interactive visualizations", () => {
       await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
       expect(escape.defaultPrevented).toBe(true);
       expect(globalKey).not.toHaveBeenCalled();
-      expect(document.activeElement).toBe(expand);
+      expect(document.activeElement).toBe(moreButton);
       expect(screen.getByTitle("Interactive visualization preview")).toBeTruthy();
     } finally { window.removeEventListener("keydown", globalKey); }
   });
@@ -126,6 +136,7 @@ describe("interactive visualizations", () => {
     expect(screen.getByText("Revenue chart · v2")).toBeTruthy();
     expect(screen.getByRole("toolbar", { name: "Revenue chart · v2 controls" })).toBeTruthy();
     await screen.findByTitle("Revenue chart · v2 preview");
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Expand preview" }));
     expect(screen.getByRole("dialog", { name: "Revenue chart · v2 preview" })).toBeTruthy();
     expect(screen.queryByText("Interactive visualization")).toBeNull();
@@ -140,9 +151,11 @@ describe("interactive visualizations", () => {
     });
     const view = render(<Visualization source={source} autoStart />);
     await screen.findByTitle("Interactive visualization preview");
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Expand preview" }));
     view.rerender(<Visualization source="<p>updated</p>" autoStart />);
     expect(invoke).toHaveBeenCalledWith("visualization_release", { id: "one" });
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Collapse preview" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     view.unmount(); resolve("late");
@@ -156,15 +169,18 @@ describe("interactive visualizations", () => {
     invoke.mockResolvedValueOnce("one").mockResolvedValue(undefined);
     render(<><button>Outside preview</button><Visualization source={source} autoStart /></>);
     const iframe = await screen.findByTitle("Interactive visualization preview");
+    const moreButton = screen.getByRole("button", { name: "More" });
+    more();
     const expand = screen.getByRole("button", { name: "Expand preview" });
     fireEvent.click(expand);
-    expect(document.activeElement).toBe(expand);
-    fireEvent.keyDown(expand, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(moreButton);
+    fireEvent.keyDown(moreButton, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(iframe);
     fireEvent.keyDown(iframe, { key: "Tab" });
-    expect(document.activeElement).toBe(expand);
+    expect(document.activeElement).toBe(moreButton);
     screen.getByRole("button", { name: "Outside preview" }).focus();
-    expect(document.activeElement).toBe(expand);
+    expect(document.activeElement).toBe(moreButton);
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Collapse preview" }));
     screen.getByRole("button", { name: "Outside preview" }).focus();
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Outside preview" }));
@@ -173,7 +189,9 @@ describe("interactive visualizations", () => {
     invoke.mockResolvedValueOnce("one").mockResolvedValue(undefined);
     const view = render(<Visualization source={source} autoStart />);
     await screen.findByTitle("Interactive visualization preview");
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Expand preview" }));
+    more();
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.querySelector("iframe")).toBeNull();
@@ -195,6 +213,7 @@ describe("interactive visualizations", () => {
   it("uses compact themed controls in the preview toolbar", () => {
     render(<Visualization source={source} />);
     expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).style.height).toBe("27px");
+    more();
     expect((screen.getByRole("button", { name: "Source" }) as HTMLButtonElement).style.fontSize).toBe("11.5px");
     expect((screen.getByRole("button", { name: "Copy source" }) as HTMLButtonElement).style.height).toBe("27px");
   });

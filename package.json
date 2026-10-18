@@ -1,7 +1,7 @@
 {
   "name": "openleash",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "OpenLeash - desktop agent harness (Tauri + Rust)",
   "repository": {
@@ -36,6 +36,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "@tauri-apps/plugin-notification": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2",
+    "echarts": "^6.1.0",
     "loading-dev": "^0.3.4",
     "lowlight": "^3.3.0",
     "lucide-react": "^1.48.0",

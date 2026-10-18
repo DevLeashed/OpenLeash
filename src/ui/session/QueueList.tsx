@@ -11,7 +11,7 @@
 // the order. Every action goes back through a command, and the events that come
 // back are what redraw this.
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { api, Item, TaskSummary } from "../../api";
 import { flash, useStore } from "../../store";
 import { I } from "../icons";
@@ -43,9 +43,29 @@ export function queueOf(items: Item[] | undefined): QueueRow[] {
     .sort((a, b) => a.seq - b.seq);
 }
 
+/** Two queues that draw the same rows. */
+function sameRows(a: QueueRow[], b: QueueRow[]): boolean {
+  return a.length === b.length && a.every((r, i) => {
+    const s = b[i]!;
+    return r.id === s.id && r.text === s.text && r.seq === s.seq && r.images.length === s.images.length && r.images.every((x, j) => x === s.images[j]);
+  });
+}
+
 export function QueueList({ task }: { task: TaskSummary }) {
-  const items = useStore((s) => s.items[task.id]);
-  const rows = queueOf(items);
+  // Derived inside the selector, and the previous rows handed back while they
+  // draw the same: the transcript array is replaced on every streamed frame,
+  // and subscribing to it whole re-rendered this list (and rebuilt `onDrop`)
+  // sixty times a second while the queue sat unchanged.
+  const cache = useRef<{ items: Item[] | undefined; rows: QueueRow[] } | null>(null);
+  const rows = useStore((s) => {
+    const items = s.items[task.id];
+    const c = cache.current;
+    if (c && c.items === items) return c.rows;
+    const next = queueOf(items);
+    const out = c && sameRows(c.rows, next) ? c.rows : next;
+    cache.current = { items, rows: out };
+    return out;
+  });
   // Pointer-based, not HTML5 drag and drop: the window's native file-drop
   // handler has to stay installed (it is the only source of real paths for a
   // dropped file) and on Windows that OLE handler eats every drag before the

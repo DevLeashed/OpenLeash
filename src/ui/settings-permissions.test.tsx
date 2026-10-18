@@ -45,13 +45,27 @@ describe("Full Access permission mode", () => {
   });
 
   it("shows the default-off Needs you setting and persists enabling it", async () => {
-    set({ settingsTab: "general", settings: { ...settings("auto"), needs_you: false } as Settings });
+    set({ settingsTab: "tabs", settings: { ...settings("auto"), needs_you: false } as Settings });
     render(<SettingsView />);
     const toggle = screen.getByRole("switch", { name: "Show Needs you inbox" });
     expect(toggle.getAttribute("aria-checked")).toBe("false");
     await act(async () => { fireEvent.click(toggle); });
     expect(invoke).toHaveBeenCalledWith("settings_update", { patch: { needs_you: true } });
     expect(get().settings?.needs_you).toBe(true);
+  });
+
+  it("keeps the tab settings on the Tabs page, not General", () => {
+    set({ settingsTab: "general", settings: settings("auto") as Settings });
+    const general = render(<SettingsView />);
+    expect(screen.queryByRole("switch", { name: "Show Needs you inbox" })).toBeNull();
+    expect(screen.queryByRole("switch", { name: "Show Pull requests" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Settings page" })).toBeNull();
+    general.unmount();
+    set({ settingsTab: "tabs" });
+    render(<SettingsView />);
+    expect(screen.getByRole("switch", { name: "Show Needs you inbox" })).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Show Pull requests" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Sort saved prompts" })).toBeTruthy();
   });
 
   it("renders the Commands settings page and persists prompt templates", async () => {
@@ -70,7 +84,7 @@ describe("Full Access permission mode", () => {
   // Accounts is what it has always opened, so that is what an install with
   // nothing recorded must still show.
   it("aims the sidebar shortcut button at any settings page", async () => {
-    set({ settingsTab: "general", settings: settings("auto") as Settings });
+    set({ settingsTab: "tabs", settings: settings("auto") as Settings });
     render(<SettingsView />);
     const picker = screen.getByRole("combobox", { name: "Settings page" });
     expect(picker.querySelector(".ddv")?.textContent).toBe("Accounts");
@@ -84,7 +98,7 @@ describe("Full Access permission mode", () => {
   });
 
   it("shows Accounts for a stored page this build does not have", () => {
-    set({ settingsTab: "general", settings: { ...settings("auto"), sidebar_button_tab: "gone" } as Settings });
+    set({ settingsTab: "tabs", settings: { ...settings("auto"), sidebar_button_tab: "gone" } as Settings });
     render(<SettingsView />);
     expect(screen.getByRole("combobox", { name: "Settings page" }).querySelector(".ddv")?.textContent).toBe("Accounts");
   });

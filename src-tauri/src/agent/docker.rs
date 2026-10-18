@@ -64,7 +64,7 @@ pub struct DockerEnv {
 /// flags: the file comes from the repository, and `--privileged` or
 /// `-v /:/host` from a cloned repo would turn "run this project in a box" into
 /// "give this project the machine".
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Mount point for the workspace inside the container.
@@ -81,9 +81,46 @@ pub struct Config {
     /// files the agent creates stay yours), `"root"`, or a user the image has.
     /// Ignored on Windows and macOS, where Docker Desktop maps ownership itself.
     pub user: Option<String>,
+    /// Memory cap for the container, e.g. `"512m"` or `"4g"`.
+    pub memory: Option<String>,
+    /// CPU cap, e.g. `2` or `0.5`.
+    pub cpus: Option<f64>,
+}
+
+/// `<digits>[b|k|m|g]`: the subset of Docker's size syntax we pass through.
+/// Validated rather than forwarded because the value comes from the repository
+/// and lands in an argv slot next to flags.
+fn valid_memory(s: &str) -> bool {
+    let s = s.trim().to_ascii_lowercase();
+    let digits = s.trim_end_matches(['b', 'k', 'm', 'g']);
+    let suffix = &s[digits.len()..];
+    !digits.is_empty()
+        && digits.len() <= 9
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && digits.parse::<u64>().is_ok_and(|n| n > 0)
+        && suffix.len() <= 1
 }
 
 impl Config {
+    /// Reject limits Docker would refuse (or misread) before any container work.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(m) = &self.memory {
+            if !valid_memory(m) {
+                return Err(format!(
+                    "{CONFIG_DIR}/{CONFIG_FILE}: memory must look like \"512m\" or \"4g\", got {m:?}"
+                ));
+            }
+        }
+        if let Some(c) = self.cpus {
+            if !(c.is_finite() && c > 0.0 && c <= 256.0) {
+                return Err(format!(
+                    "{CONFIG_DIR}/{CONFIG_FILE}: cpus must be between 0 and 256, got {c}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn guest_root(&self) -> String {
         match self.workdir.as_deref().map(str::trim) {
             Some(w) if w.starts_with('/') && w.len() > 1 && !w.contains("..") => {
@@ -169,7 +206,12 @@ pub fn add_template(project: &str) -> Result<(), String> {
 pub fn load_config(project: &str) -> Result<Config, String> {
     let p = config_dir(project).join(CONFIG_FILE);
     match std::fs::read_to_string(&p) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{CONFIG_DIR}/{CONFIG_FILE}: {e}")),
+        Ok(s) => {
+            let c: Config =
+                serde_json::from_str(&s).map_err(|e| format!("{CONFIG_DIR}/{CONFIG_FILE}: {e}"))?;
+            c.validate()?;
+            Ok(c)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(format!("{CONFIG_DIR}/{CONFIG_FILE}: {e}")),
     }
@@ -722,6 +764,17 @@ pub fn run_args(env: &DockerEnv, task_id: &str, tag: &str, cfg: &Config) -> Vec<
         "-w".into(),
         env.guest_root.clone(),
     ];
+    if let Some(m) = cfg.memory.as_deref().filter(|m| valid_memory(m)) {
+        a.push("--memory".into());
+        a.push(m.trim().to_ascii_lowercase());
+    }
+    if let Some(c) = cfg
+        .cpus
+        .filter(|c| c.is_finite() && *c > 0.0 && *c <= 256.0)
+    {
+        a.push("--cpus".into());
+        a.push(c.to_string());
+    }
     for p in &cfg.ports {
         if *p > 0 {
             // Loopback only: a dev server in a box is not something to put on
@@ -1091,6 +1144,33 @@ mod tests {
         assert_eq!(Config::default().network(), "bridge");
         let c: Config = serde_json::from_str(r#"{"network": "host"}"#).unwrap();
         assert_eq!(c.network(), "bridge", "host networking is not offered");
+    }
+
+    #[test]
+    fn resource_limits_are_validated_and_passed_through() {
+        let c: Config = serde_json::from_str(r#"{"memory": "2G", "cpus": 1.5}"#).unwrap();
+        assert!(c.validate().is_ok());
+        let a = run_args(&env(), "abc", "t:1", &c).join(" ");
+        assert!(a.contains("--memory 2g") && a.contains("--cpus 1.5"), "{a}");
+        let none = run_args(&env(), "abc", "t:1", &Config::default()).join(" ");
+        assert!(!none.contains("--memory") && !none.contains("--cpus"));
+        for bad in ["", "g", "-1g", "1g --privileged", "1tb", "0m"] {
+            let c = Config {
+                memory: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(c.validate().is_err(), "{bad:?}");
+            assert!(!run_args(&env(), "abc", "t:1", &c)
+                .join(" ")
+                .contains("--memory"));
+        }
+        for bad in [0.0, -1.0, 1000.0, f64::NAN] {
+            let c = Config {
+                cpus: Some(bad),
+                ..Default::default()
+            };
+            assert!(c.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

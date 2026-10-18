@@ -22,9 +22,9 @@
 
 use super::router::agent_kind_for_test;
 use super::runner::{
-    baseline_of, keepalive_ping, keepalive_tick, park_waiting, timer_elapsed,
-    wake_generation_is_current, wake_nap_ms, wake_now, wake_reason, KeepaliveOutcome,
-    KeepaliveTick, WakeSource,
+    baseline_of, file_fingerprint, job_wake_reason, keepalive_ping, keepalive_tick, park_waiting,
+    timer_elapsed, wake_generation_is_current, wake_nap_ms, wake_now, wake_reason,
+    KeepaliveOutcome, KeepaliveTick, WakeSource,
 };
 use super::store::Settings;
 use super::tests::{custom, err, harness, openai_call, openai_ok, Mock};
@@ -466,6 +466,223 @@ async fn a_stop_clears_a_park() {
         Some("wake"),
         "a stopped chat is not still 'waiting for' the trigger"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ───────────────────────── wake: local triggers (file, job, chat) ─────────────────────────
+
+#[test]
+fn a_file_fingerprint_sees_creation_change_and_deletion_but_not_ignored_files() {
+    let dir = std::env::temp_dir().join(format!("openleash-wake-fp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let file = dir.join("report.json");
+
+    // A path that does not exist yet is a state of its own, so "wake me when the
+    // report appears" is a change from `missing`.
+    assert_eq!(file_fingerprint(&file), "missing");
+    std::fs::write(&file, "{}").unwrap();
+    let created = file_fingerprint(&file);
+    assert_ne!(created, "missing");
+    std::fs::write(&file, "{\"done\": true}").unwrap();
+    assert_ne!(
+        file_fingerprint(&file),
+        created,
+        "a size change is a change"
+    );
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(
+        file_fingerprint(&file),
+        "missing",
+        "deletion reads as missing"
+    );
+
+    // A folder is watched recursively, honouring .gitignore: a rebuild under an
+    // ignored `target/` must not wake a chat that watches the source tree.
+    std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(dir.join("src").join("a.rs"), "fn a() {}").unwrap();
+    let tree = file_fingerprint(&dir);
+    assert!(tree.starts_with("dir:"), "got {tree}");
+    std::fs::create_dir_all(dir.join("target")).unwrap();
+    std::fs::write(dir.join("target").join("out.o"), "bin").unwrap();
+    assert_eq!(
+        file_fingerprint(&dir),
+        tree,
+        "ignored output is not a change"
+    );
+    std::fs::write(dir.join("src").join("b.rs"), "fn b() {}").unwrap();
+    assert_ne!(file_fingerprint(&dir), tree, "a new source file is");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_job_wake_fires_on_a_match_before_the_exit_and_on_the_exit_without_one() {
+    let re = regex::Regex::new("ready|listening on").unwrap();
+    assert!(
+        job_wake_reason("bg_1", Some(&re), "compiling...\n", None).is_none(),
+        "still running, no match: keep waiting"
+    );
+    let hit = job_wake_reason(
+        "bg_1",
+        Some(&re),
+        "compiling...\n  Local: listening on http://localhost:5173\nwatching\n",
+        None,
+    )
+    .expect("a match wakes");
+    assert!(
+        hit.contains("listening on http://localhost:5173") && !hit.contains("compiling"),
+        "the matching line, and only it, is quoted back: {hit}"
+    );
+    // A match and an exit in the same look: the match is what was asked for.
+    assert!(
+        job_wake_reason("bg_1", Some(&re), "ready\n", Some("exit 0"))
+            .unwrap()
+            .contains("printed a match")
+    );
+    // The job ending without the match still wakes, and says the match never came,
+    // so the agent does not assume the server is up.
+    let ended = job_wake_reason("bg_1", Some(&re), "error: port in use\n", Some("exit 1")).unwrap();
+    assert!(
+        ended.contains("exit 1") && ended.contains("without printing a match"),
+        "{ended}"
+    );
+    // No pattern: only the exit wakes.
+    assert!(job_wake_reason("bg_1", None, "ready\n", None).is_none());
+    assert_eq!(
+        job_wake_reason("bg_1", None, "", Some("exit 0")).unwrap(),
+        "background job bg_1 ended (exit 0)"
+    );
+}
+
+#[test]
+fn a_job_watcher_reads_from_its_own_position_across_a_trim() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    let job = shell::BgJob {
+        id: "bg_t".into(),
+        task_id: "t".into(),
+        cmd: "dev".into(),
+        started: chrono::Utc::now(),
+        buf: Arc::new(Mutex::new("old line\n".into())),
+        read_pos: Mutex::new(0),
+        exit: Arc::new(Mutex::new(None)),
+        stop: CancellationToken::new(),
+        kill_reason: Arc::new(Mutex::new(None)),
+        done: CancellationToken::new(),
+        remote: false,
+        dropped: Arc::new(AtomicUsize::new(0)),
+    };
+    // The park records the end; output before it is not "new".
+    let park = job.output_end();
+    assert_eq!(job.output_since(park), (String::new(), park));
+    job.buf.lock().unwrap().push_str("server ready\n");
+    let (new, end) = job.output_since(park);
+    assert_eq!(new, "server ready\n");
+    // The bound trims the front: the absolute position still points at the same
+    // byte, so nothing is re-read and nothing is skipped.
+    {
+        let mut b = job.buf.lock().unwrap();
+        b.drain(..9);
+        job.dropped.fetch_add(9, Ordering::SeqCst);
+        b.push_str("next\n");
+    }
+    assert_eq!(job.output_since(end).0, "next\n");
+    assert_eq!(
+        *job.read_pos.lock().unwrap(),
+        0,
+        "the watcher never moves the agent's own bash_output cursor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_trigger_sees_the_other_chat_stop_working() {
+    let dir = std::env::temp_dir().join(format!("openleash-wake-chat-{}", std::process::id()));
+    let _home = store::test_home(&dir);
+    let me = super::tests::task("me", "x/m");
+    let mut other = super::tests::task("other1", "x/m");
+    other.title = "Port the parser".into();
+    other.status = "running".into();
+    let (h, _events) = harness(Settings::default(), vec![me, other]);
+
+    let (id, label, state) = chats::watch_target(&h, "me", "parser").await.unwrap();
+    assert_eq!((id.as_str(), label.as_str()), ("other1", "Port the parser"));
+    assert!(chats::still_working(&state));
+    assert!(
+        chats::watch_target(&h, "me", "me").await.is_err(),
+        "a chat cannot wait for itself"
+    );
+
+    h.update_task("other1", |t| t.status = "done".into()).await;
+    let now = chats::watch_state(&h, "other1").await.unwrap();
+    assert!(!chats::still_working(&now), "done ends the wait: {now}");
+
+    // Cross-chat switched off ends the watch rather than leaving it blind.
+    h.settings.write().await.cross_chat = false;
+    assert!(chats::watch_state(&h, "other1").await.is_none());
+    assert!(chats::watch_target(&h, "me", "parser").await.is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_trigger_parks_the_real_turn_and_the_file_appearing_wakes_it() {
+    // End to end through the real loop: the model calls `wait_for_event` with a
+    // `file` source, the turn parks, the file appears, and the watcher starts a
+    // follow-up turn whose request carries the reason.
+    let _g = router::ROUTES_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("openleash-wake-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _home = store::test_home(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let watched = dir.join("report.json");
+    let m = Mock::start().await;
+    let (cp, key) = custom("wf", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let mut t = super::tests::task("tf", "wf/m");
+    t.status = "idle".into();
+    let (h, _events) = harness(s, vec![t]);
+
+    m.push(openai_call(
+        "wait_for_event",
+        json!({"source": "file", "reason": "the report", "path": watched.to_string_lossy(), "timeout_s": 600}),
+    ));
+    runner::send(h.clone(), "tf".into(), "wait for the report".into())
+        .await
+        .unwrap();
+    let mut parked_now = false;
+    for _ in 0..500 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if h.runtime("tf").wake_state.lock().unwrap().parked
+            && !h.runtime("tf").running.load(Ordering::SeqCst)
+        {
+            parked_now = true;
+            break;
+        }
+    }
+    assert!(parked_now, "the tool call parked the chat");
+    let before = m.reqs().len();
+
+    m.push(openai_ok("the report is in"));
+    std::fs::write(&watched, "{}").unwrap();
+    let mut woke = false;
+    for _ in 0..1_000 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if m.reqs().len() > before && !h.runtime("tf").running.load(Ordering::SeqCst) {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "creating the file started a follow-up turn");
+    let last = m.reqs().last().unwrap().body.to_string();
+    assert!(
+        last.contains("Woken: the report") && last.contains("was created"),
+        "the woken turn says what fired"
+    );
+    assert!(!h.runtime("tf").wake_state.lock().unwrap().parked);
+    runner::stop_tokens(&h, "tf");
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -2,10 +2,12 @@
 // Settings → Plugins has two properties that are easy to lose and impossible to
 // notice afterwards:
 //
-//   1. Every plugin ships OFF. The agent gains tools the moment a plugin is on
-//      and the user cannot undo that for a running chat, so "on" has to be
-//      something a person did. A default that drifted to `true` would hand every
-//      install GitHub writes and a mouse, and nothing else in the UI would say so.
+//   1. Computer use and GitHub ship OFF. The agent gains tools the moment a
+//      plugin is on and the user cannot undo that for a running chat, so "on"
+//      has to be something a person did. A default that drifted to `true` would
+//      hand every install GitHub writes and a mouse, and nothing else in the UI
+//      would say so. The browser is the one deliberate exception: it ships ON,
+//      in its own separate profile, and asks before it interacts with a page.
 //
 //   2. The page is labelled Experimental, and the label sits on the Plugins page
 //      header — not on the settings nav entry. The page is where the user is
@@ -23,6 +25,9 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }));
 vi.mock("./Connectors", () => ({ AppConnectors: () => <div>App connectors</div> }));
+vi.mock("./DiscordConnector", () => ({ DiscordConnector: () => <div>Discord connector</div> }));
+vi.mock("./TelegramConnector", () => ({ TelegramConnector: () => <div>Telegram connector</div> }));
+vi.mock("./SlackConnector", () => ({ SlackConnector: () => <div>Slack connector</div> }));
 
 import { api, type Plugins, type PluginsStatus, type Settings } from "../api";
 import { set } from "../store";
@@ -33,7 +38,7 @@ import { SettingsView } from "./Settings";
 const allOff: Plugins = {
   github: { enabled: false },
   computer: { enabled: false, settle_ms: 600 },
-  browser: { enabled: false, width: 1280, height: 800 },
+  browser: { enabled: false, width: 1280, height: 800, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask" as const, download_dir: "" },
 };
 
 const store = (plugins: Plugins | undefined, tab = "plugins") =>
@@ -79,13 +84,15 @@ describe("plugins ship off", () => {
     }
   });
 
-  it("still shows them off when the backend has said nothing yet", () => {
-    // The `OFF` fallback in Plugins.tsx is a second copy of the same default. A
+  it("mirrors the backend defaults when the backend has said nothing yet", () => {
+    // The `OFF` fallback in Plugins.tsx is a second copy of the Rust default. A
     // truthy field in it would light up a plugin for the one frame before the
     // real settings arrive — and if that copy ever stops being a copy, forever.
+    // The browser alone ships on, matching `BrowserCfg::default`.
     store(undefined as unknown as Plugins);
     render(<PluginsTab />);
-    for (const el of switches()) expect(el.getAttribute("aria-checked")).toBe("false");
+    const state = Object.fromEntries(switches().map((el) => [el.getAttribute("aria-label"), el.getAttribute("aria-checked")]));
+    expect(state).toEqual({ "Computer use": "false", "Browser plugin": "true" });
   });
 
   it("shows no plugin as on even though one is configured on", async () => {
@@ -102,7 +109,7 @@ describe("plugins ship off", () => {
     // A derived Rust Default leaves width/height at 0, which the UI would show
     // verbatim and the browser would clamp to 320x240. The page must never
     // display the degenerate value even if settings.json somehow carries it.
-    store({ ...allOff, browser: { enabled: false, width: 0, height: 0 } });
+    store({ ...allOff, browser: { enabled: false, width: 0, height: 0, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask" as const, download_dir: "" } });
     render(<PluginsTab />);
     fireEvent.click(screen.getByRole("button", { name: "Browser Details" }));
     expect(document.body.textContent).not.toContain("0 × 0");
@@ -127,7 +134,7 @@ describe("compact details and connectors", () => {
   });
 
   it("shows saved custom viewport rather than a different preset", () => {
-    store({ ...allOff, browser: { enabled: false, width: 1366, height: 768 } });
+    store({ ...allOff, browser: { enabled: false, width: 1366, height: 768, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask" as const, download_dir: "" } });
     render(<PluginsTab />);
     fireEvent.click(screen.getByRole("button", { name: "Browser Details" }));
     expect(document.body.textContent).toContain("1366 × 768");
@@ -161,12 +168,17 @@ describe("compact details and connectors", () => {
   it("moves GitHub to Connectors with an off switch and collapsed authentication", () => {
     store(allOff, "connectors");
     render(<ConnectorsTab />);
-    expect(switches()).toHaveLength(1);
-    expect(switches()[0]!.getAttribute("aria-checked")).toBe("false");
+    // GitHub plus the five service plugins, every one of them off — including
+    // for a settings.json written before the service plugins existed.
+    expect(switches()).toHaveLength(6);
+    for (const el of switches()) expect(el.getAttribute("aria-checked")).toBe("false");
     expect(screen.queryByRole("button", { name: "Sign in with GitHub" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "GitHub Details" }));
     expect(screen.getByRole("button", { name: "Sign in with GitHub" })).toBeTruthy();
     expect(screen.getByText("App connectors")).toBeTruthy();
+    expect(screen.getByText("Discord connector")).toBeTruthy();
+    expect(screen.getByText("Telegram connector")).toBeTruthy();
+    expect(screen.getByText("Slack connector")).toBeTruthy();
   });
 
   it("blocks duplicate saves while pending and reports failed saves without enabling", async () => {

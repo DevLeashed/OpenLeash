@@ -26,8 +26,9 @@ import { inTextField } from "../keys";
 import { flash, useStore } from "../store";
 import { Check, CircleQuestionMark, X } from "lucide-react";
 import { Button, ChoiceRow, Input, Kbd, Pressable, TextArea, Tooltip } from "./primitives";
-import { entry, initial, Q, valid, Ans, clean, isRec, draftOf, restore, value, wasSkipped } from "./Question";
+import { entry, initial, Q, valid, Ans, clean, isRec, draftOf, restore, value, wasSkipped, hasLimit, pickHint, LimitToggle } from "./Question";
 import { MdInline } from "./mdx";
+import { digitCount, digitTarget, filterEnter, filterOptions, focusRow, isLong, NoMatch, OptionFilter, revealRow } from "./QuestionFilter";
 
 /** The `ask_nonblocking` items of a task, oldest first — the order they were asked. */
 export function pendingOf(items: Item[] | undefined): Item[] {
@@ -45,6 +46,11 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
   const [page, setPage] = useState(0);
   const [sent, setSent] = useState(false);
   const otherRef = useRef<HTMLInputElement>(null);
+  // The filter over a long option list, cleared on every page turn.
+  const [query, setQuery] = useState("");
+  const filterRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { setQuery(""); }, [page]);
   const saved = useRef<string | null>(null);
   const done = !!(it.data?.answers || it.data?.dismissed);
 
@@ -71,7 +77,7 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
     api.draftGet(it.id).then((raw) => {
       const d = raw && restore(raw, qs);
       if (!live || !d) return;
-      setAns((x) => d.ans.map((a, i) => (a.skipped || a.sel.length || a.otherOn || a.multi || a.text || a.bool !== null ? a : x[i] ?? a)));
+      setAns((x) => d.ans.map((a, i) => (a.skipped || a.sel.length || a.otherOn || a.multi || a.unlimited || a.text || a.bool !== null ? a : x[i] ?? a)));
       setPage(d.page);
     }).catch(() => {});
     return () => { live = false; };
@@ -129,9 +135,15 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
   // Widen only this answer; the agent's question remains single-choice.
   const q: Q = sourceQ.type === "single" && a.multi ? { ...sourceQ, type: "multi" } : sourceQ;
   const opts = q.options ?? [];
+  // The bounds in force for this answer: none once the limits are removed.
+  const lo = a.unlimited ? undefined : q.min;
+  const hi = a.unlimited ? undefined : q.max;
   // A choice question always offers a free-text box: someone with a fourth
   // option shouldn't need a second form to say so.
   const other = q.type === "single" || q.type === "multi";
+  const long = other && isLong(opts);
+  const shown = long ? filterOptions(opts, query) : opts.map((_, i) => i);
+  const hiddenPicks = a.sel.filter((i) => !shown.includes(i)).length;
   const upd = (patch: Partial<Ans>) => setAns((x) => x.map((v, j) => (j === page ? { ...v, ...patch, skipped: false } : v)));
   const pick = (i: number) => {
     if (q.type === "single") upd({ sel: [i], otherOn: false });
@@ -141,7 +153,9 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
     upd(q.type === "single" ? { otherOn: true, sel: [] } : { otherOn: !a.otherOn });
     setTimeout(() => otherRef.current?.focus(), 20);
   };
-  const choiceKeys = other ? opts.length + 1 : q.type === "confirm" ? 2 : 0;
+  const ownAnswer = (text: string) => upd({ other: text, otherOn: true, ...(q.type === "single" ? { sel: [] } : {}) });
+  // The digits reach the rows as shown, so a filtered list renumbers from 1.
+  const choiceKeys = other ? digitCount(shown, true) : q.type === "confirm" ? 2 : 0;
   const many = qs.length > 8;
 
   // Nothing here is a gate, and that is the whole point of this card: the run
@@ -171,7 +185,7 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
     : pageDone
       ? `${answered.filter(Boolean).length} of ${qs.length} answered — the rest you can leave to the agent`
       : `this one is empty · ${answered.filter(Boolean).length} of ${qs.length} answered`;
-  const keysHint = [choiceKeys ? `1-${Math.min(9, choiceKeys)} to choose` : null, "Enter to continue", "S to skip"].filter(Boolean).join(" · ");
+  const keysHint = [choiceKeys ? `1-${Math.min(9, choiceKeys)} to choose` : null, long ? "/ to filter" : null, "Enter to continue", "S to skip"].filter(Boolean).join(" · ");
 
   return (
     <div className="asklater open" role="group" aria-label="Question the agent asked without waiting">
@@ -207,9 +221,13 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
           if (n >= 1 && n <= Math.min(9, choiceKeys)) {
             e.preventDefault();
             if (q.type === "confirm") upd({ bool: n === 1 });
-            else if (other && n - 1 === opts.length) toggleOther();
-            else pick(n - 1);
+            else {
+              const t = digitTarget(shown, n, other);
+              if (t && "other" in t) toggleOther();
+              else if (t) { pick(t.option); revealRow(listRef.current, t.option); }
+            }
           }
+          if (e.key === "/" && long) { e.preventDefault(); filterRef.current?.focus(); }
           if (e.key === "Enter") { e.preventDefault(); next(); }
           if ((e.key === "s" || e.key === "S") && !a.skipped) { e.preventDefault(); skip(); }
           if (e.key === "ArrowLeft" && page > 0) setPage(page - 1);
@@ -221,30 +239,46 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
         </div>
         {q.description && <div className="md al-qdesc"><MdInline text={q.description} /></div>}
 
-        {q.type === "multi" && <div className="al-pick">Pick any{q.min ? ` · at least ${q.min}` : ""}{q.max ? ` · at most ${q.max}` : ""}</div>}
+        {q.type === "multi" && (
+          <div className="al-row">
+            <div className="al-pick">{pickHint(q, a)}</div>
+            {hasLimit(q) && <LimitToggle a={a} onToggle={() => upd({ unlimited: !a.unlimited })} className="qbtn" />}
+          </div>
+        )}
 
         {(q.type === "single" || q.type === "multi") && (
           <div className="al-choices">
             {sourceQ.type === "single" && <Button variant="ghost" className="qbtn" aria-pressed={!!a.multi} onClick={() => upd({ multi: !a.multi, ...(a.multi ? { sel: a.sel.slice(0, 1) } : {}) })}>{a.multi ? "Use single choice" : "Allow multiple"}</Button>}
-            {opts.map((o, j) => {
+            {long && (
+              <OptionFilter ref={filterRef} query={query} onChange={setQuery} shown={shown.length} total={opts.length} hiddenPicks={hiddenPicks}
+                onDown={() => { const first = shown[0]; if (first !== undefined) focusRow(listRef.current, first); }}
+                onEnter={() => filterEnter({ query, shown, selected: a.sel, pick, ownAnswer, next })} />
+            )}
+            {/* Bounded only when long: this card sits above the composer, and
+                thirty rows would push the send bar off the screen. */}
+            <div ref={listRef} className={long ? "al-choices opt-scroll" : "al-choices"}>
+            {long && !shown.length && <NoMatch query={query} />}
+            {shown.map((j, p) => {
+              const o = opts[j]!;
               const on = a.sel.includes(j);
               return (
                 <ChoiceRow key={j} variant={q.type === "multi" ? "check" : "radio"} selected={on} onClick={() => pick(j)}>
-                  <div className="al-choice">
+                  <div className="al-choice" data-opt={j}>
                     <div className="al-choicelab">
                       <MdInline text={clean(o.label)} />
                       {isRec(o) && <span className="al-rec">Recommended</span>}
                     </div>
                     {o.description && <div className="md al-qdesc"><MdInline text={o.description} /></div>}
                   </div>
-                  {j < 9 && <Kbd className="dim">{`${j + 1}`}</Kbd>}
+                  {p < 9 && <Kbd className="dim">{`${p + 1}`}</Kbd>}
                 </ChoiceRow>
               );
             })}
+            </div>
             {other && (
               <ChoiceRow variant={q.type === "multi" ? "check" : "radio"} selected={a.otherOn} style={{ alignItems: "center", padding: "0 10px", height: 34 }} onClick={toggleOther}>
                 <Input ref={otherRef} className="" value={a.other} onClick={(e) => e.stopPropagation()} onFocus={() => !a.otherOn && upd(q.type === "single" ? { otherOn: true, sel: [] } : { otherOn: true })} onChange={(e) => upd({ other: e.currentTarget.value, otherOn: true, ...(q.type === "single" ? { sel: [] } : {}) })} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); next(); } }} placeholder={q.type === "multi" ? "Your own choices…" : "Your own choice…"} style={{ flex: 1, minWidth: 0, border: 0, outline: 0, background: "transparent", color: "var(--fg)", font: "inherit" }} />
-                {opts.length < 9 && <Kbd className="dim">{`${opts.length + 1}`}</Kbd>}
+                {shown.length < 9 && <Kbd className="dim">{`${shown.length + 1}`}</Kbd>}
               </ChoiceRow>
             )}
           </div>
@@ -267,8 +301,11 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
         )}
 
         {q.type === "number" && (
-          <Input autoFocus type="number" min={q.min} max={q.max} value={a.text} placeholder={q.placeholder ?? (q.min !== undefined && q.max !== undefined ? `${q.min}-${q.max}` : "0")} onChange={(e) => upd({ text: e.currentTarget.value })}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); next(); } }} style={{ width: 180 }} />
+          <div className="al-row">
+            <Input autoFocus type="number" min={lo} max={hi} value={a.text} placeholder={q.placeholder ?? (lo !== undefined && hi !== undefined ? `${lo}-${hi}` : "0")} onChange={(e) => upd({ text: e.currentTarget.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); next(); } }} style={{ width: 180 }} />
+            {hasLimit(q) && <LimitToggle a={a} onToggle={() => upd({ unlimited: !a.unlimited })} className="qbtn" />}
+          </div>
         )}
 
         {/* Every question can take a note, asked for or not: on a card nobody is
@@ -307,8 +344,20 @@ export function AskNonBlocking({ it, task }: { it: Item; task: TaskSummary }) {
  * so.
  */
 export function AskNonBlockingList({ task }: { task: TaskSummary }) {
-  const items = useStore((s) => s.items[task.id]);
-  const pending = pendingOf(items);
+  // Derived inside the selector, and the previous list handed back while the
+  // cards are the same objects: the transcript array is replaced on every
+  // streamed frame, and subscribing to it whole re-rendered (and rescanned)
+  // this list sixty times a second for cards that had not changed.
+  const cache = useRef<{ items: Item[] | undefined; out: Item[] } | null>(null);
+  const pending = useStore((s) => {
+    const items = s.items[task.id];
+    const c = cache.current;
+    if (c && c.items === items) return c.out;
+    const next = pendingOf(items);
+    const out = c && c.out.length === next.length && c.out.every((x, i) => x === next[i]) ? c.out : next;
+    cache.current = { items, out };
+    return out;
+  });
   if (!pending.length) return null;
   return (
     <div className="asklater-stack">

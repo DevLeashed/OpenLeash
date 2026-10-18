@@ -6,10 +6,14 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { api, ASSISTS, Assist, clampEffort, countOptionalAgents, defaultX, DEFAULT_PERM, EFFORTS, effortLabel, effortSteps, FileRef, fmt$, fmtK, Item, normPath, Perm, PERMS, ResumeMode, TaskPatch, TaskSummary, UltraX, withRequiredAgents, xDepth, xOn } from "../api";
 import { remoteApi } from "../remote";
 import { enterSendsMessage, messageSendKey } from "../keys";
-import { defaultRoute, flash, get, go, isConnected, isPhoneClient, Menu, modelInfo, persistDraft, requestPause, savePrompt, saveSettings, set, shownProviders, type State, useStore, zoom } from "../store";
+import { defaultRoute, flash, get, go, isConnected, isPhoneClient, Menu, modelInfo, NEW_CHAT_ECHO, newerSummary, persistDraft, requestPause, savePrompt, saveSettings, set, settleNewChatEcho, shownProviders, type State, useStore, zoom } from "../store";
 import { I } from "./icons";
-import { annotationBlock } from "./SelectionNote";
+import { annotationBlock, contextBlock } from "./SelectionNote";
+import { studioHandoff } from "./studioHandoff";
 import { ProviderIcon } from "./ProviderIcon";
+import { routeSummary } from "./routerModel";
+import { RaceChip } from "./RaceSetup";
+import { raceArmed, startRace, toggleRace } from "../race";
 import { Tooltip, IconButton, MenuButton, MenuRow, MenuScrim, Pressable, RoundButton, TextArea, Thumb, cycle } from "./primitives";
 
 /** Ultrathread X is still being built, so it stays out of the menus and the slash
@@ -25,7 +29,7 @@ const EMPTY_COMMANDS: { name: string; description: string; prompt: string }[] = 
 export function expandCustomCommand(text: string, commands: { name: string; prompt: string }[]): string {
   const match = text.match(/^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/i);
   if (!match) return text;
-  const builtin = ["/goal", "/plan", "/ultra", "/ultrawt", "/ultrax", "/init", "/compact", "/btw", "/model", "/effort", "/assist", "/perm", "/pause", "/resume", "/cost", "/stop", "/models", "/details", "/save", "/saved", "/paused", "/skills", "/accounts", "/mcp", "/settings", "/clear"].includes(`/${match[1]?.toLowerCase()}`);
+  const builtin = ["/goal", "/plan", "/ultra", "/ultrawt", "/ultrax", "/race", "/init", "/compact", "/btw", "/model", "/effort", "/assist", "/perm", "/pause", "/resume", "/cost", "/stop", "/models", "/details", "/save", "/saved", "/paused", "/skills", "/accounts", "/mcp", "/settings", "/clear"].includes(`/${match[1]?.toLowerCase()}`);
   const command = builtin ? undefined : commands.find((entry) => entry.name === match[1]?.toLowerCase());
   if (!command) return text;
   return command.prompt.replace(/{{args}}/g, match[2] ?? "").trim();
@@ -132,6 +136,9 @@ export function afterChange(label: string, now: boolean) {
   if (live && !now) flash(`${label} · applies with your next message (Alt-click to apply now)`);
 }
 
+/** Per chat, the artifict revision the agent was last told the studio shows. */
+const toldStudio = new Map<string, string>();
+
 export function togglePlan() {
   const on = !currentOpts().plan;
   void setOpts({ plan: on });
@@ -235,6 +242,7 @@ function localSlash(text: string, mode: "home" | "session"): boolean {
     case "/ultra": toggleUltra(); return true;
     case "/ultrawt": toggleUltraWt(); return true;
     case "/ultrax": case "/ultrax/": openUltraXEditor(); return true;
+    case "/race": toggleRace(); return true;
     case "/details": set({ details: !s.details }); return true;
     case "/agents": go("saved"); return true;
     case "/saved": go("saved"); return true;
@@ -522,8 +530,45 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
     clear();
     try {
       const h = s.home;
-      const t = await api.create({ prompt: text, project, model: h.model, effort: h.effort, perm: h.perm, plan: h.plan, worktree: !h.docker && h.worktree && !!s.projectInfo?.git, workspace: h.docker ? "docker" : h.worktree && s.projectInfo?.git ? "worktree" : "local", base_branch: h.branch, subagents: h.agents.length > 0, assist: h.assist, agents: h.agents, route: h.route, images, image_names: imageNames, files: filePaths, ultra: h.ultra, ultra_wt: h.ultra_wt, ultra_x: h.ultra_x });
-      set((st) => ({ tasks: { ...st.tasks, [t.id]: t }, home: { ...st.home, plan: false, ultra: false, ultra_wt: false, ultra_x: null } }));
+      // Artificts mode: the chat opens on its studio, and the agent is asked for
+      // a saved artifict rather than a description. The ask rides in a context
+      // block the transcript shows as a chip, not as words the user typed.
+      // A new chat started from another chat's studio is about that artifict:
+      // it is named for the agent, and the new chat opens on it.
+      const from = h.artificts ? h.studio : null;
+      const prompt = from
+        ? `${text}\n\n${contextBlock(`From the Artificts studio · ${from.title} v${from.number}`, `The user started this chat from the Artificts studio, where they are looking at the artifict “${from.title}” (id ${from.artifictId}, revision v${from.number}, version id ${from.versionId}, kind ${from.kind}). It is open beside this chat. Read it with artifict_get before you answer, and when they ask for changes to it, revise it with artifict_revise (prefer edits for targeted changes).`)}`
+        : h.artificts ? `${text}\n\n${contextBlock("Started in Artificts", "The user started this chat in Artificts mode: the chat opens beside the Artificts studio. Build what they ask for as a saved artifict (artifict_create) they can review, comment on and tweak there, rather than describing it.")}` : text;
+      // Race: N attempts of this prompt, each its own worktree chat, instead of
+      // one chat. Same options as a normal create, minus ultrathread/docker.
+      if (raceArmed()) {
+        await startRace({ prompt, project, base_branch: h.branch, perm: h.perm, plan: h.plan, assist: h.assist, agents: h.agents, route: h.route, images, image_names: imageNames, files: filePaths }, h.model, h.effort, stayOnHome);
+        set((st) => ({ home: { ...st.home, plan: false, ultra: false, ultra_wt: false, ultra_x: null, artificts: false, studio: null } }));
+        return;
+      }
+      const t = await api.create({ prompt, project, model: h.model, effort: h.effort, perm: h.perm, plan: h.plan, worktree: !h.docker && h.worktree && !!s.projectInfo?.git, workspace: h.docker ? "docker" : h.worktree && s.projectInfo?.git ? "worktree" : "local", base_branch: h.branch, subagents: h.agents.length > 0, assist: h.assist, agents: h.agents, route: h.route, images, image_names: imageNames, files: filePaths, ultra: h.ultra, ultra_wt: h.ultra_wt, ultra_x: h.ultra_x });
+      if (from) studioHandoff.set(t.id, { artifictId: from.artifictId, versionId: from.versionId });
+      // The chat opens on the message the user just sent. The backend only adds
+      // its real `user` row once workspace setup and prompt hooks are done, and
+      // until then the new chat used to be an empty "Loading conversation…".
+      // The stand-in is retired by `settleNewChatEcho` when that row (or a
+      // startup failure) arrives.
+      const echo: Item = { id: `${NEW_CHAT_ECHO}${t.id}`, kind: "user", text: prompt, data: images.length ? { images } : {}, ts: new Date().toISOString() };
+      // Opening the studio is a flag on the chat, not something the first paint
+      // has to wait a second round-trip for: it is set locally now and saved in
+      // the background, and a failed save only means the studio isn't reopened
+      // next launch — the same outcome the old `.catch` accepted.
+      const opened = (held: TaskSummary | undefined) => {
+        const summary = newerSummary(held, t);
+        return h.artificts ? { ...summary, artifict_open: true } : summary;
+      };
+      if (h.artificts) void api.update(t.id, { artifict_open: true }).catch(() => { /* kept open locally */ });
+      set((st) => {
+        // A very fast startup can publish the real row before create's reply
+        // reaches us. Don't append a second copy in that case.
+        const pending = { pendingMessages: { ...st.pendingMessages, [t.id]: [echo] } };
+        return { tasks: { ...st.tasks, [t.id]: opened(st.tasks[t.id]) }, ...pending, ...settleNewChatEcho(pending, t.id, st.items[t.id] ?? []), home: { ...st.home, plan: false, ultra: false, ultra_wt: false, ultra_x: null, artificts: false, studio: null } };
+      });
       if (!stayOnHome) go("session", { task: t.id });
     } catch (e) {
       set((st) => ({ draft: typed, attach: { ...st.attach, [key]: images }, attachFiles: { ...st.attachFiles, [key]: files } }));
@@ -531,7 +576,16 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
       flash(String(e));
     }
   } else if (s.task) {
-    const body = [annotated, text].filter(Boolean).join("\n\n");
+    // Tell the agent what the studio beside this chat is showing, so "this"
+    // and "the header" mean the design on screen. Only when that changed since
+    // the last message, so a conversation about one revision carries it once.
+    const shown = s.tasks[s.task]?.artifict_open ? s.studioView[s.task] : undefined;
+    const shownKey = shown ? `${shown.artifictId}:${shown.versionId}` : "";
+    const note = shown && toldStudio.get(s.task) !== shownKey
+      ? contextBlock(`Viewing ${shown.title} v${shown.number}`, `The user has the Artificts studio open beside this chat and is looking at the artifict “${shown.title}” (id ${shown.artifictId}, revision v${shown.number}, version id ${shown.versionId}, kind ${shown.kind}). When they refer to “this”, “it” or a part of a design, they most likely mean this one; read it with artifict_get if you need its content.`)
+      : "";
+    if (shown) toldStudio.set(s.task, shownKey);
+    const body = [annotated, text, note].filter(Boolean).join("\n\n");
     // Consume the composer before any IPC awaits: text and screenshots should
     // disappear together, and anything added during the request is a new draft.
     clear();
@@ -580,7 +634,7 @@ function RouteChip({ route }: { route: string }) {
   const r = routes?.find((x) => x.id === route);
   if (!routes?.length) return null;
   return (
-    <Tooltip content={r ? `Fallback route: ${r.name} · ${r.steps.length} fallback${r.steps.length === 1 ? "" : "s"}, then ${r.on_exhausted}` : "No fallback route · pauses when the model is out"}><MenuButton className={"routechip" + (r ? " on" : "")} onClick={(e) => openMenu("route", e)}>
+    <Tooltip content={r ? `Router: ${r.name} · ${routeSummary(r)}` : "No router · pauses when the model is out"}><MenuButton className={"routechip" + (r ? " on" : "")} onClick={(e) => openMenu("route", e)}>
       <span className="routeglyph" style={{ display: "flex" }}>{I.route(13)}</span>
       <span key={route} className="mname">{r ? r.name : "No routing"}</span>
     </MenuButton></Tooltip>
@@ -735,7 +789,10 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
     }
   };
 
-  const ph = phone ? "Message" : mode === "home"
+  // Beside an open studio the composer is a narrow column next to the design,
+  // so it takes the phone's one-word prompt rather than a sentence it can't fit.
+  const studioOpen = useStore((s) => mode === "session" && !!s.task && (s.tasks[s.task]?.artifict_open ?? false));
+  const ph = phone || studioOpen ? "Message" : mode === "home"
     ? project ? "Describe a task, or / for commands like /goal and /plan" : "Open a project folder to start"
     : paused ? "Paused · type a message and hit Resume, or just resume" : task && (task.status === "stopped" || task.status === "failed") ? "Stopped · Resume to carry on, summarise and continue, or wrap up — or say what to do instead" : running ? "Steer the agent now · Alt Enter to send after this turn" : "Follow up, or / for commands";
 
@@ -778,9 +835,13 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
       )}
       <TextArea ref={ref} className={dropAt ? "dropping" : ""} value={draft} onChange={(e) => onDraft(e.currentTarget.value)} onKeyDown={onKey} placeholder={ph} rows={mode === "home" ? 3 : 2}
         onPaste={(e) => { const pasted = Array.from(e.clipboardData.files); if (addImages(akey, pasted)) e.preventDefault(); else if (isPhoneClient() && pasted.length) { e.preventDefault(); void addRemoteFiles(akey, pasted); } }} />
-      <div className="bar">
+      <div className={"bar" + (studioOpen || (mode === "home" && home.artificts) ? " artbar" : "")}>
         <div className="bl">
-          <IconButton label="Plan mode, compact, MCP" style={{ color: "var(--mut)" }} onClick={(e) => openMenu("plus", e)}>{I.plus()}</IconButton>
+          {/* Beside an open studio the bar is pared down to what a message to
+              the design needs: attach, the model, and send/stop. Plan,
+              permissions, assist, subagents and routing are all still on the
+              chat view one click away. */}
+          {!studioOpen && <IconButton label="Plan mode, Artificts, compact, MCP" style={{ color: "var(--mut)" }} onClick={(e) => openMenu("plus", e)}>{I.plus()}</IconButton>}
           {/* Attach: the dialog, or dropping onto the box. The dialog is the OS
               one rather than a hidden <input type=file>, because the agent needs
               the real path and the browser's File object never has one. */}
@@ -800,7 +861,7 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
               }}>{I.paperclip()}</IconButton>
             </span>
           </Tooltip>
-          {o.ultra && (
+          {o.ultra && !studioOpen && (
             <Tooltip content={xOn(o.ultra_x) ? `Ultrathread X · ${xDepth(o.ultra_x)} layers, each with its own model. Click to configure.` : "Ultrathread · nested subagents, keeps going until the list is done. Click to turn off."}>
               <Pressable className={"planpill ultrapill" + (xOn(o.ultra_x) ? " ultrapillx" : "")} onClick={() => (ULTRA_X_SHOWN && xOn(o.ultra_x) ? openUltraXEditor() : toggleUltra())}>
                 <span className="ultraspark" aria-hidden="true" />
@@ -809,9 +870,10 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
               </Pressable>
             </Tooltip>
           )}
-          {o.plan && <Tooltip content="Turn plan mode off · Shift Tab"><Pressable className="planpill" onClick={togglePlan}>Plan<span style={{ fontSize: 10, opacity: 0.7 }}>{I.close(9)}</span></Pressable></Tooltip>}
-          {task?.goal?.status === "active" && <Tooltip content={task.goal.text}><div className="planpill" style={{ background: "rgba(51,214,255,0.12)", color: "#7fe4ff" }}>Goal</div></Tooltip>}
-          <MenuButton style={{ color: perm.color }} onClick={(e) => openMenu("perm", e)}><span className="dot" style={{ background: perm.color, boxShadow: `0 0 6px ${perm.color}99` }} />{perm.name}</MenuButton>
+          {mode === "home" && !studioOpen && <RaceChip />}
+          {o.plan && !studioOpen && <Tooltip content="Turn plan mode off · Shift Tab"><Pressable className="planpill" onClick={togglePlan}>Plan<span style={{ fontSize: 10, opacity: 0.7 }}>{I.close(9)}</span></Pressable></Tooltip>}
+          {task?.goal?.status === "active" && !studioOpen && <Tooltip content={task.goal.text}><div className="planpill" style={{ background: "rgba(51,214,255,0.12)", color: "#7fe4ff" }}>Goal</div></Tooltip>}
+          {!studioOpen && <MenuButton style={{ color: perm.color }} onClick={(e) => openMenu("perm", e)}><span className="dot" style={{ background: perm.color, boxShadow: `0 0 6px ${perm.color}99` }} />{perm.name}</MenuButton>}
         </div>
         <div className="bc">
           {modelReady ? <>
@@ -822,7 +884,7 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
               {effortLabel(mi, o.effort) && <span key={o.effort} className="effl">{effortLabel(mi, o.effort)}</span>}
               {I.chev()}
             </MenuButton></Tooltip>
-            <RouteChip route={task ? task.route : home.route} />
+            {!studioOpen && <RouteChip route={task ? task.route : home.route} />}
           </> : shownProviders(providers).some((p) => p.enabled && isConnected(p)) ? (
             <Tooltip content="Pick a model from a connected provider"><MenuButton className="mbtn" onClick={(e) => openMenu("model", e)}>
               <span style={{ color: "var(--dim)" }}>Pick a model</span>{I.chev()}
@@ -835,12 +897,12 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
           {mode === "home" && has && (
             <Tooltip content="Save this prompt and its options for later · clears the box"><IconButton label="Save for later" onClick={() => void savePrompt()}>{I.bookmark(13)}</IconButton></Tooltip>
           )}
-          <Tooltip content={`Assist: ${assist.desc}`}><MenuButton style={{ color: assist.color, fontWeight: 500 }} onClick={(e) => openMenu("assist", e)}>
+          {!studioOpen && <><Tooltip content={`Assist: ${assist.desc}`}><MenuButton style={{ color: assist.color, fontWeight: 500 }} onClick={(e) => openMenu("assist", e)}>
             {assist.name}{pend.assist && <PendingStar />}
           </MenuButton></Tooltip>
           <Tooltip content="Subagents this chat may use"><MenuButton style={{ color: agentCount ? "var(--mut)" : "var(--dim)" }} onClick={(e) => openMenu("agents", e)}>
             {I.agents()}{agentCount}{pend.agents && <PendingStar />}
-          </MenuButton></Tooltip>
+          </MenuButton></Tooltip></>}
           {paused && !has ? (
             // `task_resume`, never `resume_all`: this button is about *this*
             // chat, and going through the global resume woke every chat the user

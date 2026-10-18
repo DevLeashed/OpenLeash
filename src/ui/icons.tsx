@@ -1,5 +1,5 @@
 import {
-  Archive, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Bot, Check, ChevronDown, ChevronRight, Circle,
+  Archive, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Bot, ChartGantt, Check, ChevronDown, ChevronRight, Circle,
   CircleAlert, CircleX, Clock3, Copy, Download, Folder, GitBranch, Grid2X2, KeyRound, LayoutPanelLeft, ListChecks, Bookmark,
   Eye, EyeOff, Monitor, Network, PanelRight, Pause, PencilLine, Pin, Play, Plus, RotateCcw,
   Search, Settings, Shield, Sparkles, Square, SquarePen, Trash2, X, Paperclip,
@@ -41,6 +41,8 @@ export const I = {
   // Bar chart, not a gauge or a pie: the stats surfaces are all token/cost bars,
   // and an icon that matches its own screen is one fewer thing to decode.
   chart: (w = 12) => icon(BarChart3, w),
+  // Lanes of bars over time: the run timeline, which is a Gantt chart.
+  gantt: (w = 12) => icon(ChartGantt, w),
   // Reveal/hide pair for values shown on demand (the account email). Two
   // distinct glyphs rather than one rotated: the state has to be readable
   // without reading the label next to it.

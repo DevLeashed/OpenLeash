@@ -3,8 +3,16 @@ import { api, clampEffort, EFFORTS, effortLabel, effortSteps } from "../api";
 import { Button, Dropdown, Modal, Switch } from "./primitives";
 import { defaultRoute, flash, get, isConnected, modelInfo, set, shownProviders, useStore } from "../store";
 
-/** One row: a model in use, at the reasoning its agents are actually on. */
+/** One row: a model in use, at the reasoning its agents are actually on. The same
+ *  model at two levels is two rows, so a level can be changed for only some of its agents. */
 type Row = { model: string; effort: number; uses: string[] };
+const rowKey = (r: Row) => `${r.model}|${r.effort}`;
+
+/** Remembered across openings: a switch the user flipped is a preference, not a
+ *  one-off. Per-opening state made them redo it on every swap. */
+const SPREAD_KEY = "openleash.swap.spread";
+const readSpread = () => { try { return localStorage.getItem(SPREAD_KEY) === "1"; } catch { return false; } };
+const writeSpread = (v: boolean) => { try { localStorage.setItem(SPREAD_KEY, v ? "1" : "0"); } catch { /* applied for this opening only */ } };
 
 /** Batch model swap. In a chat: that chat's main agent + subagents. On the home page: defaults + every live chat. */
 export function ModelSwap() {
@@ -17,10 +25,9 @@ export function ModelSwap() {
   // Subagent types a `spread` would reach. Empty for a chat's own swap, which
   // has no reach past the chat — and the toggle is not offered there at all.
   const [agents, setAgents] = useState<{ id: string; name: string }[]>([]);
-  // Off by default and remembered per dialog opening, not persisted: "and also
-  // change what every future spawn of those types runs on" is a second decision,
-  // and it has to be made on purpose every time rather than inherited from last time.
-  const [spread, setSpread] = useState(false);
+  // Off until the user turns it on, then kept (see `SPREAD_KEY`).
+  const [spread, setSpreadState] = useState(readSpread);
+  const setSpread = (v: boolean) => { setSpreadState(v); writeSpread(v); };
   const [pick, setPick] = useState<Record<string, string>>({});
   // Reasoning is picked per row, against the model that row ends up on — a
   // destination's ladder is not the source's, and only the destination's is real.
@@ -31,7 +38,7 @@ export function ModelSwap() {
     if (!open) return;
     setRows(null);
     setAgents([]);
-    setSpread(false);
+    setSpreadState(readSpread());
     setPick({});
     setEffort({});
     api.modelsInUse(scope ?? undefined)
@@ -49,54 +56,58 @@ export function ModelSwap() {
 
   if (!open) return null;
   const close = () => set({ swap: false });
-  const changed = Object.entries(pick).filter(([from, to]) => to && to !== from);
+  // `pick` and `effort` are keyed by row (model + level), so two rows on one model
+  // are independent.
+  const modelOf = (key: string) => rows?.find((r) => rowKey(r) === key)?.model ?? "";
+  const changed = Object.entries(pick).filter(([k, to]) => to && to !== modelOf(k));
   /** The model a row is on right now, and the level picker for where it's going. */
   const target = (r: Row) => {
-    const to = pick[r.model] ?? r.model;
+    const to = pick[rowKey(r)] ?? r.model;
     const mi = modelInfo(to);
     const steps = effortSteps(mi);
     // Seed from what the row is on, snapped to a rung the destination really has:
     // a source model's level means nothing on a destination with a different ladder.
-    const cur = effort[r.model] ?? clampEffort(steps, r.effort);
+    const cur = effort[rowKey(r)] ?? clampEffort(steps, r.effort);
     return { to, mi, steps, cur };
   };
   /** Reasoning rows that have actually moved, whether or not the model did. */
   const effortChanged = rows
-    ? Object.entries(effort).filter(([from, e]) => {
-        const r = rows.find((x) => x.model === from);
-        return !!r && e !== clampEffort(effortSteps(modelInfo(pick[r.model] ?? r.model)), r.effort);
+    ? Object.entries(effort).filter(([k, e]) => {
+        const r = rows.find((x) => rowKey(x) === k);
+        return !!r && e !== clampEffort(effortSteps(modelInfo(pick[k] ?? r.model)), r.effort);
       })
     : [];
   const apply = async () => {
     if (!changed.length && !effortChanged.length) return close();
     setBusy(true);
     try {
-      const settings = await api.modelsSwap(
-        Object.fromEntries(changed),
-        scope ?? undefined,
-        // Keyed by the row's model, which the backend re-keys to the destination
-        // when that row is also swapping. A row the user only moved the reasoning
-        // on is a real change and goes through like any other — it used to be
-        // dropped here, which is why the only way to change reasoning on a model
-        // you were keeping was to swap away from it and back.
-        Object.fromEntries(effortChanged),
-        spread,
-      );
-      const map = Object.fromEntries(changed);
-      const eff = Object.fromEntries(effortChanged);
-      // Reasoning picked for the row the home default sits on, so the composer
-      // does not keep showing a level the swap already replaced.
-      const homeModel = get().home.model;
-      const homeTo = map[homeModel] ?? homeModel;
-      const homeEff = eff[homeModel];
-      set((s) => {
-        const home = homeTo !== homeModel
-          ? { ...s.home, model: homeTo, route: defaultRoute(homeTo), effort: eff[homeModel] ?? s.home.effort }
-          : homeEff != null
-            ? { ...s.home, effort: homeEff }
-            : s.home;
-        return { settings, swap: false, home };
+      const prev = get().settings;
+      // One rule per row that moved, matched on the model *and* level its agents
+      // are on now, so a sibling row on the same model is left alone.
+      const rules = (rows ?? []).flatMap((r) => {
+        const k = rowKey(r);
+        const { to, steps, cur } = target(r);
+        const e = effort[k];
+        const moved = to !== r.model;
+        const levelMoved = e != null && e !== clampEffort(steps, r.effort);
+        if (!moved && !levelMoved) return [];
+        return [{ from: r.model, from_effort: r.effort, to, to_effort: levelMoved || (moved && steps.length) ? cur : null }];
       });
+      const settings = await api.modelsSwap({}, scope ?? undefined, {}, spread, rules);
+      // The composer's default follows the global default, so it does not keep
+      // showing a model or level the swap already replaced.
+      if (!scope && prev) {
+        set((s) => {
+          const home = settings.model !== prev.model && s.home.model === prev.model
+            ? { ...s.home, model: settings.model, route: defaultRoute(settings.model), effort: settings.effort }
+            : settings.effort !== prev.effort && s.home.model === settings.model
+              ? { ...s.home, effort: settings.effort }
+              : s.home;
+          return { settings, swap: false, home };
+        });
+      } else {
+        set({ settings, swap: false });
+      }
       // Only a `spread` rewrites the agent-type models, so only a `spread` leaves
       // the catalog the Subagents panel renders pointing at the old defaults.
       // This re-read used to run on every global swap, which was the tell that the
@@ -142,7 +153,7 @@ export function ModelSwap() {
           // stayed plain, the counter said no changes, and Apply did nothing.
           const effDiff = cur !== r.effort;
           return (
-            <div key={r.model} className="srowx" style={{ alignItems: "flex-start", gap: 12, animation: `olIn .3s ${i * 30}ms both`, borderRadius: 10, background: diff || effDiff ? "rgba(167,139,250,0.06)" : "transparent", padding: "8px 10px" }}>
+            <div key={rowKey(r)} className="srowx" style={{ alignItems: "flex-start", gap: 12, animation: `olIn .3s ${i * 30}ms both`, borderRadius: 10, background: diff || effDiff ? "rgba(167,139,250,0.06)" : "transparent", padding: "8px 10px" }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 {/* The name is allowed to wrap rather than truncate: at 190px the
                     box cut off most real model names ("Claude Opus 4.5 (1M
@@ -158,7 +169,7 @@ export function ModelSwap() {
                 // opens is at least this wide too, so what you picked and what
                 // you chose from read the same.
                 style={{ width: 280, color: diff ? "#c4b5fd" : undefined }}
-                onChange={(v) => setPick({ ...pick, [r.model]: v })}
+                onChange={(v) => setPick({ ...pick, [rowKey(r)]: v })}
                 options={[
                   ...(options.some((m) => m.id === r.model) ? [] : [{ value: r.model, label: modelInfo(r.model).name, hint: "current" }]),
                   ...options.map((m) => ({ value: m.id, label: m.name, hint: m.id === r.model ? "keep" : undefined, group: provs.find((p) => p.id === m.provider)?.name ?? m.provider })),
@@ -174,7 +185,7 @@ export function ModelSwap() {
                   // this one was clipped too — and a picker you cannot read is a
                   // picker you cannot trust to change.
                   style={{ width: 140, color: effDiff ? "#c4b5fd" : undefined }}
-                  onChange={(v) => setEffort({ ...effort, [r.model]: Number(v) })}
+                  onChange={(v) => setEffort({ ...effort, [rowKey(r)]: Number(v) })}
                   // `effortSteps` returns positions in 0..4, the same range `EFFORTS` indexes.
                   options={steps.map((e) => ({
                     value: String(e),

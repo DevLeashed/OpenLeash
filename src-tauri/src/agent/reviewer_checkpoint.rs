@@ -618,3 +618,67 @@ fn safe_rel_refuses_escapes_but_allows_relative_paths() {
     // pre-agent contents, proving it still went through the real writer.
     assert_eq!(read(&work, "a b/c.txt"), "original\n");
 }
+
+/// What git itself reads from the store's config — not our own parser.
+fn shadow_config(chat: &str, key: &str) -> String {
+    let store = checkpoint::store(chat);
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(store.join("shadow.git"))
+        .args(["config", "--get", key])
+        .env("GIT_CONFIG_GLOBAL", store.join("gitconfig.global"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `ensure` writes the store's settings straight into its config file rather
+/// than spawning one `git config` per key. Git has to read every one of them
+/// back exactly — including a worktree path with the characters a config file
+/// treats as comments — and the store has to keep working as a non-bare repo.
+#[test]
+fn the_store_config_is_written_directly_and_git_reads_it_back() {
+    let (home, _g) = scratch("config");
+    let work = project_dir(&home, "my proj #1; x");
+    write(&work, "a.txt", "one\n");
+    let chat = "cfg";
+
+    let c0 = snap(chat, &work, 0, Kind::User);
+    let want = work.replace('\\', "/");
+    assert_eq!(shadow_config(chat, "core.bare"), "false");
+    assert_eq!(shadow_config(chat, "core.worktree"), want);
+    assert_eq!(shadow_config(chat, "core.autocrlf"), "false");
+    assert_eq!(shadow_config(chat, "user.name"), "OpenLeash");
+    assert_eq!(
+        shadow_config(chat, "user.email"),
+        "checkpoints@openleash.local"
+    );
+    assert_eq!(shadow_config(chat, "commit.gpgsign"), "false");
+    assert_eq!(shadow_config(chat, "gc.auto"), "0");
+
+    // The store still behaves as a work-tree repository: a change is seen,
+    // committed, and restorable.
+    write(&work, "a.txt", "two\n");
+    let c1 = snap(chat, &work, 1, Kind::Agent);
+    assert_ne!(c0, c1);
+    assert!(has(&checkpoint::changed(chat, &c0, &c1), "a.txt", "M"));
+
+    // A folder that moved is re-pinned, and pinning to the same one again is
+    // a no-op that leaves git reading the same value.
+    let other = project_dir(&home, "moved");
+    write(&other, "b.txt", "b\n");
+    checkpoint::ensure(chat, &other).unwrap();
+    assert_eq!(
+        shadow_config(chat, "core.worktree"),
+        other.replace('\\', "/")
+    );
+    checkpoint::ensure(chat, &other).unwrap();
+    assert_eq!(
+        shadow_config(chat, "core.worktree"),
+        other.replace('\\', "/")
+    );
+    checkpoint::ensure(chat, &work).unwrap();
+    assert_eq!(shadow_config(chat, "core.worktree"), want);
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -57,6 +57,14 @@ fn main_prompt_explains_inline_visualization_behavior_and_safety() {
         "block in your reply is read as that same inert diagram",
         "no network, external libraries/resources",
         "never put secrets or sensitive data",
+        // Charts: the declarative fence, the host-only hint key, and the one
+        // library path an `openleash-viz` document may load.
+        "closed top-level `openleash-chart` fence",
+        "Apache ECharts 6 option",
+        "\"openleash\": {\"height\"",
+        "<script src=\"lib/echarts.js\"></script>",
+        "the only external script the frame allows",
+        "the one exception is the bundled chart engine",
     ] {
         assert!(
             sys.contains(rule),

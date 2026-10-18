@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
 import type { Item } from "./api";
-import { bufferDelta, flushDeltas, get, set, subscribe, useStore } from "./store";
+import { bufferDelta, flushDeltas, get, keepsTranscript, set, subscribe, upsertItem, useStore } from "./store";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -80,5 +80,26 @@ describe("streamed transcript updates", () => {
     expect(get().items.perf?.[1]).toBe(untouched);
     expect(get().subItems.perf?.sub?.[0]?.text).toBe("C4");
     expect(get().subItems.perf?.other).toBe(other);
+  });
+});
+
+describe("events for chats nobody is looking at", () => {
+  it("keeps a background chat's transcript out of the store, but not the open one's", () => {
+    set({ view: "session", task: "open", hist: [], fwd: [], items: {}, subItems: {}, bg: {} });
+    expect(keepsTranscript(get(), "open")).toBe(true);
+    expect(keepsTranscript(get(), "elsewhere")).toBe(false);
+    set({ hist: [{ view: "session", task: "back" }] });
+    expect(keepsTranscript(get(), "back")).toBe(true);
+  });
+
+  it("upserts by id from the tail without touching other entries", () => {
+    const a = item("a", "A"), b = item("b", "B");
+    const list = [a, b];
+    const replaced = upsertItem(list, { ...b, text: "B2" });
+    expect(replaced).not.toBe(list);
+    expect(replaced[0]).toBe(a);
+    expect(replaced[1]?.text).toBe("B2");
+    expect(list[1]).toBe(b);
+    expect(upsertItem(list, item("c")).map((x) => x.id)).toEqual(["a", "b", "c"]);
   });
 });

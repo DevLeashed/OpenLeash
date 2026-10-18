@@ -22,8 +22,8 @@ it("lets the artifict surface take the whole window, and hands the chat back", (
   const { container } = render(<Session />);
   fireEvent.click(screen.getByRole("button", { name: "Artificts" }));
   const chat = container.querySelector(".collaboration-chat") as HTMLElement;
-  // The workspace gets the larger half of the split by default.
-  expect(chat.style.flex).toBe("0 0 34%");
+  // The studio gets most of the split by default; the chat keeps a column.
+  expect(chat.style.flex).toBe("0 0 26%");
   expect(chat.style.display).not.toBe("none");
 
   fireEvent.click(screen.getByRole("button", { name: "Expand artifict editor" }));
@@ -31,7 +31,7 @@ it("lets the artifict surface take the whole window, and hands the chat back", (
 
   fireEvent.click(screen.getByRole("button", { name: "Collapse artifict editor" }));
   expect(chat.style.display).not.toBe("none");
-  expect(chat.style.flex).toBe("0 0 34%");
+  expect(chat.style.flex).toBe("0 0 26%");
 
   // Leaving the workspace restores the chat even from an expanded surface.
   fireEvent.click(screen.getByRole("button", { name: "Expand artifict editor" }));
@@ -76,4 +76,12 @@ it("takes the subagent and background rail out of the way while the record surfa
 
   fireEvent.click(screen.getByRole("button", { name: "Chat" }));
   expect(screen.getByRole("button", { name: "Details" })).toBeTruthy();
+});
+
+it("gives the rail back on the new-task screen even though the last chat was on its artificts", () => {
+  (globalThis as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver = class { observe() {} disconnect() {} unobserve() {} } as unknown as typeof ResizeObserver;
+  // New chat from a studio: the view is Home, but `task` still names that chat.
+  set({ sidebar: true, view: "home", task: "t1", tasks: { t1: { id: "t1", artifict_open: true } as unknown as TaskSummary }, items: {} });
+  const { container } = render(<Sidebar />);
+  expect(container.querySelector(".sidebar")?.getAttribute("style")).toContain("246");
 });

@@ -262,3 +262,82 @@ fn the_manifest_shows_a_disabled_file_marked_as_disabled() {
     assert!(!m2.injecting);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `.openleash/DESIGN.md` is the project's design system: an instruction file
+/// in a subdirectory, so this drives the nested `Path::join` on every platform
+/// and pins that it is gated by trust and switchable like the flat files.
+#[test]
+fn the_design_system_file_is_injected_only_for_a_trusted_project() {
+    let d = project("design-system");
+    std::fs::create_dir_all(d.join(".openleash")).unwrap();
+    std::fs::write(
+        d.join(".openleash").join("DESIGN.md"),
+        "DESIGN-TOKENS: --accent #ff5500",
+    )
+    .unwrap();
+    let p = d.to_string_lossy().into_owned();
+    assert_eq!(
+        prompt::MEMORY_FILES.last(),
+        Some(&".openleash/DESIGN.md"),
+        "the design system is read last, after the project's own rules"
+    );
+    let files = prompt::project_files(&p, &[]);
+    assert_eq!(
+        files,
+        vec![(
+            ".openleash/DESIGN.md".to_string(),
+            "DESIGN-TOKENS: --accent #ff5500".to_string()
+        )]
+    );
+
+    {
+        let _g = trust(&p);
+        let sys = prompt::system(&env_for(&p, &[]), None, &[]);
+        assert!(
+            sys.contains(
+                "<file name=\".openleash/DESIGN.md\">\nDESIGN-TOKENS: --accent #ff5500\n</file>"
+            ),
+            "a trusted project's design system is injected:\n{sys}"
+        );
+        let disabled = vec![".openleash/DESIGN.md".to_string()];
+        let off = prompt::system(&env_for(&p, &disabled), None, &[]);
+        assert!(
+            !off.contains("DESIGN-TOKENS"),
+            "it can be switched off per project"
+        );
+    }
+    {
+        let _g = trust::TRUST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        trust::set_trust(&[]);
+        let sys = prompt::system(&env_for(&p, &[]), None, &[]);
+        assert!(
+            !sys.contains("DESIGN-TOKENS"),
+            "an untrusted folder's design system is not injected:\n{sys}"
+        );
+        assert!(sys.contains("NOT trusted"));
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_manifest_lists_the_design_system_file() {
+    let root = std::env::temp_dir().join(format!("ol-docs-design-manifest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _home = store::test_home(&root.join("home"));
+    let d = root.join("proj");
+    std::fs::create_dir_all(d.join(".openleash")).unwrap();
+    std::fs::write(d.join(".openleash").join("DESIGN.md"), "tokens").unwrap();
+    let p = d.to_string_lossy().into_owned();
+    let mut s = Settings::default();
+    trust::upsert(&mut s.trust, &p, TrustKind::Folder, TrustState::Trusted);
+    let m = trust::manifest(&s, &p);
+    let design = m
+        .instructions
+        .iter()
+        .find(|f| f.name == ".openleash/DESIGN.md")
+        .expect("the design system is listed in the trust manifest");
+    assert!(!design.disabled);
+    assert_eq!(design.bytes, 6);
+    assert!(m.injecting);
+    let _ = std::fs::remove_dir_all(&root);
+}

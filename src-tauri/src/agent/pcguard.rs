@@ -15,6 +15,7 @@
 //! objected — it can then carry on with the parts that don't need the mouse.
 //! Two Escs inside a few seconds does end the run.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -57,6 +58,38 @@ static STATE: Mutex<BannerState> = Mutex::new(BannerState {
 });
 /// Bumped on every change, so the UI can tell two identical states apart.
 static REV: AtomicU64 = AtomicU64::new(0);
+static DRIVERS: OnceLock<Mutex<HashMap<u64, (String, String)>>> = OnceLock::new();
+static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
+
+fn drivers() -> &'static Mutex<HashMap<u64, (String, String)>> {
+    DRIVERS.get_or_init(Default::default)
+}
+
+/// Ownership of exactly one driving batch. Observe-only batches never create
+/// this token, and dropping one batch cannot hide another driver's banner.
+pub struct DrivingGuard(u64);
+
+impl Drop for DrivingGuard {
+    fn drop(&mut self) {
+        let mut g = drivers().lock().unwrap_or_else(|e| e.into_inner());
+        g.remove(&self.0);
+        let visible = g.values().next().cloned();
+        drop(g);
+        if visible.is_none() {
+            *esc_task().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        set(|s| {
+            s.active = visible.is_some();
+            if let Some((id, summary)) = visible {
+                s.task_id = id;
+                s.summary = summary;
+            } else if !s.objected {
+                s.task_id.clear();
+                s.summary.clear();
+            }
+        });
+    }
+}
 
 /// Mutex poisoning here is never worth propagating: this is display state, and
 /// a panic in one tool should not make the banner permanently unavailable.
@@ -113,38 +146,32 @@ pub fn state() -> BannerState {
     lock().clone()
 }
 
-/// Show the banner for a batch that is about to run on the real desktop.
-pub fn begin(task_id: &str, summary: &str) {
+/// Start one driving batch and return its ownership token. Only that token's
+/// drop ends the batch; observe-only work has no reason to call this.
+pub fn begin(task_id: &str, summary: &str) -> DrivingGuard {
+    let token = NEXT_DRIVER.fetch_add(1, Ordering::SeqCst);
+    let mut g = drivers().lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(token, (task_id.to_string(), summary.to_string()));
+    drop(g);
     *esc_task().lock().unwrap_or_else(|e| e.into_inner()) = Some(task_id.to_string());
     set(|s| {
         s.active = true;
         s.task_id = task_id.to_string();
         s.summary = summary.to_string();
-        // A new batch clears the standing objection: the user let the agent
-        // try again, and leaving the red state up would misreport this run.
         s.objected = false;
     });
+    DrivingGuard(token)
 }
 
-/// The batch finished on its own. The banner goes away unless the user has
-/// objected, in which case it stays as a warning.
-pub fn end() {
-    let objected = lock().objected;
-    *esc_task().lock().unwrap_or_else(|e| e.into_inner()) = None;
-    set(|s| {
-        s.active = false;
-        if !objected {
-            s.summary.clear();
-            s.task_id.clear();
-        }
-    });
-}
+/// Legacy end is deliberately removed: a caller without an ownership token
+/// cannot clear another batch's guard state.
 
 /// The user pressed Esc while the agent had the mouse. Records the objection
 /// and returns the chat to tell, if a run is still going.
 pub fn objection() -> Option<String> {
     let st = set(|s| {
-        s.active = false;
+        // An objection asks the runner to cancel; until its driving token is
+        // dropped, input may still be in flight and saves must remain blocked.
         s.objected = true;
     });
     (!st.task_id.is_empty()).then_some(st.task_id)
@@ -152,12 +179,28 @@ pub fn objection() -> Option<String> {
 
 /// Clear the standing objection (new chat, or the run ended for good).
 pub fn clear() {
-    *esc_task().lock().unwrap_or_else(|e| e.into_inner()) = None;
     ESC_PENDING.store(false, Ordering::SeqCst);
+    let visible = drivers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .next()
+        .cloned();
+    if visible.is_none() {
+        *esc_task().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     set(|s| {
-        s.objected = false;
-        s.summary.clear();
-        s.task_id.clear();
+        s.active = visible.is_some();
+        if visible.is_none() {
+            s.objected = false;
+        }
+        if let Some((id, summary)) = visible {
+            s.task_id = id;
+            s.summary = summary;
+        } else {
+            s.summary.clear();
+            s.task_id.clear();
+        }
     });
 }
 
@@ -216,6 +259,9 @@ fn now_ms() -> u64 {
 /// This runs on the hook thread, which must return fast and cannot await, so
 /// the note is queued onto the async runtime rather than pushed into the inbox
 /// here: a blocked hook is one Windows silently drops, leaving Esc dead.
+///
+/// Only the Windows hook calls this; the tests drive it directly.
+#[cfg(any(windows, test))]
 fn on_esc() -> bool {
     let task = esc_task().lock().unwrap_or_else(|e| e.into_inner()).clone();
     // This process-wide hook remains installed while idle. Escape is only a
@@ -322,10 +368,10 @@ mod tests {
     fn banner_tracks_a_batch() {
         let _guard = guard();
         clear();
-        begin("t1", "click 1,2");
+        let driving = begin("t1", "click 1,2");
         let s = state();
         assert!(s.active && !s.objected && s.task_id == "t1" && s.summary == "click 1,2");
-        end();
+        drop(driving);
         // A batch that ended on its own leaves nothing behind.
         let s = state();
         assert!(!s.active && !s.objected && s.task_id.is_empty() && s.summary.is_empty());
@@ -335,7 +381,7 @@ mod tests {
     fn objection_stays_as_a_warning() {
         let _guard = guard();
         clear();
-        begin("t2", "type hi");
+        let driving = begin("t2", "type hi");
         assert_eq!(
             objection().as_deref(),
             Some("t2"),
@@ -343,14 +389,15 @@ mod tests {
         );
         // Ended, but the objection must survive: the agent is still running and
         // the user needs to see that it was told to stop.
-        end();
+        assert!(state().active);
+        drop(driving);
         let s = state();
         assert!(!s.active && s.objected && s.task_id == "t2");
         // A new batch is a fresh start and clears it.
-        begin("t2", "click 3,4");
+        let retry = begin("t2", "click 3,4");
         let s = state();
         assert!(s.active && !s.objected);
-        end();
+        drop(retry);
         clear();
     }
 
@@ -385,9 +432,9 @@ mod tests {
             "idle Escape must not arm double-Escape"
         );
 
-        begin("stale", "click 1,2");
+        let driving = begin("stale", "click 1,2");
         assert!(objection().is_some());
-        end();
+        drop(driving);
         assert!(
             state().objected,
             "a completed objection should remain dismissible"
@@ -397,6 +444,23 @@ mod tests {
             "Escape dismisses an old warning but does not stop a run"
         );
         assert!(!state().objected && state().task_id.is_empty());
+    }
+
+    #[test]
+    fn objection_does_not_mean_the_driver_finished() {
+        let _guard = guard();
+        clear();
+        clear();
+        let a = begin("driver-a", "wait then click");
+        assert!(state().active);
+        // An observe-only screenshot creates no token and cannot end A.
+        assert!(state().active);
+        let b = begin("driver-b", "other click");
+        drop(b);
+        assert!(state().active, "B cannot release A");
+        drop(a);
+        assert!(!state().active, "only A's own token releases A");
+        clear();
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub fn user_prompt(tool: &str, input: &Value, cwd: &str, project: &str) -> Strin
     // bury it in escaping; everything else is small enough to show as-is.
     let detail = match tool {
         "bash" | "shell" => input["command"].as_str().unwrap_or("").to_string(),
+        // The reviewer judges the request, not the credentials it carries.
+        "http_request" => super::http_tool::redact_input(input).to_string(),
         _ => serde_json::to_string(input).unwrap_or_else(|_| input.to_string()),
     };
     format!("Tool: {tool}\nWorking directory: {cwd}\nProject root: {project}\n\n{detail}")

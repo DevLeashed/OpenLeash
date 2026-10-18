@@ -5,10 +5,12 @@ import { ago, api, oneLine } from "../api";
 import { useEffect, useMemo, useState } from "react";
 import { chatModel, flash, go, isConnected, modelColor, openProject, set, useNow, useStore } from "../store";
 import { Composer, openMenu } from "./Composer";
+import { ArtifictWorkspace } from "./ArtifictWorkspace";
 import { bySortKey } from "./Chrome";
 import { I, StatusIcon, chatStatus, statusOf } from "./icons";
 import { globalPauseHolds, heldByGlobal, isPaused, pauseHeadline } from "./Paused";
 import { MorphText, Tooltip, Button, ChipButton, IconButton, Input, Pressable, TextButton } from "./primitives";
+import { openWelcome } from "./Welcome";
 
 /** Prompts for a chat that has nothing in it yet.
  *
@@ -30,30 +32,38 @@ const STARTERS = [
  *  task*, and the fix is to say it before one starts. */
 function FirstRun() {
   const project = useStore((s) => s.settings?.project ?? "");
-  const info = useStore((s) => s.projectInfo);
   const providers = useStore((s) => s.providers);
   const modelReady = providers.some((p) => p.enabled && isConnected(p));
   const steps = [
     { id: "model", done: modelReady, label: "Connect a model provider", hint: "Add an API key, or sign in to a subscription", cta: "Open Models", run: () => go("settings", { settingsTab: "models" }) },
     { id: "folder", done: !!project, label: "Open the project you want to work in", hint: "Agents work on real files, so they need a folder", cta: "Open folder", run: () => void pickFolder() },
-    // Only once there is a folder to decide about.
-    { id: "trust", done: !!info?.trusted, label: "Trust this folder", hint: "Until you decide, its instructions, skills, agents, hooks and MCP servers stay off", cta: "Decide", run: () => set({ trustPrompt: true }) },
-  ].filter((s) => s.id !== "trust" || !!project);
+  ];
   if (steps.every((s) => s.done)) return null;
+  const doneN = steps.filter((s) => s.done).length;
+  // Only the first open step is the call to action; the rest wait their turn.
+  const nextId = steps.find((s) => !s.done)?.id;
   return (
-    <div className="firstrun">
-      <div style={{ fontWeight: 600 }}>Before the first task</div>
-      {steps.map((s) => (
-        <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 9, minHeight: 34 }}>
-          <span aria-hidden="true" style={{ width: 12, color: s.done ? "var(--green)" : "var(--dim)" }}>{s.done ? "✓" : "•"}</span>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ color: s.done ? "var(--mut3)" : "var(--fg)" }}>{s.label}{s.done && <span className="sr-only"> — done</span>}</div>
-            {!s.done && <div className="desc">{s.hint}</div>}
-          </div>
-          {!s.done && <Button variant="ghost" style={{ height: 24, flex: "none" }} onClick={s.run}>{s.cta}</Button>}
-        </div>
-      ))}
-    </div>
+    <section className="firstrun" aria-label="Before the first task">
+      <header className="firstrun-head">
+        <span className="firstrun-title">Before the first task</span>
+        <span className="firstrun-count">{doneN} of {steps.length} done</span>
+      </header>
+      <div className="firstrun-bar" aria-hidden="true"><span style={{ width: `${(doneN / steps.length) * 100}%` }} /></div>
+      <ol className="firstrun-steps">
+        {steps.map((s, i) => (
+          <li key={s.id} className={`firstrun-step${s.done ? " done" : ""}${s.id === nextId ? " next" : ""}`}>
+            <span className="firstrun-mark" aria-hidden="true">{s.done ? "✓" : i + 1}</span>
+            <div className="firstrun-text">
+              <div className="firstrun-label">{s.label}{s.done && <span className="sr-only"> — done</span>}</div>
+              {!s.done && <div className="firstrun-hint">{s.hint}</div>}
+            </div>
+            {!s.done && (
+              <Button variant={s.id === nextId ? "primary" : "default"} style={{ flex: "none" }} onClick={s.run}>{s.cta}</Button>
+            )}
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -176,6 +186,9 @@ export function Home() {
   useEffect(() => {
     if (pausedAll) setPausing(false);
   }, [pausedAll]);
+  // Artificts mode on the new-task screen: the new chat's composer on the left
+  // and the studio on the right, the way the chat will look once it exists.
+  if (home.artificts) return <HomeStudio project={project} />;
   return (
     <>
       {I.logo()}
@@ -281,6 +294,10 @@ export function Home() {
                   <span style={{ fontSize: 11, color: "var(--dim)" }}>Fill the box</span>
                 </Pressable>
               ))}
+              <Pressable className="jrow" onClick={openWelcome}>
+                <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500, color: "#d4d4d8" }}>How to drive OpenLeash</span>
+                <span style={{ fontSize: 11, color: "var(--dim)" }}>2-minute tour</span>
+              </Pressable>
             </>
           )}
           {recent.map((t) => {
@@ -307,3 +324,38 @@ export function Home() {
   );
 }
 
+
+/** The new-task screen in Artificts mode: the composer that will start the
+ *  chat on the left, the studio on the right, as the chat will look once it
+ *  exists. A studio needs a chat to read the project's artificts through, so
+ *  when this was opened from a chat's studio it browses through that chat
+ *  (same project), with nothing on it that would act on the old chat; opened
+ *  from scratch, it is the space the new design will land in. */
+function HomeStudio({ project }: { project: string }) {
+  const studio = useStore((s) => s.home.studio ?? null);
+  // A studio reads the project's artificts through a chat of that project, so
+  // with no artifict handed over any chat here will do: the gallery shows them all.
+  const projectTask = useStore((s) => Object.values(s.tasks).find((t) => t.project === project)?.id ?? null);
+  const exit = () => set((s) => ({ home: { ...s.home, artificts: false, studio: null } }));
+  return <div className="session-collaboration-layout home-studio">
+    <div className="session-pane collaboration-chat home-studio-chat">
+      <div className="home-studio-head">
+        <span className="home-studio-title">New chat{studio ? <> about <b>{studio.title}</b></> : project ? <> in <ProjectName path={project} /></> : null}</span>
+        <Tooltip content="Leave Artificts mode"><IconButton label="Leave Artificts mode" onClick={exit}>{I.close(12)}</IconButton></Tooltip>
+      </div>
+      <div className="home-studio-spacer" />
+      <div className="home-studio-composer"><Composer mode="home" /></div>
+    </div>
+    <div className="session-pane collaboration-workspace home-studio-pane">
+      {studio
+        ? <ArtifictWorkspace key={`${studio.taskId}:${studio.artifictId}:${studio.versionId}`} taskId={studio.taskId} taskTitle="New chat" initialSelection={{ artifictId: studio.artifictId, versionId: studio.versionId }} browseOnly />
+        : projectTask
+        ? <ArtifictWorkspace key={projectTask} taskId={projectTask} taskTitle="New chat" browseOnly startInGallery />
+        : <div className="studio-blank"><div className="artifict-empty">
+          {I.logo()}
+          <p className="studio-blank-title">Your design appears here.</p>
+          <p>Describe a screen, page or component on the left. The new chat builds it as an artifict you can click to comment on, tweak and revise.</p>
+        </div></div>}
+    </div>
+  </div>;
+}

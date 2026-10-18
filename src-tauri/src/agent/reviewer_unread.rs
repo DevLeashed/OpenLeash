@@ -126,6 +126,26 @@ fn a_stop_does_not_mark_the_chat() {
 }
 
 #[test]
+fn a_chat_finished_on_screen_is_read_once_the_window_says_so() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (h, events) = harness(store::Settings::default(), vec![task("t1", "unused/model")]);
+            // It finishes while the window has it open: the backend marks it,
+            // then the window (which can see the chat is on screen) acknowledges
+            // it with `task_seen`. Left alone, the dot would return on switching away.
+            h.attention("t1", json!({"task_id": "t1", "kind": "done"}))
+                .await;
+            assert!(marked(&h, "t1").await, "the run finished");
+            h.seen("t1").await;
+            assert!(!marked(&h, "t1").await, "the window had it on screen");
+            assert_eq!(pushed(&events, "t1").last().copied(), Some(false));
+        });
+}
+
+#[test]
 fn opening_a_chat_clears_the_mark_for_every_client() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -202,5 +222,48 @@ fn ending_a_blocking_wait_clears_the_mark() {
             let t = t.lock().await;
             assert_eq!(t.waiting_kind, None, "the wait is over");
             assert_eq!(t.status, "running", "and the run carries on");
+        });
+}
+
+#[test]
+fn resuming_a_chat_acknowledges_the_mark_it_had() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            // A chat that finished while nobody was looking, then is picked back up
+            // from the list (not opened). Resuming is the user acting on it, so the
+            // old "done" mark must not survive into the resumed chat — otherwise a
+            // finished-looking chat shows the blue dot as soon as it is resumed.
+            let (h, events) = harness(store::Settings::default(), vec![waiting("t1", None)]);
+            assert!(marked(&h, "t1").await, "precondition: the chat is unread");
+            super::runner::resume(&h, "t1", None).await.unwrap();
+            assert!(
+                !marked(&h, "t1").await,
+                "resuming acknowledged the old finish"
+            );
+            assert_eq!(
+                pushed(&events, "t1").last().copied(),
+                Some(false),
+                "and connected clients are told the dot is out"
+            );
+        });
+}
+
+#[test]
+fn resuming_does_not_clear_a_pending_question() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            // The question is still unanswered: resuming must not hide it.
+            let (h, _events) = harness(
+                store::Settings::default(),
+                vec![waiting("q", Some("question"))],
+            );
+            super::runner::resume(&h, "q", None).await.unwrap();
+            assert!(marked(&h, "q").await, "the blocking wait keeps its mark");
         });
 }

@@ -7,7 +7,7 @@ import { ArtifictRecord, parseCollaborationRecord } from "./ArtifictRecord";
 import { ImageExplanation, parseImageSpec } from "./ImageExplanation";
 import { ReplyImage } from "./ReplyImage";
 import { svgImageUrl } from "./hostTheme";
-import { Button } from "./primitives";
+import { Button, Dropdown } from "./primitives";
 import { MD_PLUGINS, copyText, mdComponents } from "./mdx";
 import type { VisualizationFeedbackDraft } from "./visualizationFeedback";
 
@@ -75,6 +75,27 @@ function ImageBody({ content, label, onFeedbackDraft }: { content: string; label
   return <div className="artifict-image"><ReplyImage src={content.trim()} alt={label ?? "Artifict image"} /></div>;
 }
 
+/** The artifact itself, for every format the host draws. Shared by the inline
+ *  card's framed canvas and the studio's artboard, so a record looks the same
+ *  wherever it is read. */
+export function ArtifictBody({ format, content, label, onFeedbackDraft }: {
+  format: ArtifictReadableFormat;
+  content: string;
+  label?: string;
+  onFeedbackDraft?: (draft: VisualizationFeedbackDraft) => void;
+}) {
+  // A collaboration record is JSON, but it is a structured document rather than
+  // a code dump, so it gets the explorer instead of the pretty-printed source.
+  const record = format === "json" ? parseCollaborationRecord(content) : null;
+  return format === "markdown" ? <div className="md artifict-prose"><ReactMarkdown remarkPlugins={MD_PLUGINS} components={mdComponents}>{content}</ReactMarkdown></div>
+    : format === "text" ? <div className="artifict-text">{content}</div>
+    // An SVG data URL in an `<img>` is inert: no scripts, no external fetches.
+    : format === "svg" ? <img className="artifict-svg" alt={label ?? "SVG artifict preview"} src={svgImageUrl(content)} />
+    : format === "image" ? <ImageBody content={content} label={label} onFeedbackDraft={onFeedbackDraft} />
+    : record ? <ArtifictRecord record={record} onDraft={onFeedbackDraft} bare />
+    : <pre className="artifict-code"><code>{prettyJson(content)}</code></pre>;
+}
+
 /** One host-readable preview: the shared frame, the artifact or its source, and
  *  the controls a viewer needs. HTML never reaches here. */
 export function ArtifictOverview({ format, content, label, onFeedbackDraft, commentMode, annotations = [], activeId, onSelectAnnotation, onPoint }: {
@@ -86,21 +107,13 @@ export function ArtifictOverview({ format, content, label, onFeedbackDraft, comm
   annotations?: ArtifictAnnotation[];
   activeId?: string | null;
   onSelectAnnotation?: (annotation: ArtifictAnnotation) => void;
-  onPoint?: (point: PinPoint) => void;
+  onPoint?: (point: PinPoint, target: string) => void;
 }) {
   const [showSource, setShowSource] = useState(false);
   const [viewport, setViewport] = useState<ArtifictViewport>("full");
-  // A collaboration record is JSON, but it is a structured document rather than
-  // a code dump, so it gets the explorer instead of the pretty-printed source.
   const record = format === "json" ? parseCollaborationRecord(content) : null;
   const scroll = format === "markdown" || format === "text" || (format === "json" && !record);
-  const body = format === "markdown" ? <div className="md artifict-prose"><ReactMarkdown remarkPlugins={MD_PLUGINS} components={mdComponents}>{content}</ReactMarkdown></div>
-    : format === "text" ? <div className="artifict-text">{content}</div>
-    // An SVG data URL in an `<img>` is inert: no scripts, no external fetches.
-    : format === "svg" ? <img className="artifict-svg" alt={label ?? "SVG artifict preview"} src={svgImageUrl(content)} />
-    : format === "image" ? <ImageBody content={content} label={label} onFeedbackDraft={onFeedbackDraft} />
-    : record ? <ArtifictRecord record={record} onDraft={onFeedbackDraft} bare />
-    : <pre className="artifict-code"><code>{prettyJson(content)}</code></pre>;
+  const body = <ArtifictBody format={format} content={content} label={label} onFeedbackDraft={onFeedbackDraft} />;
   return <ArtifictCanvas
     badge={ARTIFICT_BADGE[format]}
     label={label}
@@ -112,9 +125,7 @@ export function ArtifictOverview({ format, content, label, onFeedbackDraft, comm
       <Button variant={showSource ? "primary" : "ghost"} className="artifict-tab" aria-pressed={showSource} onClick={() => setShowSource(true)}><Code2 size={12} />Source</Button>
     </div>}
     actions={<>
-      <select aria-label="Preview width" className="artifict-viewport" value={viewport} onChange={(event) => setViewport(event.currentTarget.value as ArtifictViewport)}>
-        {VIEWPORTS.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
-      </select>
+      <Dropdown placeholder="Preview width" search={false} value={viewport} onChange={(v) => setViewport(v as ArtifictViewport)} options={VIEWPORTS.map(([value, label]) => ({ value, label }))} style={{ height: 24, padding: "0 7px", gap: 6, fontSize: 11 }} />
       <Button variant="ghost" className="artifict-action" onClick={() => copyText(content, "Artifict source copied")}><Copy size={13} />Copy</Button>
     </>}>
     {showSource

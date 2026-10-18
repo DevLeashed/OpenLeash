@@ -169,6 +169,13 @@ fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
     WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Hold every shadow-git write, so a test can stand in for a snapshot that
+/// takes seconds on a large checkout.
+#[cfg(test)]
+pub fn hold_writes_for_test() -> std::sync::MutexGuard<'static, ()> {
+    lock_writes()
+}
+
 /// `~/.openleash/checkpoints`.
 pub fn root() -> PathBuf {
     super::store::data_dir().join("checkpoints")
@@ -212,6 +219,18 @@ pub fn exists(chat: &str) -> bool {
 /// call keeps "which checkout is this about?" local to the call, so a task
 /// whose folder moved cannot silently snapshot the wrong tree.
 fn git(chat: &str, worktree: Option<&str>, args: &[&str]) -> Result<Vec<u8>, String> {
+    git_env(chat, worktree, args, None)
+}
+
+/// [`git`] with an optional private index file (`GIT_INDEX_FILE`), for the
+/// plumbing that builds per-edit commits without touching the store's own
+/// index — which the next snapshot's `status` depends on.
+fn git_env(
+    chat: &str,
+    worktree: Option<&str>,
+    args: &[&str],
+    index: Option<&Path>,
+) -> Result<Vec<u8>, String> {
     let dir = store(chat);
     let gd = git_dir(chat);
     let mut c = Command::new("git");
@@ -236,6 +255,9 @@ fn git(chat: &str, worktree: Option<&str>, args: &[&str]) -> Result<Vec<u8>, Str
         .env("GIT_CONFIG_GLOBAL", dir.join("gitconfig.global"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(index) = index {
+        c.env("GIT_INDEX_FILE", index);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -267,37 +289,140 @@ fn config(chat: &str, key: &str, value: &str) {
     let _ = git_str(chat, None, &["config", "--local", key, value]);
 }
 
+/// `value` as a git config value: always quoted, so a path holding `#`, `;`
+/// or leading spaces cannot be cut short as a comment or trimmed.
+fn config_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The last `core.worktree` in a config file's text, or `None` if it has none
+/// or it is written in a form this reader does not handle. Only ever used to
+/// *skip* a `git config` call when the value already matches, so anything it
+/// gets wrong costs one process spawn, never a wrong setting.
+fn config_worktree(text: &str) -> Option<String> {
+    let mut in_core = false;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("worktree") {
+            continue;
+        }
+        found = config_unquote(raw.trim());
+    }
+    found
+}
+
+fn config_unquote(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut quoted = false;
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => quoted = !quoted,
+            '\\' => match chars.next()? {
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                _ => return None,
+            },
+            '#' | ';' if !quoted => break,
+            c => out.push(c),
+        }
+    }
+    (!quoted).then(|| out.trim_end().to_string())
+}
+
 /// Create the store if it isn't there, and pin it to `worktree`.
 ///
 /// `init --bare` followed by `core.bare=false`: the store has no checkout of
 /// its own and must never grow one, so keeping `.git` *as* the directory makes
 /// "which tree is this about" an explicit parameter of every call rather than
 /// something git infers from the folder it happens to sit in.
+///
+/// This runs before every snapshot, so it spawns as little as it can: the
+/// settings are appended to the config `init` wrote (whose platform probes —
+/// `filemode`, `symlinks`, `ignorecase` — are kept), instead of one `git
+/// config` process each, and `core.worktree` is only rewritten when the file
+/// does not already say it. A later section overrides an earlier one for
+/// single-valued keys, which is what makes appending a second `[core]` safe.
 pub fn ensure(chat: &str, worktree: &str) -> Result<(), String> {
     super::host::refuse(worktree, "Checkpoints are")?;
     let dir = store(chat);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("cannot create the checkpoint folder: {e}"))?;
     let gd = git_dir(chat);
+    let want = worktree.replace('\\', "/");
+    let cfg = gd.join("config");
     if !gd.join("HEAD").is_file() {
         let gd_s = gd.to_string_lossy().to_string();
         git_str(chat, None, &["init", "--bare", "--quiet", &gd_s])?;
-        config(chat, "core.bare", "false");
-        config(chat, "user.name", "OpenLeash");
-        config(chat, "user.email", "checkpoints@openleash.local");
-        // Belt and braces: `git()`'s flags cover these, but a store carrying its
-        // own copy of them cannot be talked out of them by a later `-c`.
-        config(chat, "core.autocrlf", "false");
-        config(chat, "commit.gpgsign", "false");
-        config(chat, "gc.auto", "0");
+        let mut text = std::fs::read_to_string(&cfg).unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        // `autocrlf`, `gpgsign` and `gc.auto` are belt and braces: `git()`'s
+        // flags cover them, but a store carrying its own copy of them cannot be
+        // talked out of them by a later `-c`.
+        text.push_str(&format!(
+            "[core]\n\tbare = false\n\tautocrlf = false\n\tworktree = {}\n\
+             [user]\n\tname = OpenLeash\n\temail = checkpoints@openleash.local\n\
+             [commit]\n\tgpgsign = false\n\
+             [gc]\n\tauto = 0\n",
+            config_quote(&want)
+        ));
+        if let Err(e) = write_config(&cfg, &text) {
+            // Never leave a half-configured store behind: without `bare =
+            // false` every later call would fail on "this operation must be
+            // run in a work tree", and `HEAD` existing would stop this branch
+            // from ever running again.
+            let _ = std::fs::remove_dir_all(&gd);
+            return Err(format!("cannot configure the checkpoint store: {e}"));
+        }
         // `add -A` on a tree that contains another checkout would otherwise
         // stage a gitlink for it and then fail on the objects behind it.
         let info = gd.join("info");
         let _ = std::fs::create_dir_all(&info);
         let _ = std::fs::write(info.join("exclude"), ".git/\n");
+        return Ok(());
     }
-    config(chat, "core.worktree", &worktree.replace('\\', "/"));
+    let current = std::fs::read_to_string(&cfg)
+        .ok()
+        .and_then(|t| config_worktree(&t));
+    if current.as_deref() != Some(want.as_str()) {
+        config(chat, "core.worktree", &want);
+    }
     Ok(())
+}
+
+/// Temp-then-rename, like the ledgers: git reading a truncated config would
+/// fail every call against the store.
+fn write_config(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("new");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Record the exact post-write content of a successful agent file edit.
@@ -315,23 +440,7 @@ pub fn record_agent_write(
     absolute_path: &Path,
 ) -> Result<(), String> {
     super::host::refuse(worktree, "Checkpoints are")?;
-    super::tools::local_guard(absolute_path)?;
-    let root = Path::new(worktree)
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve worktree: {e}"))?;
-    let path = absolute_path
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve edited file: {e}"))?;
-    let rel = path
-        .strip_prefix(&root)
-        .map_err(|_| "edited file is outside the task worktree".to_string())?;
-    let rel = rel
-        .to_str()
-        .ok_or_else(|| "edited file path is not valid UTF-8".to_string())?
-        .replace('\\', "/");
-    if !safe_rel(&rel) {
-        return Err("edited file path is unsafe".into());
-    }
+    let rel = rel_in_worktree(worktree, absolute_path)?;
     let _guard = lock_writes();
     ensure(task_id, worktree)?;
     let blob = blob_now(task_id, worktree, &rel);
@@ -349,6 +458,339 @@ pub fn record_agent_write(
     );
     write_mine(task_id, &mine);
     Ok(())
+}
+
+/// `absolute_path` as a store-relative, `/`-separated path inside `worktree`.
+/// Both sides are canonicalised, so a symlink that points out of the worktree
+/// is refused rather than recorded under an inside-looking name.
+fn rel_in_worktree(worktree: &str, absolute_path: &Path) -> Result<String, String> {
+    super::tools::local_guard(absolute_path)?;
+    let root = Path::new(worktree)
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve worktree: {e}"))?;
+    let path = absolute_path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve edited file: {e}"))?;
+    let rel = path
+        .strip_prefix(&root)
+        .map_err(|_| "edited file is outside the task worktree".to_string())?;
+    let rel = rel
+        .to_str()
+        .ok_or_else(|| "edited file path is not valid UTF-8".to_string())?
+        .replace('\\', "/");
+    if !safe_rel(&rel) {
+        return Err("edited file path is unsafe".into());
+    }
+    Ok(rel)
+}
+
+// ─────────────────────────── per-edit history ───────────────────────────
+//
+// Snapshots are per turn (and per tool round); an agent can make many edits in
+// between. Bisecting "which edit broke it" needs the tree *after each edit*,
+// so every successful file edit also becomes a commit object of its own in the
+// shadow store, built with plumbing against a private index: the parent is the
+// previous edit's commit while no snapshot has happened since, otherwise the
+// newest snapshot (which then also carries whatever shell commands or the user
+// changed in between). Nothing here moves `HEAD` or touches the store's index,
+// so the snapshot/rewind machinery above sees exactly what it saw before.
+// The commits are only reachable through the `edits` log; `gc.auto=0` keeps
+// them alive for as long as the store exists.
+
+/// Who made an edit, for the log. Borrowed so the runner need not allocate.
+#[derive(Debug, Clone, Copy)]
+pub struct EditMeta<'a> {
+    /// `Task::checkpoints.len()` when the edit ran: the turn it belongs to, so
+    /// a rewind's `truncate` can drop the edits of an abandoned branch.
+    pub count: usize,
+    /// The transcript row of the tool call (`Item::id`).
+    pub item_id: &'a str,
+    /// The subagent that made it, if not the main agent.
+    pub sub_id: Option<&'a str>,
+    /// `Task::messages.len()` when the edit ran.
+    pub msg_index: usize,
+    /// `edit_file` / `multi_edit` / `write_file`.
+    pub tool: &'a str,
+}
+
+/// One line of the `edits` log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EditRecord {
+    pub count: usize,
+    pub item_id: String,
+    pub sub_id: Option<String>,
+    pub msg_index: usize,
+    pub tool: String,
+    /// The store's `HEAD` when the edit was recorded.
+    pub head: String,
+    /// The tree before this edit.
+    pub parent: String,
+    /// The tree after this edit.
+    pub commit: String,
+    pub path: String,
+}
+
+fn edits_path(chat: &str) -> PathBuf {
+    store(chat).join("edits")
+}
+
+/// Log fields are tab-separated with the path last; anything that could break
+/// the line format is replaced rather than trusted.
+fn log_field(s: &str) -> String {
+    let s: String = s
+        .chars()
+        .map(|c| {
+            if c == '\t' || c == '\n' || c == '\r' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "-".into()
+    } else {
+        s
+    }
+}
+
+/// The edit log, oldest first. Lines that do not parse are skipped.
+pub fn read_edits(chat: &str) -> Vec<EditRecord> {
+    std::fs::read_to_string(edits_path(chat))
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.splitn(9, '\t').collect();
+                    if f.len() != 9 || f[8].is_empty() || !safe_rel(f[8]) {
+                        return None;
+                    }
+                    let opt = |v: &str| (v != "-").then(|| v.to_string());
+                    Some(EditRecord {
+                        count: f[0].parse().ok()?,
+                        item_id: opt(f[1]).unwrap_or_default(),
+                        sub_id: opt(f[2]),
+                        msg_index: f[3].parse().ok()?,
+                        tool: f[4].to_string(),
+                        head: f[5].to_string(),
+                        parent: f[6].to_string(),
+                        commit: f[7].to_string(),
+                        path: f[8].to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write an agent edit and capture its before/after states under the same
+/// checkpoint writer lock. Other agent edits cannot slip between the write
+/// and its capture. External filesystem writers are not locked by OpenLeash:
+/// their changes observed before this write belong to the parent tree, not
+/// to this tool call.
+///
+/// Snapshot failures must not turn a successful edit into a reported failure;
+/// only creating/writing the actual file propagates an error. The private
+/// index uses ordinary `git add`, never forced cache insertion, so ignored
+/// secrets and ignored build/dependency files stay out of the history.
+pub fn write_edit(
+    chat: &str,
+    worktree: &str,
+    meta: EditMeta<'_>,
+    item_index: usize,
+    absolute_path: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let _guard = lock_writes();
+    if let Some(dir) = absolute_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create directory: {e}"))?;
+    }
+    let before = prepare_edit(chat, worktree, absolute_path);
+    std::fs::write(absolute_path, bytes).map_err(|e| format!("write failed: {e}"))?;
+    // Provenance and bisect history are separate; neither grants the other
+    // restore authority. Both are captured before releasing the writer lock.
+    if let Ok(rel) = rel_in_worktree(worktree, absolute_path) {
+        let blob = blob_now(chat, worktree, &rel);
+        if blob != ABSENT {
+            let mut mine = read_mine(chat);
+            mine.insert(
+                rel,
+                AgentWrite {
+                    blob,
+                    item_index,
+                    msg_index: meta.msg_index,
+                },
+            );
+            write_mine(chat, &mine);
+        }
+    }
+    if let Ok((rel, head, parent, index)) = before {
+        let _ = finish_edit(chat, worktree, meta, rel, head, parent, &index);
+        let _ = std::fs::remove_file(index);
+    }
+    Ok(())
+}
+
+/// Private index representing the actual current tracked/non-ignored tree,
+/// rather than the previous tool's synthetic tree. This records user/shell
+/// changes between file tools even when no turn snapshot happened between.
+fn prepare_edit(
+    chat: &str,
+    worktree: &str,
+    path: &Path,
+) -> Result<(String, String, String, PathBuf), String> {
+    super::host::refuse(worktree, "Checkpoints are")?;
+    let root = Path::new(worktree)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let parent_dir = path
+        .parent()
+        .ok_or("edited file has no parent")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let full = parent_dir.join(path.file_name().ok_or("edited file has no name")?);
+    let rel = full
+        .strip_prefix(&root)
+        .map_err(|_| "edited file is outside the task worktree")?
+        .to_str()
+        .ok_or("edited path is not UTF-8")?
+        .replace('\\', "/");
+    if !safe_rel(&rel) || rel.contains(['\t', '\n', '\r']) {
+        return Err("edited file path cannot be logged".into());
+    }
+    ensure(chat, worktree)?;
+    let head = head(chat).ok_or("no snapshot to build the edit history on yet")?;
+    let index = store(chat).join("edit-index");
+    let _ = std::fs::remove_file(&index);
+    let result = (|| {
+        git_env(chat, None, &["read-tree", &head], Some(&index))?;
+        git_env(
+            chat,
+            Some(worktree),
+            &["add", "-A", "--", "."],
+            Some(&index),
+        )?;
+        let tree = String::from_utf8_lossy(&git_env(chat, None, &["write-tree"], Some(&index))?)
+            .trim()
+            .to_string();
+        let parent = git_str(
+            chat,
+            None,
+            &["commit-tree", &tree, "-p", &head, "-m", "before agent edit"],
+        )?
+        .trim()
+        .to_string();
+        Ok((rel, head, parent, index.clone()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(index);
+    }
+    result
+}
+
+fn finish_edit(
+    chat: &str,
+    worktree: &str,
+    meta: EditMeta<'_>,
+    rel: String,
+    head: String,
+    parent: String,
+    index: &Path,
+) -> Result<EditRecord, String> {
+    // Ordinary git add respects excludes and captures the platform's executable
+    // bit. Unlike update-index --cacheinfo, it cannot force an ignored secret or
+    // dependency file into the history.
+    git_env(chat, Some(worktree), &["add", "--", &rel], Some(index))?;
+    let tree = String::from_utf8_lossy(&git_env(chat, None, &["write-tree"], Some(index))?)
+        .trim()
+        .to_string();
+    let commit = git_str(
+        chat,
+        None,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &parent,
+            "-m",
+            &format!("edit {rel}"),
+        ],
+    )?
+    .trim()
+    .to_string();
+    let rec = EditRecord {
+        count: meta.count,
+        item_id: meta.item_id.to_string(),
+        sub_id: meta.sub_id.map(String::from),
+        msg_index: meta.msg_index,
+        tool: meta.tool.to_string(),
+        head,
+        parent,
+        commit,
+        path: rel,
+    };
+    use std::io::Write;
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        rec.count,
+        log_field(&rec.item_id),
+        log_field(rec.sub_id.as_deref().unwrap_or("")),
+        rec.msg_index,
+        log_field(&rec.tool),
+        rec.head,
+        rec.parent,
+        rec.commit,
+        rec.path
+    );
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(edits_path(chat))
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .map_err(|e| format!("cannot write the edit log: {e}"))?;
+    Ok(rec)
+}
+
+/// The bytes of `path` in `commit`, or `None` when that tree has no such file.
+pub fn file_at(chat: &str, commit: &str, path: &str) -> Option<Vec<u8>> {
+    if !safe_rel(path) {
+        return None;
+    }
+    git(
+        chat,
+        None,
+        &["cat-file", "blob", &format!("{commit}:{path}")],
+    )
+    .ok()
+}
+
+/// The git mode for a path in a commit, or `None` if absent.
+pub fn mode_at(chat: &str, commit: &str, path: &str) -> Option<String> {
+    if !safe_rel(path) {
+        return None;
+    }
+    git_str(chat, None, &["ls-tree", commit, "--", path])
+        .ok()?
+        .split_whitespace()
+        .next()
+        .map(String::from)
+}
+
+/// Whether two commits hold the same tree.
+pub fn same_tree(chat: &str, a: &str, b: &str) -> bool {
+    let tree = |c: &str| {
+        git_str(
+            chat,
+            None,
+            &["rev-parse", "--verify", "--quiet", &format!("{c}^{{tree}}")],
+        )
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    };
+    match (tree(a), tree(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// Capture the most recently submitted user turn without the caller needing to
@@ -790,11 +1232,27 @@ pub fn candidates(chat: &str, worktree: &str, commit: &str) -> Vec<String> {
 /// `git status` would then lie about what had changed, and the skip rule is
 /// built on that answer.
 pub fn materialize(chat: &str, commit: &str, dest: &str) -> Result<usize, String> {
+    materialize_with(chat, commit, dest, "fork-index")
+}
+
+/// [`materialize`] for a bisect scratch copy. Its own index file, so a bisect
+/// running next to a fork of the same chat cannot delete the fork's index
+/// out from under it.
+pub fn materialize_scratch(chat: &str, commit: &str, dest: &str) -> Result<usize, String> {
+    materialize_with(
+        chat,
+        commit,
+        dest,
+        &format!("bisect-index-{}", super::new_id()),
+    )
+}
+
+fn materialize_with(chat: &str, commit: &str, dest: &str, index: &str) -> Result<usize, String> {
     super::host::refuse(dest, "Checkpoints are")?;
     if !Path::new(dest).is_dir() {
         return Err("The new worktree is not there.".into());
     }
-    let tmp = store(chat).join("fork-index");
+    let tmp = store(chat).join(index);
     let _ = std::fs::remove_file(&tmp);
     let dir = store(chat);
     let mut c = Command::new("git");
@@ -878,6 +1336,23 @@ pub fn truncate(chat: &str, count: usize) {
         body.push('\n');
     }
     write_sidecar(&turns_path(chat), &body);
+    // The per-edit history follows the same cut: an edit made in a turn that
+    // no longer exists must not be offered as a bisect step.
+    let edits = read_edits(chat);
+    if edits.iter().any(|e| e.count > count) {
+        let body: String = std::fs::read_to_string(edits_path(chat))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| {
+                l.split('\t')
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|n| n <= count)
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        write_sidecar(&edits_path(chat), &body);
+    }
 }
 
 /// Drop a chat's snapshots. Called when the chat itself is deleted: the store
@@ -885,4 +1360,32 @@ pub fn truncate(chat: &str, count: usize) {
 /// deleted chat's contents on disk indefinitely.
 pub fn purge(chat: &str) {
     let _ = std::fs::remove_dir_all(store(chat));
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{config_quote, config_worktree};
+
+    /// The reader only decides whether `ensure` may skip a `git config`
+    /// spawn, so it must agree with both forms the file can hold: ours
+    /// (always quoted) and git's own (bare, as older stores were written).
+    #[test]
+    fn the_worktree_reader_agrees_with_both_writers() {
+        let ours = format!(
+            "[core]\n\tbare = true\n[core]\n\tworktree = {}\n",
+            config_quote("D:/a b/#x;y \"q\" \\z")
+        );
+        assert_eq!(
+            config_worktree(&ours).as_deref(),
+            Some("D:/a b/#x;y \"q\" \\z")
+        );
+        let gits = "[core]\n\tworktree = D:/work/proj ; trailing comment\n";
+        assert_eq!(config_worktree(gits).as_deref(), Some("D:/work/proj"));
+        // Last one wins, as it does for git; another section's key is not it.
+        let two = "[core]\n\tworktree = /old\n[remote \"o\"]\n\tworktree = /no\n[core]\n\tworktree = /new\n";
+        assert_eq!(config_worktree(two).as_deref(), Some("/new"));
+        assert_eq!(config_worktree("[core]\n\tbare = false\n"), None);
+        // Unreadable means "spawn git config", never a guessed value.
+        assert_eq!(config_worktree("[core]\n\tworktree = \"/open\n"), None);
+    }
 }

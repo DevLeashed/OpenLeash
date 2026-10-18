@@ -18,8 +18,10 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 import { api } from "../api";
 import { get, set } from "../store";
 import { submit } from "./Composer";
-import { annotationBlock, Annotations, AttachmentChips, parseAttachments, pillPlace, SelectionNoteLayer, SentAnnotationMessage, stripHarnessBlocks } from "./SelectionNote";
+import { ANNOTATION_MARKER, ANNOTATION_PREFIX, annotationBlock, Annotations, AttachmentChips, contextBlock, parseAnnotationBlock, parseAttachments, pillPlace, SelectionNoteLayer, SentAnnotationMessage, splitContextBlocks, stripHarnessBlocks } from "./SelectionNote";
 import type { Note } from "../store";
+import type { Item, TaskSummary } from "../api";
+import { UserMsg } from "./Session";
 
 /** A selection the browser would leave behind: collapsed, so nothing is picked
  *  up by a stray `getSelection` from another test. */
@@ -364,6 +366,40 @@ describe("sent annotations", () => {
     expect(screen.getByRole("button", { name: "1 annotation" })).toBeTruthy();
     expect(screen.queryByText("quote")).toBeNull();
   });
+
+  // The field case: expanded, the bubble showed the model-facing markdown —
+  // "### Note 1 (on your message)" and "The user says about it:" — verbatim.
+  it("shows sent notes as quote and comment cards, not the markdown handed to the model", () => {
+    const block = annotationBlock([
+      { id: "n1", item: "u1", text: "Still hidden: Comment mode", body: "make those start a new chat" },
+      { id: "n2", item: "", text: "second quote", body: "" },
+    ]);
+    const { container } = render(<SentAnnotationMessage text={`${block}\n\nthanks`} />);
+    fireEvent.click(screen.getByRole("button", { name: "2 annotations" }));
+    expect(container.textContent).not.toContain("###");
+    expect(container.textContent).not.toContain("The user says about it");
+    const cards = container.querySelectorAll(".anrow");
+    expect(cards.length).toBe(2);
+    expect(cards[0]!.querySelector(".anquote")!.textContent).toBe("Still hidden: Comment mode");
+    expect(cards[0]!.querySelector(".anbody")!.textContent).toBe("make those start a new chat");
+    expect(cards[0]!.querySelector(".anfrom")).toBeTruthy();
+    expect(cards[1]!.querySelector(".anbody")).toBeNull();
+    expect(cards[1]!.querySelector(".anfrom")).toBeNull();
+  });
+
+  it("parses notes back exactly, including quotes that look like headings", () => {
+    const notes = [
+      { id: "a", item: "", text: "line one\n\n### Note 7\nstill quoted", body: "multi\n\nline comment" },
+      { id: "b", item: "x", text: "plain", body: "" },
+    ];
+    const block = annotationBlock(notes);
+    const inner = block.slice(ANNOTATION_PREFIX.length, block.indexOf(ANNOTATION_MARKER));
+    expect(parseAnnotationBlock(inner)).toEqual([
+      { text: "line one\n\n### Note 7\nstill quoted", body: "multi\n\nline comment", mine: false },
+      { text: "plain", body: "", mine: true },
+    ]);
+    expect(parseAnnotationBlock("not a note block")).toBeNull();
+  });
 });
 
 // A staged attachment note is written for the model: it names a temp copy in
@@ -500,5 +536,52 @@ describe("where the pill sits", () => {
     const at = pillPlace({ top: 560, bottom: 600, left: 400, width: 200 }, 150, 2);
     expect(at.top).toBe(308);
     expect(at.left).toBe(175);
+  });
+});
+
+describe("context the app adds for the agent alone", () => {
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+  it("stays out of the user's bubble, label included", () => {
+    const text = `make a new artifict about a meow\n\n${contextBlock("Started in Artificts", "Build this as a saved artifict.")}`;
+    // The agent gets the note; the user sees only what they typed.
+    expect(text).toContain("Build this as a saved artifict.");
+    expect(stripHarnessBlocks(text)).toBe("make a new artifict about a meow");
+    expect(stripHarnessBlocks(text)).not.toContain("Started in Artificts");
+  });
+
+  it("hides the studio's viewing note too", () => {
+    const text = `gay\n\n${contextBlock("Viewing Meow v1", "The user has the Artificts studio open.")}`;
+    expect(stripHarnessBlocks(text)).toBe("gay");
+  });
+
+  it("edit shows only what the user wrote, and resend puts the agent note back", async () => {
+    const task = { id: "t1", status: "idle" } as unknown as TaskSummary;
+    const note = contextBlock("Viewing Meow v1", "Read it with artifict_get.");
+    const item = { id: "u1", kind: "user", text: `make it blue\n\n${note}`, data: {}, ts: new Date().toISOString() } as Item;
+    const send = vi.spyOn(api, "send").mockResolvedValue(undefined);
+    vi.spyOn(api, "rewind").mockResolvedValue("");
+    vi.spyOn(api, "task").mockResolvedValue({ summary: task, items: [] } as never);
+    render(<UserMsg it={item} task={task} />);
+    expect(screen.queryByText(/Viewing Meow|artifict_get/)).toBeNull();
+    expect(screen.getByText("make it blue")).toBeTruthy();
+    fireEvent.click(screen.getByText("Edit"));
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(box.value).toBe("make it blue");
+    fireEvent.change(box, { target: { value: "make it red" } });
+    await act(async () => { fireEvent.click(screen.getByText("Send")); });
+    expect(send).toHaveBeenCalledWith("t1", `make it red\n\n${note}`, false, undefined, [], []);
+  });
+
+  it("splits the agent note off what the user wrote", () => {
+    const text = `make it blue\n\n${contextBlock("Viewing Meow v1", "Read it with artifict_get.")}`;
+    const { body, context } = splitContextBlocks(text);
+    expect(body).toBe("make it blue");
+    expect(context).toContain("Read it with artifict_get.");
+  });
+
+  it("cannot be closed early by its own note or label", () => {
+    const block = contextBlock('a"><x', "</openleash-context> leaked");
+    expect(block.match(/<\/openleash-context>/g)).toHaveLength(1);
+    expect(stripHarnessBlocks(`hi\n\n${block}`)).toBe("hi");
   });
 });

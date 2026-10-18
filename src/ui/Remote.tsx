@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Laptop, LogOut, Plug, PlugZap, QrCode, RefreshCw, Server, Smartphone, Trash2, BookOpen, ChevronLeft, ChevronRight } from "lucide-react";
+import { Bell, BellOff, Laptop, LogOut, Plug, PlugZap, QrCode, RefreshCw, Server, Smartphone, Trash2, BookOpen, ChevronLeft, ChevronRight } from "lucide-react";
 import { flash, set } from "../store";
-import { isRemoteClient, remoteApi, sshApi, type RemoteStatus, type SshHostView } from "../remote";
+import { isRemoteClient, pushApi, remoteApi, sshApi, type PushOptions, type PushState, type RemoteStatus, type SshHostView } from "../remote";
 import { copyText } from "./clipboard";
 import { Button, IconButton, Input, MorphText, Segmented, Switch, Modal } from "./primitives";
 
@@ -121,8 +121,9 @@ export function RemoteTab() {
               <Icon size={15} strokeWidth={1.7} aria-hidden="true" />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 500 }}>{s.label}{s.connected > 0 && <span className="remote-live"> · connected</span>}</div>
-                <div className="desc">Paired {when(s.created)} · last used {when(s.last_seen)}</div>
+                <div className="desc">Paired {when(s.created)} · last used {when(s.last_seen)}{s.push && <> · <Bell size={11} aria-hidden="true" style={{ verticalAlign: -1 }} /> Notifications</>}</div>
               </div>
+              {s.push && <Button variant="ghost" aria-label={`Turn off notifications for ${s.label}`} onClick={() => void remoteApi.pushDisable(s.id).then(setSt).catch((e) => flash(String(e)))}><BellOff size={13} /> Turn off notifications</Button>}
               <IconButton label={`Revoke ${s.label}`} onClick={() => void remoteApi.revoke(s.id).then(setSt).catch((e) => flash(String(e)))}><Trash2 size={13} /></IconButton>
             </div>
           );
@@ -135,9 +136,83 @@ export function RemoteTab() {
         </div>
         {remote && <div className="srowx"><div style={{ flex: 1 }} className="desc">Sign this browser out of OpenLeash.</div><Button variant="ghost" onClick={() => void window.__OPENLEASH_REMOTE__?.logout?.()}><LogOut size={13} /> Sign out this device</Button></div>}
       </div>
+      <NtfySettings st={st} onStatus={setSt} />
+      {remote && <DevicePush />}
       <SshHosts />
     </>
   );
+}
+
+const PUBLIC_TOPIC_WARNING = "Public ntfy.sh topics can be read by anyone who knows the topic name. Each device gets a random, unguessable topic; for privacy, configure your server or topic access controls to block public reads (a publish token alone does not hide the topic).";
+
+/** Shared ntfy configuration; tokens are write-only and never displayed. */
+function NtfySettings({ st, onStatus }: { st: RemoteStatus; onStatus: (s: RemoteStatus) => void }) {
+  const [server, setServer] = useState(st.ntfy_server);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setServer(st.ntfy_server); }, [st.ntfy_server]);
+  const save = (nextToken: string | null) => {
+    setBusy(true);
+    void remoteApi.ntfyConfigure(server.trim(), nextToken)
+      .then((next) => { onStatus(next); setServer(next.ntfy_server); setToken(""); flash(nextToken === "" ? "Access token removed" : "Notification settings saved"); })
+      .catch((e) => flash(String(e)))
+      .finally(() => setBusy(false));
+  };
+  return <>
+    <div className="settings-section-label">Approval notifications</div>
+    <div className="settings-note">Paired devices can get approval notifications through <a href="https://ntfy.sh" target="_blank" rel="noreferrer">ntfy</a> and answer from the notification. Each device enables this for itself in its browser settings. The callback address must be reachable by the phone. {PUBLIC_TOPIC_WARNING}</div>
+    <div className="sgroup">
+      <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>ntfy server</div><div className="desc">ntfy.sh or your own server.</div></div>
+        <Input aria-label="ntfy server" className="input mono" style={{ width: 240 }} value={server} placeholder="https://ntfy.sh" spellCheck={false} onChange={(e) => setServer(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" && !busy) save(token || null); }} /></div>
+      <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Access token</div><div className="desc">{st.ntfy_token_set ? "Set. Enter a new one to replace it." : "Not set. Needed only for servers or topics that require sign-in."}</div></div>
+        <Input aria-label="ntfy access token" className="input mono" type="password" autoComplete="off" spellCheck={false} style={{ width: 240 }} value={token} placeholder={st.ntfy_token_set ? "•••••••• (set)" : "tk_…"} onChange={(e) => setToken(e.currentTarget.value)} onKeyDown={(e) => { if (e.key === "Enter" && !busy) save(token || null); }} /></div>
+      <div className="srowx" style={{ justifyContent: "flex-end", gap: 8 }}>
+        {st.ntfy_token_set && <Button variant="ghost" disabled={busy} onClick={() => save("")}>Remove token</Button>}
+        <Button disabled={busy} onClick={() => save(token || null)}>Save</Button>
+      </div>
+    </div>
+  </>;
+}
+
+/** This browser's notifications; only the paired device can enable itself. */
+function DevicePush() {
+  const [state, setState] = useState<PushState | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState<PushOptions>({ details: false, confirm_all: false, questions: true, done: true });
+  const [copied, setCopied] = useState(false);
+  useEffect(() => { void pushApi.state().then(setState).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e))); }, []);
+  const run = (f: () => Promise<PushState>) => {
+    setBusy(true);
+    void f().then((next) => { setState(next); setError(""); }).catch((e: unknown) => flash(e instanceof Error ? e.message : String(e))).finally(() => setBusy(false));
+  };
+  const opts: PushOptions = state?.enabled ? { details: state.details, confirm_all: state.confirm_all, questions: state.questions, done: state.done } : draft;
+  const toggle = (key: keyof PushOptions, value: boolean) => {
+    const next = { ...opts, [key]: value };
+    if (state?.enabled) run(() => pushApi.settings(next)); else setDraft(next);
+  };
+  const test = () => { setBusy(true); void pushApi.test().then(() => flash("Test notification sent")).catch((e: unknown) => flash(e instanceof Error ? e.message : String(e))).finally(() => setBusy(false)); };
+  return <>
+    <div className="settings-section-label">Notifications on this device</div>
+    <div className="sgroup">
+      {!state ? <div className="srowx desc">{error || "Loading…"}</div> : <>
+        <div className="srowx" style={{ alignItems: "flex-start" }}><div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 500 }}>Approval notifications</div>
+          <div className="desc">{state.enabled
+            ? <>On. In the <a href="https://ntfy.sh/docs/subscribe/phone/" target="_blank" rel="noreferrer">ntfy app</a>, subscribe to the topic below{state.server_public ? "" : <> on <span className="mono">{state.server}</span></>}. Approve once and Deny work straight from notification; Always opens a confirm page. {PUBLIC_TOPIC_WARNING}</>
+            : <>Get push notifications for approvals, questions and completed chats. Requires the free <a href="https://ntfy.sh/docs/subscribe/phone/" target="_blank" rel="noreferrer">ntfy app</a>.</>}</div>
+        </div>{state.enabled ? <Button variant="ghost" disabled={busy} onClick={() => run(pushApi.disable)}><BellOff size={13} /> Disable</Button> : <Button disabled={busy} onClick={() => run(() => pushApi.enable(draft))}><Bell size={13} /> Enable</Button>}</div>
+        {[{ key: "questions" as const, label: "When a chat asks a question" }, { key: "done" as const, label: "When a chat finishes or fails" }, { key: "details" as const, label: "Show chat name and command summary in notifications" }, { key: "confirm_all" as const, label: "Require the confirm page for every action" }].map(({ key, label }) => <div className="srowx" key={key}><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>{label}</div></div><Switch label={label} checked={opts[key]} onChange={busy ? undefined : (v) => toggle(key, v)} /></div>)}
+        {state.enabled && <>
+          <div className="srowx" style={{ alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}><div style={{ flex: 1, minWidth: 200 }}><div style={{ fontWeight: 500 }}>Topic</div><div className="mono sel desc" style={{ wordBreak: "break-all" }}>{state.topic}</div><div className="mono sel desc" style={{ wordBreak: "break-all", fontSize: 11 }}>{state.subscribe_url}</div></div>
+            {state.app_url && <a className="btn" href={state.app_url}>Open in ntfy app</a>}
+            <Button variant="ghost" onClick={() => copyText(state.subscribe_url, { failure: "Couldn't copy. Copy the address manually.", onResult: (ok) => { if (ok) { setCopied(true); window.setTimeout(() => setCopied(false), 1200); } } })}><MorphText>{copied ? "Copied" : "Copy address"}</MorphText></Button><Button variant="ghost" disabled={busy} onClick={test}>Send test</Button>
+          </div>
+          {state.base_url && <div className="srowx desc">Buttons call back to <span className="mono">{state.base_url}</span>. Your phone must be able to reach it.</div>}
+        </>}
+      </>}
+    </div>
+  </>;
 }
 
 const TAILSCALE_STEPS = [

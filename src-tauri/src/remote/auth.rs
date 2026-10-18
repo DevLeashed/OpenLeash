@@ -54,6 +54,8 @@ pub struct Vault {
     pub sessions: Vec<Session>,
     /// Other machines this app opens over SSH (`ssh.rs`).
     pub ssh_hosts: Vec<super::ssh::SshHost>,
+    /// Ntfy server credentials, kept in the private remote vault.
+    pub ntfy: Ntfy,
 }
 
 impl Default for Vault {
@@ -65,6 +67,7 @@ impl Default for Vault {
             pair_token: String::new(),
             sessions: vec![],
             ssh_hosts: vec![],
+            ntfy: Ntfy::default(),
         }
     }
 }
@@ -79,6 +82,39 @@ pub struct Session {
     pub label: String,
     pub created: i64,
     pub last_seen: i64,
+    /// Phone notification preferences are scoped to this paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushCfg>,
+}
+
+/// Ntfy server credentials persisted only in remote.json.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ntfy {
+    pub server: String,
+    pub token: String,
+}
+
+/// One paired device's ntfy subscription (not a credential itself).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushCfg {
+    pub topic: String,
+    #[serde(default)]
+    pub details: bool,
+    #[serde(default)]
+    pub confirm_all: bool,
+    #[serde(default = "yes")]
+    pub questions: bool,
+    #[serde(default = "yes")]
+    pub done: bool,
+    pub base_url: String,
+    #[serde(rename = "gen")]
+    pub r#gen: String,
+    pub since: i64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// 244 bits of OS randomness, URL-safe. `uuid` v4 draws from `getrandom`, so
@@ -147,6 +183,7 @@ impl Vault {
             label: label.chars().take(80).collect(),
             created: now,
             last_seen: now,
+            push: None,
         });
         if self.sessions.len() > MAX_SESSIONS {
             self.sessions
@@ -487,15 +524,21 @@ mod tests {
     #[test]
     fn device_labels() {
         assert_eq!(
-            device_label("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"),
+            device_label(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+            ),
             "Safari on iPhone"
         );
         assert_eq!(
-            device_label("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"),
+            device_label(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+            ),
             "Edge on Windows"
         );
         assert_eq!(
-            device_label("Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"),
+            device_label(
+                "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
+            ),
             "Chrome on Android"
         );
         assert_eq!(device_label(""), "Unknown device");

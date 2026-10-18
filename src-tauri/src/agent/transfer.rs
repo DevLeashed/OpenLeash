@@ -58,6 +58,9 @@ pub struct Origin {
     /// The user ticked "Continue running there". Honoured only by a live
     /// import, and only when the chat was running.
     pub resume: bool,
+    /// Opened from an exported file (Settings → Import) rather than sent over
+    /// SSH. Nothing is archived anywhere, and the sender may be unknown.
+    pub file: bool,
 }
 
 #[derive(Serialize)]
@@ -336,12 +339,40 @@ pub struct ImportReport {
     pub resumed: bool,
 }
 
+/// "laptop (Linux)", or just "laptop" when the system is unknown.
+fn who(host: &str, os: &str) -> String {
+    let (h, o) = (clean(host), clean(os));
+    if o.is_empty() {
+        h
+    } else {
+        format!("{h} ({o})")
+    }
+}
+
+/// Past-tense label for what happened to the chat on its way here.
+fn verb(o: &Origin) -> &'static str {
+    if o.file {
+        "Imported"
+    } else if o.moved {
+        "Moved"
+    } else {
+        "Copied"
+    }
+}
+
+/// Where the chat came from, for a one-line label.
+fn from_label(o: &Origin) -> String {
+    if o.file {
+        "a file".into()
+    } else {
+        clean(&o.host)
+    }
+}
+
 /// The model-facing note for the main agent. Built here, from this machine's
 /// own facts plus the sender's strings, cleaned.
 pub fn main_note(o: &Origin, here: &Here, new_path: &str, homeless: bool) -> String {
-    let verb = if o.moved { "MOVED" } else { "COPIED" };
-    let (ah, ao) = (clean(&o.host), clean(&o.os));
-    let (bh, bo) = (clean(&here.host), clean(&here.os));
+    let (ah, bh) = (clean(&o.host), who(&here.host, &here.os));
     let old = clean(if o.project.is_empty() {
         &o.cwd
     } else {
@@ -349,41 +380,61 @@ pub fn main_note(o: &Origin, here: &Here, new_path: &str, homeless: bool) -> Str
     });
     let new = clean(new_path);
     let code = code_line(o);
-    let mut s = format!(
-        "<system-reminder>This chat was {verb} to a different computer. Until now you were working on {ah} ({ao}); you are now running on {bh} ({bo}), which has its own files, tools and shell.\n\
-         - The project path changed: {old} on {ah} is now {new} here."
-    );
+    let mut s = if o.file {
+        format!(
+            "<system-reminder>This chat was IMPORTED from an exported file written on {}. Until now you were working there; you are now running on {bh}, which has its own files, tools and shell.
+             - The project path changed: {old} on {ah} is now {new} here.",
+            who(&o.host, &o.os)
+        )
+    } else {
+        format!(
+            "<system-reminder>This chat was {} to a different computer. Until now you were working on {}; you are now running on {bh}, which has its own files, tools and shell.
+             - The project path changed: {old} on {ah} is now {new} here.",
+            if o.moved { "MOVED" } else { "COPIED" },
+            who(&o.host, &o.os)
+        )
+    };
     if homeless {
         s.push_str(&format!(" WARNING: no matching project was found on this machine, so the chat was opened in the home folder ({new}). Ask the user where the project is (or whether to clone it) before changing anything."));
     }
-    if !o.moved {
+    if !o.moved && !o.file {
         s.push_str(&format!(
-            "\n- This is an independent copy: the original chat still exists on {ah}."
+            "
+- This is an independent copy: the original chat still exists on {ah}."
         ));
     }
     s.push_str(&format!(
-        "\n- Only the conversation came along. Background commands, worktrees, spill files, checkpoints/rewind history and any processes started before the move did NOT come along; nothing from before is running here.\
-         \n- Tool calls that were still running when the chat was sent did not complete.\
-         \n- Re-read any file before editing it: everything you read before was on the other machine.\
-         \n- The code moved only if it was pushed or synced. {code} Check `git status`, `git log -1` and the branch here before assuming the code matches.</system-reminder>"
+        "
+- Only the conversation came along. Background commands, worktrees, spill files, checkpoints/rewind history and any processes started before the move did NOT come along; nothing from before is running here.         
+- Tool calls that were still running when the chat was sent did not complete.         
+- Re-read any file before editing it: everything you read before was on the other machine.         
+- The code moved only if it was pushed or synced. {code} Check `git status`, `git log -1` and the branch here before assuming the code matches.</system-reminder>"
     ));
     s
 }
 
 /// The same facts, worded for a subagent.
 pub fn sub_note(o: &Origin, here: &Here, new_path: &str) -> String {
-    let verb = if o.moved { "moved" } else { "copied" };
     let old = clean(if o.project.is_empty() {
         &o.cwd
     } else {
         &o.project
     });
+    let what = if o.file {
+        format!(
+            "was imported from an exported file written on {}, and is now running on",
+            who(&o.host, &o.os)
+        )
+    } else {
+        format!(
+            "was {} from {} to a different computer,",
+            if o.moved { "moved" } else { "copied" },
+            who(&o.host, &o.os)
+        )
+    };
     format!(
-        "<system-reminder>The chat you are a subagent in was {verb} from {} ({}) to a different computer, {} ({}). The project {old} is now {} here; any worktree or working directory you had on the old machine is gone, so work from the new path. Nothing that was running came along, your unfinished tool calls did not complete, and you must re-read files before editing them. The code moved only if it was pushed or synced. {}</system-reminder>",
-        clean(&o.host),
-        clean(&o.os),
-        clean(&here.host),
-        clean(&here.os),
+        "<system-reminder>The chat you are a subagent in {what} {}. The project {old} is now {} here; any worktree or working directory you had on the old machine is gone, so work from the new path. Nothing that was running came along, your unfinished tool calls did not complete, and you must re-read files before editing them. The code moved only if it was pushed or synced. {}</system-reminder>",
+        who(&here.host, &here.os),
         clean(new_path),
         code_line(o)
     )
@@ -429,11 +480,7 @@ pub fn prepare_import(b: Bundle, here: &Here, land: &Landing) -> (Task, ImportRe
     t.updated_at = now;
     t.status = "stopped".into();
     t.waiting_kind = None;
-    t.step = format!(
-        "{} from {}",
-        if o.moved { "Moved" } else { "Copied" },
-        clean(&o.host)
-    );
+    t.step = format!("{} from {}", verb(&o), from_label(&o));
     t.paused = None;
     t.unpaused = false;
     t.pending = Default::default();
@@ -513,8 +560,8 @@ pub fn prepare_import(b: Bundle, here: &Here, land: &Landing) -> (Task, ImportRe
             "notice",
             format!(
                 "{} from {} to {} · now working in {}",
-                if o.moved { "Moved" } else { "Copied" },
-                clean(&o.host),
+                verb(&o),
+                from_label(&o),
                 clean(&here.host),
                 clean(&land.project)
             ),
@@ -534,13 +581,22 @@ pub fn prepare_import(b: Bundle, here: &Here, land: &Landing) -> (Task, ImportRe
     } else {
         &o.project
     });
+    let route = if o.file {
+        format!(
+            "Imported from a file written on {} to {}",
+            who(&o.host, &o.os),
+            who(&here.host, &here.os)
+        )
+    } else {
+        format!(
+            "{} from {} to {}",
+            verb(&o),
+            who(&o.host, &o.os),
+            who(&here.host, &here.os)
+        )
+    };
     let mut text = format!(
-        "{} from {} ({}) to {} ({}) · {old} → {}\nOnly the conversation came along: background commands, worktrees and rewind history stayed behind. {}",
-        if o.moved { "Moved" } else { "Copied" },
-        clean(&o.host),
-        clean(&o.os),
-        clean(&here.host),
-        clean(&here.os),
+        "{route} · {old} → {}\nOnly the conversation came along: background commands, worktrees and rewind history stayed behind. {}",
         clean(&land.project),
         code_line(&o)
     );
@@ -551,7 +607,7 @@ pub fn prepare_import(b: Bundle, here: &Here, land: &Landing) -> (Task, ImportRe
     t.items.push(Item::new(
         "notice",
         text,
-        json!({"level": "info", "transfer": {"from": clean(&o.host), "moved": o.moved, "mapped_by": land.mapped_by}}),
+        json!({"level": "info", "transfer": {"from": from_label(&o), "moved": o.moved, "mapped_by": land.mapped_by}}),
     ));
     let report = ImportReport {
         task_id: t.id.clone(),
@@ -559,7 +615,7 @@ pub fn prepare_import(b: Bundle, here: &Here, land: &Landing) -> (Task, ImportRe
         project: t.project.clone(),
         mapped_by: land.mapped_by.into(),
         warning,
-        from_host: clean(&o.host),
+        from_host: from_label(&o),
         moved: o.moved,
         resumed: false,
     };
@@ -627,6 +683,39 @@ pub async fn import_named(
     r
 }
 
+/// Work out where a received chat lands and what git says about it there.
+/// Blocking (it runs `git`), so callers use `spawn_blocking`.
+fn landing(
+    project: Option<String>,
+    origin: &Origin,
+    projects: &[String],
+    base: Option<String>,
+) -> Result<Landing, String> {
+    let known = if project.is_none() && origin.git_remote_url.is_some() {
+        projects_with_urls(projects)
+    } else {
+        vec![]
+    };
+    let (path, how) = map_project(
+        project.as_deref(),
+        origin,
+        &known,
+        |p| Path::new(p).is_dir(),
+        &home_dir(),
+    )?;
+    let repo = git::is_repo(&path);
+    Ok(Landing {
+        base_commit_ok: repo && base.as_deref().is_some_and(|c| git::has_commit(&path, c)),
+        branch: if repo {
+            git::current_branch(&path)
+        } else {
+            String::new()
+        },
+        project: path,
+        mapped_by: how,
+    })
+}
+
 async fn import_inner(
     h: &Arc<Harness>,
     path: &Path,
@@ -642,33 +731,9 @@ async fn import_inner(
     };
     let origin = bundle.origin.clone();
     let base = bundle.tasks[0].base_commit.clone();
-    let land = tokio::task::spawn_blocking(move || -> Result<Landing, String> {
-        let known = if project.is_none() && origin.git_remote_url.is_some() {
-            projects_with_urls(&projects)
-        } else {
-            vec![]
-        };
-        let (path, how) = map_project(
-            project.as_deref(),
-            &origin,
-            &known,
-            |p| Path::new(p).is_dir(),
-            &home_dir(),
-        )?;
-        let repo = git::is_repo(&path);
-        Ok(Landing {
-            base_commit_ok: repo && base.as_deref().is_some_and(|c| git::has_commit(&path, c)),
-            branch: if repo {
-                git::current_branch(&path)
-            } else {
-                String::new()
-            },
-            project: path,
-            mapped_by: how,
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let land = tokio::task::spawn_blocking(move || landing(project, &origin, &projects, base))
+        .await
+        .map_err(|e| e.to_string())??;
     let here = Here {
         host: machine_name(),
         os: os_name(),
@@ -702,6 +767,146 @@ pub async fn import_pending(h: Arc<Harness>) {
             Err(e) => eprintln!("[openleash] couldn't import {n}: {e}"),
         }
     }
+}
+
+// ───────────────────────── import from an exported file ─────────────────────────
+
+/// What a file import hands back to the UI.
+#[derive(Serialize)]
+pub struct FileImport {
+    pub chats: Vec<super::TaskSummary>,
+    /// One line per chat that could not be placed in a matching project.
+    pub warnings: Vec<String>,
+}
+
+/// The origin to describe an exported chat by. Only the repository facts a
+/// v2 bundle's header carries are kept; where the chat was and whether it was
+/// running are re-read from the task, and a file is never a move, a resume, or
+/// anything that archives something somewhere else.
+fn file_origin(base: Option<Origin>, t: &Task) -> Origin {
+    let mut o = base.unwrap_or_default();
+    if clean(&o.host).is_empty() {
+        o.host = "an unknown computer".into();
+    }
+    o.project = t.project.clone();
+    o.cwd = t.cwd.clone();
+    o.branch = t.branch.clone();
+    o.task_id = t.id.clone();
+    o.moved = false;
+    o.was_running = false;
+    o.active_subs.clear();
+    o.resume = false;
+    o.file = true;
+    o
+}
+
+/// The chats in an export file: an `openleash-chats` document (v1 export, or a
+/// v2 transfer bundle whose header is kept), a bare list, or a single chat.
+fn parse_export(text: &str) -> Result<(Option<Origin>, Vec<Task>), String> {
+    let v: Value =
+        serde_json::from_str(text).map_err(|_| "That file isn't valid JSON.".to_string())?;
+    let (origin, list) = if v["format"] == FORMAT {
+        let o = v
+            .get("origin")
+            .filter(|o| o.is_object())
+            .and_then(|o| serde_json::from_value::<Origin>(o.clone()).ok());
+        (o, v["tasks"].clone())
+    } else if v.is_array() {
+        (None, v)
+    } else {
+        (None, json!([v]))
+    };
+    let tasks: Vec<Task> =
+        serde_json::from_value(list).map_err(|e| format!("Not an OpenLeash chat export: {e}"))?;
+    if tasks.is_empty() {
+        return Err("No chats in that file.".into());
+    }
+    Ok((origin, tasks))
+}
+
+/// Open an exported file as new chats. Everything in the file is untrusted, so
+/// each chat goes through `prepare_import` exactly as one sent over SSH does
+/// (frozen prompt, read-before-write stamps, revert contents and permission
+/// level dropped or clamped), and is placed in `project` when given, else the
+/// matching project here, else the home folder with a warning.
+pub async fn import_file(
+    h: &Arc<Harness>,
+    path: &str,
+    project: Option<String>,
+) -> Result<FileImport, String> {
+    let p = PathBuf::from(path);
+    let (origin, tasks) = tokio::task::spawn_blocking(move || {
+        let meta =
+            std::fs::metadata(&p).map_err(|e| format!("Couldn't read {}: {e}", p.display()))?;
+        if !meta.is_file() {
+            return Err("That isn't a file.".to_string());
+        }
+        if meta.len() > MAX_BUNDLE {
+            return Err(format!("That file is over {} MB.", MAX_BUNDLE >> 20));
+        }
+        let text = std::fs::read_to_string(&p)
+            .map_err(|e| format!("Couldn't read {}: {e}", p.display()))?;
+        parse_export(&text)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let (perm, projects) = {
+        let s = h.settings.read().await;
+        (s.perm.clone(), s.projects.clone())
+    };
+    let here = Here {
+        host: machine_name(),
+        os: os_name(),
+        perm,
+    };
+    let mut out = FileImport {
+        chats: vec![],
+        warnings: vec![],
+    };
+    for t in tasks {
+        let o = file_origin(origin.clone(), &t);
+        let (o2, base, proj, projs) = (
+            o.clone(),
+            t.base_commit.clone(),
+            project.clone(),
+            projects.clone(),
+        );
+        let land = tokio::task::spawn_blocking(move || landing(proj, &o2, &projs, base))
+            .await
+            .map_err(|e| e.to_string())??;
+        let (t, report) = prepare_import(
+            Bundle {
+                format: FORMAT.into(),
+                version: VERSION,
+                origin: o,
+                tasks: vec![t],
+            },
+            &here,
+            &land,
+        );
+        store::try_save_task(&t)?;
+        h.emit_summary(&t);
+        out.chats.push(t.summary());
+        if !report.warning.is_empty() {
+            out.warnings
+                .push(format!("{}: {}", clean(&report.title), report.warning));
+        }
+        h.tasks
+            .write()
+            .await
+            .insert(t.id.clone(), Arc::new(tokio::sync::Mutex::new(t)));
+    }
+    Ok(out)
+}
+
+/// Settings → Import: open an exported chat file here, optionally in a chosen folder.
+#[tauri::command]
+pub async fn tasks_import(
+    h: H<'_>,
+    path: String,
+    project: Option<String>,
+) -> Result<FileImport, String> {
+    import_file(h.inner(), &path, project).await
 }
 
 // ───────────────────────────── commands ─────────────────────────────
@@ -936,6 +1141,7 @@ mod tests {
             was_running: true,
             active_subs: vec!["s1".into()],
             resume: false,
+            file: false,
         }
     }
 
@@ -1263,6 +1469,106 @@ mod tests {
         assert!(imports_dir().join("failed").join("bad.json").exists());
         // And a traversal name never reaches the disk.
         assert!(import_named(&h, "../tasks/x.json", None).await.is_err());
+        drop(_g);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn file_import_is_sanitized_and_says_where_it_came_from() {
+        let mut o = file_origin(None, &task());
+        assert!(o.file && !o.moved && !o.resume && !o.was_running);
+        assert_eq!(o.host, "an unknown computer");
+        assert_eq!(o.project, "/home/a/proj");
+        o.os = String::new();
+        let b = Bundle {
+            format: FORMAT.into(),
+            version: VERSION,
+            origin: o,
+            tasks: vec![task()],
+        };
+        let (t, r) = prepare_import(b, &here(), &land("/srv/proj", "same_path"));
+        assert_eq!(t.step, "Imported from a file");
+        assert_eq!(r.from_host, "a file");
+        assert!(t.system.is_empty() && t.touched.is_empty() && t.read_files.is_empty());
+        assert_eq!(t.perm, "auto");
+        assert!(t.hydrated, "an unhydrated import is never written to disk");
+        let note = t.stop_note.unwrap();
+        assert!(note.contains("IMPORTED from an exported file"), "{note}");
+        assert!(note.contains("an unknown computer"), "{note}");
+        assert!(!note.contains("()"), "no empty OS in parentheses: {note}");
+        assert!(!note.contains("independent copy"), "{note}");
+        assert!(t
+            .items
+            .iter()
+            .any(|i| i.kind == "notice" && i.text.starts_with("Imported from a file written on")));
+    }
+
+    #[test]
+    fn file_import_reads_exports_bundles_lists_and_single_chats() {
+        let t = serde_json::to_value(task()).unwrap();
+        let v1 =
+            json!({"format": FORMAT, "version": 1, "tasks": [t.clone(), t.clone()]}).to_string();
+        let (o, tasks) = parse_export(&v1).unwrap();
+        assert!(o.is_none() && tasks.len() == 2);
+        let v2 = json!({"format": FORMAT, "version": 2, "origin": {"host": "laptop", "git_remote_url": "git@github.com:me/proj.git"}, "tasks": [t.clone()]}).to_string();
+        let (o, _) = parse_export(&v2).unwrap();
+        let o = file_origin(o, &task());
+        assert_eq!(o.host, "laptop");
+        assert!(o.git_remote_url.is_some());
+        assert_eq!(
+            parse_export(&json!([t.clone()]).to_string())
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        assert_eq!(parse_export(&t.to_string()).unwrap().1.len(), 1);
+        assert!(parse_export("{nope").is_err());
+        assert!(parse_export(&json!({"format": FORMAT, "tasks": []}).to_string()).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_import_persists_and_lands_where_asked() {
+        let home = tmp("fhome");
+        let _g = store::test_home(&home);
+        let (h, _ev) = crate::agent::tests::harness(Default::default(), vec![]);
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let file = home.join("export.json");
+        let t = serde_json::to_value(task()).unwrap();
+        std::fs::write(
+            &file,
+            json!({"format": FORMAT, "version": 1, "tasks": [t.clone(), t]}).to_string(),
+        )
+        .unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        // Nothing matches here and no folder is given: home, with a warning each.
+        let r = import_file(&h, &path, None).await.unwrap();
+        assert_eq!(r.chats.len(), 2);
+        assert_eq!(r.warnings.len(), 2);
+        for c in &r.chats {
+            assert!(store::task_path(&c.id).exists(), "the chat was written");
+            assert_ne!(c.id, "orig1");
+        }
+
+        // A chosen folder wins.
+        let p = proj.to_string_lossy().to_string();
+        let r = import_file(&h, &path, Some(p.clone())).await.unwrap();
+        assert!(r.warnings.is_empty());
+        let saved = store::read_task_full(&store::task_path(&r.chats[0].id)).unwrap();
+        assert_eq!(saved.project, p);
+        assert!(saved.system.is_empty() && saved.touched.is_empty());
+        assert!(h.tasks.read().await.contains_key(&r.chats[0].id));
+
+        // A folder that isn't there is refused, not silently replaced.
+        assert!(import_file(
+            &h,
+            &path,
+            Some(home.join("nope").to_string_lossy().to_string())
+        )
+        .await
+        .is_err());
         drop(_g);
         let _ = std::fs::remove_dir_all(&home);
     }

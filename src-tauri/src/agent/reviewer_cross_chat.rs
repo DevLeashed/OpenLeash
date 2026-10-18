@@ -200,7 +200,13 @@ async fn send(h: &Arc<Harness>, input: Value) -> Result<String, String> {
 async fn both_tools_refuse_while_the_setting_is_off_and_list_leaks_nothing() {
     let mut other = idle("other", "Payroll import");
     other.step = "Running the migration".into();
-    let (h, _) = harness(Settings::default(), vec![task("me", "m"), other]);
+    let (h, _) = harness(
+        Settings {
+            cross_chat: false,
+            ..Settings::default()
+        },
+        vec![task("me", "m"), other],
+    );
 
     let err = list(&h, json!({})).await.unwrap_err();
     assert!(err.contains("turned off"), "got: {err}");

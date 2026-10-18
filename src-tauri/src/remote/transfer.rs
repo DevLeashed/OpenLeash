@@ -23,7 +23,7 @@
 //! there. Move archives the chat here only after the import is confirmed.
 
 use super::ssh::{self, SshHost, BASE_OPTS};
-use crate::agent::host::{login_command, sh_quote};
+use crate::agent::host::login_command;
 use crate::agent::transfer::{self as xfer, Origin};
 use crate::agent::{git, runner, Harness, Item};
 use futures_util::{SinkExt, StreamExt};
@@ -731,6 +731,7 @@ async fn send(
         was_running,
         active_subs,
         resume,
+        file: false,
     };
     let name = format!("{}.json", uuid::Uuid::new_v4().simple());
     let tmp = TempFile(std::env::temp_dir().join(format!("openleash-transfer-{name}")));

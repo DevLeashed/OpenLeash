@@ -54,3 +54,23 @@ fn a_non_repository_has_no_git_metadata() {
     let cwd = sandbox.root().to_string_lossy().to_string();
     assert_eq!(git::metadata(&cwd), None);
 }
+
+/// `metadata` is one `rev-parse` for all three answers; a detached HEAD must
+/// still read the way the separate lookups read it (`HEAD` as the branch).
+#[test]
+fn a_detached_head_matches_the_separate_lookups() {
+    let sandbox = Sandbox::new("task-git-detached");
+    let cwd = sandbox.root().to_string_lossy().to_string();
+    run(&cwd, &["init", "-q"]);
+    run(&cwd, &["config", "user.name", "OpenLeash Test"]);
+    run(&cwd, &["config", "user.email", "test@openleash.dev"]);
+    sandbox.write("file.txt", "x\n");
+    run(&cwd, &["add", "file.txt"]);
+    run(&cwd, &["commit", "-q", "-m", "initial"]);
+    run(&cwd, &["checkout", "-q", "--detach"]);
+
+    let metadata = git::metadata(&cwd).expect("a detached repository is detected");
+    assert_eq!(metadata.branch, git::current_branch(&cwd));
+    assert_eq!(metadata.head, git::head(&cwd));
+    assert!(git::is_repo_cached(&cwd), "metadata seeds the repo cache");
+}

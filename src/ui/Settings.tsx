@@ -5,7 +5,9 @@ import { flash, isNarrow, saveSettings, set, useStore } from "../store";
 import { ago } from "../api";
 import { archiveTask, deleteArchivedTasks, deleteTask, exportArchived, exportTasks, importTasks } from "./Chrome";
 import { copyText } from "./clipboard";
-import { AccountsTab, AgentsTab, RoutingTab } from "./Accounts";
+import { AccountsTab, AgentsTab } from "./Accounts";
+import { BurnerSection } from "./Burner";
+import { RoutersTab } from "./Routers";
 import { ModelsTab } from "./ModelManager";
 import { SkillsTab } from "./Skills";
 import { StatsTab } from "./Stats";
@@ -16,10 +18,12 @@ import { ChecksTab } from "./Hooks";
 import { RemoteTab } from "./Remote";
 import { WorkspacesTab } from "./Workspaces";
 import { defaultMode } from "../workspaces";
+import { archiveRace, useRaces } from "../race";
 import { SLASH } from "./Composer";
 import { stepZoom, DEFAULT_ZOOM, ZOOMS } from "../store";
 import { Minus, Plus, Trash2 } from "lucide-react";
 import { Dropdown, Button, ChoiceRow, IconButton, Input, NavTab, Pressable, Segmented, Switch, MorphText } from "./primitives";
+import { SAVED_SORT_OPTIONS, savedSortOf } from "./Saved";
 import { HIDDEN_SETTINGS_TABS, SETTINGS_TABS, settingsTabDef } from "./settingsTabs";
 
 const THEMES = [
@@ -257,17 +261,14 @@ function General() {
           </div></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Close to tray</div><div className="desc">Keep agents running after closing the window.</div></div>
           <Switch label="Close to tray" checked={s.close_to_tray !== false} onChange={(checked) => void saveSettings({ close_to_tray: checked })} /></div>
+        {/* Memory sits up here because it changes how every chat behaves, and it
+            is on by default: the switch to turn it off should not be buried. */}
+        <div className="srowx" style={{ alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Memory</div><div className="desc">The agent keeps notes about you (shared by every project) and about each project, and loads them at the start of every new chat — so preferences and corrections stick without you repeating them. It saves on its own and keeps them tidy, and never stores secrets. Plain markdown in <span className="mono">~/.openleash/memory/</span>: read, edit or delete any of it by hand.</div></div>
+          <Switch label="Memory" checked={s.memory !== false} onChange={(checked) => void saveSettings({ memory: checked })} />
+        </div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Automatically resume when an account is available</div><div className="desc">Restart chats paused because all provider accounts or keys were out of usage, or because every account was held by a usage cap.</div></div>
           <Switch label="Automatically resume when an account is available" checked={s.automatic_resume !== false} onChange={(checked) => void saveSettings({ automatic_resume: checked })} /></div>
-        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Needs you inbox</div><div className="desc">Show pending approvals and questions from all chats in the sidebar.</div></div>
-          <Switch label="Show Needs you inbox" checked={s.needs_you ?? false} onChange={(checked) => void saveSettings({ needs_you: checked })} /></div>
-        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Pull requests</div><div className="desc">Add a GitHub pull-request screen beside Saved prompts. Shows this project's PRs only. Off by default.</div></div>
-          <Switch label="Show Pull requests" checked={s.show_pull_requests ?? false} onChange={(checked) => void saveSettings({ show_pull_requests: checked })} /></div>
-        {/* The footer button sits beside the usage bar, which is about accounts, so
-            Accounts is what it has always opened and stays the default. Any page
-            is offered, including the ones the nav hides: see `settingsTabs.ts`. */}
-        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Sidebar shortcut button</div><div className="desc">The button beside the usage bar opens this settings page.</div></div>
-          <Dropdown placeholder="Settings page" value={settingsTabDef(s.sidebar_button_tab).id} options={SETTINGS_TABS.map((t) => ({ value: t.id, label: t.label, icon: <t.Icon size={13} strokeWidth={1.7} aria-hidden="true" /> }))} onChange={(v) => void saveSettings({ sidebar_button_tab: v })} style={{ width: 176, height: 28, padding: "0 8px", flex: "0 0 176px" }} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Notifications</div><div className="desc">When a chat finishes, fails or needs you. A desktop popup if the window is in the background, an in-app notice if you are looking at it.</div></div>
           <Switch label="Desktop notifications" checked={s.notify !== false} onChange={(checked) => void saveSettings({ notify: checked })} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Send message with</div></div>
@@ -310,13 +311,6 @@ function General() {
       <ProjectDocs />
       <div className="settings-section-label">Import from another tool</div>
       <ProjectImport />
-      <div className="settings-section-label">Memory</div>
-      <div className="sgroup">
-        <div className="srowx" style={{ alignItems: "flex-start" }}>
-          <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Let the agent remember things</div><div className="desc">Keeps notes per project in <span className="mono">~/.openleash/memory/</span> and reads them back in later chats, so your preferences and corrections survive between sessions. Plain markdown — read, edit or delete any of it by hand.</div></div>
-          <Switch label="Let the agent remember things" checked={s.memory ?? false} onChange={(checked) => void saveSettings({ memory: checked })} />
-        </div>
-      </div>
       <div className="settings-section-label">Trace export</div>
       <div className="sgroup">
         <div className="srowx" style={{ alignItems: "flex-start" }}>
@@ -415,6 +409,8 @@ function ChatsTab() {
   const [armAll, setArmAll] = useState(false);
   const all = Object.values(tasks);
   const archived = all.filter((t) => t.archived).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const raceMap = useRaces((st) => st.races);
+  const archivedRaces = Object.values(raceMap).filter((r) => r.archived).sort((a, b) => b.created_at.localeCompare(a.created_at));
   return (
     <>
       <div className="settings-head"><div className="settings-head-main settings-title">Chats</div></div>
@@ -427,8 +423,8 @@ function ChatsTab() {
       <div className="settings-section-label">Other chats</div>
       <div className="sgroup">
         <div className="srowx" style={{ alignItems: "flex-start" }}>
-          <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Let agents see and message your other chats</div><div className="desc">Gives a chat's main agent <span className="mono">list_chats</span> (search your chats and see what each is doing) and <span className="mono">message_chat</span> (send one of them a message). Off by default: it reads conversations you did not open, and a message starts work in one of them. A chat that is paused or archived refuses, so nothing here can unpause a chat you froze, and each message still asks unless you always-allow it. Off applies to new chats immediately; a chat already running is told the rules changed.</div></div>
-          <Switch label="Let agents see and message your other chats" checked={s.cross_chat ?? false} onChange={(checked) => void saveSettings({ cross_chat: checked })} />
+          <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Let agents see and message your other chats</div><div className="desc">Lets a chat's main agent search your other chats (<span className="mono">list_chats</span>) and message them (<span className="mono">message_chat</span>). Each message still asks unless you always-allow it.</div></div>
+          <Switch label="Let agents see and message your other chats" checked={s.cross_chat ?? true} onChange={(checked) => void saveSettings({ cross_chat: checked })} />
         </div>
       </div>
       <div className="sgroup">
@@ -454,6 +450,17 @@ function ChatsTab() {
               reach, so naming the set beats repeating the verb. */}
           <Button variant="ghost" disabled={!archived.length} style={{ height: 26 }} onClick={() => void exportArchived()}>Export archived</Button></div>
       </div>
+      {archivedRaces.length > 0 && <>
+        <div className="settings-section-label">Archived races · {archivedRaces.length}</div>
+        <div className="sgroup">
+          {archivedRaces.map((r) => (
+            <div key={r.id} className="srowx agentrow" style={{ minHeight: 42 }}>
+              <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>Race · {r.prompt}</div><div className="desc">{r.attempts.length} attempts · {baseName(r.project)}{r.winner ? (r.merged ? " · merged" : " · winner picked") : ""}</div></div>
+              <Button variant="ghost" style={{ height: 26 }} onClick={() => void archiveRace(r.id, false)}>Restore</Button>
+            </div>
+          ))}
+        </div>
+      </>}
       {archived.length ? <div className="sgroup">
         {archived.map((t) => (
           <div key={t.id} className="srowx agentrow" style={{ minHeight: 42 }} onMouseLeave={() => { if (arm === t.id) setArm(null); if (removeWorktree === t.id) setRemoveWorktree(null); }}>
@@ -506,10 +513,55 @@ function CommandsTab() {
   </>;
 }
 
+/**
+ * Settings → Tabs: every setting that decides which screens the sidebar offers
+ * or how one of them behaves, grouped by the tab it belongs to. They used to be
+ * rows in General; nothing about where they are stored has changed.
+ */
+function TabsTab() {
+  const s = useStore((st) => st.settings)!;
+  return (
+    <>
+      <div className="settings-head"><div className="settings-head-main settings-title">Tabs</div></div>
+      <div className="settings-note">What the sidebar shows, and how each screen behaves. Grouped by the tab they belong to.</div>
+      <div className="settings-section-label">Sidebar</div>
+      <div className="sgroup">
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show chats from all projects</div><div className="desc">List chats from every project folder, not just the current one.</div></div>
+          <Switch label="Show chats from all projects" checked={s.all_projects ?? false} onChange={(checked) => void saveSettings({ all_projects: checked })} /></div>
+        {/* The footer button sits beside the usage bar, which is about accounts, so
+            Accounts is what it has always opened and stays the default. Any page
+            is offered, including the ones the nav hides: see `settingsTabs.ts`. */}
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Shortcut button</div><div className="desc">The button beside the usage bar opens this settings page.</div></div>
+          <Dropdown placeholder="Settings page" value={settingsTabDef(s.sidebar_button_tab).id} options={SETTINGS_TABS.map((t) => ({ value: t.id, label: t.label, icon: <t.Icon size={13} strokeWidth={1.7} aria-hidden="true" /> }))} onChange={(v) => void saveSettings({ sidebar_button_tab: v })} style={{ width: 176, height: 28, padding: "0 8px", flex: "0 0 176px" }} /></div>
+      </div>
+      <div className="settings-section-label">Needs you</div>
+      <div className="sgroup">
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Needs you inbox</div><div className="desc">Show pending approvals and questions from all chats in the sidebar.</div></div>
+          <Switch label="Show Needs you inbox" checked={s.needs_you ?? false} onChange={(checked) => void saveSettings({ needs_you: checked })} /></div>
+      </div>
+      <div className="settings-section-label">Pull requests</div>
+      <div className="sgroup">
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Pull requests</div><div className="desc">Add a GitHub pull-request screen beside Saved prompts. Shows this project's PRs only. Off by default.</div></div>
+          <Switch label="Show Pull requests" checked={s.show_pull_requests ?? false} onChange={(checked) => void saveSettings({ show_pull_requests: checked })} /></div>
+      </div>
+      <div className="settings-section-label">Schedules</div>
+      <div className="sgroup">
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Show Schedules</div><div className="desc">Add a Schedules screen to the sidebar for recurring agent runs. Off by default. Hiding it does not pause schedules — enabled schedules keep running; pause them from the Schedules screen.</div></div>
+          <Switch label="Show Schedules" checked={s.show_schedules ?? false} onChange={(checked) => void saveSettings({ show_schedules: checked })} /></div>
+      </div>
+      <div className="settings-section-label">Saved prompts</div>
+      <div className="sgroup">
+        <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Sort order</div><div className="desc">How the Saved prompts list is ordered. The Sort control on that screen appears while chats from all projects are shown.</div></div>
+          <Dropdown value={savedSortOf(s.saved_sort)} options={SAVED_SORT_OPTIONS} onChange={(v) => void saveSettings({ saved_sort: v })} search={false} placeholder="Sort saved prompts" style={{ width: 232, height: 28, padding: "0 8px", flex: "0 0 232px" }} /></div>
+      </div>
+    </>
+  );
+}
+
 // Filtered once at module load, so `i` indexes the visible list only and the
 // staggered nav animation stays gapless. A page listed as hidden keeps its
 // branch in the render switch below and simply gets no nav button — the
-// "Sidebar shortcut button" choice in General still offers it. See
+// "Shortcut button" choice in Tabs still offers it. See
 // `settingsTabs.ts` for the list itself.
 const VISIBLE_TABS = SETTINGS_TABS.filter((t) => !HIDDEN_SETTINGS_TABS.includes(t.id));
 
@@ -533,12 +585,13 @@ export function SettingsView() {
           {tab === "general" && <General />}
           {tab === "theme" && <ThemeTab />}
           {tab === "models" && <ModelsTab />}
-          {tab === "accounts" && <AccountsTab />}
-          {tab === "routing" && <RoutingTab />}
+          {tab === "accounts" && <><AccountsTab /><BurnerSection /></>}
+          {tab === "routing" && <RoutersTab />}
           {tab === "agents" && <AgentsTab />}
           {tab === "skills" && <SkillsTab />}
           {tab === "commands" && <CommandsTab />}
           {tab === "chats" && <ChatsTab />}
+          {tab === "tabs" && <TabsTab />}
           {tab === "workspaces" && <WorkspacesTab />}
           {tab === "perms" && <Perms />}
           {tab === "plugins" && <PluginsTab />}

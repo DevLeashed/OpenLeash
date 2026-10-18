@@ -41,12 +41,14 @@
 /// The prefix is what separates "open this chat" from the bare `default` a
 /// toast with no argument would carry — a click on a toast raised before this
 /// shipped must not navigate somewhere arbitrary.
+#[cfg(any(windows, test))]
 pub const TASK_ARG: &str = "task:";
 
 /// XML-escape for the toast document. The text is app-owned, but the document is
 /// parsed as XML by the shell and a stray `<` or `&` would make the whole toast
 /// fail to parse — silently costing the user the notification rather than
 /// anything louder.
+#[cfg(any(windows, test))]
 fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
     let mut out = std::borrow::Cow::Borrowed(s);
     for (needle, replacement) in [
@@ -70,6 +72,7 @@ fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
 /// builder fills a fixed set of `text1`/`text2` fields and has nowhere to put a
 /// `launch` attribute, which is precisely why a click on its toasts has nothing
 /// to activate.
+#[cfg(any(windows, test))]
 pub fn toast_xml(title: &str, body: &str, task_id: &str) -> String {
     format!(
         r#"<toast launch="{arg}" scenario="default"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text></binding></visual></toast>"#,
@@ -81,6 +84,7 @@ pub fn toast_xml(title: &str, body: &str, task_id: &str) -> String {
 
 /// What a click asked for. `None` means "raise the app, but name nothing" — a
 /// toast with no argument, or one we can't make sense of.
+#[cfg(any(windows, test))]
 pub fn parse_activation(args: Option<&str>) -> Option<String> {
     let id = args?.trim().strip_prefix(TASK_ARG)?;
     // Task ids are 12 hex chars (`agent::new_id` truncates a UUID). Requiring
@@ -523,7 +527,7 @@ pub use imp::register;
 
 /// The CLSID toast clicks are delivered to. Off Windows it exists only so the
 /// tests below have something stable to assert on.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 pub const ACTIVATOR_CLSID: &str = "com.openleash.app";
 
 /// Register the class object so toast clicks can reach this process, and register

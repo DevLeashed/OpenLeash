@@ -191,6 +191,26 @@ describe("a question the agent isn't waiting on", () => {
     expect(response).toEqual({ answers: [["openleash", "leash"]], notes: [""], skipped: [] });
   });
 
+  // The agent's count is its guess at what is useful, and the user can waive it for
+  // their own answer. Waiving it moves the hint to ready-to-send; nothing else changes.
+  it("removes a count limit for this answer, and the card reads ready to send", () => {
+    const capped = card({
+      data: { title: "Crates", questions: [{ question: "Which crates?", type: "multi", max: 2, options: [{ label: "openleash" }, { label: "leash" }, { label: "tauri" }] }] },
+    } as Partial<Item>);
+    render(<AskNonBlocking it={capped} task={task} />);
+    expect(screen.getByText("Pick any · at most 2")).toBeTruthy();
+    fireEvent.click(screen.getByText("openleash"));
+    fireEvent.click(screen.getByText("leash"));
+    fireEvent.click(screen.getByText("tauri"));
+    expect(document.querySelector(".al-hint")!.textContent).not.toBe("ready to send");
+    fireEvent.click(screen.getByRole("button", { name: "Remove limits" }));
+    expect(document.querySelector(".al-hint")!.textContent).toBe("ready to send");
+    fireEvent.click(screen.getByRole("button", { name: /Send answer/ }));
+    expect(answerNonBlocking).toHaveBeenCalledTimes(1);
+    const [, , response] = answerNonBlocking.mock.calls[0]!;
+    expect(response).toEqual({ answers: [["openleash", "leash", "tauri"]], notes: [""], skipped: [] });
+  });
+
   it("sends the chosen option as the answer, with the item it belongs to", () => {
     render(<AskNonBlocking it={card()} task={task} />);
     fireEvent.click(screen.getByText("leash"));

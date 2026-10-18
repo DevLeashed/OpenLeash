@@ -89,7 +89,7 @@ fn remote_output(cwd: &str, args: &[&str]) -> std::io::Result<std::process::Outp
     })
 }
 
-fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
     let out = output(cwd, args).map_err(|e| format!("git not available: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -108,37 +108,99 @@ pub struct RepoMetadata {
 }
 
 pub fn metadata(cwd: &str) -> Option<RepoMetadata> {
-    // An unborn repo prints `true` and `HEAD` before rev-parse exits unsuccessfully.
-    // Preserve that as a repo with no branch or base commit, as the old helpers did.
+    // One process for all three answers. Plain `HEAD` comes before
+    // `--abbrev-ref`, which applies to every revision after it. An unborn repo
+    // prints `true` and then fails on `HEAD`; preserve that as a repo with no
+    // branch or base commit, as the old helpers did.
     let out = output(
         cwd,
-        &["rev-parse", "--is-inside-work-tree", "--abbrev-ref", "HEAD"],
+        &[
+            "rev-parse",
+            "--is-inside-work-tree",
+            "HEAD",
+            "--abbrev-ref",
+            "HEAD",
+        ],
     )
-    .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut lines = stdout.lines().map(str::trim);
-    if lines.next()? != "true" {
-        return None;
-    }
-    let branch = lines.next().unwrap_or_default();
-    if !out.status.success() {
-        return Some(RepoMetadata {
-            branch: String::new(),
-            head: None,
-        });
-    }
-    let head = git(cwd, &["rev-parse", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string());
-    Some(RepoMetadata {
-        branch: branch.to_string(),
-        head,
-    })
+    .ok();
+    let meta = out.and_then(|out| {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines().map(str::trim);
+        if lines.next()? != "true" {
+            return None;
+        }
+        if !out.status.success() {
+            return Some(RepoMetadata {
+                branch: String::new(),
+                head: None,
+            });
+        }
+        let head = lines.next().map(str::to_string);
+        let branch = lines.next().unwrap_or_default().to_string();
+        Some(RepoMetadata { branch, head })
+    });
+    // Fresh from the process just run, so it seeds the prompt builder's cache.
+    remember_repo(cwd, meta.is_some());
+    meta
 }
 
 pub fn is_repo(cwd: &str) -> bool {
     git(cwd, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// How long [`is_repo_cached`] trusts an answer. The system prompt is built
+/// once per agent, from many agents in a chat, and each build asked git again;
+/// a folder becoming (or ceasing to be) a repository within a minute of a chat
+/// starting is rare, and the cost of being wrong is only the prompt's "is a
+/// git repository" line.
+const REPO_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn repo_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn remember_repo(cwd: &str, is_repo: bool) {
+    repo_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cwd.to_string(), (is_repo, std::time::Instant::now()));
+}
+
+fn cached_repo(cwd: &str) -> Option<bool> {
+    repo_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(cwd)
+        .filter(|(_, at)| at.elapsed() < REPO_CACHE_TTL)
+        .map(|(r, _)| *r)
+}
+
+/// [`is_repo`], answered from a short-lived per-folder cache when it can be.
+/// Blocking on a miss: async callers use [`is_repo_async`].
+pub fn is_repo_cached(cwd: &str) -> bool {
+    if let Some(r) = cached_repo(cwd) {
+        return r;
+    }
+    let r = is_repo(cwd);
+    remember_repo(cwd, r);
+    r
+}
+
+/// [`is_repo_cached`] for async code: a miss runs git on the blocking pool,
+/// never on a runtime worker.
+pub async fn is_repo_async(cwd: &str) -> bool {
+    if let Some(r) = cached_repo(cwd) {
+        return r;
+    }
+    let cwd = cwd.to_string();
+    tokio::task::spawn_blocking(move || is_repo_cached(&cwd))
+        .await
         .unwrap_or(false)
 }
 
@@ -198,6 +260,31 @@ pub fn branches(cwd: &str) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// Create `name` at `base` (`HEAD` when empty) without checking it out. The
+/// project's checkout and every chat's worktree stay where they are; the branch
+/// is there to pick as the base for new chats. It never moves an existing branch.
+pub fn create_branch(cwd: &str, name: &str, base: &str) -> Result<(), String> {
+    let name = name.trim();
+    let base = if base.trim().is_empty() {
+        "HEAD"
+    } else {
+        base.trim()
+    };
+    // `git branch` reads a leading `-` as an option. `refs/heads/` makes
+    // check-ref-format apply the full refname rules without expanding shorthand
+    // such as `@{-1}`, which `--branch` would resolve and then accept.
+    if name.is_empty()
+        || name.starts_with('-')
+        || git(cwd, &["check-ref-format", &format!("refs/heads/{name}")]).is_err()
+    {
+        return Err(format!("'{name}' is not a valid branch name."));
+    }
+    if base.starts_with('-') {
+        return Err(format!("'{base}' is not a branch to start from."));
+    }
+    git(cwd, &["branch", name, base]).map(|_| ())
 }
 
 pub fn slug(text: &str) -> String {
@@ -932,6 +1019,40 @@ pub fn review(cwd: &str, base: &str) -> Result<Vec<FileDiff>, String> {
     Ok(files)
 }
 
+/// What [`review`] adds up to, for the session header: files changed and
+/// lines added/removed, without building (and shipping over IPC) every line.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewStats {
+    pub files: usize,
+    pub add: usize,
+    pub del: usize,
+}
+
+/// [`review`]'s totals from `git diff --numstat` against the same `base`.
+///
+/// Kept to `review`'s exact semantics so the header and the review screen
+/// never disagree: a binary file counts as a file with no lines (numstat's
+/// `-`), and untracked files are the same first 200 that `review` lists, each
+/// counted as at most 3000 added lines of UTF-8 text, as `review` counts them.
+pub fn review_stats(cwd: &str, base: &str) -> Result<ReviewStats, String> {
+    let raw = git(cwd, &["diff", "--numstat", "--no-ext-diff", base, "--"])?;
+    let mut s = ReviewStats::default();
+    for line in raw.lines().filter(|l| !l.is_empty()) {
+        let mut it = line.splitn(3, '\t');
+        s.add += it.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+        s.del += it.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+        s.files += 1;
+    }
+    if let Ok(untracked) = git(cwd, &["ls-files", "--others", "--exclude-standard"]) {
+        for p in untracked.lines().filter(|l| !l.is_empty()).take(200) {
+            let content = read_worktree_file(cwd, p).unwrap_or_default();
+            s.add += content.lines().take(3000).count();
+            s.files += 1;
+        }
+    }
+    Ok(s)
+}
+
 pub fn revert_file(cwd: &str, base: &str, path: &str) -> Result<(), String> {
     let existed = git(cwd, &["cat-file", "-e", &format!("{base}:{path}")]).is_ok();
     if existed {
@@ -1054,4 +1175,184 @@ pub fn commit_with(cwd: &str, message: &str, no_verify: bool) -> Result<String, 
     Ok(git(cwd, &["rev-parse", "--short", "HEAD"])?
         .trim()
         .to_string())
+}
+
+#[cfg(test)]
+mod branch_create_tests {
+    use super::{branches, create_branch, current_branch, git};
+
+    /// Run `git` in `cwd` with a fixed identity; the test must not depend on the
+    /// developer's config (signing, user name).
+    fn run(cwd: &str, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A repository with one commit on whatever branch git starts on.
+    fn repo(tag: &str) -> (super::super::reviewer_sandbox::Sandbox, String) {
+        let sb = super::super::reviewer_sandbox::Sandbox::new(tag);
+        let cwd = sb.root().to_string_lossy().to_string();
+        run(&cwd, &["init", "-q"]);
+        sb.write("a.txt", "one\n");
+        run(&cwd, &["add", "-A"]);
+        run(&cwd, &["commit", "-q", "-m", "base"]);
+        (sb, cwd)
+    }
+
+    fn rev(cwd: &str, name: &str) -> String {
+        git(cwd, &["rev-parse", name]).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn a_new_branch_starts_at_the_base_and_the_checkout_stays_put() {
+        let (_sb, cwd) = repo("branch-create-ok");
+        let base = current_branch(&cwd);
+
+        create_branch(&cwd, "feature/login", &base).unwrap();
+
+        assert_eq!(
+            current_branch(&cwd),
+            base,
+            "creating a branch must not switch to it"
+        );
+        assert!(branches(&cwd).contains(&"feature/login".to_string()));
+        assert_eq!(rev(&cwd, "feature/login"), rev(&cwd, &base));
+    }
+
+    #[test]
+    fn an_empty_base_starts_from_the_checked_out_commit() {
+        let (_sb, cwd) = repo("branch-create-head");
+        create_branch(&cwd, "from-head", "  ").unwrap();
+        assert_eq!(rev(&cwd, "from-head"), rev(&cwd, "HEAD"));
+    }
+
+    #[test]
+    fn names_git_would_reject_are_refused_and_nothing_is_created() {
+        let (_sb, cwd) = repo("branch-create-names");
+        let before = branches(&cwd);
+        // Empty, a leading dash (an option to `git branch`), spaces, `..`,
+        // `@{` (a revision shorthand), `~`, a `.lock` suffix and a trailing slash.
+        for bad in [
+            "",
+            "-x",
+            "--all",
+            "a b",
+            "a..b",
+            "x@{-1}",
+            "bad~name",
+            "x.lock",
+            "trailing/",
+        ] {
+            assert!(
+                create_branch(&cwd, bad, "HEAD").is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        assert_eq!(
+            branches(&cwd),
+            before,
+            "a refused name must not leave a branch behind"
+        );
+    }
+
+    #[test]
+    fn a_base_that_reads_as_an_option_is_refused() {
+        let (_sb, cwd) = repo("branch-create-base");
+        assert!(create_branch(&cwd, "ok-name", "--force").is_err());
+        assert!(!branches(&cwd).contains(&"ok-name".to_string()));
+    }
+
+    #[test]
+    fn an_existing_branch_is_never_moved() {
+        let (sb, cwd) = repo("branch-create-existing");
+        let base = current_branch(&cwd);
+        create_branch(&cwd, "keep", &base).unwrap();
+        let kept = rev(&cwd, "keep");
+
+        // Move the base on, so a silent force would be visible as a changed commit.
+        sb.write("b.txt", "two\n");
+        run(&cwd, &["add", "-A"]);
+        run(&cwd, &["commit", "-q", "-m", "second"]);
+
+        assert!(create_branch(&cwd, "keep", &base).is_err());
+        assert_eq!(
+            rev(&cwd, "keep"),
+            kept,
+            "the existing branch must keep its commit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_stats_tests {
+    use super::{git, review, review_stats, ReviewStats};
+
+    /// The session header reads `review_stats`, the review screen reads
+    /// `review`; they must add up to the same thing for every kind of change.
+    #[test]
+    fn review_stats_add_up_to_what_review_shows() {
+        let sb = super::super::reviewer_sandbox::Sandbox::new("review-stats");
+        let cwd = sb.root().to_string_lossy().to_string();
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&cwd)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        sb.write("keep.txt", "a\nb\nc\n");
+        sb.write("gone.txt", "1\n2\n");
+        sb.write("old-name.txt", "same\ncontent\nhere\n");
+        std::fs::write(sb.root().join("blob.bin"), [0u8, 1, 2, 0, 3]).unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "base"]);
+        let base = git(&cwd, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        sb.write("keep.txt", "a\nB\nc\nd\n");
+        std::fs::remove_file(sb.root().join("gone.txt")).unwrap();
+        std::fs::write(sb.root().join("blob.bin"), [9u8, 0, 9, 0]).unwrap();
+        run(&["mv", "old-name.txt", "new-name.txt"]);
+        sb.write("staged.txt", "s1\ns2\n");
+        run(&["add", "staged.txt"]);
+        run(&["commit", "-q", "-m", "more"]);
+        sb.write("untracked.txt", "u1\nu2\nu3\n");
+
+        let files = review(&cwd, &base).unwrap();
+        let want = ReviewStats {
+            files: files.len(),
+            add: files.iter().map(|f| f.add).sum(),
+            del: files.iter().map(|f| f.del).sum(),
+        };
+        assert!(want.files >= 5, "the fixture covers each kind: {want:?}");
+        assert_eq!(review_stats(&cwd, &base).unwrap(), want);
+    }
 }

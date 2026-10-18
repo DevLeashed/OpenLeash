@@ -70,8 +70,12 @@ pub const MAX_RESULTS: usize = 10;
 
 /// Plugin tool names. Must match `plugins::schemas`. Anything not listed here
 /// classifies as [`Source::Other`] and is therefore never deferred, which is
-/// the safe direction for a tool nobody has taught this file about.
-const PLUGIN_IDS: [&str; 4] = ["github", "computer", "render", "browser"];
+/// the safe direction for a tool nobody has taught this file about. The service
+/// plugins (`plugin_services::SERVICES`) are listed too, so `defer_plugins`
+/// covers them like the others.
+const PLUGIN_IDS: [&str; 9] = [
+    "github", "computer", "render", "browser", "linear", "jira", "slack", "notion", "gitlab",
+];
 
 /// Where a deferred tool came from. Carried so a search result can say whose
 /// tool it is, and so a description can name what is being held back.

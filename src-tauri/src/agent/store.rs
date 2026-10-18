@@ -182,6 +182,15 @@ pub struct Route {
     pub steps: Vec<String>,
     /// pause | fail
     pub on_exhausted: String,
+    /// Optional label shown in the router editor.
+    #[serde(default)]
+    pub description: String,
+    /// Models ordered weakest to strongest.
+    #[serde(default)]
+    pub ladder: Vec<String>,
+    /// Ordered routing rules.
+    #[serde(default)]
+    pub rules: Vec<super::routerules::Rule>,
 }
 
 /// A subagent definition (built-in or user-made).
@@ -805,6 +814,10 @@ pub struct Settings {
     /// Show the optional GitHub pull-request screen next to Saved prompts.
     #[serde(default)]
     pub show_pull_requests: bool,
+    /// Show the Schedules screen in the sidebar. Off by default; enabled
+    /// schedules run either way.
+    #[serde(default)]
+    pub show_schedules: bool,
     /// Sidebar shows chats from every project, not just the current one.
     #[serde(default)]
     pub all_projects: bool,
@@ -860,18 +873,22 @@ pub struct Settings {
     #[serde(default)]
     pub project_docs: Vec<ProjectDocRule>,
     /// Let the agent see the user's other chats — and their live state — and
-    /// send one of them a message (`list_chats`, `message_chat`). Off by
-    /// default: this is the one tool pair that reaches *outside* the chat the
-    /// user opened, so an agent can read conversations it was never given and
-    /// start a turn in one of them. The main agent only — a chat's main agent is
-    /// the one with the wider view, and a fan-out of subagents each messaging
-    /// other chats is not something a brief asks for.
+    /// send one of them a message (`list_chats`, `message_chat`). On by
+    /// default; the user can switch it off. It is the one tool pair that
+    /// reaches *outside* the chat the user opened, so an agent can read
+    /// conversations it was never given and start a turn in one of them. The
+    /// main agent only — a chat's main agent is the one with the wider view,
+    /// and a fan-out of subagents each messaging other chats is not something
+    /// a brief asks for.
     ///
     /// The tool list does not change with the switch: a chat that already holds
     /// the frozen prefix keeps its tools and is told the rules changed (see
     /// `runner::announce_changes`), so toggling mid-chat cannot leave the cached
     /// prefix disagreeing with what the model may do.
-    #[serde(default)]
+    /// `= "t"` rather than `#[serde(default)]`: a field-level default means
+    /// *false*, so a settings.json written before this flag existed would load
+    /// with it off. An explicit `false` from the user still wins.
+    #[serde(default = "t")]
     pub cross_chat: bool,
     /// Let the agent keep this chat's name up to date as the work moves on
     /// (the `set_title` tool). It rides along on turns the agent is already
@@ -894,13 +911,35 @@ pub struct Settings {
     /// Existing installs keep the established automatic-resume behavior.
     #[serde(default = "t")]
     pub automatic_resume: bool,
-    /// Let the agent write notes to this project's memory folder and read them
-    /// back in future chats (the `memory` tool). Off by default: the agent can
-    /// only ever write *its own* notes, but that is still a file it creates
-    /// without asking, and what survives between sessions is your call. The
-    /// files are plain markdown under `~/.openleash/memory/`, editable by hand.
+    /// The welcome tour has been shown (and closed) once. The frontend opens it
+    /// on its own only while this is false *and* there are no chats, so an
+    /// existing install that predates the flag — which loads it as false — is
+    /// not ambushed by a first-run tour. It stays reachable from the palette.
     #[serde(default)]
+    pub welcome_seen: bool,
+    /// Let the agent keep long-term memory (the `memory` tool): notes about the
+    /// user shared by every project, and notes per project, loaded at the start
+    /// of each new chat. On by default. The agent only ever writes its own
+    /// notes, as plain markdown under `~/.openleash/memory/` that the user can
+    /// read, edit or delete by hand.
+    #[serde(default = "t")]
     pub memory: bool,
+    /// Whether the on-by-default switch for `memory` has been applied to this
+    /// settings file. Builds before it wrote `"memory": false` into every file
+    /// whether or not anyone chose it, so the serde default alone would leave
+    /// every existing install off. `load_settings` turns memory on once for a
+    /// file without this marker and sets it, so a later "off" sticks.
+    #[serde(default)]
+    pub memory_default_applied: bool,
+    /// Whether the on-by-default switch for the browser plugin has been
+    /// applied to this settings file. The same story as
+    /// `memory_default_applied`: builds before it wrote
+    /// `"browser": {"enabled": false, …}` into every file because that was
+    /// the default, not because anyone chose it. `load_settings` turns the
+    /// browser on once for a file without this marker and sets it, so an off
+    /// chosen afterwards (saved together with the marker) sticks.
+    #[serde(default)]
+    pub browser_default_applied: bool,
     #[serde(default = "t")]
     pub deny_env_files: bool,
     /// Folder trust decisions. A folder with no decision here is untrusted —
@@ -916,6 +955,11 @@ pub struct Settings {
     pub cache_keepalive: bool,
     #[serde(default = "keepalive_pings_default")]
     pub cache_keepalive_pings: u32,
+    /// Keep a chat's row in the stats after the chat is deleted. On by default:
+    /// the spend happened either way, and the row is what explains a total no
+    /// live chat accounts for. Off drops the row when the chat is deleted.
+    #[serde(default = "t")]
+    pub keep_chat_stats: bool,
     #[serde(default = "t")]
     pub tool_search: bool,
     #[serde(default)]
@@ -938,6 +982,11 @@ pub struct Settings {
     /// would make "off by default" untrue.
     #[serde(default)]
     pub trace_endpoint: String,
+    /// "Spend quota before it resets": the backlog queue and the thresholds
+    /// the watcher in `agent::burner` acts on. Off by default; a file written
+    /// before this field existed loads with it off and an empty queue.
+    #[serde(default)]
+    pub burner: super::burner::BurnerCfg,
     /// Every key of `settings.json` this build has no field for.
     ///
     /// A catch-all, not a rejection: `deny_unknown_fields` is deliberately off
@@ -1050,6 +1099,7 @@ impl Default for Settings {
             sidebar_button_tab: sidebar_button_tab_default(),
             needs_you: false,
             show_pull_requests: false,
+            show_schedules: false,
             all_projects: false,
             saved_sort: String::new(),
             plugins: Default::default(),
@@ -1063,20 +1113,25 @@ impl Default for Settings {
             agent_titles: true,
             automatic_chat_reorder: true,
             automatic_resume: true,
-            memory: false,
-            cross_chat: false,
+            welcome_seen: false,
+            memory: true,
+            memory_default_applied: true,
+            browser_default_applied: true,
+            cross_chat: true,
             deny_env_files: true,
             trust: vec![],
             git_attribution: "co-authored-by".into(),
             git_commit_verify: false,
             cache_keepalive: false,
             cache_keepalive_pings: keepalive_pings_default(),
+            keep_chat_stats: true,
             tool_search: true,
             defer_plugins: false,
             checkpoints: true,
             // Exporting traces requires the user to name a collector. A fresh
             // install has none, so this starts off and stays off until they do.
             trace_endpoint: String::new(),
+            burner: Default::default(),
             // A fresh install has no file, so nothing can be unrecognised. The
             // catch-all is filled only by `load_settings`, from a file this
             // build did not write.
@@ -1179,7 +1234,32 @@ pub fn load_settings() -> Settings {
     // edit converge on the same state.
     super::mcp::sync_auto_approve(&mut s.allow, &s.mcp);
     super::checks::migrate_hooks(&mut s);
+    apply_memory_default(&mut s);
+    // After `plugins.migrate`: the render fold-in only copies render's
+    // viewport while the browser is still off, so switching it on first
+    // would drop the numbers an old render user had.
+    apply_browser_default(&mut s);
     s
+}
+
+/// See `Settings::memory_default_applied`. Once per settings file.
+fn apply_memory_default(s: &mut Settings) {
+    if !s.memory_default_applied {
+        s.memory = true;
+        s.memory_default_applied = true;
+    }
+}
+
+/// See `Settings::browser_default_applied`. Once per settings file. Nothing
+/// is written here — like memory's, the marker reaches disk with the next
+/// save, and until then every load reaches the same answer (on). Switching
+/// the plugin on launches nothing: Chromium starts lazily, on the first
+/// `browser` call or panel open.
+fn apply_browser_default(s: &mut Settings) {
+    if !s.browser_default_applied {
+        s.plugins.browser.enabled = true;
+        s.browser_default_applied = true;
+    }
 }
 
 pub fn save_settings(s: &Settings) {
@@ -2067,7 +2147,7 @@ pub fn valid_skill_name(n: &str) -> bool {
 
 /// Normalize a skill name: lowercase, spaces/underscores to dashes,
 /// everything else dropped. Returns "" when nothing usable remains.
-fn normalize_skill_name(n: &str) -> String {
+pub fn normalize_skill_name(n: &str) -> String {
     let mut out = String::new();
     for c in n.trim().to_lowercase().chars() {
         if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
@@ -2193,22 +2273,39 @@ pub fn parse_skill_md(text: &str, fallback_name: &str) -> Option<SkillMeta> {
     })
 }
 
+/// The most directory entries [`count_skill_files`] looks at, and how deep it
+/// goes. The count is a label in the settings list; a skill folder that
+/// carries a `node_modules` (or links back to an ancestor, which `is_dir`
+/// follows) would otherwise make listing skills walk an unbounded tree.
+const SKILL_COUNT_ENTRIES: usize = 2_000;
+const SKILL_COUNT_DEPTH: usize = 6;
+
 fn count_skill_files(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    if let Ok(rd) = std::fs::read_dir(dir) {
+    fn walk(dir: &std::path::Path, depth: usize, budget: &mut usize, n: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
             let p = e.path();
             if p.is_dir() {
-                n += count_skill_files(&p);
+                if depth < SKILL_COUNT_DEPTH {
+                    walk(&p, depth + 1, budget, n);
+                }
             } else if p.file_name().and_then(|x| x.to_str()) != Some("SKILL.md") {
-                n += 1;
+                *n += 1;
             }
         }
     }
+    let (mut budget, mut n) = (SKILL_COUNT_ENTRIES, 0);
+    walk(dir, 0, &mut budget, &mut n);
     n
 }
 
-fn read_skill_dir(dir: &std::path::Path, source: &str) -> Vec<SkillDef> {
+fn read_skill_dir(dir: &std::path::Path, source: &str, count_files: bool) -> Vec<SkillDef> {
     let mut out = vec![];
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
@@ -2238,7 +2335,11 @@ fn read_skill_dir(dir: &std::path::Path, source: &str) -> Vec<SkillDef> {
                 source: source.into(),
                 path: md.to_string_lossy().to_string(),
                 enabled: true,
-                files: count_skill_files(&d),
+                files: if count_files {
+                    count_skill_files(&d)
+                } else {
+                    0
+                },
                 disable_model_invocation: disable,
                 user_invocable: palette,
             });
@@ -2256,10 +2357,35 @@ fn read_skill_dir(dir: &std::path::Path, source: &str) -> Vec<SkillDef> {
 /// this is the single door into the skills list, and a project skill's
 /// description is injected into the system prompt.
 pub fn all_skills(s: &Settings, project: &str) -> Vec<SkillDef> {
-    let mut out = read_skill_dir(&skills_dir(), "user");
-    if crate::agent::trust::trusted(&s.trust, project) {
+    skills_in(&SkillScope::of(s, project), project, true)
+}
+
+/// The settings [`all_skills`] depends on, lifted out so the disk work can run
+/// after the settings lock is released (and off the async runtime): every
+/// model request reads settings, and a skills folder can be large.
+#[derive(Debug, Clone)]
+pub struct SkillScope {
+    trusted: bool,
+    disabled: Vec<String>,
+}
+
+impl SkillScope {
+    pub fn of(s: &Settings, project: &str) -> Self {
+        SkillScope {
+            trusted: crate::agent::trust::trusted(&s.trust, project),
+            disabled: s.disabled_skills.clone(),
+        }
+    }
+}
+
+/// [`all_skills`] from a lifted [`SkillScope`]. `count_files = false` leaves
+/// `files` at 0: the system prompt never shows the count, so building one does
+/// not walk every skill's folder for it.
+pub fn skills_in(scope: &SkillScope, project: &str, count_files: bool) -> Vec<SkillDef> {
+    let mut out = read_skill_dir(&skills_dir(), "user", count_files);
+    if scope.trusted {
         for dir in project_skill_dirs(project) {
-            for d in read_skill_dir(&dir, "project") {
+            for d in read_skill_dir(&dir, "project", count_files) {
                 match out.iter_mut().find(|x| x.name == d.name) {
                     Some(x) => *x = d,
                     None => out.push(d),
@@ -2268,7 +2394,7 @@ pub fn all_skills(s: &Settings, project: &str) -> Vec<SkillDef> {
         }
     }
     for x in out.iter_mut() {
-        x.enabled = !s.disabled_skills.contains(&x.name);
+        x.enabled = !scope.disabled.contains(&x.name);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -2280,7 +2406,7 @@ pub fn all_skills(s: &Settings, project: &str) -> Vec<SkillDef> {
 pub fn read_project_skills(project: &str) -> Vec<SkillDef> {
     let mut out: Vec<SkillDef> = vec![];
     for dir in project_skill_dirs(project) {
-        for d in read_skill_dir(&dir, "project") {
+        for d in read_skill_dir(&dir, "project", true) {
             match out.iter_mut().find(|x| x.name == d.name) {
                 Some(x) => *x = d,
                 None => out.push(d),
@@ -2475,8 +2601,23 @@ mod task_header_tests {
     #[test]
     fn new_pull_request_page_is_off_by_default_and_for_old_settings() {
         assert!(!Settings::default().show_pull_requests);
-        let old: Settings = serde_json::from_str(r#"{"model":"m","effort":1,"perm":"turbo","worktree":false,"subagents":true}"#).unwrap();
+        let old: Settings = serde_json::from_str(
+            r#"{"model":"m","effort":1,"perm":"turbo","worktree":false,"subagents":true}"#,
+        )
+        .unwrap();
         assert!(!old.show_pull_requests);
+    }
+
+    #[test]
+    fn schedules_page_is_off_by_default_and_for_old_settings() {
+        assert!(!Settings::default().show_schedules);
+        let old: Settings = serde_json::from_str(
+            r#"{"model":"m","effort":1,"perm":"turbo","worktree":false,"subagents":true}"#,
+        )
+        .unwrap();
+        assert!(!old.show_schedules);
+        let on: Settings = serde_json::from_str(r#"{"show_schedules":true}"#).unwrap();
+        assert!(on.show_schedules);
     }
 
     #[test]
@@ -2727,6 +2868,17 @@ mod tests {
         )
         .unwrap();
         assert!(!off.automatic_chat_reorder);
+    }
+
+    #[test]
+    fn welcome_seen_defaults_off_and_round_trips() {
+        assert!(!Settings::default().welcome_seen);
+        let old: Settings = serde_json::from_str(r#"{"ui_size":"v2"}"#).unwrap();
+        assert!(!old.welcome_seen);
+        let seen: Settings = serde_json::from_str(r#"{"welcome_seen":true}"#).unwrap();
+        assert!(seen.welcome_seen);
+        let json = serde_json::to_string(&seen).unwrap();
+        assert!(json.contains("\"welcome_seen\":true"));
     }
 
     #[test]
@@ -3005,30 +3157,117 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_off_until_asked_for() {
-        // Memory writes files that survive between sessions, so it is opt-in.
-        // Unlike research, the serde default here is deliberately `false`.
-        assert!(!Settings::default().memory);
+    fn memory_is_on_by_default_and_an_explicit_off_survives_the_migration() {
+        assert!(Settings::default().memory);
+        // A file written before the field had a serde default of its own.
         let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
-        assert!(!old.memory);
+        assert!(old.memory);
+        // Old builds serialized `"memory": false` whether or not anyone chose
+        // it, so a pre-marker file is turned on once...
+        let mut pre: Settings = serde_json::from_str(r#"{"memory":false}"#).unwrap();
+        assert!(!pre.memory && !pre.memory_default_applied);
+        apply_memory_default(&mut pre);
+        assert!(pre.memory && pre.memory_default_applied);
+        // ...and an off chosen after that, which saves with the marker, sticks.
+        let mut chosen: Settings =
+            serde_json::from_str(r#"{"memory":false,"memory_default_applied":true}"#).unwrap();
+        apply_memory_default(&mut chosen);
+        assert!(!chosen.memory);
     }
 
     #[test]
-    fn cross_chat_is_off_until_asked_for() {
-        // Reading another chat's state and messaging it reaches outside the one
-        // conversation the user opened, so it is opt-in like memory. A
-        // settings.json written before the flag existed must load with it off,
-        // not with whatever a field-level default happened to be.
-        assert!(!Settings::default().cross_chat);
+    fn browser_is_on_by_default_and_an_explicit_off_survives_the_migration() {
+        // A fresh install: on, with the marker already set.
+        let fresh = Settings::default();
+        assert!(fresh.plugins.browser.enabled && fresh.browser_default_applied);
+        // An old file that only ever had the old default written into it is
+        // turned on once...
+        let mut pre: Settings = serde_json::from_str(
+            r#"{"plugins":{"browser":{"enabled":false,"width":1024,"height":700}}}"#,
+        )
+        .unwrap();
+        assert!(!pre.plugins.browser.enabled && !pre.browser_default_applied);
+        apply_browser_default(&mut pre);
+        assert!(pre.plugins.browser.enabled && pre.browser_default_applied);
+        assert_eq!(
+            (pre.plugins.browser.width, pre.plugins.browser.height),
+            (1024, 700),
+            "only the switch moves"
+        );
+        // ...and the marker round-trips, so a later off sticks...
+        let mut saved: Settings =
+            serde_json::from_str(&serde_json::to_string(&pre).unwrap()).unwrap();
+        assert!(saved.browser_default_applied);
+        saved.plugins.browser.enabled = false;
+        let mut chosen: Settings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        apply_browser_default(&mut chosen);
+        assert!(!chosen.plugins.browser.enabled, "an explicit off survives");
+        // ...and an explicit on with the marker stays on.
+        let mut on: Settings = serde_json::from_str(
+            r#"{"browser_default_applied":true,"plugins":{"browser":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        apply_browser_default(&mut on);
+        assert!(on.plugins.browser.enabled);
+    }
+
+    /// End to end through `load_settings`, including the order against the
+    /// `render` fold-in: an old render user keeps render's viewport.
+    #[test]
+    fn load_settings_switches_the_browser_on_once_after_the_render_fold_in() {
+        let root = std::env::temp_dir().join(format!(
+            "ol-browser-default-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _home = test_home(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("settings.json");
+
+        std::fs::write(
+            &file,
+            r#"{"plugins":{"browser":{"enabled":false},"render":{"enabled":true,"width":900,"height":600}}}"#,
+        )
+        .unwrap();
+        let s = load_settings();
+        assert!(s.plugins.browser.enabled && s.browser_default_applied);
+        assert_eq!(
+            (s.plugins.browser.width, s.plugins.browser.height),
+            (900, 600)
+        );
+
+        std::fs::write(&file, r#"{"plugins":{"browser":{"enabled":false}}}"#).unwrap();
+        let mut s = load_settings();
+        assert!(
+            s.plugins.browser.enabled,
+            "pre-marker off is the old default"
+        );
+        // The user turns it off; the save carries the marker; it stays off.
+        s.plugins.browser.enabled = false;
+        save_settings(&s);
+        let back = load_settings();
+        assert!(!back.plugins.browser.enabled && back.browser_default_applied);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(raw["browser_default_applied"], serde_json::json!(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cross_chat_is_on_by_default_and_respects_an_explicit_off() {
+        // Listing and messaging other chats is on for new installs, and a
+        // settings.json written before the flag existed must load with it on
+        // too (`= "t"`, not a field-level `false` default). An explicit `false`
+        // from the user still wins.
+        assert!(Settings::default().cross_chat);
         let old: Settings = serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110}"#).unwrap();
-        assert!(!old.cross_chat);
-        // And an explicit choice still round-trips.
-        let on: Settings =
-            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"cross_chat":true}"#).unwrap();
-        assert!(on.cross_chat);
+        assert!(old.cross_chat);
+        let off: Settings =
+            serde_json::from_str(r#"{"ui_size":"v2","ui_zoom":110,"cross_chat":false}"#).unwrap();
+        assert!(!off.cross_chat);
         assert!(serde_json::to_string(&Settings::default())
             .unwrap()
-            .contains("\"cross_chat\":false"));
+            .contains("\"cross_chat\":true"));
     }
 
     #[test]
@@ -3247,6 +3486,50 @@ hi",
         assert!(valid_skill_name("pdf-forms"));
         assert!(!valid_skill_name("PDF"));
         assert!(!valid_skill_name("has space"));
+    }
+
+    #[test]
+    fn the_prompt_skill_list_skips_the_file_count_and_the_ui_count_is_bounded() {
+        let root = std::env::temp_dir().join(format!("ol-skills-{}-count", std::process::id()));
+        let _home = test_home(&root);
+        let skill = skills_dir().join("heavy");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: heavy\ndescription: A skill with a huge folder\n---\n",
+        )
+        .unwrap();
+        std::fs::write(skill.join("ref.md"), "x").unwrap();
+        // Deeper than the walk goes, and wider than its entry budget.
+        let mut deep = skill.join("node_modules");
+        for i in 0..(SKILL_COUNT_DEPTH + 3) {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("too-deep.js"), "x").unwrap();
+        let wide = skill.join("wide");
+        std::fs::create_dir_all(&wide).unwrap();
+        for i in 0..(SKILL_COUNT_ENTRIES + 50) {
+            std::fs::write(wide.join(format!("f{i}")), "").unwrap();
+        }
+
+        let s = Settings::default();
+        let ui = all_skills(&s, "");
+        let heavy = ui.iter().find(|x| x.name == "heavy").unwrap();
+        assert!(
+            heavy.files >= 1 && heavy.files <= SKILL_COUNT_ENTRIES,
+            "{}",
+            heavy.files
+        );
+
+        let prompt = skills_in(&SkillScope::of(&s, ""), "", false);
+        let heavy = prompt.iter().find(|x| x.name == "heavy").unwrap();
+        assert_eq!(
+            heavy.files, 0,
+            "the prompt path does not walk skill folders"
+        );
+        assert_eq!(heavy.description, "A skill with a huge folder");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3787,6 +4070,7 @@ mod memory_tests {
         let t = Task {
             id: "m1".into(),
             title: "t".into(),
+            route_log: vec![],
             titled: false,
             status: "idle".into(),
             waiting_kind: None,
@@ -3798,6 +4082,7 @@ mod memory_tests {
             base_commit: None,
             worktree: false,
             model: "m".into(),
+            burner: None,
             effort: 2,
             perm: "auto".into(),
             plan: false,
@@ -3844,6 +4129,7 @@ mod memory_tests {
             usage: Default::default(),
             read_files: Default::default(),
             read_hashes: Default::default(),
+            spans: vec![],
             checkpoints: vec![],
             touched: Default::default(),
             created_at: chrono::Utc::now(),

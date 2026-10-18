@@ -107,4 +107,6 @@ cd src-tauri && cargo fmt --all --check # Rust formatting gate
 cd src-tauri && cargo test --locked     # Rust tests
 ```
 
-CI also runs `npm audit --audit-level=high`, a pinned RustSec audit, and `npx eslint . --max-warnings 89`. Clippy is report-only in CI (`continue-on-error`) while existing warnings are addressed; it is useful locally but not a merge gate. See `.github/workflows/ci.yml` for the authoritative checks and current lint budget.
+The release checklist also runs `npm audit --audit-level=high`, `npx eslint . --max-warnings 89`, `cargo audit` and `cargo clippy --locked --all-targets -- -D warnings`; see [release checklist](release-checklist.md#run-the-gates). Clippy is advisory: report its results, but its existing warnings do not block a change. Keep the ESLint warning count at or below 89, and lower that ceiling as warnings are fixed.
+
+This checkout has no `.github/workflows/ci.yml`. The only workflow is the manual **Build downloads** one, so these checks are not run automatically.

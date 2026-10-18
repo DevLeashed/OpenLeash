@@ -109,11 +109,11 @@ export function netWindows(list: AccountView[]): Window[] {
   const labels = Array.from(new Set(on.flatMap((a) => a.usage!.windows.map((w) => w.label)))).slice(0, 2);
   return labels.map((label) => {
     const ws = on.map((a) => a.usage!.windows.find((w) => w.label === label)).filter(Boolean) as Window[];
-    // An account that's out on ANY window (e.g. the week) has nothing left in the others either.
-    const used = on.reduce((s, a) => {
-      const w = a.usage!.windows.find((x) => x.label === label);
-      return s + (a.usage!.windows.some((x) => x.used >= 99.5) ? 100 : w?.used ?? 0);
-    }, 0) / on.length;
+    // Keep each aggregate tied to its own provider window. A full weekly
+    // allowance does not mean the separate 5h window is full (and vice versa).
+    // Missing readings are unknown, not unused allowance. Only accounts that
+    // actually report this window belong in its average.
+    const used = ws.reduce((sum, w) => sum + w.used, 0) / ws.length;
     const next = ws.filter((w) => w.resets_at > 0).map((w) => w.resets_at).sort()[0] ?? 0;
     return { label, used, resets_at: next };
   });
@@ -505,7 +505,12 @@ export function AccountsTab() {
   useNow(15_000);
   const refresh = async () => {
     setBusy(true);
-    try { set({ accounts: await api.accountsRefresh(), models: await api.poolModels() }); } catch (e) { flash(String(e)); }
+    try {
+      set({ accounts: await api.accountsRefresh() });
+      // Publish the refreshed readings before waiting for model discovery. A
+      // newer accounts event during that wait must not be overwritten here.
+      set({ models: await api.poolModels() });
+    } catch (e) { flash(String(e)); }
     setBusy(false);
   };
   const close = () => setDialog(null);

@@ -426,3 +426,23 @@ fn the_threshold_counts_the_core_plus_the_tail() {
         "at/under: load everything"
     );
 }
+
+/// The browser plugin ships on, so it is in every new chat's frozen tail.
+/// Like any plugin it is declared, not deferred, unless plugin deferral is
+/// asked for — the system prompt names it, and a deferred tool the prompt
+/// names would be a list that is not there.
+#[test]
+fn the_default_on_browser_is_declared_unless_plugin_deferral_is_on() {
+    let defaults = super::plugins::schemas(&super::plugins::PluginsCfg::default());
+    assert_eq!(names(&defaults), ["browser"]);
+    let mut frozen = tail();
+    frozen.retain(|t| t["name"] != "browser");
+    frozen.extend(defaults);
+    let declared = Deferral::new(29, &frozen, &[], false, true);
+    assert!(names(&declared.tool_list(core(29), &[])).contains(&"browser".to_string()));
+    let cat = Catalog::build(&frozen, &[], false);
+    let b = cat.tools.iter().find(|t| t.name == "browser").unwrap();
+    assert!(!b.defer, "declared by default");
+    let deferred = Deferral::new(29, &frozen, &[], true, true);
+    assert!(!names(&deferred.tool_list(core(29), &[])).contains(&"browser".to_string()));
+}

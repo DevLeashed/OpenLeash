@@ -43,7 +43,8 @@ describe("the shared artifict canvas", () => {
     const { container } = draw("markdown", "# Heading");
     const stage = container.querySelector(".artifict-canvas-stage")!;
     expect(stage.getAttribute("data-viewport")).toBe("full");
-    fireEvent.change(screen.getByLabelText("Preview width"), { target: { value: "phone" } });
+    fireEvent.click(screen.getByLabelText("Preview width"));
+    fireEvent.click(screen.getByRole("option", { name: "Phone" }));
     expect(stage.getAttribute("data-viewport")).toBe("phone");
     // The artifact is still the artifact, seen the way a phone would see it.
     expect(screen.getByRole("heading", { name: "Heading" })).toBeTruthy();

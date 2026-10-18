@@ -1605,3 +1605,151 @@ fn a_repeated_call_asks_at_the_threshold_and_is_denied_well_past_it() {
         .unwrap_or_else(|| panic!("must deny past the ceiling"));
     assert!(deny_reason(&d).is_some(), "{}", show(&d));
 }
+
+// ─────────────────────────── the lsp arm ───────────────────────────
+//
+// `lsp` only ever *asks* a language server questions, but starting one is not
+// a read: rust-analyzer, gopls and tsserver load the project's build
+// configuration and drive its toolchain, and a repository controls that
+// configuration. So the tool is deliberately *not* read-only: it runs on Full
+// access or under an allow rule naming the server, and asks otherwise —
+// including in plan mode, where Full access alone must not start one.
+
+/// The input the runner gates: the model's call plus the server it resolved.
+fn lsp_call(server: &str) -> Value {
+    json!({"operation": "definition", "path": "src/main.rs", "line": 3, "__server": server})
+}
+
+#[test]
+fn lsp_is_not_classified_read_only() {
+    assert!(
+        !super::permissions::is_read_only_tool("lsp"),
+        "a read-only classification would start language servers on every rung, plan mode included"
+    );
+}
+
+#[test]
+fn lsp_runs_on_full_access_and_asks_on_the_allowlist_rung_with_a_per_server_rule() {
+    for perm in ["full", "turbo"] {
+        let c = Ctx { perm, ..ctx(&[]) };
+        let d = check("lsp", &lsp_call("rust-analyzer"), None, &c);
+        assert!(is_allow(&d), "{perm}: {}", show(&d));
+    }
+    for perm in ["ask", "auto", "reviewer"] {
+        let c = Ctx { perm, ..ctx(&[]) };
+        match check("lsp", &lsp_call("rust-analyzer"), None, &c) {
+            Decision::Ask {
+                title,
+                rule,
+                reason,
+                ..
+            } => {
+                assert!(title.contains("rust-analyzer"), "{perm}: {title}");
+                assert_eq!(rule.as_deref(), Some("lsp:rust-analyzer"), "{perm}");
+                assert!(reason.contains("trust"), "the card says why: {reason}");
+            }
+            d => panic!("{perm} should ask, got {}", show(&d)),
+        }
+    }
+}
+
+#[test]
+fn an_lsp_allow_rule_covers_its_server_only_and_only_in_its_project() {
+    let rules = [allow_rule("lsp:rust-analyzer", PROJECT)];
+    let c = ctx(&rules);
+    assert!(is_allow(&check(
+        "lsp",
+        &lsp_call("rust-analyzer"),
+        None,
+        &c
+    )));
+    assert!(
+        !is_allow(&check(
+            "lsp",
+            &lsp_call("typescript-language-server"),
+            None,
+            &c
+        )),
+        "allowing one server is not allowing every server"
+    );
+    let elsewhere = Ctx {
+        project: OTHER_PROJECT,
+        cwd: OTHER_PROJECT,
+        ..ctx(&rules)
+    };
+    assert!(
+        !is_allow(&check("lsp", &lsp_call("rust-analyzer"), None, &elsewhere)),
+        "a rule granted for one project does not start servers in another"
+    );
+    let every = [allow_rule("lsp *", "")];
+    assert!(is_allow(&check(
+        "lsp",
+        &lsp_call("gopls"),
+        None,
+        &ctx(&every)
+    )));
+}
+
+#[test]
+fn plan_mode_asks_before_starting_a_language_server_even_on_full_access() {
+    let c = Ctx {
+        perm: "full",
+        plan: true,
+        ..ctx(&[])
+    };
+    match check("lsp", &lsp_call("rust-analyzer"), None, &c) {
+        Decision::Ask { .. } => {}
+        d => panic!(
+            "plan mode must not start a server unasked, got {}",
+            show(&d)
+        ),
+    }
+    // An explicit rule is the user's standing answer to that question.
+    let rules = [allow_rule("lsp:rust-analyzer", "")];
+    let c = Ctx {
+        plan: true,
+        ..ctx(&rules)
+    };
+    assert!(is_allow(&check(
+        "lsp",
+        &lsp_call("rust-analyzer"),
+        None,
+        &c
+    )));
+}
+
+#[test]
+fn an_lsp_deny_rule_beats_full_access_and_a_blanket_allow() {
+    let rules = [global_deny("lsp:rust-analyzer"), allow_rule("lsp *", "")];
+    let c = Ctx {
+        perm: "full",
+        ..ctx(&rules)
+    };
+    let d = check("lsp", &lsp_call("rust-analyzer"), None, &c);
+    assert!(deny_reason(&d).is_some(), "{}", show(&d));
+    assert!(
+        is_allow(&check("lsp", &lsp_call("gopls"), None, &c)),
+        "the deny names one server"
+    );
+    let all = [global_deny("lsp")];
+    let c = Ctx {
+        perm: "full",
+        ..ctx(&all)
+    };
+    assert!(deny_reason(&check("lsp", &lsp_call("gopls"), None, &c)).is_some());
+}
+
+#[test]
+fn the_disabled_rung_refuses_lsp_unless_a_rule_allows_it() {
+    let c = Ctx {
+        perm: "disabled",
+        ..ctx(&[])
+    };
+    assert!(deny_reason(&check("lsp", &lsp_call("clangd"), None, &c)).is_some());
+    let rules = [allow_rule("lsp:clangd", "")];
+    let c = Ctx {
+        perm: "disabled",
+        ..ctx(&rules)
+    };
+    assert!(is_allow(&check("lsp", &lsp_call("clangd"), None, &c)));
+}

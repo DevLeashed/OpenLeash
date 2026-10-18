@@ -14,10 +14,13 @@
 
 use super::accounts::{self, now};
 use super::providers::{self, ChatRequest, Fail, StreamEvent, Target, Turn};
+use super::routerules;
 use super::store::{Route, Settings};
-use super::{Harness, Item};
+use super::{Harness, Item, Message};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -30,8 +33,12 @@ static ROUTES: std::sync::RwLock<Vec<Route>> = std::sync::RwLock::new(Vec::new()
 #[cfg(test)]
 pub static ROUTES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Publish the route table. Rules are normalized on the way in, so every entry
+/// point (app, headless, ACP, an import) gets unique rule ids.
 pub fn set_routes(r: &[Route]) {
-    *ROUTES.write().unwrap() = r.to_vec();
+    let mut routes = r.to_vec();
+    normalize_routes(&mut routes);
+    *ROUTES.write().unwrap() = routes;
 }
 
 /// A route by id (`abc`) or legacy model-style id (`route/abc`).
@@ -88,21 +95,712 @@ pub fn steps(model: &str, route_id: &str) -> (Vec<String>, String) {
 }
 
 /// Smallest window across a chain, so compaction keeps every fallback usable.
+///
+/// Rule targets are deliberately not part of this: see
+/// `effective_context_window`.
 pub fn context_window(model: &str, route_id: &str) -> u64 {
     let (s, _) = steps(model, route_id);
-    s.iter()
+    chain_window(&s)
+}
+
+pub fn max_output(model: &str, route_id: &str) -> u64 {
+    let (s, _) = steps(model, route_id);
+    chain_output(&s)
+}
+
+fn chain_output(chain: &[String]) -> u64 {
+    chain
+        .iter()
+        .map(|m| providers::model_info(m).output)
+        .min()
+        .unwrap_or(32_000)
+}
+
+fn chain_window(chain: &[String]) -> u64 {
+    chain
+        .iter()
         .map(|m| providers::model_info(m).context)
         .min()
         .unwrap_or(128_000)
         .max(8_000)
 }
 
-pub fn max_output(model: &str, route_id: &str) -> u64 {
-    let (s, _) = steps(model, route_id);
-    s.iter()
-        .map(|m| providers::model_info(m).output)
-        .min()
-        .unwrap_or(32_000)
+// ───────────────────────────── router rules ─────────────────────────────
+//
+// `routerules` is the pure engine; this is where it meets a live request:
+// the situation is read from the task, the runtime and the settings, the
+// decision picks the model the fallback chain starts from, and the outcome is
+// remembered per agent (`Runtime::router`) and shown in the transcript.
+
+/// Newest entries kept in `Task::route_log`.
+pub const ROUTE_LOG_CAP: usize = 500;
+
+/// One agent's live router state. Kept in `Runtime::router`, so it is never
+/// persisted: holds and stuck counters reset when the app restarts.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRoute {
+    pub signals: routerules::Signals,
+    pub hold: Option<routerules::Hold>,
+    /// The (model, effort) the router last moved this agent to; None = it is
+    /// on its base model and effort. What compaction sizes its window from,
+    /// and what a transcript notice is only written on a change of.
+    pub last: Option<(String, usize)>,
+}
+
+/// One switch the router made, in a chat's audit log (`Task::route_log`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct RouteEvent {
+    /// Unix seconds.
+    pub at: i64,
+    /// "main" or the subagent id.
+    pub agent: String,
+    /// "main", the subagent type, or a system kind ("compactor", …).
+    pub agent_kind: String,
+    pub from: String,
+    pub to: String,
+    pub effort_from: usize,
+    pub effort_to: usize,
+    pub action: String,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub reason: String,
+}
+
+/// Router-state key of an agent's own turns: "main" or the subagent id.
+pub fn agent_key(sub: Option<&str>) -> String {
+    sub.unwrap_or("main").to_string()
+}
+
+/// Router-state key for a request. One-shots get their own key so a routed
+/// compaction never reads as the agent itself having moved (which would also
+/// resize the agent's compaction window).
+fn state_key(who: &Who<'_>) -> String {
+    if who.turn {
+        agent_key(who.sub)
+    } else {
+        format!("sys:{}:{}", who.usage_id, who.sub.unwrap_or("main"))
+    }
+}
+
+/// Successful edits are what "progress" means to the `no_progress` condition.
+fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "edit_file" | "multi_edit" | "write_file")
+}
+
+/// Feed one tool round's outcomes `(tool, input, is_error)` into an agent's
+/// stuck signals. Called by the agent loop after every round, whether or not
+/// any route has rules: the counters are cheap, and a rule added mid-run then
+/// sees the run's real state.
+pub fn record_round<'a>(
+    rt: &super::Runtime,
+    agent: &str,
+    calls: impl IntoIterator<Item = (&'a str, &'a serde_json::Value, bool)>,
+) {
+    let mut map = rt.router.lock().unwrap();
+    let st = map.entry(agent.to_string()).or_default();
+    let mut progress = false;
+    for (name, input, is_err) in calls {
+        let p = !is_err && is_edit_tool(name);
+        progress |= p;
+        st.signals.record(name, input, is_err, p);
+    }
+    st.signals.round(progress);
+}
+
+/// The route whose rules apply to a request. A legacy `route/<id>` model is
+/// its own route (that is also the chain `steps` uses for it), otherwise the
+/// task's route. None when there is no such route or it has no rules — the
+/// router then behaves exactly as it did before rules existed.
+pub fn rules_route(route_id: &str, base: &str) -> Option<Route> {
+    let r = if base.starts_with("route/") {
+        route(base)
+    } else {
+        route(route_id)
+    };
+    r.filter(|r| !r.rules.is_empty())
+}
+
+/// The fallback chain for a routed request: the routed model first, then the
+/// base model's own chain, then the route's remaining steps. Keep the base
+/// model explicitly: the route's `steps` list normally contains fallbacks,
+/// not the model that the user picked. A routed model that is unavailable must
+/// still fall back to the model the agent would otherwise have called.
+pub fn routed_steps(routed: &str, base: &str, route_id: &str) -> (Vec<String>, String) {
+    if routed == base {
+        return steps(base, route_id);
+    }
+    if base.starts_with("route/") {
+        if let Some(r) = route(base) {
+            let mut chain = vec![routed.to_string()];
+            chain.extend(r.steps.iter().filter(|s| *s != routed).cloned());
+            let out = if r.on_exhausted == "fail" {
+                "fail"
+            } else {
+                "pause"
+            };
+            return (chain, out.into());
+        }
+    }
+    let mut chain = vec![routed.to_string()];
+    if !base.is_empty() && base != routed {
+        chain.push(base.to_string());
+    }
+    match route(route_id) {
+        Some(r) => {
+            chain.extend(
+                r.steps
+                    .iter()
+                    .filter(|s| *s != routed && *s != base)
+                    .cloned(),
+            );
+            (
+                chain,
+                if r.on_exhausted == "fail" {
+                    "fail".into()
+                } else {
+                    "pause".into()
+                },
+            )
+        }
+        None => (chain, "pause".into()),
+    }
+}
+
+/// Repair every route's rules (missing / duplicate ids, unset modes) so the
+/// editor, the log and the dry-run can key on rule ids. Returns whether
+/// anything changed.
+pub fn normalize_routes(routes: &mut [Route]) -> bool {
+    let mut changed = false;
+    for r in routes {
+        changed |= routerules::normalize(&mut r.rules);
+    }
+    changed
+}
+
+/// The model the router last moved this agent to, if it is routed right now.
+fn routed_model(h: &Harness, task_id: &str, agent: &str) -> Option<String> {
+    let rt = h.runtime_if(task_id)?;
+    let map = rt.router.lock().unwrap();
+    map.get(agent)?.last.as_ref().map(|(m, _)| m.clone())
+}
+
+/// The context window compaction should respect for this agent: the routed
+/// model's chain while a rule or hold has moved it, else the base chain.
+///
+/// Folding rule targets into `context_window` instead would size every chat
+/// by its smallest *possible* model, and the "big context → long-context
+/// model" preset would compact at the very size it exists to get past.
+pub fn effective_context_window(
+    h: &Harness,
+    task_id: &str,
+    agent: &str,
+    model: &str,
+    route_id: &str,
+) -> u64 {
+    match routed_model(h, task_id, agent) {
+        Some(m) if m != model && rules_route(route_id, model).is_some() => {
+            // Context sizing follows the routed model's configured fallback
+            // chain, not the base model inserted as a last-resort retry by
+            // `routed_steps`; otherwise even a long-context target is sized
+            // back down to the base model's window.
+            chain_window(&steps(&m, route_id).0)
+        }
+        _ => context_window(model, route_id),
+    }
+}
+
+/// Preview the chain this request would use before deciding to compact. Unlike
+/// `effective_context_window`, this evaluates current rules (including a rule
+/// triggered for the first time by this very prompt). Evaluation is read-only:
+/// no holds are spent, counters consumed, or switches announced until request().
+pub async fn prospective_context_window(
+    h: &Arc<Harness>,
+    who: &Who<'_>,
+    model: &str,
+    route_id: &str,
+    req: &ChatRequest,
+) -> u64 {
+    let Some(r) = rules_route(route_id, model).filter(|_| who.usage_id != "keepalive") else {
+        return context_window(model, route_id);
+    };
+    let s = live_situation(h, who, model, req.effort, route_id, req).await;
+    let d = routerules::evaluate(&r.rules, &r.ladder, &s);
+    // The prospective context guard is choosing whether this model can avoid
+    // compaction; the base model's last-resort retry must not drag the window
+    // back down before the new long-context target gets its first request.
+    chain_window(&steps(&d.model, route_id).0)
+}
+
+/// `max_output`, by the same reasoning as `effective_context_window`. The
+/// router clamps a request to the chain it actually starts, so a turn that
+/// moves back to a smaller model is never sent a too-large `max_tokens`.
+pub fn effective_max_output(
+    h: &Harness,
+    task_id: &str,
+    agent: &str,
+    model: &str,
+    route_id: &str,
+) -> u64 {
+    match routed_model(h, task_id, agent) {
+        Some(m) if m != model && rules_route(route_id, model).is_some() => {
+            chain_output(&routed_steps(&m, model, route_id).0)
+        }
+        _ => max_output(model, route_id),
+    }
+}
+
+/// Rough prompt size of a request, in tokens (the same heuristic as the
+/// context ring's breakdown).
+pub fn estimate_tokens(system: &str, tools: &[serde_json::Value], messages: &[Message]) -> u64 {
+    let p = super::runner::context_parts(system, tools, messages);
+    p.system + p.instructions + p.skills + p.tools + p.attachments + p.history + p.summary
+}
+
+/// Whether any message carries an image block.
+pub fn has_images(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .any(|m| m.content.iter().any(|b| b["type"] == "image"))
+}
+
+/// Remove `<system-reminder>…</system-reminder>` sections (harness notes, not
+/// the user's words). An unclosed tag drops the rest of the text.
+fn strip_reminders(s: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find(OPEN) {
+        out.push_str(&rest[..i]);
+        match rest[i..].find(CLOSE) {
+            Some(j) => rest = &rest[i + j + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The text of the latest genuine user message: the newest user turn with
+/// non-empty text once harness reminders are stripped. A user turn that
+/// carries tool results is a tool round — its text blocks are the harness's
+/// loop / diagnostics notes — so it is skipped.
+pub fn latest_user_text(messages: &[Message]) -> String {
+    for m in messages.iter().rev() {
+        if m.role != "user" || m.content.iter().any(|b| b["type"] == "tool_result") {
+            continue;
+        }
+        let text = m
+            .content
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .map(strip_reminders)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            return text.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Pool kind → percent left on its best usable account (100 − the fullest
+/// reported window). Accounts that are off, cooling down, or have reported no
+/// usage yet are left out, so "no usage reported" stays distinguishable.
+pub fn headroom(views: &[accounts::AccountView]) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    for v in views.iter().filter(|v| v.enabled && v.available) {
+        let Some(u) = &v.usage else { continue };
+        if u.windows.is_empty() {
+            continue;
+        }
+        let used = u.windows.iter().map(|w| w.used).fold(0.0_f64, f64::max);
+        let left = (100.0 - used).clamp(0.0, 100.0);
+        let e = out.entry(v.kind.clone()).or_insert(left);
+        if left > *e {
+            *e = left;
+        }
+    }
+    out
+}
+
+/// Everything about a request that is not read from its messages.
+pub struct SituationInput<'a> {
+    pub agent: String,
+    pub sub: bool,
+    pub turn: bool,
+    pub base_model: &'a str,
+    pub base_effort: usize,
+    pub route_id: &'a str,
+    pub plan: bool,
+    pub context_tokens: u64,
+    pub signals: &'a routerules::Signals,
+    pub hold: Option<routerules::Hold>,
+    pub headroom: BTreeMap<String, f64>,
+    pub budget_used_pct: Option<f64>,
+    pub now: chrono::DateTime<chrono::Local>,
+}
+
+/// The base model's window as a rule should see it. A legacy `route/<id>`
+/// "model" has no catalog entry of its own, so it is its chain's window.
+fn base_context(base: &str, route_id: &str) -> u64 {
+    if base.starts_with("route/") {
+        context_window(base, route_id)
+    } else {
+        providers::model_info(base).context
+    }
+}
+
+/// Build a [`routerules::Situation`]. Pure: the live and the "load from this
+/// chat" callers gather the inputs, this assembles them.
+pub fn situation(i: SituationInput<'_>, messages: &[Message]) -> routerules::Situation {
+    use chrono::{Datelike, Timelike};
+    let (repeat_failures, failing_tool) = i.signals.worst();
+    routerules::Situation {
+        agent: i.agent,
+        sub: i.sub,
+        turn: i.turn,
+        base_model: i.base_model.to_string(),
+        base_effort: i.base_effort,
+        base_context: base_context(i.base_model, i.route_id),
+        plan: i.plan,
+        images: has_images(messages),
+        context_tokens: i.context_tokens,
+        user_text: latest_user_text(messages),
+        repeat_failures,
+        failing_tool,
+        errors_in_row: i.signals.errors_in_row,
+        last_error_tool: i.signals.last_error_tool.clone(),
+        no_progress_turns: i.signals.no_progress_turns,
+        turns: i.signals.turns,
+        headroom: i.headroom,
+        budget_used_pct: i.budget_used_pct,
+        minute_of_day: i.now.hour() * 60 + i.now.minute(),
+        weekday: i.now.weekday().num_days_from_monday() as u8,
+        hold: i.hold,
+    }
+}
+
+fn budget_pct(s: &Settings) -> Option<f64> {
+    (s.budget > 0.0).then(|| s.month_spend() / s.budget * 100.0)
+}
+
+/// An agent's signals and hold, as they stand before this request.
+fn agent_state(
+    h: &Harness,
+    task_id: &str,
+    key: &str,
+) -> (routerules::Signals, Option<routerules::Hold>) {
+    match h.runtime_if(task_id) {
+        Some(rt) => {
+            let map = rt.router.lock().unwrap();
+            map.get(key)
+                .map(|s| (s.signals.clone(), s.hold.clone()))
+                .unwrap_or_default()
+        }
+        None => Default::default(),
+    }
+}
+
+/// The situation of a live request.
+async fn live_situation(
+    h: &Arc<Harness>,
+    who: &Who<'_>,
+    base: &str,
+    effort: usize,
+    route_id: &str,
+    req: &ChatRequest,
+) -> routerules::Situation {
+    let plan = match h.task(who.task_id).await {
+        Ok(t) => t.lock().await.plan,
+        Err(_) => false,
+    };
+    // A one-shot is named by what it is ("compactor", "title", …), even when it
+    // runs for a subagent: a rule naming "explore" means the explorer's turns.
+    let agent = if who.turn {
+        agent_kind(h, who).await
+    } else {
+        who.usage_id.to_string()
+    };
+    let (signals, hold) = if who.turn {
+        agent_state(h, who.task_id, &agent_key(who.sub))
+    } else {
+        Default::default()
+    };
+    let settings = h.settings.read().await;
+    let input = SituationInput {
+        agent,
+        sub: who.sub.is_some(),
+        turn: who.turn,
+        base_model: base,
+        base_effort: effort,
+        route_id,
+        plan,
+        context_tokens: estimate_tokens(&req.system, &req.tools, &req.messages),
+        signals: &signals,
+        hold,
+        headroom: headroom(&h.accts.views(&settings.accounts)),
+        budget_used_pct: budget_pct(&settings),
+        now: chrono::Local::now(),
+    };
+    drop(settings);
+    situation(input, &req.messages)
+}
+
+/// The live situation of a chat's main agent (or one subagent), for the route
+/// editor's "load from this chat". Best effort: the context size is the last
+/// measured prompt where there is one, otherwise an estimate from history.
+pub async fn situation_for_task(
+    h: &Arc<Harness>,
+    task_id: &str,
+    agent: Option<&str>,
+) -> Result<routerules::Situation, String> {
+    let agent = agent.filter(|a| !a.is_empty() && *a != "main");
+    // Settings first and released before the task lock is taken, so this
+    // never holds one lock while waiting on the other.
+    let settings = h.settings.read().await.clone();
+    let (headroom, budget_used_pct) = {
+        (
+            headroom(&h.accts.views(&settings.accounts)),
+            budget_pct(&settings),
+        )
+    };
+    let t = h.task(task_id).await?;
+    let t = t.lock().await;
+    let sub = match agent {
+        Some(id) => Some(
+            t.subs
+                .iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| format!("no subagent {id} in this chat"))?,
+        ),
+        None => None,
+    };
+    let base = super::resolve_model(&t, sub, sub.map(|s| s.depth).unwrap_or(0), &t.model);
+    let effort = effort_for_agent(&settings, &t, sub);
+    let empty = vec![];
+    let messages: &[Message] = match sub {
+        Some(s) => t.sub_msgs.get(&s.id).unwrap_or(&empty),
+        None => &t.messages,
+    };
+    let context_tokens = match sub {
+        None if t.usage.last_context > 0 => t.usage.last_context,
+        _ => estimate_tokens(&t.system, &t.mcp_tools, messages),
+    };
+    let key = agent_key(agent);
+    let (signals, hold) = agent_state(h, task_id, &key);
+    let input = SituationInput {
+        agent: sub.map(|s| s.role.clone()).unwrap_or_else(|| "main".into()),
+        sub: sub.is_some(),
+        turn: true,
+        base_model: &base,
+        base_effort: effort,
+        route_id: &t.route,
+        plan: t.plan,
+        context_tokens,
+        signals: &signals,
+        hold,
+        headroom,
+        budget_used_pct,
+        now: chrono::Local::now(),
+    };
+    Ok(situation(input, messages))
+}
+
+/// What the route editor's dry-run shows: the exact `evaluate` a live request
+/// runs, on rules repaired the way loading repairs them.
+pub fn dry_run(route: &Route, s: &routerules::Situation) -> routerules::Decision {
+    let mut rules = route.rules.clone();
+    routerules::normalize(&mut rules);
+    routerules::evaluate(&rules, &route.ladder, s)
+}
+
+/// A model's human name, for notices.
+fn model_name(m: &str) -> String {
+    let n = providers::model_info(m).name;
+    if n.is_empty() {
+        m.to_string()
+    } else {
+        n
+    }
+}
+
+const EFFORTS: [&str; 5] = ["Max", "Extra High", "High", "Medium", "Low"];
+
+fn effort_name(e: usize) -> &'static str {
+    EFFORTS[e.min(4)]
+}
+
+/// The transcript line for a switch. `now` = None means back on the base.
+fn notice_text(
+    s: &routerules::Situation,
+    d: &routerules::Decision,
+    now: Option<&(String, usize)>,
+) -> String {
+    let reason = if d.reason.is_empty() {
+        "no rule applies".to_string()
+    } else {
+        d.reason.clone()
+    };
+    let Some((model, effort)) = now else {
+        return format!("Router: back to {} — {reason}", model_name(&s.base_model));
+    };
+    if *model == s.base_model {
+        return format!("Router: effort → {} — {reason}", effort_name(*effort));
+    }
+    let with_effort = if *effort != s.base_effort {
+        format!(" · {} effort", effort_name(*effort))
+    } else {
+        String::new()
+    };
+    let verb = match d.action.as_str() {
+        "escalate" => "escalated to",
+        "deescalate" => "stepped down to",
+        _ => "switched to",
+    };
+    format!(
+        "Router: {verb} {}{with_effort} — {reason}",
+        model_name(model)
+    )
+}
+
+/// Remember what this decision moved the agent to, and when that differs from
+/// where it was, say so in the transcript and the chat's route log.
+async fn announce(
+    h: &Arc<Harness>,
+    who: &Who<'_>,
+    s: &routerules::Situation,
+    d: &routerules::Decision,
+) {
+    let now = d.routed(s).then(|| (d.model.clone(), d.effort));
+    let prev = {
+        let rt = h.runtime(who.task_id);
+        let mut map = rt.router.lock().unwrap();
+        let e = map.entry(state_key(who)).or_default();
+        std::mem::replace(&mut e.last, now.clone())
+    };
+    // Unchanged, or base → base (nothing ever moved): nothing to tell.
+    if now == prev {
+        return;
+    }
+    let (from, effort_from) = prev
+        .clone()
+        .unwrap_or_else(|| (s.base_model.clone(), s.base_effort));
+    let (to, effort_to) = now
+        .clone()
+        .unwrap_or_else(|| (s.base_model.clone(), s.base_effort));
+    let action = if now.is_none() && d.action != "revert" {
+        // Back on the base because no rule picks anything now (a one-request
+        // rule stopped matching) or a `stay` rule suspended a hold.
+        if d.action == "stay" {
+            "stay".to_string()
+        } else {
+            "base".to_string()
+        }
+    } else {
+        d.action.clone()
+    };
+    let text = notice_text(s, d, now.as_ref());
+    h.stats.event_in(who.task_id, "router_switches");
+    let ev = RouteEvent {
+        at: now_secs(),
+        agent: agent_key(who.sub),
+        agent_kind: s.agent.clone(),
+        from: from.clone(),
+        to: to.clone(),
+        effort_from,
+        effort_to,
+        action: action.clone(),
+        rule_id: d.rule_id.clone(),
+        rule_name: d.rule_name.clone(),
+        reason: d.reason.clone(),
+    };
+    if let Ok(t) = h.task(who.task_id).await {
+        let mut t = t.lock().await;
+        t.route_log.push(ev);
+        let over = t.route_log.len().saturating_sub(ROUTE_LOG_CAP);
+        if over > 0 {
+            t.route_log.drain(..over);
+        }
+    }
+    if who.side {
+        return;
+    }
+    h.upsert_in(
+        who.task_id,
+        who.sub,
+        Item::new(
+            "notice",
+            text,
+            json!({
+                "level": "router",
+                "action": action,
+                "from": from,
+                "to": to,
+                "effort_from": effort_from,
+                "effort_to": effort_to,
+                "rule": d.rule_name,
+                "rule_id": d.rule_id,
+                "reason": d.reason,
+            }),
+        ),
+    )
+    .await;
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// A served turn spends its hold: store the hold the decision left behind, and
+/// reset the stuck counters a stuck-style rule acted on. Only on success, so a
+/// request that was cancelled, refreshed or failed — and is then built again
+/// for the same turn — never counts a hold turn twice.
+fn commit(h: &Harness, who: &Who<'_>, d: &routerules::Decision) {
+    let rt = h.runtime(who.task_id);
+    let mut map = rt.router.lock().unwrap();
+    let e = map.entry(agent_key(who.sub)).or_default();
+    e.hold = d.hold.clone();
+    if d.consume_stuck {
+        e.signals.consume();
+    }
+}
+
+/// The route lost its rules (or the chat its route): drop a hold and the
+/// "routed" mark, so neither outlives the rules that made them.
+fn forget(h: &Harness, who: &Who<'_>) {
+    if let Some(rt) = h.runtime_if(who.task_id) {
+        if let Some(e) = rt.router.lock().unwrap().get_mut(&state_key(who)) {
+            e.hold = None;
+            e.last = None;
+        }
+    }
+}
+
+/// Clamp `max_tokens` to what every model of the chain can produce.
+fn with_output_cap<'a>(req: Cow<'a, ChatRequest>, cap: u64) -> Cow<'a, ChatRequest> {
+    if cap == 0 || req.max_tokens <= cap {
+        return req;
+    }
+    match req {
+        Cow::Owned(mut r) => {
+            r.max_tokens = cap;
+            Cow::Owned(r)
+        }
+        Cow::Borrowed(r) => Cow::Owned(ChatRequest {
+            system: r.system.clone(),
+            messages: r.messages.clone(),
+            tools: r.tools.clone(),
+            effort: r.effort,
+            max_tokens: cap,
+            cache_key: r.cache_key.clone(),
+        }),
+    }
 }
 
 pub enum RouteErr {
@@ -317,24 +1015,33 @@ fn targets(h: &Harness, s: &Settings, step: &str) -> Vec<Target> {
 /// Only for the main turn. A one-shot request (`oneshot`) picks its own level on
 /// purpose — a summary, a side question — and that level is the request's, not the
 /// chat's, so it is left alone.
+/// Resolve the current agent definition just as the runner does at launch.
+/// Unknown/deleted roles inherit the chat; explicit per-sub overrides still win.
+fn effort_for_agent(settings: &Settings, t: &super::Task, sub: Option<&super::SubInfo>) -> usize {
+    let def = sub.and_then(|s| {
+        super::store::all_agents(settings, &t.project)
+            .into_iter()
+            .find(|d| d.id == s.role)
+    });
+    super::resolve_effort(
+        t,
+        sub,
+        def.as_ref().and_then(|d| d.effort),
+        def.as_ref().is_some_and(|d| d.tools == "read_only"),
+    )
+}
+
 async fn live_effort(h: &Arc<Harness>, who: &Who<'_>, fallback: usize) -> usize {
     if !who.turn {
         return fallback;
     }
+    let settings = h.settings.read().await.clone();
     let Ok(t) = h.task(who.task_id).await else {
         return fallback;
     };
     let t = t.lock().await;
-    // A subagent's own override wins over the chat's, matching the loop.
-    match who.sub {
-        Some(sid) => t
-            .subs
-            .iter()
-            .find(|x| x.id == sid)
-            .and_then(|x| x.effort)
-            .unwrap_or(t.effort),
-        None => t.effort,
-    }
+    let sub = who.sub.and_then(|sid| t.subs.iter().find(|s| s.id == sid));
+    effort_for_agent(&settings, &t, sub)
 }
 
 /// The caller's request with one field replaced, without requiring `ChatRequest`
@@ -354,6 +1061,26 @@ fn with_effort(req: &ChatRequest, effort: usize) -> Cow<'_, ChatRequest> {
     })
 }
 
+/// The caller's request with any image over the provider's pixel limit shrunk
+/// (or stubbed). One such image makes the provider reject the whole request with
+/// a 400, and no retry or fallback can fix that. Borrowed in the normal case: the
+/// check reads image headers only, and the history is copied only to change it.
+fn with_fitted_images(req: &ChatRequest) -> Cow<'_, ChatRequest> {
+    if !super::imagefit::needs_fit(&req.messages) {
+        return Cow::Borrowed(req);
+    }
+    let mut messages = req.messages.clone();
+    super::imagefit::fit_messages(&mut messages);
+    Cow::Owned(ChatRequest {
+        system: req.system.clone(),
+        messages,
+        tools: req.tools.clone(),
+        effort: req.effort,
+        max_tokens: req.max_tokens,
+        cache_key: req.cache_key.clone(),
+    })
+}
+
 /// Run one model request through the task's chain. Pauses (and waits) when everything is out.
 pub async fn request(
     h: &Arc<Harness>,
@@ -363,11 +1090,20 @@ pub async fn request(
     on: &mut (dyn FnMut(StreamEvent) + Send),
     cancel: &CancellationToken,
 ) -> Result<(Turn, Target), RouteErr> {
+    // Every request passes here, including the one-shots (compaction, side
+    // questions, keepalives) that send history without the main loop's repairs.
+    let fitted = with_fitted_images(req);
+    let req: &ChatRequest = &fitted;
     let mut first_label: Option<String> = None;
     let (mut route_id, mut chosen) = live(h, &who, model).await;
     let mut swapped_from: Option<String> = None;
     // The retry line this pass last put on the task, so a success can clear it.
     let mut retry_line: Option<String> = None;
+    // Re-evaluate from the same pre-request signals/hold on every retry pass.
+    // This refreshes time/headroom/budget after an exhausted pause without ever
+    // spending a hold twice; `commit` runs only once a pass is served.
+    let mut first_sit: Option<routerules::Situation> = None;
+    let rules_on = who.usage_id != "keepalive";
     loop {
         if !who.side {
             if !h.wait_unpaused(who.task_id, cancel).await {
@@ -403,8 +1139,92 @@ pub async fn request(
         // worse half of the bug — on a model with a different ladder it lands as
         // a level that does not exist, or as a much cheaper or dearer answer than
         // the user just asked for.
-        let pass = with_effort(req, live_effort(h, &who, req.effort).await);
-        let (chain, on_out) = steps(&chosen, &route_id);
+        let base_effort = live_effort(h, &who, req.effort).await;
+        // `chosen` stays the BASE model throughout: the swap detection above
+        // compares it with the live reading, so a routed model in its place
+        // would read as a user swap and announce one that never happened.
+        let rules = if rules_on {
+            rules_route(&route_id, &chosen)
+        } else {
+            None
+        };
+        let decided = match rules {
+            None => {
+                // Cheap (a runtime lookup), and it keeps a hold or a
+                // "routed" mark from outliving the rules that made it.
+                if rules_on {
+                    forget(h, &who);
+                }
+                None
+            }
+            Some(r) => {
+                let s = live_situation(h, &who, &chosen, base_effort, &route_id, req).await;
+                let s = if first_sit.as_ref().is_some_and(|first| {
+                    first.base_model != chosen || first.base_effort != base_effort
+                }) {
+                    // A user-selected model/effort swap while paused starts from
+                    // that choice, not a hold or an effort override from before it.
+                    routerules::Situation {
+                        hold: None,
+                        base_model: chosen.clone(),
+                        base_effort,
+                        base_context: base_context(&chosen, &route_id),
+                        ..s
+                    }
+                } else {
+                    s
+                };
+                if first_sit.is_none() {
+                    first_sit = Some(s.clone());
+                }
+                let d = routerules::evaluate(&r.rules, &r.ladder, &s);
+                let consume_stuck = d.consume_stuck
+                    && r.rules
+                        .iter()
+                        .find(|rule| rule.id == d.rule_id)
+                        .is_some_and(|rule| {
+                            rule.when.iter().any(|c| {
+                                let threshold = if c.count > 0 {
+                                    c.count
+                                } else {
+                                    match c.kind.as_str() {
+                                        "stuck" => 2,
+                                        "errors_in_row" => 3,
+                                        "no_progress" => 5,
+                                        _ => 1,
+                                    }
+                                };
+                                !c.not
+                                    && match c.kind.as_str() {
+                                        "stuck" => s.repeat_failures >= threshold,
+                                        "errors_in_row" => s.errors_in_row >= threshold,
+                                        "no_progress" => s.no_progress_turns >= threshold,
+                                        _ => false,
+                                    }
+                            })
+                        });
+                let d = routerules::Decision { consume_stuck, ..d };
+                announce(h, &who, &s, &d).await;
+                Some(((route_id.clone(), chosen.clone(), base_effort), d))
+            }
+        };
+        let (start, effort) = match &decided {
+            Some((_, d)) => (d.model.clone(), d.effort),
+            None => (chosen.clone(), base_effort),
+        };
+        let pass = with_effort(req, effort);
+        let (chain, on_out) = if decided.is_some() {
+            routed_steps(&start, &chosen, &route_id)
+        } else {
+            steps(&chosen, &route_id)
+        };
+        // A routed model may produce less than the base one the caller sized
+        // `max_tokens` for; a request over a model's limit is a 400.
+        let pass = if decided.is_some() {
+            with_output_cap(pass, chain_output(&chain))
+        } else {
+            pass
+        };
         let settings = h.settings.read().await.clone();
         let mut last_err = String::from("no provider configured");
         let mut failed: Vec<String> = vec![];
@@ -548,6 +1368,11 @@ pub async fn request(
                             {
                                 h.stats.event_in(who.task_id, "fallbacks");
                                 notice(h, &who, format!("Now using {label}")).await;
+                            }
+                            if who.turn {
+                                if let Some((_, d)) = &decided {
+                                    commit(h, &who, d);
+                                }
                             }
                             return Ok((turn, t));
                         }

@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { chord } from "../keys";
 import { api, ASSISTS, baseName, clampEffort, EFFORTS, effortLabel, effortSteps, isRequiredAgent, ModelInfo, PERMS, TaskSummary, withRequiredAgents, xOn } from "../api";
 import { matchesTaskQuery, taskSearchDetail } from "./task-search";
-import { chatModel, defaultRoute, flash, get, go, isConnected, modelColor, modelInfo, openProject, openTask, requestPause, saveSettings, set, shownProviders, stepZoom, subModel, useStore, DEFAULT_ZOOM, ZOOMS } from "../store";
+import { chatModel, defaultRoute, flash, get, go, isConnected, modelColor, modelInfo, openProject, requestPause, saveSettings, set, shownProviders, stepZoom, subModel, useStore, DEFAULT_ZOOM, ZOOMS } from "../store";
 import { afterChange, openUltraXEditor, setOpts, togglePlan, toggleUltra, toggleUltraWt, ULTRA_X_SHOWN } from "./Composer";
 import { messageable, chatProjectIsCurrent, MassScope, massTargets, pickAll, projectMenuEntries, ProjectCtxMenu, sortKey, togglePick, archiveTask } from "./Chrome";
 import { pickFolder } from "./Home";
@@ -12,17 +12,25 @@ import { useProjectLabel, useSshHosts } from "./ProjectName";
 import { isSsh, projectLabel } from "../sshPath";
 import { I, StatusIcon, chatStatus } from "./icons";
 import { ChatStatsPanel } from "./ChatStats";
-import { openTransfer, SendToMachine } from "./SendToMachine";
+import { RunTimelinePanel } from "./RunTimeline";
+import { SendToMachine } from "./SendToMachine";
+import { openSaveAsSkill, SaveAsSkill } from "./SaveAsSkill";
+import { MoveChat, openMove } from "./MoveChat";
 import { ModelSwap, openSwap } from "./ModelSwap";
 import { Notices } from "./Notices";
 import { isPaused } from "./Paused";
 import { UltraXEditor } from "./UltraX";
+import { RaceOverlays } from "./Race";
+import { toggleRace, useRaces } from "../race";
 import { TrustDialog } from "./Trust";
 import { ProviderIcon } from "./ProviderIcon";
 import { AnchoredPanel, ColorPicker, Button, Loader, Modal, TextArea, TextButton, Tooltip, IconButton, Input, MenuRow, MenuScrim, Segmented, Switch, Kbd, useAnchoredPanel } from "./primitives";
-import { ArrowLeftRight, BrainCircuit, Check, Copy, FolderGit2, FolderOpen, GitCompare, GitFork, History, Keyboard, Layers, MessagesSquare, MonitorUp, Network, PanelLeft, PanelRight, Route, ScrollText, Server, ServerCog, Shield, Sparkles, SquareTerminal, Star, UserRoundCog, ZoomIn, ZoomOut } from "lucide-react";
+import { ArrowLeftRight, BrainCircuit, Check, Copy, FolderGit2, FolderInput, FolderOpen, GitCompare, GitFork, History, Keyboard, Layers, MessagesSquare, Network, PanelLeft, PanelRight, Route, ScrollText, Server, ServerCog, Shield, Sparkles, SquareTerminal, Star, Trophy, UserRoundCog, ZoomIn, ZoomOut } from "lucide-react";
 import { SETTINGS_TABS } from "./settingsTabs";
 import { ShortcutSheet } from "./Shortcuts";
+import { openRouterLog, RouterActivity } from "./RouterActivity";
+import { routeMenuSummary } from "./routerModel";
+import { openWelcome, Welcome } from "./Welcome";
 
 const li = (C: typeof History, size = 14) => <C aria-hidden="true" size={size} strokeWidth={1.7} />;
 
@@ -56,7 +64,13 @@ function SmallMenu({ z }: { z: number }) {
   const agents = useStore((s) => s.agents);
   const home = useStore((s) => s.home);
   const task = useStore((s) => (s.view !== "home" && s.task ? s.tasks[s.task] : null));
-  const close = () => set({ menu: null });
+  const [newBranch, setNewBranch] = useState(false);
+  const [branchName, setBranchName] = useState("");
+  const [branchError, setBranchError] = useState("");
+  const [creatingBranch, setCreatingBranch] = useState(false);
+  const branchInput = useRef<HTMLInputElement>(null);
+  const close = () => { setNewBranch(false); setBranchName(""); setBranchError(""); set({ menu: null }); };
+  const raceOn = useRaces((s) => s.config.on);
   const sources = useOpenSources(menu === "folder");
   const label = useProjectLabel(menu === "folder" ? settings?.projects : undefined);
   // Read from the subscriptions above, not through get(): these two mirror
@@ -68,7 +82,8 @@ function SmallMenu({ z }: { z: number }) {
   let rows: Row[] = [];
   if (menu === "plus") rows = [
     ...(task ? [{ icon: li(GitFork), label: "Fork this chat…", desc: "Branch off a new chat from here — the whole conversation, or just its context", run: () => openFork(task.id) }] : []),
-    ...(task ? [{ icon: li(MonitorUp), label: "Send to another machine…", desc: "Copy or move this chat to OpenLeash on another computer over SSH", run: () => openTransfer(task.id) }] : []),
+    ...(task ? [{ icon: li(FolderInput), label: "Move to…", desc: "Another folder, a WSL distro, or another machine over SSH", run: () => openMove(task.id) }] : []),
+    ...(task ? [{ icon: li(Sparkles), label: "Save as skill…", desc: "Distil this chat into a reusable SKILL.md you review before it's saved", run: () => openSaveAsSkill(task.id) }] : []),
     { icon: li(ArrowLeftRight), label: task ? "Swap Models…" : "Swap All Models…", k: "/models", run: openSwap },
     // Home only, and only because it needs nothing to point at: it works from
     // the roster of working chats, so there is no "the chat this was opened for"
@@ -76,9 +91,13 @@ function SmallMenu({ z }: { z: number }) {
     ...(task ? [] : [{ icon: li(MessagesSquare), label: "Message all chats…", desc: "One message to the main agent of every chat working right now in this project", run: openMassAll }]),
     { sep: true },
     { icon: li(BrainCircuit), label: "Plan mode", desc: "Propose a plan before editing", k: "Shift Tab", toggle: o.plan, run: () => togglePlan() },
+    // New-task only: opens the chat straight onto its Artificts studio and asks
+    // for a saved artifict. One-shot like plan mode; its pill shows once it is on.
+    ...(task ? [] : [{ icon: li(Layers), label: "Artificts", desc: "Open the new chat on the Artificts studio and build a design you can comment on and tweak", toggle: !!home.artificts, run: () => set((s) => ({ home: { ...s.home, artificts: !s.home.artificts } })) }]),
     { icon: li(Network), label: "Ultrathread", desc: "Fan out nested subagents and keep going until everything's done", k: "/ultra", toggle: o.ultra, run: () => toggleUltra() },
     { icon: li(GitFork), label: "Ultrathread worktrees", desc: "Each worker gets its own git worktree; a fuze agent merges them back", k: "/ultrawt", toggle: o.ultra_wt, run: () => toggleUltraWt() },
     ...(ULTRA_X_SHOWN ? [{ icon: li(Layers), label: "Ultrathread X…", desc: "A ladder of subagent layers, each with its own model, effort and fanout", k: "/ultrax", toggle: xOn(o.ultra_x), run: () => { close(); openUltraXEditor(); } }] : []),
+    ...(task ? [] : [{ icon: li(Trophy), label: "Race", desc: "Run this prompt 2–6 times in separate worktrees, then judge and pick the best", k: "/race", toggle: raceOn, run: () => { close(); toggleRace(); } }]),
     ...(task ? [task.paused
       ? { icon: I.play(12), label: "Resume this task", run: () => { close(); api.resume(task.id).catch((e) => flash(String(e))); } }
       : { icon: I.pause(12), label: "Pause this task", desc: "Freezes the agent and all its subagents", run: () => { close(); requestPause(task.id)?.catch((e) => flash(String(e))); } }] : []),
@@ -91,11 +110,12 @@ function SmallMenu({ z }: { z: number }) {
     const model = task ? task.pending.model ?? task.model : home.model;
     const pickRoute = (id: string) => { close(); void setOpts({ route: id }); };
     rows = [
-      { head: "When the model runs out" },
-      { icon: I.pause(12), label: "No routing", desc: "Pause and wait", check: !cur, run: () => pickRoute("") },
-      ...routes.map((r) => ({ icon: li(Route), label: r.name, desc: r.steps.map((s) => modelInfo(s).name).concat(r.on_exhausted).join(" then "), k: r.heads?.includes(model) ? "for this model" : r.all ? "all models" : "", check: r.id === cur, run: () => pickRoute(r.id) })),
+      { head: "Router" },
+      { icon: I.pause(12), label: "No routing", desc: "Use the chat's model; pause when it runs out", check: !cur, run: () => pickRoute("") },
+      ...routes.map((r): Row => ({ icon: li(Route), label: r.name, desc: routeMenuSummary(r, (m) => modelInfo(m).name), k: r.heads?.includes(model) ? "for this model" : r.all ? "all models" : "", check: r.id === cur, run: () => pickRoute(r.id) })),
       { sep: true },
-      { icon: I.plus(13), label: "Edit routes…", run: () => go("settings", { settingsTab: "routing" }) },
+      ...(task ? [{ icon: li(ScrollText), label: "Router activity…", desc: "What the router switched in this chat, and why", run: () => openRouterLog(task.id) }] : []),
+      { icon: I.plus(13), label: "Edit routers…", run: () => go("settings", { settingsTab: "routing" }) },
     ];
   }
   if (menu === "assist") rows = [
@@ -125,7 +145,12 @@ function SmallMenu({ z }: { z: number }) {
     { head: "Permissions" },
     ...PERMS.map((p) => ({ label: p.name, desc: p.desc, check: p.id === o.perm, run: () => { setOpts({ perm: p.id }); close(); } })),
   ];
-  if (menu === "branch") rows = [{ head: "Base branch" }, ...(info?.branches ?? []).slice(0, 12).map((b) => ({ label: b, mono: true, k: b === info?.branch ? "current" : "", check: b === (home.branch || info?.branch), run: () => { set((s) => ({ home: { ...s.home, branch: b }, menu: null })); } }))];
+  if (menu === "branch") rows = [
+    { head: "Base branch" },
+    ...(info?.branches ?? []).slice(0, 12).map((b) => ({ label: b, mono: true, k: b === info?.branch ? "current" : "", check: b === (home.branch || info?.branch), run: () => { setNewBranch(false); setBranchName(""); set((s) => ({ home: { ...s.home, branch: b }, menu: null })); } })),
+    { sep: true },
+    { icon: I.plus(13), label: "New branch…", run: () => { setNewBranch(true); setBranchError(""); setTimeout(() => branchInput.current?.focus(), 0); } },
+  ];
   if (menu === "folder") rows = [
     { head: "Projects" },
     ...(settings?.projects ?? []).slice(0, 8).map((p) => ({ icon: isSsh(p) ? <Server size={12} strokeWidth={1.8} aria-label="SSH" /> : undefined, label: label(p), desc: p, check: p === settings?.project, ctx: (x: number, y: number) => set({ menu: null, projCtx: { p, x, y } }), run: async () => { close(); await openProject(p); } })),
@@ -142,6 +167,35 @@ function SmallMenu({ z }: { z: number }) {
     <>
       <MenuScrim onClick={close} />
       <div className="pop" style={{ ...style, ...(fit ? { width: "max-content", maxWidth: W } : null), maxHeight: "60vh", overflowY: "auto" }}>
+        {newBranch && menu === "branch" && <form onSubmit={async (e) => {
+          e.preventDefault();
+          if (creatingBranch) return;
+          const name = branchName.trim();
+          if (!name) { setBranchError("Enter a branch name"); branchInput.current?.focus(); return; }
+          const path = get().settings?.project;
+          if (!path) { setBranchError("Open a project first"); return; }
+          setCreatingBranch(true); setBranchError("");
+          try {
+            const branches = await api.projectBranchCreate(path, name, home.branch || info?.branch || "");
+            set((s) => s.settings?.project === path && s.projectInfo
+              ? { projectInfo: { ...s.projectInfo, branches }, home: { ...s.home, branch: name }, menu: null }
+              : { menu: null });
+            setNewBranch(false); setBranchName(""); setCreatingBranch(false);
+          } catch (error) {
+            setBranchError(String(error));
+            setCreatingBranch(false);
+          }
+        }} style={{ padding: "4px 6px 7px" }}>
+          <div className="mhead" style={{ paddingLeft: 2 }}>New branch from {home.branch || info?.branch || "HEAD"}</div>
+          <div style={{ display: "flex", gap: 5 }}>
+            <Input ref={branchInput} className="input mono" aria-label="New branch name" placeholder="feature/my-branch" value={branchName}
+              disabled={creatingBranch} onChange={(e) => { setBranchName(e.currentTarget.value); setBranchError(""); }}
+              onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setNewBranch(false); setBranchName(""); setBranchError(""); } }}
+              style={{ minWidth: 0, flex: 1, fontSize: 12 }} />
+            <Button onClick={() => branchInput.current?.form?.requestSubmit()} disabled={creatingBranch || !branchName.trim()}>{creatingBranch ? <Loader /> : "Create"}</Button>
+          </div>
+          {branchError && <div role="alert" style={{ margin: "5px 2px 0", color: "var(--red)", fontSize: 11 }}>{branchError}</div>}
+        </form>}
         {rows.map((m, i) => m.sep ? <div key={i} className="msep" /> : m.head ? <div key={i} className="mhead">{m.head}</div> : (
           // A row is one line: anything that used to sit under the label is a
           // tooltip now, so the list stays scannable at a glance.
@@ -462,6 +516,7 @@ function Palette() {
         { g: "Chat", icon: I.pin(12), label: cur.pinned ? "Unpin this chat" : "Pin this chat", run: () => { void api.update(cur.id, { pinned: !cur.pinned }); } },
         { g: "Chat", icon: I.edit(12), label: "Rename this chat", run: () => set({ renaming: cur.id, sidebar: true }) },
         { g: "Chat", icon: I.copy(12), label: "Duplicate this chat", run: () => { void api.duplicate(cur.id).then((d) => set((s) => ({ tasks: { ...s.tasks, [d.id]: d } }))).catch((e) => flash(String(e))); } },
+        { g: "Chat", icon: li(Sparkles), label: "Save this chat as a skill…", run: () => openSaveAsSkill(cur.id) },
         { g: "Chat", icon: I.archive(12), label: "Archive this chat", run: () => { void archiveTask(cur.id); } },
       ] : []),
       { g: "Action", icon: li(FolderOpen), label: "Open project folder…", k: "Ctrl O", run: pickFolder },
@@ -471,19 +526,21 @@ function Palette() {
       ...projectMenuEntries(settings?.project ?? "", settings?.projects ?? []).slice(1, 6).map((p) => ({ g: "Project", icon: isSsh(p) ? li(Server) : I.folder(), label: projectLabel(p, sshHosts), run: () => { void openProject(p); } })),
       { g: "Go to", icon: I.bookmark(), label: "Saved prompts", run: () => go("saved") },
       { g: "Go to", icon: I.pause(13), label: "Paused chats", run: () => go("paused") },
+      ...(settings?.show_schedules ? [{ g: "Go to", icon: I.clock(), label: "Schedules", run: () => go("schedules") }] : []),
       { g: "Go to", icon: I.gear(), label: "Settings", k: "Ctrl ,", run: () => go("settings") },
       // Generated from the one list the Settings nav reads, so a page added there
       // is reachable here without a second list to keep in step. This replaces six
       // hand-written rows that covered a third of the tabs.
       ...SETTINGS_TABS.map((tab) => ({ g: "Go to", icon: li(tab.Icon), label: tab.label, run: () => go("settings", { settingsTab: tab.id }) })),
       { g: "Go to", icon: li(Keyboard), label: "Keyboard shortcuts", run: () => { set({ pal: false }); setShortcuts(true); } },
+      { g: "Go to", icon: li(Sparkles), label: "Welcome tour", run: openWelcome },
       { g: "View", icon: li(ZoomIn), label: "Zoom in", k: "Ctrl +", run: () => stepZoom(1) },
       { g: "View", icon: li(ZoomOut), label: "Zoom out", k: "Ctrl −", run: () => stepZoom(-1) },
       ...ZOOMS.map((n) => ({ g: "View", icon: "%", label: `Interface zoom ${n}%${n === DEFAULT_ZOOM ? " (default)" : ""}`, k: n === DEFAULT_ZOOM ? "Ctrl 0" : undefined, run: () => saveSettings({ ui_zoom: n }) })),
       { g: "Action", icon: I.pause(13), label: "Pause all agents", run: () => api.pauseAll().catch((e) => flash(String(e))) },
       { g: "Action", icon: I.play(13), label: "Resume all agents", run: () => api.resumeAll().catch((e) => flash(String(e))) },
       { g: "Go to", icon: li(UserRoundCog), label: "Accounts and usage limits", run: () => go("settings", { settingsTab: "accounts" }) },
-      { g: "Go to", icon: li(Network), label: "Routing and fallbacks", run: () => go("settings", { settingsTab: "routing" }) },
+      { g: "Go to", icon: li(Network), label: "Routers and fallbacks", run: () => go("settings", { settingsTab: "routing" }) },
       ...ASSISTS.map((a) => ({ g: "Assist", icon: li(Sparkles), label: "Assist mode: " + a.name, run: () => { void setOpts({ assist: a.id, now: true }); } })),
       ...EFFORTS.map((e, j) => ({ g: "Effort", icon: li(BrainCircuit), label: "Effort: " + e, run: () => { void setOpts({ effort: j }); } })),
       ...PERMS.map((p) => ({ g: "Permission", icon: li(Shield), label: "Permission: " + p.name, run: () => { void setOpts({ perm: p.id }); } })),
@@ -706,7 +763,6 @@ export function ForkChat() {
     try {
       const f = await api.fork(id, m);
       set({ fork: null, tasks: { ...get().tasks, [f.id]: f } });
-      await openTask(f.id);
       go("session", { task: f.id });
       flash(`Forked · ${m === "full" ? "full copy" : "compacted"}`);
     } catch (e) {
@@ -769,12 +825,18 @@ export function Overlays({ z }: { z: number }) {
       <Palette />
       <ModelSwap />
       <UltraXEditor />
+      <RaceOverlays />
       <MassMessage />
       <ForkChat />
+      <MoveChat />
       <SendToMachine />
+      <SaveAsSkill />
       <ChatStatsPanel />
+      <RunTimelinePanel />
+      <RouterActivity />
       <TrustDialog />
       <OpenProjectDialogs />
+      <Welcome />
       {toast && createPortal(<div className="toast" role="status"><span>{toast}</span>{toastAction && <button type="button" className="toast-act" onClick={() => { const a = toastAction; set({ toast: null, toastAction: null }); a.run(); }}>{toastAction.label}</button>}</div>, document.body)}
       <Notices />
     </>

@@ -35,7 +35,7 @@ it("hosts the plugin's browser as a view of the Artificts surface, not a panel o
   // The chat remembers it was left on its artificts surface — that is saved with
   // the chat — so the second render opens straight into it, and the browser view
   // is simply what the plugin adds to that surface.
-  set({ settings: { ...settings, plugins: { ...settings.plugins, browser: { enabled: true, width: 1280, height: 800 } } } });
+  set({ settings: { ...settings, plugins: { ...settings.plugins, browser: { enabled: true, width: 1280, height: 800, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask" as const, download_dir: "" } } } });
   const { container } = render(<Session />);
   const workspace = container.querySelector(".collaboration-workspace")!;
   expect(workspace).toBeTruthy();
@@ -44,4 +44,15 @@ it("hosts the plugin's browser as a view of the Artificts surface, not a panel o
   expect(workspace.contains(screen.getByText("Browser for browser-chat"))).toBe(true);
   fireEvent.click(screen.getByText("Close test browser"));
   expect(screen.queryByText("Browser for browser-chat")).toBeNull();
+});
+it("offers the Browser view by default, before any plugin setting has been saved", () => {
+  (globalThis as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver = class { observe() {} disconnect() {} unobserve() {} } as unknown as typeof ResizeObserver;
+  vi.spyOn(api, "review").mockResolvedValue({ git: false, files: [] });
+  const task = { id: "default-chat", title: "Chat", status: "stopped", model: "test/model", project: "D:/dummy", subs: [], pending: {}, todos: [], cost: 0, tokens: {}, artifict_open: true, usage: { cost: 0, last_context: 0, cache_read: 0 }, context_window: 200000 } as unknown as TaskSummary;
+  // The browser ships on (Rust `BrowserCfg::default`), so a settings object
+  // without a plugins block still shows the view.
+  set({ task: task.id, tasks: { [task.id]: task }, items: { [task.id]: [] }, settings: {} as unknown as Settings, details: false, find: false });
+  render(<Session />);
+  fireEvent.click(screen.getByRole("button", { name: "Browser" }));
+  expect(screen.getByText("Browser for default-chat")).toBeTruthy();
 });

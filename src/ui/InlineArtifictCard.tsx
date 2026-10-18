@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
-import { Send } from "lucide-react";
+import { Layers, Send } from "lucide-react";
 import { artifictApi, artifictContentError, type ArtifictFeedback, type ArtifictFormat } from "./artifictApi";
 import { useStore } from "../store";
 import { ArtifictContentPreview } from "./ArtifictWorkspace";
-import { ArtifictWipNotice } from "./ArtifictWipNotice";
 import { Button, TextArea } from "./primitives";
 import type { Item } from "../api";
 
@@ -133,6 +132,10 @@ export function InlineArtifictCard({ item, taskId, onOpenArtifict }: {
   taskId?: string;
   onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void;
 }) {
+  // While this chat is on its Artificts studio, a saved artifict is already on
+  // screen beside the transcript: the card collapses to one row that points at
+  // it, so the same design is not drawn twice.
+  const studioOpen = useStore((s) => !!taskId && s.view === "session" && s.task === taskId && (s.tasks[taskId]?.artifict_open ?? false));
   if (isArtifictTool(item) && item.data?.status === "running") {
     const title = buildingTitle(item);
     const hasDraft = typeof item.data?.preview_draft === "string" && item.data.preview_draft.length > 0;
@@ -152,6 +155,12 @@ export function InlineArtifictCard({ item, taskId, onOpenArtifict }: {
   if (!card) return null;
   const saved = card.persistence === "project";
   const version = card.versionId!;
+  if (saved && studioOpen) return <section className="artifict-inline collapsed" aria-label={`Artifict: ${card.title}`}>
+    <Layers size={13} aria-hidden="true" />
+    <strong className="artifict-inline-title">{card.title}</strong>
+    <span className="artifict-inline-meta">{item.data?.name === "artifict_revise" ? "Revised" : "Saved"} · in the studio</span>
+    {onOpenArtifict && <Button variant="ghost" className="artifict-action" aria-label={`Show ${card.title} in the studio`} onClick={() => onOpenArtifict({ artifictId: card.artifictId!, versionId: version })}>Show</Button>}
+  </section>;
   // The frame belongs to the preview below (the shared canvas, or the isolated
   // HTML runtime); this row names the artifct above it instead of boxing the
   // whole thing in a second border.
@@ -159,9 +168,8 @@ export function InlineArtifictCard({ item, taskId, onOpenArtifict }: {
     <header className="artifict-inline-bar">
       <strong className="artifict-inline-title">{card.title}</strong>
       <span className="artifict-inline-meta">{saved ? `Saved to project · version ${version.slice(0, 8)}` : "One-off · in this chat"}</span>
-      {saved && onOpenArtifict && <Button variant="ghost" className="artifict-action" aria-label={`Open ${card.title} in Artificts`} onClick={() => onOpenArtifict({ artifictId: card.artifictId!, versionId: version })}>Open in Artificts</Button>}
+      {saved && onOpenArtifict && <Button variant="default" className="artifict-action artifict-open-studio" aria-label={`Open ${card.title} in Artificts`} title="Comment on it, tweak it and compare versions in the studio" onClick={() => onOpenArtifict({ artifictId: card.artifictId!, versionId: version })}><Layers size={12} aria-hidden="true" />Open in Artificts</Button>}
     </header>
-    <ArtifictWipNotice format={card.kind} content={card.content} />
     {/* The same renderer the workbench uses, so a collaboration record is an
         explorer here too instead of a wall of raw JSON. */}
     <ArtifictContentPreview format={card.kind} content={card.content} label={card.title} autoStart />

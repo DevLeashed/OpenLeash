@@ -41,6 +41,7 @@ fn cfg(github: bool, computer: bool, browser: bool) -> PluginsCfg {
             enabled: browser,
             ..Default::default()
         },
+        ..Default::default()
     }
 }
 
@@ -288,14 +289,34 @@ fn a_sub_agent_tool_list_follows_the_parents_frozen_prefix() {
 
     // A `Default` snapshot is what a cold task carries in `Task.plugins`, which is
     // exactly why `prefix_plugins` falls back to live settings instead of
-    // trusting it: read literally it means "every plugin off", and a first
-    // subagent would inherit that and conclude computer use was switched off.
+    // trusting it: read literally it means "computer off, browser on" whatever
+    // the user chose, and a first subagent would inherit that and conclude
+    // computer use was switched off (or that a browser the user turned off is
+    // there).
     let cold = PluginsCfg::default();
     assert!(
-        !cold.computer.enabled && !cold.browser.enabled,
-        "the cold-task default is all-off, which is why it must not be used as-is"
+        !cold.computer.enabled && cold.browser.enabled,
+        "the cold-task default is the shipped default, not the user's settings, which is why it must not be used as-is"
     );
     assert!(!super::tools::schemas(Some("all"), &cold)
         .iter()
         .any(|t| t["name"] == "screenshot"));
+}
+
+/// The browser ships on, so a new chat on a fresh install offers it and the
+/// screen section steers the model to it instead of the user's screen — to
+/// every subagent policy, read-only included (its reads are free; the runner
+/// refuses what a read-only agent may not do).
+#[test]
+fn a_default_install_offers_the_browser_and_steers_to_it() {
+    let d = PluginsCfg::default();
+    for sub in [None, Some("all"), Some("read_only"), Some("no_shell")] {
+        let names = offered(&d, sub);
+        assert!(names.iter().any(|n| n == "browser"), "{sub:?}: {names:?}");
+        assert!(!names.iter().any(|n| n == "computer" || n == "screenshot"));
+    }
+    let section = prompt::screen_section(&d);
+    assert!(section.contains("`browser`"), "{section}");
+    assert!(!section.contains("`computer`"), "{section}");
+    assert!(section.contains("cannot see or drive the user's screen"));
 }

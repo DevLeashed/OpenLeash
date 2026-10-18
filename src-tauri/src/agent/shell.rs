@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -386,6 +387,18 @@ fn pump<R: AsyncRead + Unpin + Send + 'static>(
     r: Option<R>,
     buf: Arc<Mutex<String>>,
 ) -> tokio::task::JoinHandle<()> {
+    pump_counted(r, buf, Arc::new(AtomicUsize::new(0)))
+}
+
+/// `pump`, also counting the bytes the bound drops off the front. A reader that
+/// keeps its own position (a `wait_for_event` job trigger) needs the count to
+/// turn "absolute bytes seen" into an index into what is left of the buffer;
+/// without it, a trim after 2 MB would make it re-read or skip output.
+fn pump_counted<R: AsyncRead + Unpin + Send + 'static>(
+    r: Option<R>,
+    buf: Arc<Mutex<String>>,
+    dropped: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let Some(mut r) = r else { return };
         let mut chunk = [0u8; 8192];
@@ -400,6 +413,7 @@ fn pump<R: AsyncRead + Unpin + Send + 'static>(
                         let cut = b.len() - 1_000_000;
                         let cut = (cut..b.len()).find(|i| b.is_char_boundary(*i)).unwrap_or(0);
                         b.drain(..cut);
+                        dropped.fetch_add(cut, Ordering::SeqCst);
                     }
                 }
             }
@@ -424,6 +438,32 @@ pub struct BgJob {
     pub done: CancellationToken,
     /// Runs on an SSH host: its output is never spilled to a local file.
     pub remote: bool,
+    /// Bytes trimmed off the front of `buf` so far (see `pump_counted`).
+    pub dropped: Arc<AtomicUsize>,
+}
+
+impl BgJob {
+    /// Absolute output position: every byte ever captured, trimmed or not.
+    pub fn output_end(&self) -> usize {
+        let b = self.buf.lock().unwrap();
+        self.dropped.load(Ordering::SeqCst) + b.len()
+    }
+
+    /// Output captured after absolute position `from`, and the new end.
+    ///
+    /// Independent of `read_pos` on purpose: this is for a watcher, and moving
+    /// the agent's own `bash_output` cursor would hide output it never saw.
+    /// Output already trimmed off the front is gone; the text starts at what
+    /// is left.
+    pub fn output_since(&self, from: usize) -> (String, usize) {
+        let b = self.buf.lock().unwrap();
+        let dropped = self.dropped.load(Ordering::SeqCst);
+        let start = from.saturating_sub(dropped).min(b.len());
+        let start = (start..=b.len())
+            .find(|i| b.is_char_boundary(*i))
+            .unwrap_or(b.len());
+        (b[start..].to_string(), dropped + b.len())
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -471,8 +511,9 @@ impl BgManager {
         } = job;
         let id = format!("bg_{}", &super::new_id()[..6]);
         let buf = Arc::new(Mutex::new(String::new()));
-        pump(Some(stdout), buf.clone());
-        pump(stderr, buf.clone());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        pump_counted(Some(stdout), buf.clone(), dropped.clone());
+        pump_counted(stderr, buf.clone(), dropped.clone());
         let (exit, stop) = (Arc::new(Mutex::new(None)), CancellationToken::new());
         let (kill_reason, done) = (Arc::new(Mutex::new(None)), CancellationToken::new());
         let bg = Arc::new(BgJob {
@@ -487,6 +528,7 @@ impl BgManager {
             kill_reason: kill_reason.clone(),
             done: done.clone(),
             remote: true,
+            dropped,
         });
         self.jobs.lock().unwrap().insert(id.clone(), bg);
         self.prune_finished();
@@ -542,8 +584,9 @@ impl BgManager {
     ) -> Result<String, String> {
         let mut child = c.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
         let buf = Arc::new(Mutex::new(String::new()));
-        pump(child.stdout.take(), buf.clone());
-        pump(child.stderr.take(), buf.clone());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        pump_counted(child.stdout.take(), buf.clone(), dropped.clone());
+        pump_counted(child.stderr.take(), buf.clone(), dropped.clone());
         let exit = Arc::new(Mutex::new(None));
         let stop = CancellationToken::new();
         let (kill_reason, done) = (Arc::new(Mutex::new(None)), CancellationToken::new());
@@ -559,6 +602,7 @@ impl BgManager {
             kill_reason: kill_reason.clone(),
             done: done.clone(),
             remote: false,
+            dropped,
         });
         self.jobs.lock().unwrap().insert(id.clone(), job);
         self.prune_finished();

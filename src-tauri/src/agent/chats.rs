@@ -427,9 +427,75 @@ async fn sender_label(h: &Arc<Harness>, id: &str) -> String {
     }
 }
 
+/// Is a chat in this state still doing the work a `wait_for_event` `chat`
+/// trigger waits out? Only actively working counts: a chat that stopped, finished,
+/// paused, parked on its own trigger, or needs the user is as far as it will get
+/// without someone else acting, so waiting on it longer would only stall.
+pub(crate) fn still_working(state: &str) -> bool {
+    matches!(state, "running" | "waiting")
+}
+
+/// Resolve the chat a `wait_for_event` `chat` trigger names, the way
+/// `message_chat` resolves `to`: `(id, label, state)`. A read, so it needs only
+/// the cross-chat switch, not an approval.
+pub(crate) async fn watch_target(
+    h: &Arc<Harness>,
+    me: &str,
+    to: &str,
+) -> Result<(String, String, String), String> {
+    let (on, paused_all) = {
+        let s = h.settings.read().await;
+        (s.cross_chat, s.paused_all)
+    };
+    if !on {
+        return Err(OFF.into());
+    }
+    let all = rows(h, paused_all).await;
+    let target = resolve(&all, to)?;
+    if target.id == me {
+        return Err("That's this chat — it can't wait for itself.".into());
+    }
+    Ok((target.id.clone(), label(target), state_word(target)))
+}
+
+/// The current state word of one chat, or `None` once it no longer exists (or
+/// the user switched cross-chat off, which ends the watch the same way).
+pub(crate) async fn watch_state(h: &Harness, id: &str) -> Option<String> {
+    let paused_all = {
+        let s = h.settings.read().await;
+        if !s.cross_chat {
+            return None;
+        }
+        s.paused_all
+    };
+    let r = h.tasks.read().await.get(id).cloned()?;
+    let row = row_of(&*r.lock().await, paused_all);
+    let parked = h
+        .runtime_if(id)
+        .is_some_and(|rt| rt.wake_state.lock().unwrap().parked);
+    Some(state_word(&ChatRow { parked, ..row }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_actively_working_chat_keeps_a_chat_trigger_waiting() {
+        assert!(still_working("running"));
+        assert!(still_working("waiting"));
+        for settled in [
+            "done",
+            "stopped",
+            "idle",
+            "paused",
+            "waiting on a trigger",
+            "needs the user's approval",
+            "needs an answer from the user",
+        ] {
+            assert!(!still_working(settled), "{settled} should end the wait");
+        }
+    }
 
     fn row(id: &str, title: &str) -> ChatRow {
         ChatRow {

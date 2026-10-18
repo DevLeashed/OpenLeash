@@ -32,19 +32,19 @@ export function ReplyTable({ children }: { children?: ReactNode }) {
     return (sort.descending ? -order : order) || a.index - b.index;
   });
   return <div className="reply-table">
-    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", margin: "8px 0" }}>
+    <div className="rt-bar">
       <label htmlFor={id}>Filter rows</label>
-      <input id={id} type="search" value={query} onChange={event => setQuery(event.target.value)} style={{ minWidth: 120, flex: 1 }} />
-      <span role="status">{filtered.length} / {rows.length} rows</span>
-      {(query || sort) && <button type="button" onClick={() => { setQuery(""); setSort(null); }}>Reset table</button>}
+      <input id={id} type="search" placeholder="Type to filter…" value={query} onChange={event => setQuery(event.target.value)} />
+      <span className="rt-count" role="status">{filtered.length} / {rows.length} rows</span>
+      {(query || sort) && <button type="button" className="rt-reset" onClick={() => { setQuery(""); setSort(null); }}>Reset table</button>}
     </div>
-    <div style={{ overflowX: "auto" }}><table>
+    <div className="rt-scroll"><table>
       {cloneElement(head, {}, cloneElement(headerRow, {}, headers.map((cell, column) => cloneElement(cell, { key: column, "aria-sort": sort?.column === column ? sort.descending ? "descending" : "ascending" : "none" },
-        <button type="button" onClick={() => setSort(current => ({ column, descending: current?.column === column ? !current.descending : false }))} style={{ font: "inherit", color: "inherit", background: "transparent", border: 0, cursor: "pointer", textAlign: "inherit" }}>
-          {cell.props.children}{sort?.column === column ? sort.descending ? " ↓" : " ↑" : " ↕"}
+        <button type="button" className="rt-sort" onClick={() => setSort(current => ({ column, descending: current?.column === column ? !current.descending : false }))}>
+          {cell.props.children}<span className="rt-arrow" aria-hidden="true">{sort?.column === column ? sort.descending ? "↓" : "↑" : "↕"}</span>
         </button>))))}
       {cloneElement(body, {}, filtered.map(({ row, index }) => cloneElement(row, { key: index })))}
     </table></div>
-    {!filtered.length && <p>No matching rows.</p>}
+    {!filtered.length && <p className="rt-empty">No matching rows.</p>}
   </div>;
 }

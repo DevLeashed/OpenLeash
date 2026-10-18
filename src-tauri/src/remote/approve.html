@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#0f0f11" />
+<meta name="referrer" content="no-referrer" />
+<meta name="robots" content="noindex" />
+<title>Approve · OpenLeash</title>
+<style>
+  :root { color-scheme: dark; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  html, body { margin: 0; height: 100%; background: #0f0f11; color: #e8e8ea; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { min-height: 100%; min-height: 100dvh; display: flex; align-items: center; justify-content: center; box-sizing: border-box; padding: max(24px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+  .card { width: 100%; max-width: 420px; background: #19191c; border: 1px solid #2a2a2e; border-radius: 14px; padding: 24px; box-sizing: border-box; }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  .chat { margin: 0 0 14px; color: #a2a2a8; font-size: 14px; overflow-wrap: anywhere; }
+  .kind { font-size: 12px; color: #77777e; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+  pre { margin: 0 0 8px; padding: 12px; border-radius: 10px; border: 1px solid #33333a; background: #0f0f11; font: 13px/1.45 ui-monospace, "SF Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }
+  .detail { margin: 0 0 8px; color: #a2a2a8; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  button { display: block; margin-top: 10px; width: 100%; min-height: 48px; padding: 12px; border: 0; border-radius: 10px; background: #ff6363; color: #140707; font: 600 16px system-ui, sans-serif; cursor: pointer; -webkit-tap-highlight-color: transparent; overflow-wrap: anywhere; }
+  button.secondary { background: #26262b; color: #e8e8ea; border: 1px solid #33333a; }
+  button.deny { background: transparent; color: #ff8a8a; border: 1px solid #4a2a2e; }
+  button:disabled { opacity: .6; cursor: default; }
+  .msg { min-height: 1.4em; margin-top: 14px; font-size: 14px; color: #ff8a8a; }
+  .msg.ok { color: #7ee2a8; font-weight: 600; font-size: 16px; }
+  a { color: #ff8a8a; }
+  .open { display: inline-block; margin-top: 12px; font-size: 14px; }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) { .card { padding: 20px 16px; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1 id="head">Approval request</h1>
+    <p class="chat" id="chat">Loading…</p>
+    <div id="req" hidden>
+      <div class="kind" id="kind"></div>
+      <pre id="title"></pre>
+      <p class="detail" id="detail" hidden></p>
+      <div id="actions">
+        <button id="once" type="button">Approve once</button>
+        <button id="always" type="button" class="secondary" hidden></button>
+        <button id="deny" type="button" class="deny">Deny</button>
+      </div>
+    </div>
+    <div class="msg" id="msg" role="alert"></div>
+    <a class="open" id="open" href="/" hidden>Open OpenLeash</a>
+  </div>
+</main>
+<script src="/__openleash/push/approve.js"></script>
+</body>
+</html>

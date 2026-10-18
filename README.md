@@ -32,20 +32,22 @@ The agent executes model-authored commands, so the permission layer is security-
 - **Tools.** `read_file`, `edit_file`, `write_file`, `glob`, `grep`, `bash`, `todo_write`, `web_fetch`, subagents and more. Each tool's description states when to use it and when not to.
 - **Edits.** Exact-string, unique-match edits. They fail if the agent has not read the file or if the file changed since.
 - **Permission gates.** Read-only commands run without asking. Everything else asks. Allow rules never match chained commands (`&&`, `;`, `|`, `$(...)`, backticks, redirects). Plan mode blocks edits until you approve.
-- **Parallel tasks.** Each task runs in its own **git worktree**, so concurrent agents do not collide. Review and commit per branch.
+- **Parallel tasks.** Each task runs in its own **git worktree** or a **docker** workspace, so concurrent agents do not collide. Review and commit per branch. Best-of-N races compare several attempts and merge only the one you pick.
 - **Subagents.** Large searches run in a fresh, read-only context to keep the main one clean.
-- **Providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Gemini, OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, LM Studio, vLLM and custom endpoints.
-- **Controls.** A live todo list, mid-turn steering, `Esc` to pause or kill the whole process tree, and a budget cap.
+- **Providers.** Anthropic natively (adaptive thinking, effort), plus OpenAI, Google (Gemini), OpenRouter, Z.ai, OpenCode, Ollama, DeepSeek, Groq, xAI, Mistral, Together, Fireworks, Moonshot, LM Studio, vLLM and custom endpoints. A ChatGPT or Claude subscription can be used instead of an API key, where the account type allows it.
+- **Controls.** A live todo list, mid-turn steering, `Esc` to pause or kill the whole process tree, usage caps per account, and a budget cap.
 - **Goal mode.** `/goal <what done looks like>` keeps the agent working until it shows the goal is met.
-- **Extensions.** Skills (`SKILL.md`), MCP servers (stdio and HTTP), hooks, and project memory via `OPENLEASH.md` / `AGENTS.md` / `CLAUDE.md`.
+- **Extensions.** Skills (`SKILL.md`), MCP servers (stdio and HTTP), hooks, a headless CLI and an editor server (ACP), and project memory via `OPENLEASH.md` / `AGENTS.md` / `CLAUDE.md`.
+- **Memory.** The agent remembers you across every project, and each project's decisions, without being asked. Notes are plain markdown loaded into each new chat.
+- **Discord, Telegram and Slack.** Message your agent from Discord, Telegram or Slack. Each channel, thread or DM is a chat on your machine, with approvals and questions relayed back. Only the users you list can reach it.
+- **Artificts.** Agents can make HTML, SVG, Markdown, data and image deliverables, with a studio to comment on, edit, restore and export them.
+- **Schedules.** Send a prompt to a new chat every N minutes, daily or weekly.
+- **Browser.** A headless browser the agent can drive, with a shared view you can watch and annotate.
+- **Phone approvals.** Approve or answer from your phone through remote control and ntfy.
 - **Review view.** Per-file revert and commit, with or without git.
-- **No telemetry.** Requests go only to the providers and services you use.
+- **No telemetry.** Requests go only to the providers and services you use. Updates check GitHub for new releases.
 
 The full list is in [docs/features.md](docs/features.md).
-
-## Roadmap
-
-- Agent sandboxes (already kinda  in..)
 
 ## Getting started
 
@@ -79,7 +81,7 @@ To make a production build, run `npm run tauri build`.
 | `Ctrl K` | Command palette |
 | `Ctrl N` | New task |
 | `Shift Tab` | Toggle plan mode |
-| `Alt Enter` | Steer the agent without stopping its turn |
+| `Alt Enter` | Queue a message to send after the current turn |
 | `Esc` | Pause. Press twice to hard-stop. |
 | `Ctrl O` | Open a project folder |
 
@@ -119,6 +121,9 @@ Changes to `permissions.rs`, `tools.rs` or tool dispatch need a test that fails 
 ## Documentation
 
 - [Features](docs/features.md)
+- [Workspaces: local, worktree and docker](docs/workspaces.md)
+- [Remote control, SSH and WSL](docs/remote.md)
+- [Artifict collaboration](docs/artifict-collaboration.md)
 - [Building from source](docs/building.md)
 - [Configuration](docs/configuration.md)
 - [Shortcuts and slash commands](docs/shortcuts.md)
