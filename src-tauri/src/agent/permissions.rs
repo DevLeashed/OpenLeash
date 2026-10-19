@@ -256,6 +256,7 @@ fn plugin_deny(tool: &str, action: &str, ctx: &Ctx) -> Option<String> {
         "github" => format!("github:{action}"),
         "computer" => "computer *".to_string(),
         "browser" => format!("browser:{action}"),
+        "sandbox" => format!("sandbox:{action}"),
         // For `lsp` the "action" is the language server the runner resolved.
         "lsp" => format!("lsp:{action}"),
         t if super::plugin_services::is_service(t) => format!("{t}:{action}"),
@@ -1265,6 +1266,8 @@ fn deny_tier(
     // UI writes, not on a command line. `lsp` names its server the same way.
     let action = if tool == "lsp" {
         input["__server"].as_str().unwrap_or("")
+    } else if tool == "sandbox" {
+        input["op"].as_str().unwrap_or("")
     } else {
         input["action"].as_str().unwrap_or("")
     };
@@ -1573,6 +1576,47 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                 reason: reason.into(),
                 rule: Some(rule),
             }
+        }
+        // Sandboxes (`sandbox.rs`): the agent's own containers, not the user's
+        // machine, so using one needs no approval -- but it is still an
+        // action, so plan mode and the Disabled rung refuse everything except
+        // looking at the list, and `create` asks first because it builds a
+        // large image and starts a container on the user's Docker engine.
+        "sandbox" => {
+            let op = input["op"].as_str().unwrap_or("");
+            if op == "list" {
+                return Decision::Allow;
+            }
+            if ctx.plan {
+                return Decision::Deny(format!("Plan mode is active: sandbox `{op}` is disabled until the plan is approved. `list` still works."));
+            }
+            if disabled {
+                return Decision::Deny(DISABLED_MSG.into());
+            }
+            let rule = format!("sandbox:{op}");
+            let allowed = ctx.allow.iter().any(|r| {
+                deny_pattern(&r.pattern).is_none()
+                    && (r.pattern == rule || r.pattern == "sandbox *")
+            });
+            // Deleting is the one sandbox action that destroys something the
+            // user may care about (a disk, snapshots, shared files).
+            if op == "delete" && rung != Rung::Turbo && !allowed {
+                return Decision::Ask {
+                    title: format!("Delete sandbox · {}", input["sandbox"].as_str().unwrap_or("?").chars().take(60).collect::<String>()),
+                    detail: serde_json::to_string_pretty(input).unwrap_or_default(),
+                    reason: "Permanently removes the sandbox: its disk, snapshots and shared files.".into(),
+                    rule: Some(rule),
+                };
+            }
+            if op == "create" && rung != Rung::Turbo && !allowed {
+                return Decision::Ask {
+                    title: format!("Create sandbox · {}", input["name"].as_str().unwrap_or("new").chars().take(60).collect::<String>()),
+                    detail: serde_json::to_string_pretty(input).unwrap_or_default(),
+                    reason: "Starts a new Linux desktop container on your Docker engine (the first one builds a ~1 GB image).".into(),
+                    rule: Some(rule),
+                };
+            }
+            Decision::Allow
         }
         // The browser plugin. See `browser_check` for the whole decision table.
         "browser" => browser_check(input, ctx),

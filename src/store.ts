@@ -9,7 +9,7 @@ import type { SchedulesState } from "./api";
 import { listenRaces } from "./race";
 import { BisectEvent, BisectProbe, BisectReport } from "./api";
 
-export type View = "home" | "session" | "diff" | "saved" | "pulls" | "paused" | "settings" | "schedules";
+export type View = "home" | "session" | "diff" | "saved" | "pulls" | "paused" | "settings" | "schedules" | "race";
 export type Menu = null | "plus" | "perm" | "branch" | "folder" | "model" | "assist" | "agents" | "route";
 
 export interface State {
@@ -1575,7 +1575,7 @@ export function subModel(t: Pick<TaskSummary, "model" | "pending" | "ultra_x">, 
 export const ZOOMS = [60, 70, 80, 90, 100, 110, 125, 150, 175, 200];
 
 /** The zoom a fresh install starts on, and what Ctrl 0 / Reset goes back to. */
-export const DEFAULT_ZOOM = 110;
+export const DEFAULT_ZOOM = typeof navigator !== "undefined" && /linux/i.test(navigator.platform || navigator.userAgent) ? 100 : 110;
 
 /**
  * Current zoom as a CSS scale factor. Every overlay that positions itself in

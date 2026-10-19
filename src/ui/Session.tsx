@@ -7,6 +7,7 @@ import ReactMarkdown from "react-markdown";
 import { copyText, mdComponents, MD_PLUGINS as MD_PLUGINS_SHARED, MdInline, replyUrlTransform } from "./mdx";
 import { RecoverySummary } from "./RecoverySummary";
 import { AssistantMarkdown } from "./Visualization";
+import { getStudioView, patchStudioView } from "./studioViewState";
 import { ArtifictWorkspace, studioHandoff } from "./ArtifictWorkspace";
 import { InlineArtifictCard, hasArtifictCardSlot, type ArtifictWorkspaceSelection } from "./InlineArtifictCard";
 import { BrowserPanel } from "./BrowserPanel";
@@ -16,7 +17,7 @@ import { api, ago, effortLabel, fmt$, Bg, FileRef, Item, ItemData, ToolAction, T
 import { flash, get, go, isPhoneClient, loadPreviousHistory, loadSubTranscript, chatModel, modelColor, modelInfo, newerSummary, openTask, requestPause, set, subModel, useStore, useThrottled, zoom } from "../store";
 import { Composer, humanBytes, MAX_FILES, MAX_IMAGE, PendingStar } from "./Composer";
 import { openSwap } from "./ModelSwap";
-import { Annotations, AttachmentChips, SentAnnotationMessage, splitContextBlocks, stripHarnessBlocks } from "./SelectionNote";
+import { Annotations, AttachmentChips, SentAnnotationMessage, splitContextBlocks, stagedAttachments, stripHarnessBlocks } from "./SelectionNote";
 import { heldByGlobal, isPaused } from "./Paused";
 import { enterSendsMessage, messageSendKey } from "../keys";
 import { I, StatusIcon, chatStatus } from "./icons";
@@ -654,10 +655,12 @@ async function pickFiles(): Promise<string[]> {
 }
 
 /** The staged temp copies the backend made for a message, as pickable file refs,
- *  so an edited message can be resent with the attachments it went out with. */
+ *  so an edited message can be resent with the attachments it went out with.
+ *  Only the files: the pictures still on the message are resent as image blocks
+ *  from `data.images`, and listing their staged copies here as well sent every
+ *  picture twice, once as an image and once as a path. */
 function stagedFiles(data: ItemData | undefined): FileRef[] {
-  const staged = Array.isArray(data?.attachments) ? data!.attachments! : [];
-  return staged.map((a, i) => ({ path: a.path, name: a.name || `attachment-${i + 1}`, size: a.size, isDir: false, image: false }));
+  return stagedAttachments(data).files.map((a) => ({ path: a.path, name: a.name, size: a.size, isDir: false, image: false }));
 }
 
 /** One user message: the bubble, its attachments, and the editor it becomes when
@@ -721,7 +724,14 @@ export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: Tas
       // what went out the first time.
       const withStaged = files.length ? files : stagedFiles(it.data);
       const paths = withStaged.filter((f) => !f.image).map((f) => f.path);
-      const imageNames = imgs.map((_, i) => withStaged.find((f) => f.image)?.name ?? `image-${i + 1}`);
+      // A picture that went out with the message keeps the name it was staged
+      // under; one pasted or attached in the editor is named like the composer's.
+      const sentImages = Array.isArray(it.data?.images) ? (it.data.images as string[]) : [];
+      const sentNames = stagedAttachments(it.data).images.map((a) => a.name);
+      const imageNames = imgs.map((src, i) => {
+        const sent = sentImages.indexOf(src);
+        return (sent >= 0 ? sentNames[sent] : undefined) ?? withStaged.filter((f) => f.image)[i]?.name ?? `image-${i + 1}`;
+      });
       await api.send(task.id, text, false, imgs.length ? imgs : undefined, paths, imageNames);
       setEditing(false);
     } catch (e) {
@@ -782,7 +792,7 @@ export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: Tas
       {!live && <IconButton label="Rewind to here: pick a checkpoint and choose whether to put back the conversation, the files, or both." className="rw" onClick={() => setRwOpen(true)}>{I.rewind()}</IconButton>}
       {rwOpen && <Rewind taskId={task.id} itemId={it.id} onClose={() => setRwOpen(false)} />}
       <div className="ucol">
-      <div className="ubub">{Array.isArray(it.data?.images) && it.data.images.length > 0 && <div className="ubimgs">{it.data.images.map((src: string, i: number) => <Thumb key={i} src={src} items={(it.data.images as string[]).map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />)}</div>}<AttachmentChips text={it.text} /><SentAnnotationMessage text={stripHarnessBlocks(it.text, it.data)} /></div>
+      <div className="ubub">{Array.isArray(it.data?.images) && it.data.images.length > 0 && <div className="ubimgs">{it.data.images.map((src: string, i: number) => <Thumb key={i} src={src} items={(it.data.images as string[]).map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />)}</div>}<AttachmentChips text={it.text} data={it.data} /><SentAnnotationMessage text={stripHarnessBlocks(it.text, it.data)} /></div>
       <div className="msgacts">
         <span onClick={() => copyText(stripHarnessBlocks(it.text, it.data))}>Copy</span>
         <span onClick={startEdit}>Edit</span>
@@ -2203,7 +2213,14 @@ export function Session() {
     const handed = studioHandoff.get(handoffId) ?? null;
     studioHandoff.delete(handoffId);
     setWorkspaceSelection(handed);
+    // This chat's own tab and expanded state (the studio restores the rest itself).
+    const back = getStudioView(handoffId);
+    setWorkspaceTab(back.tab ?? "artificts");
+    setWorkspaceExpanded(back.expanded ?? false);
   }, [handoffId]);
+  useEffect(() => {
+    if (handoffId) patchStudioView(handoffId, { tab: workspaceTab, expanded: workspaceExpanded });
+  }, [handoffId, workspaceTab, workspaceExpanded]);
   // Stable identity on purpose. This is handed to `Timeline` and passed down to
   // every row: as an inline arrow it was a new prop on every Session render, and
   // Session re-renders on every summary event for this chat (status, step, cost,

@@ -5,11 +5,14 @@ import {
   RefreshCw, Scan, Send, Smartphone, Sparkles, Tablet, Trash2, WandSparkles, X,
 } from "lucide-react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { ArtifictAnnotation, ArtifictDetail, ArtifictFeedback, ArtifictFormat, ArtifictSummary, artifictApi, exportFileName, exportTarget, parseArtifictState } from "./artifictApi";
 import { ArtifictOverview, ARTIFICT_BADGE } from "./ArtifictCanvas";
 import { ArtifictEditPanel } from "./ArtifictEditPanel";
 import { applyEditsToSource, editChanges, editNote, liveEdits, MAX_EDIT_ELEMENTS, type EditProp, type EditSet, type ElementEdit, type InspectPick } from "./artifictEdits";
 import { ArtifictThumb } from "./ArtifictThumb";
+import { Sandboxes } from "./Sandboxes";
+import { getStudioView, patchStudioView } from "./studioViewState";
 import { ArtifictTweaksPanel } from "./ArtifictTweaksPanel";
 import { CommentComposer, HtmlArtboard, ReadableArtboard, StudioSource, type StudioDevice, type StudioMode } from "./ArtifictStudioStage";
 import { parseTweaks, tweakMessages, tweakState, type TweakValue } from "./artifictTweaks";
@@ -125,20 +128,34 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
   // The records are a view of their own rather than a rail beside the one you
   // opened: the studio starts on the record itself, and "All artificts" is the
   // way to the set.
-  const [gallery, setGallery] = useState(startInGallery);
+  // The studio remounts when the chat changes (it is keyed by chat), so the view this chat left is read back here.
+  // Browse-only embeds borrow another chat's studio and neither read nor write it.
+  const saved = useMemo(() => (browseOnly ? {} : getStudioView(taskId)), []); // eslint-disable-line react-hooks/exhaustive-deps
+  const [gallery, setGallery] = useState(saved.gallery ?? startInGallery);
+  // The studio has two modes: the project's artificts, and the sandboxes (agent-owned computers).
+  const [sbx, setSbx] = useState(saved.sbx ?? false);
+  // When this chat's agent makes or picks a sandbox, show it rather than leaving the user on a design.
+  useEffect(() => {
+    if (browseOnly) return;
+    let un: (() => void) | undefined; let dead = false;
+    void Promise.resolve(listen<{ task?: string; attached?: boolean }>("ol://sandbox", ({ payload }) => {
+      if (payload.attached && payload.task === taskId) { setSbx(true); setGallery(false); }
+    })).then((u) => { if (typeof u === "function") { if (dead) u(); else un = u; } });
+    return () => { dead = true; un?.(); };
+  }, [browseOnly, taskId]);
   const [expanded, setExpanded] = useState(false);
   // Expand is a claim on the layout, and the layout belongs to the pane that
   // hosts this surface, so the state is reported out rather than acted on here.
   useEffect(() => { onExpandedChange?.(expanded); }, [expanded, onExpandedChange]);
   const [filter, setFilter] = useState("");
-  const [mode, setMode] = useState<StudioMode>("interact");
+  const [mode, setMode] = useState<StudioMode>((saved.mode as StudioMode | undefined) ?? "interact");
   const [device, setDeviceState] = useState<StudioDevice>(savedDevice);
   const setDevice = (value: StudioDevice) => { setDeviceState(value); try { localStorage.setItem(DEVICE_STORE, value); } catch { /* Not persisted; still applied. */ } };
   const [showSource, setShowSource] = useState(false);
   // Comments, Tweaks and Details are cards that float over the canvas, opened
   // from the toolbar — never a column that takes the design's width. Closed
   // until asked for; the comments themselves are already on the canvas as pins.
-  const [panel, setPanel] = useState<null | "comments" | "tweaks" | "details" | "edit" | "ask">(null);
+  const [panel, setPanel] = useState<null | "comments" | "tweaks" | "details" | "edit" | "ask">((saved.panel as null | "comments" | "tweaks" | "details" | "edit" | "ask" | undefined) ?? null);
   const togglePanel = (which: "comments" | "tweaks" | "details" | "edit" | "ask") => setPanel((open) => open === which ? null : which);
   const [activeAnnotation, setActiveAnnotation] = useState<string | null>(null);
   // Drafts belong to an exact version, not whichever preview happens to be open.
@@ -155,8 +172,12 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(""), 2600); return () => clearTimeout(t); }, [notice]);
-  const initialArtifictId = initialSelection?.artifictId ?? "";
-  const initialVersionId = initialSelection?.versionId ?? "";
+  // An explicit selection (a card, or a handoff from another chat) wins; otherwise this chat's own last one.
+  const initialArtifictId = initialSelection?.artifictId ?? saved.artifictId ?? "";
+  const initialVersionId = initialSelection?.versionId ?? (initialSelection ? "" : saved.versionId ?? "");
+  useEffect(() => {
+    if (!browseOnly) patchStudioView(taskId, { artifictId, versionId, gallery, sbx, mode, panel });
+  }, [browseOnly, taskId, artifictId, versionId, gallery, sbx, mode, panel]);
   // The backend publishes a new id every time an artifict is written — from the
   // agent's own tools as much as from here — so a revision the agent makes during
   // a turn lands in an open studio without a manual Refresh.
@@ -280,7 +301,7 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
   useEffect(() => { if (format && format !== "html") { setMode((m) => m === "edit" ? "interact" : m); setPanel((p) => p === "edit" ? null : p); } }, [format]);
   // Publish what is on screen so the chat can tell the agent; withdrawn when
   // the studio closes, the gallery is up, or nothing is selected.
-  const shownId = !browseOnly && !gallery && current && selectedDetail ? `${selectedDetail.summary.id}:${current.id}` : "";
+  const shownId = !browseOnly && !gallery && !sbx && current && selectedDetail ? `${selectedDetail.summary.id}:${current.id}` : "";
   const shownTitle = selectedDetail?.summary.title ?? "";
   const shownNumber = current?.number ?? 0;
   useEffect(() => {
@@ -496,7 +517,7 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
   // phase and consume it, the way useEscapeClose does.
   const escapeRef = useRef(onEscape);
   escapeRef.current = onEscape;
-  const escapeActive = !gallery && !!current && (mode !== "interact" || !!pending);
+  const escapeActive = !gallery && !sbx && !!current && (mode !== "interact" || !!pending);
   useEffect(() => {
     if (!escapeActive) return;
     const onKey = (e: KeyboardEvent) => {
@@ -573,12 +594,16 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
   return <section aria-label="Artifict workspace" className="studio" onKeyDown={onKeyDown}>
     {portalOr(<div role="toolbar" aria-label="Artifict tools" className={toolbarSlot ? "studio-bar in-header" : "studio-bar artifict-workspace-bar"}>
       <div className="studio-bar-group studio-title-group">
-        {rows.length > 0 && <Tooltip content={gallery ? "Back to the open artifict" : "All artificts in this project"} side="bottom"><button type="button" className={`studio-tool studio-gallery-toggle${gallery ? " on" : ""}`} aria-label={gallery ? "Back to artifict" : "All artificts"} aria-expanded={gallery} onClick={() => setGallery((value) => !value)}>{gallery ? <ChevronLeft size={15} aria-hidden="true" /> : <LayoutGrid size={14} aria-hidden="true" />}</button></Tooltip>}
-        <b className="studio-title" title={detail?.summary.title}>{gallery ? "Artificts" : detail?.summary.title ?? "Artificts"}</b>
-        {!gallery && format && <span className="artifict-badge">{ARTIFICT_BADGE[format]}</span>}
+        {!sbx && rows.length > 0 && <Tooltip content={gallery ? "Back to the open artifict" : "All artificts in this project"} side="bottom"><button type="button" className={`studio-tool studio-gallery-toggle${gallery ? " on" : ""}`} aria-label={gallery ? "Back to artifict" : "All artificts"} aria-expanded={gallery} onClick={() => setGallery((value) => !value)}>{gallery ? <ChevronLeft size={15} aria-hidden="true" /> : <LayoutGrid size={14} aria-hidden="true" />}</button></Tooltip>}
+        <b className="studio-title" title={detail?.summary.title}>{sbx ? "Sandboxes" : gallery ? "Artificts" : detail?.summary.title ?? "Artificts"}</b>
+        {!gallery && !sbx && format && <span className="artifict-badge">{ARTIFICT_BADGE[format]}</span>}
         {!toolbarSlot && <span className="studio-task" title={taskTitle}>{taskTitle}</span>}
       </div>
-      {!gallery && detail && current && <div className="studio-bar-group studio-versions" aria-label="Versions">
+      {(gallery || sbx || rows.length === 0) && <div className="studio-bar-group studio-seg" role="group" aria-label="Studio mode">
+        <button type="button" aria-pressed={!sbx} className={!sbx ? "on" : ""} onClick={() => setSbx(false)}><Layers size={12} aria-hidden="true" />Artificts</button>
+        <button type="button" aria-pressed={sbx} className={sbx ? "on" : ""} onClick={() => setSbx(true)}><Monitor size={12} aria-hidden="true" />Sandboxes</button>
+      </div>}
+      {!gallery && !sbx && detail && current && <div className="studio-bar-group studio-versions" aria-label="Versions">
         <Tool label="Previous version ( [ )" disabled={busy || position <= 0} onClick={() => chooseVersion(versions[position - 1]!.id)}><ChevronLeft size={14} /></Tool>
         <Dropdown placeholder="Exact artifict version" search={versions.length > 10} disabled={busy} value={versionId} onChange={chooseVersion} style={{ height: 28, maxWidth: 230, padding: "0 8px", gap: 6, fontSize: 11.5 }}
           options={versions.map((v) => ({ value: v.id, label: `v${v.number}`, hint: `${new Date(v.created_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}${v.author === "user" ? " · yours" : ""}` }))} />
@@ -589,7 +614,7 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
         </>}
       </div>}
       <span className="studio-spacer" />
-      {!gallery && detail && current && <>
+      {!gallery && !sbx && detail && current && <>
         <div className="studio-bar-group studio-seg" role="radiogroup" aria-label="Canvas mode">
           <Tooltip content="Use the design (Esc)" side="bottom"><button type="button" role="radio" aria-checked={mode === "interact"} aria-label="Interact" className={mode === "interact" ? "on" : undefined} onClick={() => setCanvasMode("interact")}><MousePointer2 size={14} /></button></Tooltip>
           <Tooltip content="Click anything to comment (C)" side="bottom"><button type="button" role="radio" aria-checked={mode === "comment"} aria-label="Comment" className={mode === "comment" ? "on" : undefined} onClick={() => setCanvasMode("comment")}><MessageSquarePlus size={14} /><span>Comment</span></button></Tooltip>
@@ -619,7 +644,8 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
     </div>)}
     {busy && <div className="studio-progress" role="status" aria-label="Loading / saving…" />}
     {error && <div className="studio-error" role="alert"><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}><X size={12} /></button></div>}
-    {gallery ? <div className="artifict-gallery">
+    {sbx ? <Sandboxes taskId={taskId} browseOnly={browseOnly} />
+    : gallery ? <div className="artifict-gallery">
         <Input aria-label="Filter artificts" value={filter} onChange={e => setFilter(e.currentTarget.value)} placeholder="Find an artifict…" />
         <div className="artifict-cards">{filteredRows.map((row) => <div key={row.id} className="artifict-card" aria-current={row.id === artifictId ? "true" : undefined}>
           <div className="artifict-card-frame">

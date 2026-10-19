@@ -9,8 +9,9 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null), sav
 import { ArtifictWorkspace, ASK_REQUESTS } from "./ArtifictWorkspace";
 import { parseBridgeMessage } from "./artifictBridge";
 import { buildVisualizationDocument } from "./vizDocument";
+import { resetStudioViews } from "./studioViewState";
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); vi.clearAllMocks(); resetStudioViews(); });
 
 const at = "2026-10-08T10:00:00Z";
 const version = (id: string, content: string, parentId: string | null, extra: Record<string, unknown> = {}) => ({ id, parentId, createdAt: at, content, decisions: ["Bold headline"], constraints: [], codeRefs: [], ...extra });

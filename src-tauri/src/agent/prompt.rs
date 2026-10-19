@@ -507,6 +507,8 @@ pub fn screen_section(cfg: &super::plugins::PluginsCfg) -> String {
     // is watching what you type into it.
     s.push_str("- Never synthesise input to the desktop from a shell to get around this: no `powershell`/`SendKeys`/`xdotool`, no Win32 `mouse_event`/`keybd_event`/`SetCursorPos`. A shell that is powerful enough to fake input is powerful enough to do real damage, and the user who turned the screen tools off expects that boundary to hold. If a shell is the only way to drive a UI, that is the case where asking first is the right call.\n");
     if cfg.computer.enabled {
+        s.push_str("- For native apps such as Blender, games, 3D tools, CAD, or other software with no useful headless interface, use `computer` directly. Take a screenshot, interact in short batches, use key chords and deliberate mouse-button drags (including middle-drag for 3D viewport navigation), then inspect a fresh screenshot before continuing. Prefer keyboard shortcuts for precise native-app commands; use longer drag durations when the application needs continuous pointer motion.\n");
+        s.push_str("- Escape during computer control stops the current screen-input batch; do not retry screen control after the user objects. The always-on-top banner explains that Esc twice stops the whole run.\n");
         s.push_str("- When you do use a screen tool, the user is watching: type into fields you were asked to fill, don't retype or submit drafts that were already pending, and check you are in the right window before pressing keys. Anything you send to a running agent or another system is not undoable by you.\n");
     }
     s

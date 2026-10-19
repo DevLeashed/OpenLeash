@@ -544,10 +544,10 @@ textarea.input { height: auto; min-height: 30px; padding: 8px 10px; line-height:
 .composer .bar > .bl, .composer .bar > .br { display: flex; align-items: center; gap: 2px; min-width: 0; }
 .composer .bar > .br { justify-content: flex-end; }
 .composer .bar > .bc { display: flex; justify-content: center; min-width: 0; }
-/* Artificts: the narrow column puts the model picker on its own row above the rest. */
-.composer .bar.artbar { display: flex; flex-wrap: wrap; }
-.composer .bar.artbar > .bc { order: -1; flex: 0 0 100%; justify-content: flex-start; }
-.composer .bar.artbar > .bl { flex: 1 1 auto; }
+/* Artificts: the narrow column keeps attach, the model picker and send on one row. */
+.composer .bar.artbar { display: flex; flex-wrap: nowrap; }
+.composer .bar.artbar > .bc { flex: 1 1 0; min-width: 0; justify-content: flex-start; }
+.composer .bar.artbar > .bl { flex: 0 0 auto; }
 .composer .bar.artbar > .br { flex: 0 0 auto; margin-left: auto; }
 /* The composer measures its own width: beside the Artificts studio a chat is a
    narrow column inside a wide window, and the three-column bar then drew the
@@ -2856,3 +2856,49 @@ th[aria-sort="ascending"] .rt-arrow, th[aria-sort="descending"] .rt-arrow { opac
 
 /* Context breakdown bars grow from the left and ease when their share changes. */
 .ctx-breakdown-bar i { transform-origin: left; animation: olGrowX .45s var(--out) both; transition: width .4s var(--ease); }
+
+/* ───────── Sandboxes: the artifict studio, for containers ───────── */
+.sbx-gallery { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.sbx-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.sbx-card .sbx-frame { background: #0b0d12; }
+.sbx-off { display: flex; flex-direction: column; align-items: center; gap: 6px; color: var(--mut3); font-size: 11px; }
+.sbx-new { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; min-height: 150px; border: 1px dashed var(--line2); border-radius: 14px; background: transparent; color: var(--mut2); font: inherit; font-size: 12px; cursor: pointer; transition: border-color .15s, color .15s, background .15s; }
+.sbx-new:hover:not(:disabled) { border-color: var(--accent); color: var(--accent2); background: var(--ov-30); }
+.sbx-new:disabled { opacity: .45; cursor: default; }
+.sbx-state { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--mut2); white-space: nowrap; }
+.sbx-frame .sbx-state { position: absolute; z-index: 1; left: 6px; bottom: 6px; padding: 3px 7px; border-radius: 999px; background: var(--panel-glass); backdrop-filter: blur(8px); }
+.sbx-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--mut3); }
+.sbx-state i[data-state="running"] { background: #4ade80; box-shadow: 0 0 0 3px rgba(74, 222, 128, .18); }
+.sbx-state i[data-state="stopped"] { background: #fbbf24; }
+.sbx-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.sbx-frame .sbx-badge { position: absolute; z-index: 1; top: 6px; right: 6px; }
+.sbx-badge.agent { background: rgba(var(--accent-rgb), .18); color: var(--accent2); }
+.sbx-badge.you { background: rgba(251, 191, 36, .18); color: #fbbf24; }
+.sbx-banner { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid rgba(251, 191, 36, .35); border-radius: 10px; background: rgba(251, 191, 36, .08); color: var(--fg2); font-size: 12px; }
+.sbx-banner.info { border-color: rgba(var(--accent-rgb), .35); background: rgba(var(--accent-rgb), .08); }
+.sbx-build { font-family: var(--mono); font-size: 11px; color: var(--mut2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sbx-detail { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.sbx-bar { flex: none; display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-bottom: 1px solid var(--line); background: var(--panel); overflow-x: auto; scrollbar-width: none; }
+.sbx-name { flex: 0 1 220px; min-width: 80px; height: 26px; padding: 0 7px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--fg); font: inherit; font-size: 13px; font-weight: 600; }
+.sbx-name:hover { background: var(--ov-30); }
+.sbx-name:focus { outline: none; border-color: var(--accent); background: var(--raise); }
+.sbx-body { flex: 1; min-height: 0; display: flex; }
+.sbx-stage { position: relative; flex: 1; min-width: 0; background: #07080b; display: grid; }
+.sbx-live { width: 100%; height: 100%; border: 0; background: #07080b; }
+.sbx-stage-off { display: grid; place-items: center; position: relative; }
+.sbx-stage-msg { display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--mut2); font-size: 12px; text-align: center; max-width: 360px; }
+.sbx-stage-msg b { color: var(--fg); font-size: 14px; }
+.sbx-hint { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 2; }
+.sbx-side { flex: none; width: 300px; display: flex; flex-direction: column; border-left: 1px solid var(--line); background: var(--panel); min-height: 0; }
+.sbx-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.sbx-row.col { flex-direction: column; align-items: stretch; gap: 6px; }
+.sbx-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.sbx-snap, .sbx-file { display: flex; align-items: center; gap: 6px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.sbx-snap-name, .sbx-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.sbx-form { display: flex; flex-direction: column; gap: 10px; font-size: 12px; }
+.sbx-form label { display: flex; flex-direction: column; gap: 4px; color: var(--mut2); }
+.sbx-select { height: 30px; padding: 0 8px; border: 1px solid var(--line2); border-radius: 8px; background: var(--raise); color: var(--fg); font: inherit; }
+@media (max-width: 760px) { .sbx-side { position: absolute; right: 0; top: 40px; bottom: 0; z-index: 5; box-shadow: -10px 0 30px rgba(0, 0, 0, .3); } .sbx-body { position: relative; } }
+
+.sbx-section { margin-top: 8px; font-size: 12px; font-weight: 600; color: var(--fg2); }
+.sbx-section .desc { font-weight: 400; margin-left: 6px; }

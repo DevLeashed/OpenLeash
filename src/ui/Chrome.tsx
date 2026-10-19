@@ -317,7 +317,10 @@ export const sortKey = (t: TaskSummary, automatic = get().settings?.automatic_ch
 export function chatPriority(t: TaskSummary, pausedAll = false): number {
   if (t.status === "waiting" && (t.waiting_kind === "question" || t.waiting_kind === "approval")) return 0;
   if (isPaused(t, pausedAll)) return 1;
-  if (t.status === "running") return 2;
+  // A chat parked on a trigger (`wait_for_event`) is still going: it wakes itself,
+  // so it belongs with the running chats. Ranking it below `done` sank it to the
+  // bottom of the list, which hid the chats the user is most likely waiting for.
+  if (t.status === "running" || t.status === "waiting") return 2;
   if (t.status === "done" || t.status === "failed" || t.status === "stopped") return 3;
   return 4;
 }

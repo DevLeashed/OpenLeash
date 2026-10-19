@@ -470,7 +470,7 @@ pub async fn app_update_install(
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Let the webview and notification identity finish initialization first.
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         loop {
             let updates = app.state::<Updates>();
             if let Ok(view) = updates.check(&app).await {

@@ -185,7 +185,7 @@ describe("composer race setup", () => {
 });
 
 describe("sidebar race group", () => {
-  it("groups a race's chats under one header with a Compare button", () => {
+  it("groups a race's chats under one header that opens the comparison screen", () => {
     set({ tasks: { a: task("a"), b: task("b"), x: task("x", { title: "Unrelated chat" }) }, settings: { routes: [], saved_prompts: [], project: "C:/p" } as unknown as Settings });
     setRaces({ races: { r1: race() } });
     const view = render(<Sidebar />);
@@ -195,7 +195,7 @@ describe("sidebar race group", () => {
     expect(group.textContent).toContain("Race · a");
     expect(group.textContent).toContain("Race · b");
     expect(group.textContent).not.toContain("Unrelated chat");
-    act(() => { fireEvent.click(within(group).getByRole("button", { name: "Compare" })); });
+    act(() => { fireEvent.click(group.querySelector(".race-head")!); });
     expect(getRaces().open).toBe("r1");
   });
 });

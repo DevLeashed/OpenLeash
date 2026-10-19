@@ -158,6 +158,8 @@ export interface TaskSummary {
   step: string; project: string; cwd: string; branch: string; base_branch: string; worktree: boolean;
   /** Present when this chat runs in a docker workspace (src/workspaces.ts). */
   docker?: DockerEnv | null; container?: ContainerState | null;
+  /** The sandbox (an agent-owned desktop, src/sandboxApi.ts) this chat is attached to. */
+  sandbox?: string | null;
   model: string; effort: number; perm: Perm; plan: boolean; ultra: boolean; ultra_wt: boolean; ultra_x: UltraX | null; subagents: boolean; goal: Goal | null;
   assist: Assist; agents: string[]; pending: { model?: string; assist?: Assist; agents?: string[] }; paused: Pause | null; serving: string; route: string; unpaused: boolean; busy: number;
   /** The background commands alive in this chat *now*, so the UI can name what a
@@ -368,6 +370,10 @@ export interface Settings {
   /** Long-term memory: global notes about the user plus per-project notes,
    *  loaded into every new chat. On by default; absent reads as on. */
   memory?: boolean;
+  /** Projects (folder paths) whose own notes are kept in
+   *  `<project>/.openleash/memory/` so they can be committed, instead of under
+   *  `~/.openleash/memory/`. Absent reads as none. */
+  memory_in_project?: string[];
   /** Let an agent search the user's other chats, see what each is doing, and
    *  send one of them a message. On by default. */
   cross_chat?: boolean;
@@ -1075,6 +1081,8 @@ export interface NewRace {
   prompt: string; project: string; base_branch: string; perm: Perm; plan: boolean; assist: Assist; agents: string[]; route?: string;
   attempts: RaceAttemptSpec[]; judge_model: string; judge_effort: number;
   images?: string[]; image_names?: string[]; files?: string[];
+  /** "worktree" (default) or "docker": a private clone with commands in the project's container. */
+  workspace?: "worktree" | "docker";
 }
 export interface RaceCheck { label: string; cmd: string; ok: boolean; output: string }
 export interface RaceAttempt { task_id: string; model: string; effort: number; checks: RaceCheck[]; checked: boolean }

@@ -13,9 +13,9 @@ import { SERVICE_SPECS, ServicePluginCard } from "./ServicePlugins";
 import { BrowserSettings } from "./BrowserSettings";
 
 // Mirrors the Rust defaults (`PluginsCfg::default`) for the frame before settings
-// arrive: everything off except the browser, which ships on and asks before it
-// interacts with a page.
-const OFF: Plugins = { github: { enabled: false }, computer: { enabled: false, settle_ms: 600 }, browser: { enabled: true, width: 1280, height: 800, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask", download_dir: "" } };
+// arrive: GitHub off; computer use and the browser on, and the browser asks before
+// it interacts with a page.
+const OFF: Plugins = { github: { enabled: false }, computer: { enabled: true, settle_ms: 600 }, browser: { enabled: true, width: 1280, height: 800, persistent_profile: false, headed: false, developer_mode: false, interactions: "ask", download_dir: "" } };
 
 function Details({ name, children }: { name: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
@@ -52,7 +52,7 @@ export function PluginsTab() {
   return <>
     <div className="settings-head"><div className="settings-head-main settings-title">Plugins</div><span className="exptag" title="Each plugin gives the agent real capabilities on this machine">Experimental</span><Button disabled={busy} onClick={check}>{busy ? "Checking…" : "Check again"}</Button></div>
     <div className="desc">Built-in tool sets for agents. Turning one on applies to new chats (and existing ones after <span className="mono">/compact</span>), so running chats keep their prompt cache.</div>
-    <div className="desc">Still finding its shape, and each one hands the agent real capabilities on this machine. Computer use is off until you switch it on yourself; the browser is on by default, runs in its own separate profile and asks before it interacts with a page. Availability below checks readiness, not whether a plugin is enabled.</div>
+    <div className="desc">Still finding its shape, and each one hands the agent real capabilities on this machine. Computer use and the browser are on by default. The browser runs in its own separate profile and asks before it interacts with a page. Availability below checks readiness, not whether a plugin is enabled.</div>
     <fieldset disabled={saving} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} aria-busy={saving}>
       <div className="sgroup">
         <div className="srowx"><div style={{ flex: 1 }}><div>Computer use</div><div className="desc">{!pc ? "Checking…" : pc.ok && primary ? `Screen available · ${primary.name || "primary"} · ${primary.w}×${primary.h}${undriven > 0 ? ` · ${undriven} more can be looked at, not clicked` : ""}` : `Can't capture the screen: ${pc.error ?? "no monitors"}`}</div></div><Switch label="Computer use" checked={p.computer.enabled} onChange={(enabled) => void save({ ...p, computer: { ...p.computer, enabled } })} /></div>

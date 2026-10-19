@@ -745,7 +745,7 @@ pub struct Settings {
     /// yyyy-mm-dd -> dollars
     pub spend: HashMap<String, f64>,
     pub tokens_month: u64,
-    /// Interface zoom in percent. 110 = default, matching `DEFAULT_ZOOM` in the frontend.
+    /// Interface zoom in percent. Defaults to 100 on Linux and 110 on Windows/macOS.
     pub ui_zoom: u32,
     pub accounts: Vec<Account>,
     pub routes: Vec<Route>,
@@ -921,7 +921,7 @@ pub struct Settings {
     /// user shared by every project, and notes per project, loaded at the start
     /// of each new chat. On by default. The agent only ever writes its own
     /// notes, as plain markdown under `~/.openleash/memory/` that the user can
-    /// read, edit or delete by hand.
+    /// read, edit or delete by hand (or in the project, see `memory_in_project`).
     #[serde(default = "t")]
     pub memory: bool,
     /// Whether the on-by-default switch for `memory` has been applied to this
@@ -931,6 +931,14 @@ pub struct Settings {
     /// file without this marker and sets it, so a later "off" sticks.
     #[serde(default)]
     pub memory_default_applied: bool,
+    /// Projects whose own notes are kept in `<project>/.openleash/memory/` so
+    /// they can be committed, instead of under `~/.openleash/memory/`. Per
+    /// project, compared as normalized folder paths like `project_docs`; empty
+    /// means every project keeps them privately, which is what an upgrade from
+    /// a build without this setting should do. A project not listed still reads
+    /// notes already committed there. See `memory::Dirs`.
+    #[serde(default)]
+    pub memory_in_project: Vec<String>,
     /// Whether the on-by-default switch for the browser plugin has been
     /// applied to this settings file. The same story as
     /// `memory_default_applied`: builds before it wrote
@@ -1025,6 +1033,10 @@ fn sidebar_button_tab_default() -> String {
     "accounts".into()
 }
 
+fn default_ui_zoom() -> u32 {
+    if cfg!(target_os = "linux") { 100 } else { 110 }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -1072,7 +1084,7 @@ impl Default for Settings {
             budget: 50.0,
             spend: HashMap::new(),
             tokens_month: 0,
-            ui_zoom: 110,
+            ui_zoom: default_ui_zoom(),
             accounts: vec![],
             routes: vec![],
             agents: vec![],
@@ -1116,6 +1128,7 @@ impl Default for Settings {
             welcome_seen: false,
             memory: true,
             memory_default_applied: true,
+            memory_in_project: vec![],
             browser_default_applied: true,
             cross_chat: true,
             deny_env_files: true,
@@ -1203,10 +1216,10 @@ pub fn load_settings() -> Settings {
         };
         s.ui_size = "custom".into();
     }
-    // v2 layout: 110% is the new default zoom.
+    // v2 layout: migrate the legacy default to the platform's current default zoom.
     if s.ui_size != "v2" {
         if s.ui_zoom == 100 || s.ui_zoom == 0 {
-            s.ui_zoom = 110;
+            s.ui_zoom = default_ui_zoom();
         }
         s.ui_size = "v2".into();
     }
@@ -3271,11 +3284,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_install_starts_at_110_percent() {
+    fn fresh_install_uses_the_platform_zoom_default() {
         // The frontend's DEFAULT_ZOOM has to agree with this, or the app boots
         // at one size and Ctrl 0 / Reset jumps to another.
         let s = Settings::default();
-        assert_eq!(s.ui_zoom, 110);
+        assert_eq!(s.ui_zoom, default_ui_zoom());
         // And the default must not walk the old named-size migration on first load.
         assert_eq!(s.ui_size, "v2");
     }
@@ -4137,6 +4150,7 @@ mod memory_tests {
             touched_at: chrono::Utc::now(),
             hydrated: true,
             docker: None,
+            sandbox: None,
         };
         save_task(&t);
         // What is on disk still carries the old prompt; that is the whole point --

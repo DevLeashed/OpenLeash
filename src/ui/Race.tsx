@@ -6,21 +6,26 @@ import { baseName, fmt$, normPath, raceApi, type Race, type RaceAttempt, type Ra
 import { flash, go, modelInfo, useNow, useStore } from "../store";
 import { archiveRace, attemptElapsed, budgetMessage, closeRace, fmtDuration, isBudgetError, openWorktree, RACE_STATE, raceCost, upsertRace, useRaces } from "../race";
 import { deleteTask } from "./Chrome";
-import { chatStatus, statusOf } from "./icons";
-import { Button, ConfirmDialog, Dropdown, Modal, Switch } from "./primitives";
+import { chatStatus, I, statusOf } from "./icons";
+import { Button, ConfirmDialog, Dropdown, IconButton, Modal, Switch } from "./primitives";
 import { effortOpts, RaceSetupDialog, useModelOptions } from "./RaceSetup";
 import "./Race.css";
 
 /** Mounted once in the overlay layer: the composer's race setup and the comparison view. */
 export function RaceOverlays() {
-  const open = useRaces((s) => s.open);
+  return <RaceSetupDialog />;
+}
+
+/** The comparison screen: reached by pressing a race group in the sidebar. */
+export function RaceScreen() {
   const race = useRaces((s) => (s.open ? s.races[s.open] ?? null : null));
-  return (
-    <>
-      <RaceSetupDialog />
-      {open && race && <RaceView race={race} onClose={closeRace} />}
-    </>
-  );
+  if (!race) {
+    return <div style={{ flex: 1, padding: "24px 28px" }}>
+      <div className="empty">This race is gone.</div>
+      <Button variant="ghost" onClick={closeRace}>Close</Button>
+    </div>;
+  }
+  return <RaceView key={race.id} race={race} onClose={closeRace} />;
 }
 
 function effortName(model: string, effort: number) {
@@ -102,7 +107,7 @@ export function RaceView({ race, onClose }: { race: Race; onClose: () => void })
   const into = target ?? "the project's current branch";
 
   return (
-    <Modal onClose={onClose} ariaLabel="Race" className="modal-race">
+    <div className="race-screen" role="region" aria-label="Race">
       <div className="race-header">
         <div className="race-heading">
           <div className="race-title" title={race.prompt}>{race.prompt || "Race"}</div>
@@ -136,7 +141,7 @@ export function RaceView({ race, onClose }: { race: Race; onClose: () => void })
         <Button onClick={() => void judge(false)} disabled={busy || busyState}>{busyState ? `${st.label}…` : race.judge ? "Re-judge" : "Judge now"}</Button>
         <div style={{ flex: 1 }} />
         <Button variant="ghost" onClick={() => setDialog("forget")}>Forget race</Button>
-        <Button variant="ghost" onClick={() => void archiveRace(race.id)} disabled={busyState}>Archive race</Button>
+        <IconButton label="Archive race" onClick={() => void archiveRace(race.id)} disabled={busyState}>{I.archive(14)}</IconButton>
         <Button variant="ghost" onClick={() => { setRemoveWorktree(false); setDialog("cleanup"); }} disabled={!winner || !losers.length}>Clean up losers…</Button>
         <Button variant="primary" onClick={() => setDialog("merge")} disabled={!winner || busy || !!race.merged}>Merge winner into {into}…</Button>
       </div>
@@ -175,7 +180,7 @@ export function RaceView({ race, onClose }: { race: Race; onClose: () => void })
         <ConfirmDialog title="Over the monthly budget" confirm="Judge anyway" onClose={() => setDialog(null)} onConfirm={() => void judge(true)}
           body={`${dialog.budget || "The monthly budget cap is reached."} Running the judge will spend more.`} />
       )}
-    </Modal>
+    </div>
   );
 }
 
@@ -220,7 +225,7 @@ function AttemptCard({ n, attempt, task, stats, rank, winner, onOpen, onPick, on
       <div className="race-card-actions">
         <Button variant="ghost" onClick={onOpen} disabled={!task}>Open chat</Button>
         <Button variant="ghost" onClick={() => setShowStats((v) => !v)} disabled={!task} aria-expanded={showStats}>Stats</Button>
-        <Button variant="ghost" onClick={onFolder} disabled={!task?.worktree} title={task?.cwd ? `Open ${task.cwd} in the file manager` : "This attempt's chat was deleted"}>Open folder</Button>
+        <Button variant="ghost" onClick={onFolder} disabled={!task?.worktree && !task?.docker} title={task?.cwd ? `Open ${task.cwd} in the file manager` : "This attempt's chat was deleted"}>Open folder</Button>
         <Button variant={winner ? "default" : "ghost"} onClick={onPick} disabled={!task && !winner}>{winner ? "Unpick" : "Pick winner"}</Button>
       </div>
     </div>

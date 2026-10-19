@@ -73,8 +73,9 @@ pub const MAX_RESULTS: usize = 10;
 /// the safe direction for a tool nobody has taught this file about. The service
 /// plugins (`plugin_services::SERVICES`) are listed too, so `defer_plugins`
 /// covers them like the others.
-const PLUGIN_IDS: [&str; 9] = [
-    "github", "computer", "render", "browser", "linear", "jira", "slack", "notion", "gitlab",
+const PLUGIN_IDS: [&str; 10] = [
+    "github", "computer", "render", "browser", "sandbox", "linear", "jira", "slack", "notion",
+    "gitlab",
 ];
 
 /// Where a deferred tool came from. Carried so a search result can say whose

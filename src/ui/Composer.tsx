@@ -6,7 +6,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { api, ASSISTS, Assist, clampEffort, countOptionalAgents, defaultX, DEFAULT_PERM, EFFORTS, effortLabel, effortSteps, FileRef, fmt$, fmtK, Item, normPath, Perm, PERMS, ResumeMode, TaskPatch, TaskSummary, UltraX, withRequiredAgents, xDepth, xOn } from "../api";
 import { remoteApi } from "../remote";
 import { enterSendsMessage, messageSendKey } from "../keys";
-import { defaultRoute, flash, get, go, isConnected, isPhoneClient, Menu, modelInfo, NEW_CHAT_ECHO, newerSummary, persistDraft, requestPause, savePrompt, saveSettings, set, settleNewChatEcho, shownProviders, type State, useStore, zoom } from "../store";
+import { chatModel, defaultRoute, flash, get, go, isConnected, isPhoneClient, Menu, modelInfo, NEW_CHAT_ECHO, newerSummary, persistDraft, requestPause, savePrompt, saveSettings, set, settleNewChatEcho, shownProviders, type State, useStore, zoom } from "../store";
 import { I } from "./icons";
 import { annotationBlock, contextBlock } from "./SelectionNote";
 import { studioHandoff } from "./studioHandoff";
@@ -522,8 +522,25 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
   // would land in the visible transcript.
   const filePaths = files.filter((f) => !f.image).map((f) => f.path);
   const imageNames = images.map((_, i) => files.find((f) => f.image && f.imageIndex === i)?.name ?? `image-${i + 1}`);
+  // The stand-in row shown until the backend's own arrives carries the same
+  // shape the backend records (images first, then files), so the bubble shows
+  // its file chips from the moment it is sent.
+  const echoData: Item["data"] = images.length || filePaths.length
+    ? {
+      images,
+      attachments: [
+        ...imageNames.map((name) => ({ path: "", name, size: 0 })),
+        ...files.filter((f) => !f.image).map((f) => ({ path: f.path, name: f.name, size: f.size })),
+      ],
+    }
+    : {};
   if (text.startsWith("/") && localSlash(text, mode)) return clear();
   if (text === "/goal" && mode === "home") return flash("Say what done looks like, e.g. /goal all tests pass on Windows");
+  // Checked before the draft is consumed: with no model picked the message is
+  // refused and stays in the box. The backend refuses it too.
+  const sessionTask = mode === "session" && s.task ? s.tasks[s.task] : undefined;
+  const model = mode === "home" ? s.home.model : sessionTask ? chatModel(sessionTask) : "";
+  if (!model) return flash("Pick a model first");
   if (mode === "home") {
     const project = s.settings?.project ?? "";
     if (!project) return flash("Pick a project folder first");
@@ -553,7 +570,7 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
       // until then the new chat used to be an empty "Loading conversation…".
       // The stand-in is retired by `settleNewChatEcho` when that row (or a
       // startup failure) arrives.
-      const echo: Item = { id: `${NEW_CHAT_ECHO}${t.id}`, kind: "user", text: prompt, data: images.length ? { images } : {}, ts: new Date().toISOString() };
+      const echo: Item = { id: `${NEW_CHAT_ECHO}${t.id}`, kind: "user", text: prompt, data: echoData, ts: new Date().toISOString() };
       // Opening the studio is a flag on the chat, not something the first paint
       // has to wait a second round-trip for: it is set locally now and saved in
       // the background, and a failed save only means the studio isn't reopened
@@ -594,7 +611,7 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
       id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       kind: "user",
       text: body,
-      data: images.length ? { images } : {},
+      data: echoData,
       ts: new Date().toISOString(),
     };
     set((st) => ({ pendingMessages: { ...st.pendingMessages, [s.task!]: [...(st.pendingMessages[s.task!] ?? []), optimistic] } }));

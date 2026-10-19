@@ -8,7 +8,7 @@
 // than as a bare paste or as an item id the model cannot resolve.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MockInstance } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -461,6 +461,55 @@ describe("the staged block becomes a chip list", () => {
     const chips = container.querySelectorAll(".ubatchip");
     expect(chips).toHaveLength(1);
     expect(chips[0]!.textContent).toContain("image-1.png");
+  });
+});
+
+// The backend keeps the staged-path note out of the visible text (it goes to the
+// model only) and records the copies on the item's `attachments` field instead:
+// images first, then files. A bubble that only parsed the text showed no files.
+describe("a sent message's attachments come from the item", () => {
+  const png = "data:image/png;base64,AAA";
+  const staged = [
+    { path: "/tmp/ol/b/01-shot.png", name: "shot.png", size: 3 },
+    { path: "/tmp/ol/b/02-report.pdf", name: "report.pdf", size: 2048 },
+  ];
+  const task = { id: "t1", status: "idle" } as unknown as TaskSummary;
+  const item = (data: Record<string, unknown>) => ({ id: "u1", kind: "user", text: "look at these", data, ts: new Date().toISOString() }) as Item;
+
+  it("shows a chip for each file, and none for a picture already shown as a thumbnail", () => {
+    const { container } = render(<UserMsg it={item({ images: [png], attachments: staged })} task={task} />);
+    const chips = [...container.querySelectorAll(".ubatchip")].map((c) => c.textContent);
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toContain("report.pdf");
+    expect(chips[0]).toContain("2 KB");
+    expect(container.querySelector(".ubimgs img, .ubimgs [style]"), "the picture stays a thumbnail").toBeTruthy();
+    // The bubble never shows the temp path, only the name the user chose.
+    expect(container.textContent).not.toContain("/tmp/ol");
+  });
+
+  it("names a picture the timeline has dropped, so the bubble still says it went out", () => {
+    const { container } = render(<UserMsg it={item({ images: [], images_dropped: 1, attachments: staged })} task={task} />);
+    const chips = [...container.querySelectorAll(".ubatchip")].map((c) => c.textContent ?? "");
+    expect(chips.map((c) => c.replace(/\d.*$/, ""))).toEqual(["shot.png", "report.pdf"]);
+  });
+
+  it("still reads the old in-text note for messages saved before the field existed", () => {
+    const old = `look\n\n<openleash-attachments>\nnote\n- \`/tmp/a/old.rs\`\n</openleash-attachments>`;
+    const { container } = render(<AttachmentChips text={old} data={{}} />);
+    expect(container.querySelector(".ubatchip")?.textContent).toContain("old.rs");
+  });
+
+  it("an edit resends each picture once, as an image, and the files by their staged path", async () => {
+    const send = vi.spyOn(api, "send").mockResolvedValue(undefined);
+    vi.spyOn(api, "rewind").mockResolvedValue("");
+    vi.spyOn(api, "task").mockResolvedValue({ summary: task, items: [] } as never);
+    const { container } = render(<UserMsg it={item({ images: [png], attachments: staged })} task={task} />);
+    const view = within(container);
+    fireEvent.click(view.getByText("Edit"));
+    // The editor lists the file, not the picture's staged copy a second time.
+    expect(container.querySelectorAll(".filechip")).toHaveLength(1);
+    await act(async () => { fireEvent.click(view.getByText("Send")); });
+    expect(send).toHaveBeenCalledWith("t1", "look at these", false, [png], ["/tmp/ol/b/02-report.pdf"], ["shot.png"]);
   });
 });
 

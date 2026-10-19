@@ -5,10 +5,21 @@ import type { TaskSummary } from "../api";
 import { baseName } from "../api";
 import { flash, go, saveSettings, set, useStore } from "../store";
 import { CONTAINER_LABEL, defaultMode, workspacesApi, type ContainerState, type DockerProjectInfo, type WorkspaceMode, type WorkspacesList } from "../workspaces";
+import { sandboxApi, useSandboxes } from "../sandboxApi";
 import { Button, ConfirmDialog, IconButton, Input, Segmented, Tooltip } from "./primitives";
 
 /** Docker facts for a project. The engine is never asked here: opening a
  *  project must not run a docker command for someone who doesn't use docker. */
+/** The desktop image agents' sandboxes start from. Empty means the built-in Ubuntu + XFCE one. */
+function SandboxImageRow() {
+  const { data, reload } = useSandboxes();
+  const [image, setImage] = useState("");
+  useEffect(() => { if (data) setImage(data.image ?? ""); }, [data?.image]); // eslint-disable-line react-hooks/exhaustive-deps
+  const save = () => { const v = image.trim(); if (v === (data?.image ?? "")) return; sandboxApi.setImage(v).then(() => { flash(v ? "Sandboxes will use that image" : "Sandboxes use the built-in Ubuntu desktop"); return reload(); }).catch((e) => flash(String(e))); };
+  return <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Sandbox desktop image</div><div className="desc">Empty uses the built-in Ubuntu + XFCE desktop, installed automatically. Or give a Docker image name or id for new sandboxes (existing ones keep theirs until reset). It needs bash, Xvfb, x11vnc, noVNC/websockify, xdotool and ImageMagick.</div></div>
+    <Input aria-label="Sandbox image" className="input mono" style={{ width: 220 }} placeholder="ubuntu-xfce:latest" value={image} onChange={(e) => setImage(e.currentTarget.value)} onBlur={save} onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} /></div>;
+}
+
 export function useDockerInfo(project: string) {
   const [info, setInfo] = useState<DockerProjectInfo | null>(null);
   useEffect(() => {
@@ -154,6 +165,7 @@ export function WorkspacesTab() {
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>New tasks use</div><div className="desc">The default on the new-task screen. Docker needs a <span className="mono">.openleash_docker/Dockerfile</span> in the project.</div></div>
           <Segmented label="New tasks use" value={mode} onChange={(v) => { void saveSettings({ workspace: v, worktree: v === "worktree" }); set((st) => ({ home: { ...st.home, worktree: v === "worktree", docker: v === "docker" } })); }}
             options={[{ value: "local", label: "Local" }, { value: "worktree", label: "Worktree" }, { value: "docker", label: "Docker" }]} /></div>
+        <SandboxImageRow />
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Stop idle containers after</div><div className="desc">Minutes without a command or a background job. They start again when you send the chat a message. 0 keeps them running. A project's <span className="mono">openleash.json</span> can override this.</div></div>
           <Input aria-label="Idle minutes" className="input mono" style={{ width: 72 }} inputMode="numeric" value={idle} onChange={(e) => setIdle(e.currentTarget.value.replace(/\D/g, "").slice(0, 4))} onBlur={() => { const n = Number(idle || 0); if (n !== s.docker_idle_minutes) void saveSettings({ docker_idle_minutes: n }); }} /></div>
         {project && info?.has_config && <div className="srowx"><div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Image for {baseName(project)}</div><div className="desc" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{build ? build.line : "Rebuilt automatically whenever anything in .openleash_docker changes."}</div></div>

@@ -11,12 +11,14 @@
 import { useSyncExternalStore } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { MAX_RACE_ATTEMPTS, MIN_RACE_ATTEMPTS, raceApi, type NewRace, type Race, type RaceAttemptSpec, type RaceEvent, type TaskSummary } from "./api";
-import { flash, get as getApp, set as setApp } from "./store";
+import { back, flash, get as getApp, go, set as setApp } from "./store";
 
 /** The composer's race options. `attempts`/`judge` null means "follow the
  *  composer's own model and effort", so a model switched after turning race on
  *  is the one the attempts run on unless the user picked them by hand. */
-export interface RaceConfig { on: boolean; n: number; attempts: RaceAttemptSpec[] | null; judge: RaceAttemptSpec | null }
+export interface RaceConfig { on: boolean; n: number; attempts: RaceAttemptSpec[] | null; judge: RaceAttemptSpec | null;
+  /** Where each attempt works: a git worktree (default) or a docker workspace. */
+  workspace?: "worktree" | "docker" }
 
 export interface RaceStore {
   races: Record<string, Race>;
@@ -30,7 +32,7 @@ export interface RaceStore {
 }
 
 export const DEFAULT_RACE_N = 3;
-const freshConfig = (): RaceConfig => ({ on: false, n: DEFAULT_RACE_N, attempts: null, judge: null });
+const freshConfig = (): RaceConfig => ({ on: false, n: DEFAULT_RACE_N, attempts: null, judge: null, workspace: "worktree" });
 
 let state: RaceStore = { races: {}, open: null, setup: false, config: freshConfig(), collapsed: {} };
 const subs = new Set<() => void>();
@@ -175,8 +177,12 @@ export function upsertRace(race: Race) {
   setRaces((s) => ({ races: applyRaceEvent(s.races, race) }));
 }
 
-export const openRace = (id: string) => setRaces({ open: id });
-export const closeRace = () => setRaces({ open: null });
+export const openRace = (id: string) => { setRaces({ open: id }); go("race"); };
+export const closeRace = () => {
+  setRaces({ open: null });
+  const h = getApp().hist;
+  if (h.length && h[h.length - 1]?.view !== "race") back(); else go("home");
+};
 
 /** Race is for new tasks in a git project only, like ultrathread worktrees. */
 export function raceAvailable(): string | null {
@@ -209,7 +215,7 @@ export async function startRace(req: Omit<NewRace, "attempts" | "judge_model" | 
   if (!getApp().projectInfo?.git) throw new Error("Race needs a git repo");
   const cfg = state.config;
   const judge = resolveJudge(cfg, model, effort);
-  const r = await raceApi.create({ ...req, attempts: resolveAttempts(cfg, model, effort), judge_model: judge.model, judge_effort: judge.effort });
+  const r = await raceApi.create({ ...req, workspace: cfg.workspace ?? "worktree", attempts: resolveAttempts(cfg, model, effort), judge_model: judge.model, judge_effort: judge.effort });
   setApp((st) => ({ tasks: { ...st.tasks, ...Object.fromEntries(r.tasks.map((t) => [t.id, t])) } }));
   // One-shot, like plan mode: the next new task is a plain one again. The
   // picked models are kept, so a second race starts from the same lineup.

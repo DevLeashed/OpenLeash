@@ -140,6 +140,16 @@ pub struct NewRace {
     pub image_names: Vec<String>,
     #[serde(default)]
     pub files: Vec<String>,
+    /// Where each attempt works: `"worktree"` (default) or `"docker"`, a private
+    /// clone with its commands in the project's container (see `docker.rs`).
+    #[serde(default)]
+    pub workspace: String,
+}
+
+impl NewRace {
+    pub fn uses_docker(&self) -> bool {
+        self.workspace == "docker"
+    }
 }
 
 fn default_judge_effort() -> usize {
@@ -1315,16 +1325,17 @@ pub async fn merge(h: &Arc<Harness>, id: &str) -> Result<(Race, String), String>
         .task(&winner)
         .await
         .map_err(|_| "The winning chat was deleted.".to_string())?;
-    let (project, cwd, branch, worktree) = {
+    let (project, cwd, branch, worktree, docker) = {
         let t = t.lock().await;
         (
             t.project.clone(),
             t.cwd.clone(),
             t.branch.clone(),
             t.worktree,
+            t.docker.clone(),
         )
     };
-    if !worktree {
+    if !worktree && docker.is_none() {
         return Err(
             "The winning attempt is not in a worktree, so there is no branch to merge.".into(),
         );
@@ -1375,6 +1386,16 @@ pub async fn merge(h: &Arc<Harness>, id: &str) -> Result<(Race, String), String>
         race.attempts.len()
     );
     let msg = tokio::task::spawn_blocking(move || {
+        // A docker attempt is a clone, so its branch isn't in the project's
+        // repository yet: commit what the agent left, then push the branch in,
+        // after which it merges exactly like a worktree branch.
+        if let Some(env) = &docker {
+            let dirty = git::git(&cwd, &["status", "--porcelain"])?;
+            if !dirty.trim().is_empty() {
+                git::commit_with(&cwd, &format!("race: {message}"), no_verify)?;
+            }
+            git::push_workspace_branch(&env.host_root, &env.project, &branch)?;
+        }
         merge_winner(&project, &cwd, &branch, &message, no_verify)
     })
     .await
@@ -1443,6 +1464,11 @@ mod tests {
         assert!(!s.plan);
         assert_eq!(s.judge_model, "");
         assert_eq!(s.judge_effort, 2);
+        // Worktrees unless a request says docker, so old callers are unchanged.
+        assert!(!s.uses_docker());
+        let mut d = s.clone();
+        d.workspace = "docker".into();
+        assert!(d.uses_docker());
         let blank: NewRace =
             serde_json::from_value(json!({"prompt":"p","project":"x","attempts":[],"perm":""}))
                 .unwrap();

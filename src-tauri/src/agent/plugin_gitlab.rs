@@ -1962,7 +1962,7 @@ pub async fn whoami(http: &reqwest::Client, cfg: &GitlabCfg) -> Result<Identity,
 mod tests {
     use super::*;
 
-    const TOKEN: &str = concat!("glpat", "-DUMMYdummy0123456789");
+    const TOKEN: &str = "dummy-gitlab-token-0123456789";
     const BASE: &str = "https://gitlab.example.com";
 
     fn no_env(_: &str) -> Option<String> {

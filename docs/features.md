@@ -204,6 +204,14 @@ Each scope is a `MEMORY.md` index plus one small markdown file per note. When a 
 
 The agent saves on its own. It uses the `memory` tool to `save` new notes, `update` notes that changed instead of duplicating them, `forget` notes that are stale, and `recall` a note's detail. It is told not to store secrets or anything a `grep` would find again. A note is framed as the agent's own earlier writing, never as your instructions: when one conflicts with what you say now, you win. Writes refuse invisible and control characters (zero-width, bidi overrides, Unicode tag characters), and a hand-edited index line containing one is not loaded. Each index is capped at 200 lines or 25 KB.
 
+**Keep a project's notes in the project.** Under Memory, **Keep this project's memory in the project** (a per-project switch, off by default) saves that project's notes in `<project>/.openleash/memory/` instead, so they can be committed and shared. Notes about you stay in `~/.openleash`. The two project folders are read as one set, so turning the switch on or off never hides a note:
+
+- Notes already in `.openleash/memory/` are read even when the switch is off. The switch only decides where *new* notes go. `update` and `forget` act on the folder a note lives in.
+- If both folders hold a note with the same name, or the same filename, the `~/.openleash` one wins and the other is hidden (left untouched on disk).
+- The folder is used only when the project is **trusted**. An untrusted clone's notes would go straight into the system prompt, so they are neither read nor written, and new notes go to `~/.openleash` instead. Remote (SSH) projects always use `~/.openleash`.
+- Writing there is a file write: plan mode refuses it, and the allowlist rung asks first. In a worktree chat the project folder is outside the working directory, so the Auto rung asks too.
+- Notes you had before switching stay in `~/.openleash` and are not copied across. Copy the files by hand if you want them committed. Chats already running keep the notes they started with.
+
 Everything is plain markdown that you can read, edit or delete by hand. Switching Memory off removes the tool's effect and the snapshot from new chats; nothing on disk is deleted. Builds before this one shipped memory off by default and wrote that default into every settings file, so the first launch of this build turns it on once. A later "off" sticks.
 
 ## Save a chat as a skill
@@ -304,15 +312,18 @@ The server is picked by file extension: rust-analyzer for Rust, typescript-langu
 
 - **`file`**: a file or folder (recursive, honouring `.gitignore`) being created, changed or deleted, such as a build artifact or a report.
 - **`job`**: one of the chat's own background commands exiting, or, with `match`, printing a line that matches a regex (`ready|listening on`). The matching line is handed back to the agent. Watching never moves the agent's own `bash_output` cursor.
+- **`process`**: an operating-system process (by `pid`, from any source, such as a terminal or the IDE) exiting. The chat records the process's start time when it parks, so an id that is later reused by a different process does not count as the original still running. Use `job` for the chat's own background commands, since those also report their output.
 - **`chat`**: another chat (by id or title, needs **Other chats** on) stopping work, whether it finishes, stops, pauses, parks or needs its user.
 
 Any source except `timer` takes `timeout_s`, which wakes the chat anyway if the trigger never fires. Local triggers are checked every two seconds. As before, sending a message, Stop, or Resume clears the park, and a park does not survive an app restart.
 
 ## Browser
 
-The Browser plugin is **on by default**; computer use remains opt-in. Existing
-installs are switched on once on upgrade, just like Memory, and a later off
-sticks. No Chromium process starts until the tool or shared view is first used.
+The Browser plugin and computer use are **on by default**. Existing installs keep
+whatever their settings file already says, so a saved `enabled: false` stays off; only
+a missing field takes the new default. The Browser plugin is also switched on once on
+upgrade, just like Memory, and a later off sticks. No Chromium process starts until the
+tool or shared view is first used.
 Install Chrome or Edge if neither is available. The agent's browser never borrows
 your everyday browser profile or controls your desktop.
 

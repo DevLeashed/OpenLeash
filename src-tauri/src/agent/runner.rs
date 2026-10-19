@@ -42,8 +42,9 @@ use super::providers::{self, ChatRequest, StreamEvent};
 use super::router::{self, RouteErr, Who};
 use super::store::{self, AgentDef, AllowRule, UltraX};
 use super::{
-    checkpoint, checks, git, prompt, resolve_model, review, toolindex, tools, Broadcast,
-    Checkpoint, ContextParts, Harness, Item, Message, QueuedMsg, Runtime, SubInfo, Task, Todo,
+    checkpoint, checks, git, prompt, require_chat_model, resolve_model, review, toolindex, tools,
+    Broadcast, Checkpoint, ContextParts, Harness, Item, Message, QueuedMsg, Runtime, SubInfo, Task,
+    Todo,
 };
 use futures_util::future::join_all;
 use serde_json::{json, Value};
@@ -477,17 +478,18 @@ fn local_poll_interval() -> std::time::Duration {
 fn wait_for_event_schema() -> Value {
     json!({
         "name": "wait_for_event",
-        "description": "Park this task on a local trigger and end the turn. Use it when the honest next step is to wait for something outside the conversation rather than to poll: \"wait for CI on this branch\", \"wait for a review on PR 42\", \"wait half an hour, then continue\", \"wake me when the dev server prints `ready`\", \"continue when the build output file changes\" or \"continue once that other chat finishes\". The task becomes `waiting`, comes off your hands, and a follow-up turn is started automatically when the trigger fires — you do NOT need to poll `task_status` or `bash_output`. Only the main agent may park a task. Prefer a concrete, checkable source: `timer` for a delay, `ci` or `pr` for GitHub, `file` for a file or folder changing, `job` for one of this chat's background commands exiting or printing a match, `chat` for another chat to stop working. Give `timeout_s` with anything but `timer` so a trigger that never fires still wakes you.",
+        "description": "Park this task on a local trigger and end the turn. Use it when the honest next step is to wait for something outside the conversation rather than to poll: \"wait for CI on this branch\", \"wait for a review on PR 42\", \"wait half an hour, then continue\", \"wake me when the dev server prints `ready`\", \"continue when the build output file changes\" or \"continue once that other chat finishes\". The task becomes `waiting`, comes off your hands, and a follow-up turn is started automatically when the trigger fires — you do NOT need to poll `task_status` or `bash_output`. Only the main agent may park a task. Prefer a concrete, checkable source: `timer` for a delay, `ci` or `pr` for GitHub, `file` for a file or folder changing, `job` for one of this chat's background commands exiting or printing a match, `process` for any running process (by `pid`) exiting, `chat` for another chat to stop working. Give `timeout_s` with anything but `timer` so a trigger that never fires still wakes you.",
         "input_schema": {"type":"object","properties":{
             "reason":{"type":"string","description":"Short note shown in the chat and fed back to you on the wake."},
-            "source":{"type":"string","enum":["timer","ci","pr","file","job","chat"],
-                "description":"timer = wake after delay_s. ci = wake when the latest workflow run for branch finishes. pr = wake when PR `pr` gets a new comment/review. file = wake when `path` (a file or folder) is created, changed or deleted. job = wake when background command `job_id` exits, or as soon as its new output matches `match`. chat = wake when the chat `chat` stops working (finishes, stops, pauses or needs its user)."},
+            "source":{"type":"string","enum":["timer","ci","pr","file","job","process","chat"],
+                "description":"timer = wake after delay_s. ci = wake when the latest workflow run for branch finishes. pr = wake when PR `pr` gets a new comment/review. file = wake when `path` (a file or folder) is created, changed or deleted. job = wake when background command `job_id` exits, or as soon as its new output matches `match`. process = wake when the OS process `pid` exits, whoever started it. chat = wake when the chat `chat` stops working (finishes, stops, pauses or needs its user)."},
             "delay_s":{"type":"integer","description":"timer only: seconds to wait (30–86400)."},
             "branch":{"type":"string","description":"ci only: branch to watch (default: the task's branch)."},
             "pr":{"type":"integer","description":"pr only: pull request number."},
             "repo":{"type":"string","description":"owner/name (default: the working directory's origin remote)."},
             "path":{"type":"string","description":"file only: file or folder to watch, relative to the working directory. Folders are watched recursively, honouring .gitignore."},
             "job_id":{"type":"string","description":"job only: a background command id from `bash` run_in_background (e.g. bg_1a2b3c)."},
+            "pid":{"type":"integer","description":"process only: the OS process id to wait for. It must belong to a running process when you park."},
             "match":{"type":"string","description":"job only, optional: a regex; wake as soon as new output matches it (e.g. `ready|listening on`). Without it, wake when the job exits."},
             "chat":{"type":"string","description":"chat only: a chat id or title from `list_chats`."},
             "timeout_s":{"type":"integer","description":"Optional, not for timer: give up and wake anyway after this many seconds (30–86400)."}},
@@ -647,7 +649,8 @@ pub(crate) struct WakeSource {
     pub(crate) repo: String,
     /// The GitHub state seen at park time, so a poll can tell *new* from "still
     /// the same run/comment that was already there" and not wake on the status
-    /// quo. Only meaningful for `ci`/`pr`.
+    /// quo. Only meaningful for `ci`/`pr`. For `process`, the watched process's
+    /// start time at park time (see `procwatch`), so a reused id is not a match.
     #[serde(default)]
     pub(crate) baseline: String,
     /// `file`: the resolved path being watched.
@@ -659,6 +662,9 @@ pub(crate) struct WakeSource {
     /// `job`: optional regex over new output.
     #[serde(default, rename = "match")]
     pub(crate) pattern: String,
+    /// `process`: the OS process id to wait for.
+    #[serde(default)]
+    pub(crate) pid: u32,
     /// `chat`: the watched chat's id (resolved at park time) …
     #[serde(default)]
     pub(crate) chat: String,
@@ -700,6 +706,7 @@ impl WakeSource {
                 "{} (job {} to print `{}`)",
                 self.reason, self.job_id, self.pattern
             ),
+            "process" => format!("{} (process {} to exit)", self.reason, self.pid),
             "chat" => format!("{} (chat `{}` to finish)", self.reason, self.chat_label),
             _ => self.reason.clone(),
         }
@@ -709,7 +716,7 @@ impl WakeSource {
     }
     /// Watched on this machine on the short local interval.
     fn is_local(&self) -> bool {
-        matches!(self.source.as_str(), "file" | "job" | "chat")
+        matches!(self.source.as_str(), "file" | "job" | "process" | "chat")
     }
 }
 
@@ -948,6 +955,8 @@ pub async fn send_attachments(
     later: bool,
 ) -> Result<(), String> {
     let t = h.task(&task_id).await?;
+    // Refused before anything is staged or recorded.
+    require_chat_model(&*t.lock().await)?;
     let (project, docker) = {
         let t = t.lock().await;
         (t.project.clone(), t.docker.is_some())
@@ -987,6 +996,8 @@ pub async fn send_attachments_as(
     later: bool,
 ) -> Result<(), String> {
     let t = h.task(&task_id).await?;
+    // Refused before anything is staged or recorded.
+    require_chat_model(&*t.lock().await)?;
     let (project, docker) = {
         let t = t.lock().await;
         (t.project.clone(), t.docker.is_some())
@@ -1107,6 +1118,8 @@ pub async fn send_opts(
 ) -> Result<(), String> {
     let rt = h.runtime(&task_id);
     let t = h.task(&task_id).await?;
+    // Refused before anything is recorded: no item, no history entry, no run.
+    require_chat_model(&*t.lock().await)?;
     warm_container(&h, &task_id, &t).await;
     let (project, cwd) = {
         let guard = t.lock().await;
@@ -2479,6 +2492,16 @@ async fn local_wake_reason(
             *job_pos = end.saturating_sub(keep);
             job_wake_reason(&src.job_id, job_re, &new, exit.as_deref())
         }
+        "process" => {
+            // Read-only: is the id still held by the same process? See `procwatch`.
+            let pid = src.pid;
+            let now: Option<String> = tokio::task::spawn_blocking(move || {
+                super::procwatch::process_identity(pid)
+            })
+            .await
+            .ok()?;
+            super::procwatch::process_exit_reason(pid, &src.baseline, now.as_deref())
+        }
         "chat" => match super::chats::watch_state(h, &src.chat).await {
             None => Some(format!(
                 "chat `{}` is gone, or cross-chat access was switched off",
@@ -3431,13 +3454,13 @@ fn feature_sections(settings: &store::Settings) -> String {
 ///
 /// Separate from [`feature_sections`] because it needs the project and reads
 /// the disk; the rules about memory stay in that section with the switch.
-async fn memory_snapshot(on: bool, project: &str) -> String {
+async fn memory_snapshot(on: bool, in_repo: bool, project: &str) -> String {
     if !on {
         return String::new();
     }
     let project = project.to_string();
     tokio::task::spawn_blocking(move || {
-        super::memory::snapshot(&super::memory::Dirs::for_project(&project))
+        super::memory::snapshot(&super::memory::Dirs::for_project(&project, in_repo))
     })
     .await
     .unwrap_or_default()
@@ -3489,7 +3512,7 @@ async fn frozen_prefix(
         return Ok((sys, mcp, plugins));
     }
     let agent_id = format!("ol-{task_id}");
-    let (skills, inject_global_claude, disabled_docs, extra, plugins, mem_on) = {
+    let (skills, inject_global_claude, disabled_docs, extra, plugins, mem_on, mem_repo) = {
         let s = h.settings.read().await;
         let out = (
             store::all_skills(&s, &project),
@@ -3498,11 +3521,12 @@ async fn frozen_prefix(
             feature_sections(&s),
             s.plugins.clone(),
             s.memory,
+            super::memory::in_project_enabled(&s.memory_in_project, &project),
         );
         drop(s);
         out
     };
-    let remembered = memory_snapshot(mem_on, &project).await;
+    let remembered = memory_snapshot(mem_on, mem_repo, &project).await;
     let system = prompt::system(
         &prompt::Env {
             cwd: &cwd,
@@ -3564,7 +3588,7 @@ async fn prefix_for(
     if !t.system.is_empty() {
         return (t.system.clone(), t.mcp_tools.clone(), t.plugins.clone());
     }
-    let (skills, inject_global_claude, disabled_docs, extra, plugins, mem_on) = {
+    let (skills, inject_global_claude, disabled_docs, extra, plugins, mem_on, mem_repo) = {
         let s = h.settings.read().await;
         let out = (
             store::all_skills(&s, &t.project),
@@ -3573,11 +3597,12 @@ async fn prefix_for(
             feature_sections(&s),
             s.plugins.clone(),
             s.memory,
+            super::memory::in_project_enabled(&s.memory_in_project, &t.project),
         );
         drop(s);
         out
     };
-    let remembered = memory_snapshot(mem_on, &t.project).await;
+    let remembered = memory_snapshot(mem_on, mem_repo, &t.project).await;
     let system = prompt::system(
         &prompt::Env {
             cwd: &t.cwd,
@@ -5598,6 +5623,14 @@ impl Agent {
                     Ok(v) => (v, false),
                     Err(e) => (json!(e), true),
                 }
+            } else if name == "sandbox" {
+                match self
+                    .exec_sandbox(&effective_input, item_id.as_deref())
+                    .await
+                {
+                    Ok(v) => (v, false),
+                    Err(e) => (json!(e), true),
+                }
             } else if name == "browser" {
                 match self
                     .exec_browser(&effective_input, item_id.as_deref())
@@ -5980,6 +6013,323 @@ impl Agent {
         })
         .await;
         Ok(content)
+    }
+
+    /// Tell the UI a sandbox changed (who is driving it, a new picture to show).
+    fn sandbox_changed(&self, id: &str) {
+        (self.h.bus)("ol://sandbox", json!({"id": id, "task": self.task_id}));
+    }
+
+    /// This chat just started using a sandbox (made or picked it): tell its
+    /// studio to show it, so what the agent set up is in front of the user.
+    fn sandbox_attached(&self, id: &str) {
+        (self.h.bus)(
+            "ol://sandbox",
+            json!({"id": id, "task": self.task_id, "attached": true}),
+        );
+    }
+
+    async fn sandbox_of_task(&self) -> Result<Option<String>, String> {
+        let t = self.h.task(&self.task_id).await?;
+        let id = t.lock().await.sandbox.clone();
+        Ok(id)
+    }
+
+    /// The sandbox this chat is attached to, running: started first if it was
+    /// stopped, because "my computer is off" is not something an agent should
+    /// have to report back to the user.
+    async fn attached_sandbox(&self) -> Result<super::sandbox::Sandbox, String> {
+        use super::sandbox as sbx;
+        let id = self.sandbox_of_task().await?.ok_or(
+            "This chat has no sandbox yet. `sandbox list` to see them, then `use` one or `create` a new one.",
+        )?;
+        let sb = sbx::load(&id).map_err(|e| format!("{e} `sandbox list` shows what exists."))?;
+        if sbx::view_of(&id).await?["state"] != "running" {
+            self.step(format!("Starting sandbox {}", sb.name)).await;
+            sbx::start(&id, &|_| {}).await?;
+            self.sandbox_changed(&id);
+        }
+        Ok(sb)
+    }
+
+    async fn attach_sandbox(&self, id: Option<String>) {
+        self.h
+            .update_task(&self.task_id, |t| t.sandbox = id.clone())
+            .await;
+        self.h.save_task(&self.task_id).await;
+    }
+
+    /// The `sandbox` tool: the agent's own computers. See `sandbox.rs`.
+    async fn exec_sandbox(&self, input: &Value, item_id: Option<&str>) -> Result<Value, String> {
+        use super::{plugins, sandbox as sbx};
+        let op = input["op"].as_str().unwrap_or("").to_string();
+        let observe = op == "list" || (op == "screen" && plugins::computer_is_observe(input));
+        if !observe {
+            if let Some(s) = self.sub.as_ref().filter(|s| s.def.tools == "read_only") {
+                return Err(format!(
+                    "The {} agent is read-only: it can `list` sandboxes and look at a screen, nothing else.",
+                    s.def.id
+                ));
+            }
+            self.gate("sandbox", input, None).await?;
+        }
+        let text = |s: String| -> Result<Value, String> { Ok(json!(s)) };
+        match op.as_str() {
+            "list" => {
+                let v = sbx::views().await;
+                if let Some(e) = v["dockerError"].as_str() {
+                    return Err(format!("Sandboxes need Docker: {e}"));
+                }
+                let mine = self.sandbox_of_task().await?;
+                let rows: Vec<String> = v["sandboxes"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|s| {
+                                format!(
+                                    "- {} \"{}\" · {} · {}x{}{}{}",
+                                    s["id"].as_str().unwrap_or(""),
+                                    s["name"].as_str().unwrap_or(""),
+                                    s["state"].as_str().unwrap_or(""),
+                                    s["width"],
+                                    s["height"],
+                                    if mine.as_deref() == s["id"].as_str() {
+                                        " · attached to this chat"
+                                    } else {
+                                        ""
+                                    },
+                                    match s["driver"]["kind"].as_str() {
+                                        Some("user") => " · the user is driving it",
+                                        Some("agent") => " · an agent is driving it",
+                                        _ => "",
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if rows.is_empty() {
+                    text("No sandboxes yet. `sandbox create` makes one.".into())
+                } else {
+                    text(rows.join("\n"))
+                }
+            }
+            "create" => {
+                let name = input["name"].as_str().unwrap_or("Agent sandbox").to_string();
+                let sb = sbx::create(sbx::NewSandbox {
+                    name,
+                    width: input["width"].as_u64().map(|n| n as u32),
+                    height: input["height"].as_u64().map(|n| n as u32),
+                    memory: String::new(),
+                    cpus: 0.0,
+                })?;
+                self.sandbox_changed(&sb.id);
+                self.step(format!("Creating sandbox {}", sb.name)).await;
+                if let Err(e) = sbx::start(&sb.id, &|_| {}).await {
+                    // A sandbox that can't start is no use to anyone; don't
+                    // leave an empty one in the user's list.
+                    let _ = sbx::delete(&sb.id).await;
+                    self.sandbox_changed(&sb.id);
+                    return Err(e);
+                }
+                self.attach_sandbox(Some(sb.id.clone())).await;
+                self.sandbox_attached(&sb.id);
+                text(format!(
+                    "Created and started sandbox \"{}\" ({}), {}x{}. This chat is attached to it: start with `screen` [{{\"type\":\"screenshot\"}}] or `exec`.",
+                    sb.name, sb.id, sb.width, sb.height
+                ))
+            }
+            "use" => {
+                let sb = sbx::find(
+                    input["sandbox"]
+                        .as_str()
+                        .ok_or("`sandbox` (an id or name) is required.")?,
+                )?;
+                self.step(format!("Using sandbox {}", sb.name)).await;
+                sbx::start(&sb.id, &|_| {}).await?;
+                self.attach_sandbox(Some(sb.id.clone())).await;
+                self.sandbox_attached(&sb.id);
+                text(format!(
+                    "Attached to sandbox \"{}\" ({}), {}x{}, running.",
+                    sb.name, sb.id, sb.width, sb.height
+                ))
+            }
+            "start" => {
+                let sb = self.attached_sandbox().await?;
+                text(format!("Sandbox \"{}\" is running.", sb.name))
+            }
+            "stop" => {
+                let id = self.sandbox_of_task().await?.ok_or("No sandbox attached.")?;
+                sbx::stop(&id).await?;
+                self.sandbox_changed(&id);
+                text("Stopped. It keeps its disk; `start` brings it back.".into())
+            }
+            "delete" => {
+                let sb = sbx::find(
+                    input["sandbox"]
+                        .as_str()
+                        .ok_or("`sandbox` (an id or name) is required.")?,
+                )?;
+                self.step(format!("Deleting sandbox {}", sb.name)).await;
+                sbx::delete(&sb.id).await?;
+                // Every chat pointed at it goes back to the host.
+                let ids: Vec<String> = self.h.tasks.read().await.keys().cloned().collect();
+                for tid in ids {
+                    let on_it = match self.h.task(&tid).await {
+                        Ok(t) => t.lock().await.sandbox.as_deref() == Some(sb.id.as_str()),
+                        Err(_) => false,
+                    };
+                    if on_it {
+                        self.h.update_task(&tid, |t| t.sandbox = None).await;
+                        self.h.save_task(&tid).await;
+                    }
+                }
+                self.sandbox_changed(&sb.id);
+                text(format!("Deleted sandbox \"{}\" ({}).", sb.name, sb.id))
+            }
+            "release" => {
+                let had = self.sandbox_of_task().await?;
+                self.attach_sandbox(None).await;
+                if let Some(id) = had {
+                    self.sandbox_changed(&id);
+                }
+                text("Detached. The sandbox keeps running for the user until stopped.".into())
+            }
+            "exec" => {
+                let sb = self.attached_sandbox().await?;
+                if !sb.shell {
+                    return Err("The user turned off shell commands for this sandbox (Artificts → Sandboxes).".into());
+                }
+                let cmd = input["command"]
+                    .as_str()
+                    .filter(|c| !c.trim().is_empty())
+                    .ok_or("`command` is required.")?;
+                self.step(format!("Sandbox: {}", cmd.chars().take(80).collect::<String>()))
+                    .await;
+                let guard = sbx::agent_begin(&sb.id, &self.task_id, cmd);
+                self.sandbox_changed(&sb.id);
+                let r = sbx::exec(&sb.id, cmd, input["timeout_s"].as_u64().unwrap_or(120)).await;
+                drop(guard);
+                self.sandbox_changed(&sb.id);
+                let (code, out) = r?;
+                self.set_item(item_id, |i| i.data["meta"] = json!(format!("exit {code}")))
+                    .await;
+                text(format!("exit code {code}\n{out}"))
+            }
+            "screen" => {
+                use base64::Engine;
+                let sb = self.attached_sandbox().await?;
+                if !sb.computer {
+                    return Err("The user turned off screen control for this sandbox (Artificts → Sandboxes).".into());
+                }
+                let summary = plugins::computer_summary(input);
+                self.step(format!(
+                    "Sandbox screen: {}",
+                    summary.chars().take(80).collect::<String>()
+                ))
+                .await;
+                let guard = sbx::agent_begin(&sb.id, &self.task_id, &summary);
+                self.sandbox_changed(&sb.id);
+                let pc_token = self.cancel.child_token();
+                let (ran, failed, region) = sbx::act(&sb.id, input, &pc_token).await;
+                pc_token.cancel();
+                if self.cancel.is_cancelled() {
+                    return Err(format!("Interrupted by user after {ran} action(s)."));
+                }
+                if ran > 0 && !observe {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                let shot = sbx::screenshot(&sb.id, region, false).await;
+                drop(guard);
+                self.sandbox_changed(&sb.id);
+                let bytes = match shot {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(match &failed {
+                            Some(f) => format!("{f} Then the screenshot failed too: {e}"),
+                            None => format!("{ran} action(s) ran, then the screenshot failed: {e}"),
+                        })
+                    }
+                };
+                let img = tools::ImageData {
+                    media_type: "image/jpeg".into(),
+                    bytes: bytes.len() as u64,
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                };
+                let display = format!("sandbox screen {}x{}", sb.width, sb.height);
+                self.finish_image(item_id, &display, &img).await;
+                let mut content = tools::image_content(&display, &img);
+                let view = match region {
+                    Some((x, y, w, h)) => format!(
+                        "a {w}x{h} region at ({x},{y}) of the {}x{} screen",
+                        sb.width, sb.height
+                    ),
+                    None => format!("the whole {}x{} screen", sb.width, sb.height),
+                };
+                content[0]["text"] = json!(match &failed {
+                    Some(e) => format!(
+                        "{e} ({ran} earlier action(s) ran.) Picture: {view}. Coordinates are screen pixels."
+                    ),
+                    None => format!("After the actions: {view}. Coordinates are screen pixels."),
+                });
+                self.set_item(item_id, |i| {
+                    i.data["meta"] = json!(if failed.is_some() {
+                        "failed".to_string()
+                    } else {
+                        format!("{ran} action{}", if ran == 1 { "" } else { "s" })
+                    })
+                })
+                .await;
+                Ok(content)
+            }
+            "publish" => {
+                let sb = self.attached_sandbox().await?;
+                let file = input["file"].as_str();
+                let title = input["title"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| match file {
+                        Some(f) => f.rsplit('/').next().unwrap_or(f).to_string(),
+                        None => format!("{} screen", sb.name),
+                    });
+                let (kind, content) = sbx::publish_content(&sb.id, file).await?;
+                let project = self.h.task(&self.task_id).await?.lock().await.project.clone();
+                let note = input["note"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty());
+                let artifict = crate::artificts::create(
+                    &project,
+                    crate::artificts::ArtifictInput {
+                        title: title.chars().take(200).collect(),
+                        kind,
+                        content,
+                        decisions: note
+                            .map(|n| vec![n.chars().take(500).collect()])
+                            .unwrap_or_default(),
+                        constraints: vec![format!("Made in sandbox \"{}\"", sb.name)],
+                        code_refs: vec![],
+                    },
+                )?;
+                self.h.emit_artifict(&self.task_id, &artifict);
+                self.set_item(item_id, |i| {
+                    i.data["artifict_card"] = json!({
+                        "title": artifict.title, "kind": artifict.kind, "persistence": "project",
+                        "artifict_id": artifict.id, "version_id": artifict.current_version_id
+                    })
+                })
+                .await;
+                text(format!(
+                    "Published \"{}\" to the Artificts tab (artifict {}).",
+                    artifict.title, artifict.id
+                ))
+            }
+            other => Err(format!(
+                "Unknown op `{other}`. Use list, create, use, start, stop, release, delete, screen, exec or publish."
+            )),
+        }
     }
 
     /// Browser plugin: drive a real browser — navigate, snapshot, read, click,
@@ -7248,7 +7598,7 @@ impl Agent {
             } => {
                 let kind = if name == "bash" || name == "shell" {
                     "command"
-                } else if name.starts_with("mcp__") || name == "github" || name == "computer" {
+                } else if name.starts_with("mcp__") || name == "github" || name == "computer" || name == "sandbox" {
                     "mcp"
                 } else {
                     "edit"
@@ -8141,19 +8491,44 @@ impl Agent {
     /// `agent::memory`, where they are tested against temporary folders; this
     /// only applies the setting and finds the folders for this task's project.
     async fn memory(&self, input: &Value) -> Result<String, String> {
-        if !self.h.settings.read().await.memory {
-            return Err("Memory is turned off in Settings → General.".into());
-        }
         let task = self.h.task(&self.task_id).await?;
         let project = task.lock().await.project.clone();
+        let (on, in_repo) = {
+            let s = self.h.settings.read().await;
+            (
+                s.memory,
+                super::memory::in_project_enabled(&s.memory_in_project, &project),
+            )
+        };
+        if !on {
+            return Err("Memory is turned off in Settings → General.".into());
+        }
         let input = input.clone();
         // Resolving the project folder shells out to `git rev-parse`, and the
         // actions touch the disk: keep both off the async workers.
-        tokio::task::spawn_blocking(move || {
-            super::memory::run(&super::memory::Dirs::for_project(&project), &input)
+        let dirs = tokio::task::spawn_blocking(move || {
+            super::memory::Dirs::for_project(&project, in_repo)
         })
         .await
-        .map_err(|e| format!("memory tool failed: {e}"))?
+        .map_err(|e| format!("memory tool failed: {e}"))?;
+        // `~/.openleash/memory` is the app's own folder and has never been
+        // gated. The project's `.openleash/memory` is the user's repository: a
+        // note written there is a file write, so it answers to the same gate as
+        // one — plan mode refuses it, the allowlist rung asks, and a path rule
+        // that denies the folder denies this too. A note's *content* is not in
+        // the gated input; the target is the index, which every write changes.
+        if let Some(repo) = dirs.repo_write(&input) {
+            let index = repo.join("MEMORY.md");
+            self.gate(
+                "write_file",
+                &json!({"path": index.to_string_lossy(), "content": ""}),
+                Some(&index.to_string_lossy()),
+            )
+            .await?;
+        }
+        tokio::task::spawn_blocking(move || super::memory::run(&dirs, &input))
+            .await
+            .map_err(|e| format!("memory tool failed: {e}"))?
     }
 
     /// Who this agent is, as other agents see it.
@@ -8299,9 +8674,9 @@ impl Agent {
         let source = input["source"].as_str().unwrap_or("").to_string();
         if !matches!(
             source.as_str(),
-            "timer" | "ci" | "pr" | "file" | "job" | "chat"
+            "timer" | "ci" | "pr" | "file" | "job" | "process" | "chat"
         ) {
-            return Err("`source` must be one of: timer, ci, pr, file, job, chat.".into());
+            return Err("`source` must be one of: timer, ci, pr, file, job, process, chat.".into());
         }
         let reason = input["reason"]
             .as_str()
@@ -8323,6 +8698,7 @@ impl Agent {
             pattern: String::new(),
             chat: String::new(),
             chat_label: String::new(),
+            pid: 0,
             timeout_s: input["timeout_s"]
                 .as_u64()
                 .map(|s| s.clamp(30, 86_400))
@@ -8393,6 +8769,24 @@ impl Agent {
                 src.job_id = id;
                 src.pattern = pattern;
                 src.baseline = job.output_end().to_string();
+            }
+            "process" => {
+                // Any process on this machine, not only this chat's own jobs (use
+                // `job` for those). Recording the start time now is what lets a
+                // later look tell this process from one that reuses its id.
+                let pid = input["pid"]
+                    .as_u64()
+                    .filter(|p| *p > 0 && *p <= u64::from(u32::MAX))
+                    .ok_or("`process` needs `pid`: the id of the process to wait for.")?
+                    as u32;
+                let now = tokio::task::spawn_blocking(move || super::procwatch::process_identity(pid))
+                    .await
+                    .map_err(|e| format!("Couldn't look up process {pid}: {e}"))?;
+                let Some(identity) = now else {
+                    return Err(format!("There's no running process with id {pid}, so there is nothing to wait for. Check the id, or use `job` for a background command this chat started."));
+                };
+                src.pid = pid;
+                src.baseline = identity;
             }
             "chat" => {
                 let to = text("chat");
@@ -11370,7 +11764,10 @@ mod tests {
         use crate::agent::proof;
         use crate::agent::tests::{harness, task};
 
-        let (h, _) = harness(store::Settings::default(), vec![task("clipoff", "m/x")]);
+        let mut settings = store::Settings::default();
+        settings.plugins.computer.enabled = false;
+        settings.plugins.browser.enabled = false;
+        let (h, _) = harness(settings, vec![task("clipoff", "m/x")]);
         let agent = Agent {
             h: h.clone(),
             task_id: "clipoff".into(),
@@ -12659,6 +13056,176 @@ mod http_request_dispatch_tests {
                 .unwrap_err();
             assert!(err.to_lowercase().contains("refused"), "{url}: {err}");
         }
+    }
+}
+
+/// Memory kept in the project (`<project>/.openleash/memory/`) is the one place
+/// the `memory` tool writes into the user's repository, and the one place a
+/// repository can write into the prompt. `memory.rs` tests the folder rules;
+/// these pin the two boundaries that need the dispatcher: a save into the
+/// project is a file write (plan mode refuses it), and a folder the user has
+/// not trusted is not used at all.
+#[cfg(test)]
+mod memory_in_project_dispatch_tests {
+    #![allow(clippy::await_holding_lock)]
+
+    use super::*;
+    use crate::agent::trust::{self, TrustKind, TrustState};
+
+    struct Fixture {
+        agent: Agent,
+        root: PathBuf,
+        _home: std::sync::MutexGuard<'static, ()>,
+        _trust: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Fixture {
+        fn project(&self) -> PathBuf {
+            self.root.join("project")
+        }
+        fn committed(&self) -> PathBuf {
+            self.project().join(super::super::memory::IN_PROJECT)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            trust::set_trust(&[]);
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture(plan: bool, trusted: bool, in_project: bool) -> Fixture {
+        use crate::agent::tests::{harness, task};
+        let root = std::env::temp_dir().join(format!("ol-mem-repo-{}", uuid::Uuid::new_v4()));
+        let home = store::test_home(&root.join("home"));
+        let lock = trust::TRUST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let p = project.to_string_lossy().to_string();
+        let mut decisions = vec![];
+        if trusted {
+            trust::upsert(&mut decisions, &p, TrustKind::Folder, TrustState::Trusted);
+        }
+        trust::set_trust(&decisions);
+
+        let mut t = task("mem-repo", "unused/model");
+        t.project = p.clone();
+        t.cwd = p.clone();
+        t.perm = "turbo".into();
+        t.plan = plan;
+        let settings = store::Settings {
+            memory: true,
+            memory_in_project: if in_project { vec![p] } else { vec![] },
+            ..Default::default()
+        };
+        let (h, _) = harness(settings, vec![t]);
+        Fixture {
+            agent: Agent {
+                h,
+                task_id: "mem-repo".into(),
+                sub: None,
+                cancel: CancellationToken::new(),
+            },
+            root,
+            _home: home,
+            _trust: lock,
+        }
+    }
+
+    fn save() -> Value {
+        json!({"action": "save", "kind": "project", "name": "Release freeze",
+               "summary": "no merges until Friday", "content": "Freeze starts Monday."})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_mode_refuses_a_save_into_the_project_and_writes_nothing() {
+        let f = fixture(true, true, true);
+        let err = f
+            .agent
+            .exec_inner("memory", &save(), None, "call-mem")
+            .await
+            .unwrap_err();
+        assert!(err.contains("Plan mode is active"), "{err}");
+        assert!(
+            !f.committed().exists(),
+            "plan mode must leave the user's project untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_mode_refuses_to_correct_or_forget_a_note_that_lives_in_the_project() {
+        // Out of plan mode a note is committed; the same note, edited in plan
+        // mode, must not change — update and forget are file writes too.
+        let f = fixture(false, true, true);
+        f.agent
+            .exec_inner("memory", &save(), None, "call-save")
+            .await
+            .unwrap();
+        let index = std::fs::read_to_string(f.committed().join("MEMORY.md")).unwrap();
+        f.agent
+            .h
+            .update_task("mem-repo", |t| t.plan = true)
+            .await;
+        for action in [
+            json!({"action": "update", "file": "release-freeze.md", "content": "changed"}),
+            json!({"action": "forget", "file": "release-freeze.md"}),
+        ] {
+            let err = f
+                .agent
+                .exec_inner("memory", &action, None, "call-mem")
+                .await
+                .unwrap_err();
+            assert!(err.contains("Plan mode is active"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(f.committed().join("release-freeze.md")).unwrap(),
+            "Freeze starts Monday."
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.committed().join("MEMORY.md")).unwrap(),
+            index
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_goes_into_the_project_when_the_rung_allows_a_write() {
+        let f = fixture(false, true, true);
+        let out = f
+            .agent
+            .exec_inner("memory", &save(), None, "call-mem")
+            .await
+            .expect("a trusted project that opted in takes the note");
+        assert!(out.contains("Saved"), "{out}");
+        assert!(f.committed().join("MEMORY.md").is_file());
+        assert!(f.committed().join("release-freeze.md").is_file());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_mode_still_lets_memory_use_its_own_folder_when_the_project_did_not_opt_in() {
+        // Unchanged behaviour: `~/.openleash/memory` is not the user's project.
+        let f = fixture(true, true, false);
+        f.agent
+            .exec_inner("memory", &save(), None, "call-mem")
+            .await
+            .expect("the app's own folder is not gated by plan mode");
+        assert!(!f.committed().exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untrusted_project_keeps_its_notes_private_even_when_opted_in() {
+        let f = fixture(false, false, true);
+        f.agent
+            .exec_inner("memory", &save(), None, "call-mem")
+            .await
+            .expect("the note is saved, privately");
+        assert!(
+            !f.committed().exists(),
+            "an untrusted folder is never written to or read from"
+        );
+        let dirs = super::super::memory::Dirs::for_project(&f.project().to_string_lossy(), true);
+        assert!(dirs.in_repo.is_none());
+        assert_eq!(super::super::memory::open(&dirs.project).entries.len(), 1);
     }
 }
 

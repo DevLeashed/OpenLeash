@@ -251,6 +251,16 @@ describe("RunTimelinePanel", () => {
     expect(get()).toMatchObject({ runTimeline: null, details: true, subOpen: null });
   });
 
+  it("gives the pane back from the Artificts studio, where the rail is not drawn", async () => {
+    set({ tasks: { t1: { id: "t1", title: "Fix the flaky test", status: "done", subs: [], artifict_open: true } as never } } as never);
+    const update = vi.spyOn(api, "update").mockResolvedValue(null as never);
+    await show();
+    fireEvent.click(screen.getByText("Context window…"));
+    expect(get().tasks.t1?.artifict_open).toBe(false);
+    expect(update).toHaveBeenCalledWith("t1", { artifict_open: false });
+    expect(get()).toMatchObject({ details: true, runTimeline: null });
+  });
+
   it("says so when the chat has no recorded timings", async () => {
     await show(fixture({ recorded: false, blocks: [], start_ms: null, end_ms: null }));
     expect(await screen.findByText(/No timings recorded for this chat/)).toBeTruthy();

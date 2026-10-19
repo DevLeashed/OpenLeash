@@ -99,10 +99,12 @@ are complete:
 
 - No CI or tag-based release workflow is currently present.
 - No production signing or notarization is configured.
-- The download workflow publishes no updater assets at all: no signature, no
-  `latest.json`, and no signing step. In-app updates therefore have nothing to
-  consume yet, and a manifest published by hand still needs a `signature` field
-  in each platform entry (the plugin requires the key; nothing checks its value).
+- The download workflow publishes no `latest.json` and no signing step. Generate
+  the manifest with `python scripts/assemble-updater.py <version> [tag] > latest.json`
+  and upload it, with the build installers (`build_installers` on), to the release as
+  `latest.json`; without it in-app updates have nothing to consume. Its `signature`
+  fields are empty (the plugin requires them; the app does not verify them). macOS
+  has no in-place update asset and keeps the manual link.
 - No published release has yet established install/upgrade behavior across the
   supported OS matrix. Linux installers target Ubuntu 24.04; older distributions
   may not be compatible.

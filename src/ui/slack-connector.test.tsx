@@ -14,8 +14,8 @@ vi.mock("../store", () => ({
 import { SLACK_MANIFEST, SlackConnector, slackSummary } from "./SlackConnector";
 
 const ME = "U0ME00001";
-const APP = "xapp-1-A0APP0001-1111111111111-aaaaaaaaaaaaaaaaaaaaaaaa";
-const BOT = "xox" + "b-111111111111-2222222222222-BBBBBBBBBBBBBBBBBBBBBBBB";
+const APP = "dummy-app-level-token";
+const BOT = "dummy-bot-token";
 const base = (over: Partial<SlackStatus> = {}): SlackStatus => ({
   enabled: false, has_app_token: false, has_bot_token: false, allowed_users: [], allowed_teams: [], allowed_channels: [], allow_dms: true, require_mention: true,
   project: "", model: "", perm: "auto", state: "off", error: "", bot_name: "", bot_id: "", team_name: "", chats: 0, last_ignored: "", ...over,

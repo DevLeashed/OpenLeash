@@ -434,7 +434,9 @@ fn the_threshold_counts_the_core_plus_the_tail() {
 #[test]
 fn the_default_on_browser_is_declared_unless_plugin_deferral_is_on() {
     let defaults = super::plugins::schemas(&super::plugins::PluginsCfg::default());
-    assert_eq!(names(&defaults), ["browser"]);
+    // The built-in sandbox tool is declared alongside it; the browser must be in the list.
+    assert!(names(&defaults).contains(&"browser".to_string()));
+    assert!(names(&defaults).contains(&"sandbox".to_string()));
     let mut frozen = tail();
     frozen.retain(|t| t["name"] != "browser");
     frozen.extend(defaults);

@@ -39,7 +39,7 @@
 
 use super::{git, tools};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -166,7 +166,7 @@ pub struct ComputerCfg {
 impl Default for ComputerCfg {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             settle_ms: 600,
         }
     }
@@ -317,6 +317,9 @@ pub fn schemas(cfg: &PluginsCfg) -> Vec<Value> {
     if cfg.browser.enabled {
         v.push(browser_schema());
     }
+    // Built in, not a plugin: sandboxes touch nothing of the user's, and each
+    // one carries its own switches for what an agent may do inside it.
+    v.push(super::sandbox::tool_schema());
     v.extend(super::plugin_services::schemas(cfg));
     v
 }
@@ -606,14 +609,22 @@ impl Gh<'_> {
                 Ok(format!(
                     "{} · {}\n{}\ndefault branch: {} · {} stars · {} forks · {} open issues+PRs · {}{}\n{}",
                     v["full_name"].as_str().unwrap_or(&r),
-                    if v["private"] == true { "private" } else { "public" },
+                    if v["private"] == true {
+                        "private"
+                    } else {
+                        "public"
+                    },
                     v["description"].as_str().unwrap_or(""),
                     v["default_branch"].as_str().unwrap_or("?"),
                     v["stargazers_count"],
                     v["forks_count"],
                     v["open_issues_count"],
                     v["language"].as_str().unwrap_or("?"),
-                    if v["archived"] == true { " · ARCHIVED" } else { "" },
+                    if v["archived"] == true {
+                        " · ARCHIVED"
+                    } else {
+                        ""
+                    },
                     v["html_url"].as_str().unwrap_or("")
                 ))
             }
@@ -1333,7 +1344,10 @@ fn shrink_png(bytes: Vec<u8>) -> Vec<u8> {
 pub fn browser_image(bytes: Vec<u8>) -> Result<tools::ImageData, String> {
     let raw = shrink_png(bytes);
     if (raw.len() as u64) > tools::MAX_IMAGE_BYTES {
-        return Err(format!("browser: the screenshot is {:.1} MiB, over the limit — try a smaller viewport, or not `full_page`.", raw.len() as f64 / 1_048_576.0));
+        return Err(format!(
+            "browser: the screenshot is {:.1} MiB, over the limit — try a smaller viewport, or not `full_page`.",
+            raw.len() as f64 / 1_048_576.0
+        ));
     }
     Ok(tools::ImageData {
         media_type: "image/png".into(),
@@ -1411,7 +1425,7 @@ const POINTED: &[&str] = &[
 /// enough to click inside it.
 const MIN_REGION: f64 = 8.0;
 
-fn computer_schema() -> Value {
+pub fn computer_schema() -> Value {
     let pt = json!({"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"]});
     json!({
         "name": "computer",
@@ -1422,7 +1436,7 @@ fn computer_schema() -> Value {
     - click {x, y, button: left|right|middle|back|forward (default left), keys: modifiers held during the click e.g. [\"CTRL\"]}\n\
     - double_click {x, y} · triple_click {x, y}\n\
     - move {x, y}\n\
-    - drag {path: [{x,y}, …]} (press at the first point, release at the last)\n\
+    - drag {path: [{x,y}, …], button?: left|right|middle (default left), duration_ms?: 10–3000} (smoothly drag along the path; use middle-drag for Blender viewport orbit/pan)\n\
     - scroll {x, y, scroll_x, scroll_y} (pixels; positive scroll_y = down, ~100 per wheel notch)\n\
     - mouse_down {x, y, button} · mouse_up {x?, y?, button?} (press and hold, or release where it is; anything still held is released when the batch ends)\n\
     - type {text}\n\
@@ -1439,6 +1453,7 @@ fn computer_schema() -> Value {
                 "keys":{"type":"array","items":{"type":"string"}},
                 "path":{"type":"array","items": pt},
                 "scroll_x":{"type":"integer"},"scroll_y":{"type":"integer"},
+                "duration_ms":{"type":"integer","minimum":10,"maximum":3000},
                 "text":{"type":"string"},
                 "ms":{"type":"integer"}},
                 "required":["type"]}}},
@@ -1467,7 +1482,7 @@ pub fn computer_is_observe(input: &Value) -> bool {
 /// as a broken harness. `github` and `browser` stay, because part of what they
 /// do *is* allowed for a read-only agent (reading a page, reading GitHub).
 pub fn offered_to_sub(policy: &str, name: &str) -> bool {
-    !(policy == "read_only" && name == "computer")
+    !(policy == "read_only" && matches!(name, "computer" | "sandbox"))
 }
 
 /// Short human summary of a batch, e.g. `click 400,120 → type "hi" → keypress CTRL+S`.
@@ -1501,11 +1516,16 @@ pub fn computer_summary(input: &Value) -> String {
                 },
                 "drag" => match a["path"].as_array().filter(|p| p.len() >= 2) {
                     Some(p) => format!(
-                        "drag {},{} → {},{}",
+                        "{}-drag {},{} → {},{}{}",
+                        a["button"].as_str().unwrap_or("left"),
                         p[0]["x"],
                         p[0]["y"],
                         p[p.len() - 1]["x"],
-                        p[p.len() - 1]["y"]
+                        p[p.len() - 1]["y"],
+                        a["duration_ms"]
+                            .as_u64()
+                            .map(|ms| format!(" ({ms}ms)"))
+                            .unwrap_or_default()
                     ),
                     None => "drag".into(),
                 },
@@ -1880,7 +1900,11 @@ fn key_of(name: &str) -> Result<enigo::Key, String> {
             let mut ch = n.chars();
             match (ch.next(), ch.next()) {
                 (Some(c), None) => K::Unicode(c.to_ascii_lowercase()),
-                _ => return Err(format!("Unknown key `{n}`. Use names like ENTER, TAB, ESC, UP, PAGEDOWN, F5, CTRL, SHIFT, ALT, WIN, or a single character.")),
+                _ => {
+                    return Err(format!(
+                        "Unknown key `{n}`. Use names like ENTER, TAB, ESC, UP, PAGEDOWN, F5, CTRL, SHIFT, ALT, WIN, or a single character."
+                    ));
+                }
             }
         }
     })
@@ -2106,11 +2130,7 @@ fn notches(px: i64) -> i32 {
         return 0;
     }
     let n = ((px as f64 / 100.0).round() as i32).clamp(-30, 30);
-    if n == 0 {
-        px.signum() as i32
-    } else {
-        n
-    }
+    if n == 0 { px.signum() as i32 } else { n }
 }
 
 fn with_held_keys<T, K: Copy, E>(
@@ -2213,9 +2233,11 @@ fn one(
             e.move_mouse(screen[0].0, screen[0].1, Coordinate::Abs)
                 .map_err(err)?;
             pause(50);
+            let drag_button = button_of(a);
+            let duration = a["duration_ms"].as_u64().unwrap_or(240).clamp(10, 3000);
             with_held_keys(
                 e,
-                &[Button::Left],
+                &[drag_button],
                 |e, button, press| {
                     e.button(
                         button,
@@ -2230,20 +2252,21 @@ fn one(
                 |e| {
                     // Interpolate so apps see a real drag, but stop on cancellation
                     // or injection failure and always release the held mouse button.
+                    let steps = ((duration / 12).clamp(10, 120)) as u32;
                     for w in screen.windows(2) {
                         let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-                        for i in 1..=10 {
+                        for i in 1..=steps {
                             if cancel.is_cancelled() {
                                 return Err("Interrupted by user.".into());
                             }
-                            let t = i as f64 / 10.0;
+                            let t = i as f64 / steps as f64;
                             e.move_mouse(
                                 x0 + ((x1 - x0) as f64 * t) as i32,
                                 y0 + ((y1 - y0) as f64 * t) as i32,
                                 Coordinate::Abs,
                             )
                             .map_err(err)?;
-                            pause(12);
+                            pause((duration / steps as u64 / (screen.len() - 1) as u64).max(1));
                         }
                     }
                     Ok(())
@@ -2463,11 +2486,17 @@ mod tests {
                 {"type": "mouse_up"},
                 {"type": "wait", "ms": 500}
             ]})),
-            "zoom 100x50 at 10,20 → drag 1,2 → 30,40 → key down SHIFT → mouse down 5,6 → mouse up → wait 500ms"
+            "zoom 100x50 at 10,20 → left-drag 1,2 → 30,40 → key down SHIFT → mouse down 5,6 → mouse up → wait 500ms"
         );
         assert_eq!(
             computer_summary(&json!({"actions": [{"type": "screenshot", "monitor": 1}]})),
             "screenshot monitor 1"
+        );
+        assert_eq!(
+            computer_summary(
+                &json!({"actions": [{"type": "drag", "button": "middle", "duration_ms": 850, "path": [{"x": 1, "y": 2}, {"x": 30, "y": 40}]}]})
+            ),
+            "middle-drag 1,2 → 30,40 (850ms)"
         );
     }
 
@@ -2515,9 +2544,14 @@ mod tests {
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["browser"], "only the browser ships on");
+        assert_eq!(
+            names,
+            ["computer", "browser", "sandbox"],
+            "computer use, the browser and the built-in sandbox tool are offered by default"
+        );
         c.browser.enabled = false;
-        assert!(schemas(&c).is_empty());
+        c.computer.enabled = false;
+        assert_eq!(schemas(&c).len(), 1, "the sandbox tool has no toggle");
         c.github.enabled = true;
         c.computer.enabled = true;
         c.browser.enabled = true;
@@ -2525,11 +2559,16 @@ mod tests {
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["github", "computer", "browser"]);
-        // Browser is independent: it moves no mouse, so it can be on while
-        // computer use is off.
+        assert_eq!(names, ["github", "computer", "browser", "sandbox"]);
+        // The sandbox tool is independent of the host's computer toggle.
         c.computer.enabled = false;
-        assert_eq!(schemas(&c).last().unwrap()["name"], "browser");
+        assert_eq!(
+            schemas(&c)
+                .iter()
+                .filter(|s| s["name"] == "sandbox")
+                .count(),
+            1
+        );
     }
 
     /// The default promise, asserted from both directions. The `enabled` half
@@ -2542,12 +2581,10 @@ mod tests {
     /// derived `Default` here would pass every existing test and still open a
     /// postage-stamp window on a fresh install.
     #[test]
-    fn a_default_config_runs_no_plugin_and_still_has_usable_settings() {
+    fn a_default_config_runs_only_the_shipped_plugins_and_still_has_usable_settings() {
         let d = PluginsCfg::default();
-        assert!(
-            !d.github.enabled && !d.computer.enabled,
-            "github and computer must ship off: {d:?}"
-        );
+        assert!(!d.github.enabled, "github must ship off: {d:?}");
+        assert!(d.computer.enabled, "computer use ships on: {d:?}");
         assert!(d.browser.enabled, "the browser ships on");
         assert_eq!(d.browser.interactions, "ask", "interactions still ask");
         assert!(!d.browser.developer_mode && !d.browser.headed && !d.browser.persistent_profile);
@@ -2555,17 +2592,17 @@ mod tests {
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(offered, ["browser"], "no other plugin may offer a tool");
+        assert_eq!(offered, ["computer", "browser", "sandbox"], "no other plugin may offer a tool");
 
         assert_eq!((d.browser.width, d.browser.height), (1280, 800));
         assert_eq!(d.computer.settle_ms, 600);
 
-        // The off-by-default has to survive deserialising a settings.json that
+        // The shipped default has to survive deserialising a settings.json that
         // predates the tunable fields, since that is how an existing install
         // upgrades: absent fields take the same Default, not a zero.
         let old: PluginsCfg =
             serde_json::from_str(r#"{"github":{"token":"ghp_x"},"computer":{}}"#).unwrap();
-        assert!(!old.computer.enabled && !old.github.enabled);
+        assert!(old.computer.enabled && !old.github.enabled);
         assert_eq!((old.browser.width, old.browser.height), (1280, 800));
         assert_eq!(old.computer.settle_ms, 600);
         // And a user who did turn one on keeps it, including their numbers.
@@ -2899,12 +2936,16 @@ mod pc_geometry_tests {
             assert!(err.contains("outside the screenshot"), "{err}");
         }
         assert!(to_screen("t:main", &json!(10), &json!(900)).is_err());
-        assert!(to_screen("t:main", &json!("10"), &json!(10))
-            .unwrap_err()
-            .contains("required"));
-        assert!(to_screen("t:main", &json!(null), &json!(null))
-            .unwrap_err()
-            .contains("required"));
+        assert!(
+            to_screen("t:main", &json!("10"), &json!(10))
+                .unwrap_err()
+                .contains("required")
+        );
+        assert!(
+            to_screen("t:main", &json!(null), &json!(null))
+                .unwrap_err()
+                .contains("required")
+        );
     }
 
     /// `preflight` is what stops a batch that clicks before it has ever looked,
@@ -2918,14 +2959,16 @@ mod pc_geometry_tests {
         assert!(err.contains("Take a screenshot first"), "{err}");
         // A screenshot the batch takes itself is what its later coordinates are
         // measured against, so nothing after it is pre-checked.
-        assert!(preflight(
-            "t:main",
-            &[
-                json!({"type": "screenshot"}),
-                json!({"type": "click", "x": 1, "y": 2})
-            ]
-        )
-        .is_ok());
+        assert!(
+            preflight(
+                "t:main",
+                &[
+                    json!({"type": "screenshot"}),
+                    json!({"type": "click", "x": 1, "y": 2})
+                ]
+            )
+            .is_ok()
+        );
         // `mouse_up` may release wherever the pointer is.
         assert!(preflight("t:main", &[json!({"type": "mouse_up"})]).is_ok());
         seen("t:main", 0, (1600, 900), (3840, 2160), None, true, 0.0);
@@ -2955,11 +2998,13 @@ mod pc_geometry_tests {
             }
         );
         // A region with no picture to measure it against cannot be resolved.
-        assert!(screenshot_view(
-            "t:main",
-            &json!({"type": "screenshot", "x": 1, "y": 2, "width": 400, "height": 200})
-        )
-        .is_err());
+        assert!(
+            screenshot_view(
+                "t:main",
+                &json!({"type": "screenshot", "x": 1, "y": 2, "width": 400, "height": 200})
+            )
+            .is_err()
+        );
         seen("t:main", 0, (1600, 900), (3840, 2160), None, true, 0.0);
         assert_eq!(
             screenshot_view(
@@ -2980,11 +3025,13 @@ mod pc_geometry_tests {
         )
         .is_err());
         // Smaller than a few pixels is not a view of anything.
-        assert!(screenshot_view(
-            "t:main",
-            &json!({"type": "screenshot", "x": 10, "y": 10, "width": 4, "height": 4})
-        )
-        .is_err());
+        assert!(
+            screenshot_view(
+                "t:main",
+                &json!({"type": "screenshot", "x": 10, "y": 10, "width": 4, "height": 4})
+            )
+            .is_err()
+        );
         // Over the edge is trimmed rather than refused; what is left is still a
         // real region of the picture.
         assert_eq!(

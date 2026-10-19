@@ -19,6 +19,7 @@ import { get, set } from "../store";
 import { Composer } from "./Composer";
 import { stripHarnessBlocks } from "./SelectionNote";
 import { studioHandoff } from "./studioHandoff";
+import { resetStudioViews } from "./studioViewState";
 
 const chat = (over: Partial<TaskSummary> = {}) => ({
   id: "t1", title: "chat", titled: false, status: "idle", step: "", project: "D:/proj", cwd: ".", branch: "", base_branch: "main",
@@ -37,7 +38,7 @@ const enter = () => {
   fireEvent(box, createEvent.keyDown(box, { key: "Enter" }));
 };
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); studioHandoff.clear(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); studioHandoff.clear(); resetStudioViews(); });
 
 describe("a chat whose studio is open", () => {
   const mount = (draft: string, task = chat()) => {

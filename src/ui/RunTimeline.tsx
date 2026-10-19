@@ -278,10 +278,20 @@ export async function jumpToRow(taskId: string, lane: string, item: string, opts
 }
 
 /** Close the panel and open the chat's Details rail, where the context-window
- *  ring already lives — this panel does not draw a second one. */
+ *  ring already lives — this panel does not draw a second one.
+ *
+ *  The rail is not drawn while the Artificts workspace is open (`Session` stands
+ *  it down for the record surface), so opening it from there would look like the
+ *  button did nothing. Hand the pane back to the chat first, as its "Chat" button
+ *  does. */
 export function openContextWindow(taskId: string) {
   set({ runTimeline: null });
   ensureOpen(taskId);
+  const task = get().tasks[taskId];
+  if (task?.artifict_open) {
+    set((s) => (s.tasks[taskId] ? { tasks: { ...s.tasks, [taskId]: { ...s.tasks[taskId]!, artifict_open: false } } } : {}));
+    void api.update(taskId, { artifict_open: false }).catch(() => {});
+  }
   set({ details: true, subOpen: null });
 }
 

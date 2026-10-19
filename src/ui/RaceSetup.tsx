@@ -77,7 +77,7 @@ function RaceSetupBody() {
       </div>
       <div className="mb" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         <div className="desc" style={{ fontSize: 11.5, color: "var(--mut3)", lineHeight: 1.55 }}>
-          Your prompt runs as {attempts.length} independent chats, each in its own git worktree. When they finish, the project's checks run on each and a
+          Your prompt runs as {attempts.length} independent chats, each in its own {cfg.workspace === "docker" ? "docker workspace (a private clone, commands in the project's container)" : "git worktree"}. When they finish, the project's checks run on each and a
           read-only judge ranks them. You pick the winner and decide whether to merge it.
         </div>
         <div style={{ display: "flex", gap: 9, alignItems: "center", flexWrap: "wrap" }}>
@@ -86,12 +86,18 @@ function RaceSetupBody() {
             options={Array.from({ length: MAX_RACE_ATTEMPTS - MIN_RACE_ATTEMPTS + 1 }, (_, i) => ({ value: String(i + MIN_RACE_ATTEMPTS), label: String(i + MIN_RACE_ATTEMPTS) }))} />
           {cfg.attempts && <Button variant="ghost" style={{ fontSize: 11.5, padding: "3px 8px" }} onClick={() => patch({ attempts: null })}>Use {modelInfo(model).name} for all</Button>}
         </div>
+        <div style={{ display: "flex", gap: 9, alignItems: "center", flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11, color: "var(--mut3)" }}>Each attempt works in</span>
+          <Segmented label="Attempt workspace" quiet value={cfg.workspace ?? "worktree"} onChange={(v) => patch({ workspace: v === "docker" ? "docker" : "worktree" })}
+            options={[{ value: "worktree", label: "Worktree" }, { value: "docker", label: "Docker" }]} />
+          {cfg.workspace === "docker" && <span style={{ fontSize: 11, color: "var(--dim)" }}>Needs a trusted project with .openleash_docker/</span>}
+        </div>
         <div className="race-setup-list">
           {attempts.map((a, i) => <ModelEffort key={i} label={`Attempt ${i + 1}`} spec={a} options={options} onChange={(s) => setAttempt(i, s)} />)}
           <div className="race-setup-sep" />
           <ModelEffort label="Judge" spec={judge} options={options} onChange={(s) => patch({ judge: s })} />
         </div>
-        <div style={{ fontSize: 11, color: "var(--dim)" }}>Permissions, plan mode, assist and subagents follow the composer. Ultrathread and Docker are not used in a race.</div>
+        <div style={{ fontSize: 11, color: "var(--dim)" }}>Permissions, plan mode, assist and subagents follow the composer. Ultrathread is not used in a race.</div>
       </div>
       <div className="mf">
         <Button variant="ghost" onClick={() => { close(); if (cfg.on) toggleRace(); }}>Turn race off</Button>

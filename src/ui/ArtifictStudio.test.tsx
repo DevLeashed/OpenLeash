@@ -10,8 +10,9 @@ import { listenToFrame, parseBridgeMessage } from "./artifictBridge";
 import { changedTweaks, parseTweaks, tweakMessages, tweakState } from "./artifictTweaks";
 import { artboardLayout } from "./ArtifictStudioStage";
 import { buildVisualizationDocument } from "./vizDocument";
+import { resetStudioViews } from "./studioViewState";
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); vi.clearAllMocks(); resetStudioViews(); });
 
 const manifest = `<script type="application/openleash-tweaks+json">[
   {"var":"--accent","label":"Accent","type":"color","value":"#6d5dfc"},

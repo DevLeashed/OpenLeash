@@ -11,8 +11,9 @@ import { ArtifictPinLayer, findQuoteRange, normalizeQuote, pointFromEvent, quote
 import { InlineArtifictCard } from "./InlineArtifictCard";
 import { set } from "../store";
 import type { Item } from "../api";
+import { resetStudioViews } from "./studioViewState";
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); set({ artificts: {} }); });
+afterEach(() => { cleanup(); vi.clearAllMocks(); set({ artificts: {} }); resetStudioViews(); });
 
 const v1 = { id: "v1", parentId: null, createdAt: "2026-10-08T10:00:00Z", content: "# First", decisions: [], constraints: [], codeRefs: [] };
 const v2 = { id: "v2", parentId: "v1", createdAt: "2026-10-08T11:00:00Z", content: "# Second", decisions: [], constraints: [], codeRefs: [] };

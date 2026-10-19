@@ -2,12 +2,13 @@
 // Settings → Plugins has two properties that are easy to lose and impossible to
 // notice afterwards:
 //
-//   1. Computer use and GitHub ship OFF. The agent gains tools the moment a
+//   1. GitHub ships OFF. The agent gains tools the moment a
 //      plugin is on and the user cannot undo that for a running chat, so "on"
 //      has to be something a person did. A default that drifted to `true` would
-//      hand every install GitHub writes and a mouse, and nothing else in the UI
-//      would say so. The browser is the one deliberate exception: it ships ON,
-//      in its own separate profile, and asks before it interacts with a page.
+//      hand every install GitHub writes, and nothing else in the UI
+//      would say so. Computer use and the browser are the deliberate exceptions:
+//      both ship ON. The browser runs in its own separate profile and asks before
+//      it interacts with a page; computer use asks before each click and keystroke.
 //
 //   2. The page is labelled Experimental, and the label sits on the Plugins page
 //      header — not on the settings nav entry. The page is where the user is
@@ -92,7 +93,7 @@ describe("plugins ship off", () => {
     store(undefined as unknown as Plugins);
     render(<PluginsTab />);
     const state = Object.fromEntries(switches().map((el) => [el.getAttribute("aria-label"), el.getAttribute("aria-checked")]));
-    expect(state).toEqual({ "Computer use": "false", "Browser plugin": "true" });
+    expect(state).toEqual({ "Computer use": "true", "Browser plugin": "true" });
   });
 
   it("shows no plugin as on even though one is configured on", async () => {
@@ -213,7 +214,7 @@ describe("the plugins page is labelled experimental", () => {
     expect(tags[0]!.textContent?.toLowerCase()).toContain("experimental");
     // And it has to say what the tag means, not just that it is there.
     expect(document.body.textContent).toContain("Still finding its shape");
-    expect(document.body.textContent).toContain("off until you switch it on");
+    expect(document.body.textContent).toContain("Computer use and the browser are on by default");
   });
 
   it("does not tag the Plugins entry in the settings nav", () => {

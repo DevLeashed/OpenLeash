@@ -74,6 +74,38 @@ function ThemeTab() {
 }
 
 /**
+ * Where this project's memory notes live: the app's own folder (the default) or
+ * `<project>/.openleash/memory/`, where they can be committed with the code.
+ *
+ * Per project, and stored as the normalized folder paths `memory_in_project`
+ * holds — the same shape `project_docs` uses, so a path picked one way matches
+ * when compared another. Turning it off does not hide notes already committed
+ * there: the backend keeps reading them and merges them with the private ones,
+ * the private copy winning a conflict. A remote (SSH) project has no local
+ * folder to write to, so it gets no switch.
+ */
+function ProjectMemory() {
+  const s = useStore((st) => st.settings)!;
+  const project = s.project;
+  if (!project || project.startsWith("ssh://")) return null;
+  const listed = s.memory_in_project ?? [];
+  const on = listed.some((p) => normPath(p) === normPath(project));
+  const toggle = (checked: boolean) => {
+    const rest = listed.filter((p) => normPath(p) !== normPath(project));
+    void saveSettings({ memory_in_project: checked ? [...rest, project] : rest });
+  };
+  return (
+    <div className="srowx" style={{ alignItems: "flex-start" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontWeight: 500 }}>Keep this project's memory in the project</div>
+        <div className="desc">Save this project's notes in <span className="mono">.openleash/memory/</span> inside the folder instead of <span className="mono">~/.openleash</span>, so they can be committed and shared. Notes about you stay private. Notes already in that folder are always read, and where both folders hold the same note the <span className="mono">~/.openleash</span> one wins. Only used once the folder is trusted. Applies to new chats.</div>
+      </div>
+      <Switch label="Keep this project's memory in the project" checked={on} onChange={toggle} />
+    </div>
+  );
+}
+
+/**
  * Per-project instruction files, with a switch to stop any of them reaching the
  * agent's prompt.
  *
@@ -267,6 +299,7 @@ function General() {
           <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500 }}>Memory</div><div className="desc">The agent keeps notes about you (shared by every project) and about each project, and loads them at the start of every new chat — so preferences and corrections stick without you repeating them. It saves on its own and keeps them tidy, and never stores secrets. Plain markdown in <span className="mono">~/.openleash/memory/</span>: read, edit or delete any of it by hand.</div></div>
           <Switch label="Memory" checked={s.memory !== false} onChange={(checked) => void saveSettings({ memory: checked })} />
         </div>
+        {s.memory !== false && <ProjectMemory />}
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Automatically resume when an account is available</div><div className="desc">Restart chats paused because all provider accounts or keys were out of usage, or because every account was held by a usage cap.</div></div>
           <Switch label="Automatically resume when an account is available" checked={s.automatic_resume !== false} onChange={(checked) => void saveSettings({ automatic_resume: checked })} /></div>
         <div className="srowx"><div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Notifications</div><div className="desc">When a chat finishes, fails or needs you. A desktop popup if the window is in the background, an in-app notice if you are looking at it.</div></div>

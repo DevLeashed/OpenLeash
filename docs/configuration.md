@@ -37,10 +37,11 @@ Official setup references: [Slack MCP](https://docs.slack.dev/ai/slack-mcp-serve
 
 ## Browser
 
-The Browser plugin is **on by default**, unlike computer use. The first launch of
-this build turns it on once for existing settings too; turning it off afterwards
-sticks (`browser_default_applied` records that migration). Chromium is started
-only when the browser is first used. Chrome or Edge must be installed; an enabled
+The Browser plugin and computer use are **on by default**. A settings file that
+already saves `enabled: false` for either keeps it off; only a missing field takes the
+new default. The Browser plugin is also switched on once on upgrade (`browser_default_applied`
+records that migration), and a later off sticks. Chromium is started only when the
+browser is first used. Chrome or Edge must be installed; an enabled
 plugin does not imply a browser is available.
 
 Settings → Plugins → Browser stores these fields under `plugins.browser`:
@@ -75,7 +76,7 @@ link-local and reserved targets remain blocked regardless of rules. See
 
 ## Memory
 
-Settings → General → **Memory** (`memory` in `settings.json`, on by default) controls long-term agent memory. Notes are plain markdown under `~/.openleash/memory/`: `_global/` holds notes about you and applies to every project, and each `<project>-<hash>/` folder holds one project's notes. Edit or delete them freely. A `MEMORY.md` line whose file is gone is ignored. See [Features](features.md#agent-memory).
+Settings → General → **Memory** (`memory` in `settings.json`, on by default) controls long-term agent memory. Notes are plain markdown under `~/.openleash/memory/`: `_global/` holds notes about you and applies to every project, and each `<project>-<hash>/` folder holds one project's notes. Edit or delete them freely. A `MEMORY.md` line whose file is gone is ignored. `memory_in_project` is a list of project folders that keep their notes in `<project>/.openleash/memory/` instead (the per-project switch under Memory; empty by default). See [Features](features.md#agent-memory).
 
 ## Quota burner
 
@@ -103,7 +104,7 @@ Settings has eighteen pages, in this order. The keys are in `settings.json` unle
 | **Tabs** | `all_projects` (off); the shortcut button's target `sidebar_button_tab` (`accounts`); Needs you `needs_you` (off); Pull requests `show_pull_requests` (off); Schedules `show_schedules` (off); Saved sort `saved_sort`. |
 | **Workspaces** | Default workspace (`workspace`); docker idle timeout `docker_idle_minutes` (15); `docker_auto_rebuild` (on). See [Workspaces](workspaces.md). |
 | **Permissions** | Permission mode `perm`; allow and deny rules `allow` (a `!` prefix denies); `deny_env_files` (on). Stored modes are `disabled`, `allowlist`, `reviewer`, `auto` and `turbo`, where `turbo` is Full Access. New installs start at Full Access. Seeded allow rules are `git status*`, `git diff*` and `git log*`. |
-| **Plugins** | Computer use `plugins.computer` (off; `settle_ms` 600); Browser `plugins.browser` (on, see [Browser](#browser)); custom MCP plugins. |
+| **Plugins** | Computer use `plugins.computer` (on; `settle_ms` 600); Browser `plugins.browser` (on, see [Browser](#browser)); custom MCP plugins. |
 | **Connectors** | GitHub and the five service plugins (`plugins.github`, `plugins.linear`, `plugins.jira`, `plugins.slack`, `plugins.notion`, `plugins.gitlab`), each off by default, and the chat platforms (Discord, Telegram, Slack), which are stored in `connectors.json`. |
 | **Checks & hooks** | Diagnostics `diagnostics` (on); verify nudge `verify_nudge` (on); checkpoints `checkpoints` (on); `hooks` and `trusted_hooks`. See [Security](security-model.md). |
 | **MCP servers** | Servers `mcp` (each with `enabled`, `auto_approve`, `oauth` and `defer`); `tool_search` (on); `defer_plugins` (off). |

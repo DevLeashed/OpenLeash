@@ -21,15 +21,12 @@ export function RaceGroup({ race, children }: { race: Race; children: ReactNode 
   });
   return (
     <div className="race-group" data-race={race.id}>
-      <Pressable className="srow race-head" aria-expanded={!folded} onClick={toggle}>
-        <span className={"race-chev" + (folded ? "" : " open")}>{I.chevR()}</span>
+      <Pressable className="srow race-head" onClick={() => openRace(race.id)}>
+        <button type="button" className={"race-chev" + (folded ? "" : " open")} aria-expanded={!folded} aria-label={folded ? "Expand race" : "Collapse race"} onClick={(e) => { e.stopPropagation(); toggle(); }}>{I.chevR()}</button>
         <span className="t">Race · {race.prompt}</span>
         <span className="race-pill small" style={{ ["--race-c" as string]: st.color }}>{race.winner ? (race.merged ? "Merged" : "Picked") : race.state === "running" && progress ? `Running ${progress}` : st.label}</span>
-        <Tooltip content="Compare the attempts">
-          <button type="button" className="race-compare" onClick={(e) => { e.stopPropagation(); openRace(race.id); }}>Compare</button>
-        </Tooltip>
         <Tooltip content="Archive the race and its chats">
-          <button type="button" className="race-compare" onClick={(e) => { e.stopPropagation(); void archiveRace(race.id); }}>Archive</button>
+          <Pressable className="rowact" aria-label="Archive" onClick={(e) => { e.stopPropagation(); void archiveRace(race.id); }}>{I.archive(12)}</Pressable>
         </Tooltip>
       </Pressable>
       {!folded && <div className="race-group-rows">{children}</div>}

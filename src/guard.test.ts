@@ -12,9 +12,20 @@ describe("PC-control banner layout and visibility", () => {
     expect(frontend).toContain('"You pressed Esc. The agent was told to stop."');
   });
 
+  it("clearly distinguishes stopping screen control from stopping the run", () => {
+    expect(frontend).toContain("OpenLeash is controlling your computer · Esc to stop");
+    expect(frontend).toContain("Esc to stop");
+    expect(frontend).toContain("press it twice to stop the entire run");
+  });
+
   it("paints the native window edges and fills its available height", () => {
     expect(frontend).toMatch(/html, body, #root \{[^}]*background: #18181b/);
     expect(frontend).toMatch(/\.bar \{\s*margin: 0; height: 100%/);
+  });
+
+  it("sizes for the always-on-top control instructions", () => {
+    expect(native).toContain('.inner_size(560.0, 62.0)');
+    expect(native).toContain('.title("OpenLeash is controlling your computer · Esc to stop")');
   });
 
   it("reasserts topmost after showing without stealing keyboard focus", () => {

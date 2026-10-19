@@ -25,6 +25,7 @@ const loadSchedulesView = () => import("./ui/Schedules");
 const Review = lazy(() => loadReview().then((m) => ({ default: m.Review })));
 const Saved = lazy(() => loadSaved().then((m) => ({ default: m.Saved })));
 const SettingsView = lazy(() => loadSettings().then((m) => ({ default: m.SettingsView })));
+const RaceScreen = lazy(() => import("./ui/Race").then((m) => ({ default: m.RaceScreen })));
 const Schedules = lazy(() => loadSchedulesView().then((m) => ({ default: m.Schedules })));
 
 function pendingApproval(): string | null {
@@ -152,6 +153,7 @@ export default function App() {
               {view === "paused" && <Paused />}
               {view === "settings" && <SettingsView />}
               {view === "schedules" && <Schedules />}
+              {view === "race" && <RaceScreen />}
               </Suspense>
             </div>
           )}

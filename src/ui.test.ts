@@ -157,7 +157,7 @@ describe("routes in the model list", () => {
 });
 
 describe("interface zoom", () => {
-  it("steps through IDE-style percentages and resets to the 110% default", async () => {
+  it("steps through IDE-style percentages and resets to the platform default", async () => {
     const tick = () => new Promise((r) => setTimeout(r, 0));
     set({ settings: { ui_zoom: 100 } as unknown as Settings });
     stepZoom(1); await tick();
@@ -166,15 +166,15 @@ describe("interface zoom", () => {
     expect(get().settings?.ui_zoom).toBe(100);
     set({ settings: { ui_zoom: 150 } as unknown as Settings });
     stepZoom(0); await tick();
-    expect(get().settings?.ui_zoom).toBe(110);
+    expect(get().settings?.ui_zoom).toBe(DEFAULT_ZOOM);
   });
 
-  it("reports the 110% default when settings haven't loaded yet", () => {
+  it("reports the platform default when settings haven't loaded yet", () => {
     // Overlays position themselves in unzoomed pixels; before boot they have no
-    // setting to read, so they fall back to the default rather than to 100%.
+    // setting to read, so they fall back to the platform's default.
     set({ settings: null });
-    expect(DEFAULT_ZOOM).toBe(110);
-    expect(zoom()).toBe(1.1);
+    expect(DEFAULT_ZOOM).toBe(/linux/i.test(navigator.platform || navigator.userAgent) ? 100 : 110);
+    expect(zoom()).toBe(DEFAULT_ZOOM / 100);
     set({ settings: { ui_zoom: 80 } as unknown as Settings });
     expect(zoom()).toBe(0.8);
   });
@@ -252,8 +252,10 @@ describe("chat list order", () => {
       { ...base, id: "approval", status: "waiting", waiting_kind: "approval" },
       { ...base, id: "wake", status: "waiting", waiting_kind: "wake" },
     ] as unknown as TaskSummary[];
+    // A parked chat is still going (it wakes itself), so it stays with the
+    // running chats above the finished backlog instead of sinking beneath it.
     expect(chats.sort(compareChats).map((chat) => chat.id)).toEqual([
-      "question", "approval", "paused", "running", "done", "wake",
+      "question", "approval", "paused", "running", "wake", "done",
     ]);
   });
   it("honors a manual drag position while automatic reorder is enabled", () => {

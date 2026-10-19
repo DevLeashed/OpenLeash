@@ -2000,6 +2000,253 @@ async fn docker_rebuild(h: H<'_>, project: String, no_cache: bool) -> Result<Str
     r
 }
 
+// ───────────────────────────── sandboxes ─────────────────────────────
+//
+// The agent's own computers (`agent/sandbox.rs`). Every command ends by
+// telling the UI which sandbox changed (`ol://sandbox`), so the manager and the
+// chat header refresh without polling.
+
+fn sandbox_changed(h: &Harness, id: &str) {
+    (h.bus)("ol://sandbox", json!({ "id": id }));
+}
+
+#[tauri::command]
+async fn sandbox_list() -> Value {
+    agent::sandbox::views().await
+}
+
+/// Install the desktop image now (or pull the user's own), so a sandbox never
+/// has to do it mid-start. Progress arrives as `ol://sandbox-build` events.
+#[tauri::command]
+async fn sandbox_prepare(h: H<'_>) -> Result<(), String> {
+    let bus = h.bus.clone();
+    let progress = move |line: &str| bus("ol://sandbox-build", json!({"line": line}));
+    let r = agent::sandbox::ensure_image(&progress).await;
+    (h.bus)(
+        "ol://sandbox-build",
+        json!({"done": true, "error": r.as_ref().err()}),
+    );
+    sandbox_changed(&h, "");
+    r
+}
+
+#[tauri::command]
+async fn sandbox_image_set(h: H<'_>, image: String) -> Result<(), String> {
+    agent::sandbox::set_custom_image(&image)?;
+    sandbox_changed(&h, "");
+    Ok(())
+}
+
+#[tauri::command]
+async fn sandbox_create(
+    h: H<'_>,
+    name: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    memory: Option<String>,
+    cpus: Option<f64>,
+) -> Result<Value, String> {
+    let sb = agent::sandbox::create(agent::sandbox::NewSandbox {
+        name,
+        width,
+        height,
+        memory: memory.unwrap_or_default(),
+        cpus: cpus.unwrap_or(0.0),
+    })?;
+    sandbox_changed(&h, &sb.id);
+    agent::sandbox::view_of(&sb.id).await
+}
+
+#[tauri::command]
+async fn sandbox_update(
+    h: H<'_>,
+    id: String,
+    patch: agent::sandbox::Patch,
+) -> Result<Value, String> {
+    agent::sandbox::update(&id, patch)?;
+    agent::sandbox::apply_limits(&id).await;
+    sandbox_changed(&h, &id);
+    agent::sandbox::view_of(&id).await
+}
+
+/// Start a sandbox. The first ever start builds the desktop image; its output
+/// arrives as `ol://sandbox-build` events.
+#[tauri::command]
+async fn sandbox_start(h: H<'_>, id: String) -> Result<Value, String> {
+    let bus = h.bus.clone();
+    let id2 = id.clone();
+    let progress = move |line: &str| bus("ol://sandbox-build", json!({"id": id2, "line": line}));
+    sandbox_changed(&h, &id);
+    let r = agent::sandbox::start(&id, &progress).await;
+    (h.bus)(
+        "ol://sandbox-build",
+        json!({"id": id, "done": true, "error": r.as_ref().err()}),
+    );
+    sandbox_changed(&h, &id);
+    r?;
+    agent::sandbox::view_of(&id).await
+}
+
+#[tauri::command]
+async fn sandbox_stop(h: H<'_>, id: String) -> Result<Value, String> {
+    let r = agent::sandbox::stop(&id).await;
+    sandbox_changed(&h, &id);
+    r?;
+    agent::sandbox::view_of(&id).await
+}
+
+#[tauri::command]
+async fn sandbox_reset(
+    h: H<'_>,
+    id: String,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Value, String> {
+    let size = match (width, height) {
+        (Some(w), Some(ht)) => Some((w, ht)),
+        _ => None,
+    };
+    agent::sandbox::reset(&id, size).await?;
+    sandbox_changed(&h, &id);
+    agent::sandbox::view_of(&id).await
+}
+
+#[tauri::command]
+async fn sandbox_delete(h: H<'_>, id: String) -> Result<(), String> {
+    agent::sandbox::delete(&id).await?;
+    sandbox_changed(&h, &id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn sandbox_clone(h: H<'_>, id: String, name: String) -> Result<Value, String> {
+    let sb = agent::sandbox::clone_sandbox(&id, &name).await?;
+    sandbox_changed(&h, &sb.id);
+    agent::sandbox::view_of(&sb.id).await
+}
+
+#[tauri::command]
+async fn sandbox_snapshot(h: H<'_>, id: String, name: String) -> Result<Value, String> {
+    agent::sandbox::snapshot(&id, &name).await?;
+    sandbox_changed(&h, &id);
+    agent::sandbox::view_of(&id).await
+}
+
+#[tauri::command]
+async fn sandbox_restore(h: H<'_>, id: String, snapshot: String) -> Result<Value, String> {
+    agent::sandbox::restore(&id, &snapshot).await?;
+    sandbox_changed(&h, &id);
+    agent::sandbox::view_of(&id).await
+}
+
+#[tauri::command]
+async fn sandbox_snapshot_delete(h: H<'_>, id: String, snapshot: String) -> Result<Value, String> {
+    agent::sandbox::delete_snapshot(&id, &snapshot).await?;
+    sandbox_changed(&h, &id);
+    agent::sandbox::view_of(&id).await
+}
+
+/// The user takes (or hands back) the mouse and keyboard. While they have
+/// them, the agent's actions on this sandbox are refused.
+#[tauri::command]
+async fn sandbox_control(h: H<'_>, id: String, user: bool) -> Result<(), String> {
+    agent::sandbox::load(&id)?;
+    agent::sandbox::set_user_control(&id, user);
+    sandbox_changed(&h, &id);
+    Ok(())
+}
+
+/// A small picture of the screen for cards and lists, as a data URL.
+#[tauri::command]
+async fn sandbox_thumb(id: String) -> Result<Option<String>, String> {
+    use base64::Engine;
+    agent::sandbox::load(&id)?;
+    match agent::sandbox::thumbnail(&id).await {
+        Ok(b) => Ok(Some(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(b)
+        ))),
+        // Not running, or not drawn yet: the card shows its placeholder.
+        Err(_) => Ok(None),
+    }
+}
+
+#[tauri::command]
+async fn sandbox_files(id: String) -> Result<Vec<Value>, String> {
+    agent::sandbox::list_files(&id)
+}
+
+#[tauri::command]
+async fn sandbox_files_import(h: H<'_>, id: String, paths: Vec<String>) -> Result<usize, String> {
+    let n = agent::sandbox::import_paths(&id, &paths)?;
+    sandbox_changed(&h, &id);
+    Ok(n)
+}
+
+#[tauri::command]
+async fn sandbox_files_export(id: String, rel: String, dest: String) -> Result<(), String> {
+    agent::sandbox::export_path(&id, &rel, &dest)
+}
+
+#[tauri::command]
+async fn sandbox_files_delete(h: H<'_>, id: String, rel: String) -> Result<(), String> {
+    agent::sandbox::delete_path(&id, &rel)?;
+    sandbox_changed(&h, &id);
+    Ok(())
+}
+
+/// Attach a chat to a sandbox (or back to the host with `None`). Takes effect
+/// on the chat's next tool call, so it can be swapped mid-conversation.
+#[tauri::command]
+async fn task_set_sandbox(
+    h: H<'_>,
+    task_id: String,
+    sandbox: Option<String>,
+) -> Result<(), String> {
+    if let Some(s) = &sandbox {
+        agent::sandbox::load(s)?;
+    }
+    h.update_task(&task_id, |t| t.sandbox = sandbox.clone()).await;
+    h.save_task(&task_id).await;
+    if let Some(s) = &sandbox {
+        sandbox_changed(&h, s);
+    }
+    Ok(())
+}
+
+/// Save what a sandbox is showing, or a file from it, as an artifict in the
+/// chat's project: the user's own "keep this" button on the live view.
+#[tauri::command]
+async fn sandbox_publish(
+    h: H<'_>,
+    task_id: String,
+    id: String,
+    title: String,
+    file: Option<String>,
+) -> Result<artificts::Artifict, String> {
+    let project = artifict_project(&h, &task_id).await?;
+    let sb = agent::sandbox::load(&id)?;
+    let (kind, content) = agent::sandbox::publish_content(&id, file.as_deref()).await?;
+    let title = if title.trim().is_empty() {
+        format!("{} screen", sb.name)
+    } else {
+        title
+    };
+    let artifict = artificts::create(
+        &project,
+        artificts::ArtifictInput {
+            title: title.chars().take(200).collect(),
+            kind,
+            content,
+            decisions: vec![],
+            constraints: vec![format!("Made in sandbox \"{}\"", sb.name)],
+            code_refs: vec![],
+        },
+    )?;
+    h.emit_artifict(&task_id, &artifict);
+    Ok(artifict)
+}
+
 /// Bring a docker chat's branch into the project repository.
 #[tauri::command]
 async fn docker_push_branch(h: H<'_>, id: String) -> Result<String, String> {
@@ -2353,9 +2600,13 @@ async fn task_create(h: H<'_>, req: NewTask) -> Result<TaskSummary, String> {
 #[tauri::command]
 async fn race_create(h: H<'_>, req: agent::race::NewRace) -> Result<Value, String> {
     let h = h.inner().clone();
+    if req.uses_docker() {
+        check_docker_allowed(&req.project)?;
+    }
     let (race, tasks) = agent::race::create(&req, |a| {
         let h = h.clone();
         let spec = req.clone();
+        let docker = req.uses_docker();
         async move {
             let task = NewTask {
                 prompt: spec.prompt,
@@ -2364,8 +2615,8 @@ async fn race_create(h: H<'_>, req: agent::race::NewRace) -> Result<Value, Strin
                 effort: a.effort,
                 perm: spec.perm,
                 plan: spec.plan,
-                worktree: true,
-                workspace: Some("worktree".into()),
+                worktree: !docker,
+                workspace: Some(if docker { "docker" } else { "worktree" }.into()),
                 base_branch: spec.base_branch,
                 assist: spec.assist,
                 agents: spec.agents,
@@ -2558,6 +2809,11 @@ async fn create_task_with_options(
     if project.is_empty() || !project_dir_exists(&project).await {
         return Err("Pick a project folder first.".into());
     }
+    // Refused before the chat exists: a chat made with no model could never
+    // answer its first message, and the draft should survive for a retry.
+    if req.model.trim().is_empty() {
+        return Err(agent::NO_MODEL_PICKED.into());
+    }
     let mode = workspace_mode(req.workspace.as_deref(), req.worktree);
     if agent::host::is_ssh(&project) && mode != "local" {
         return Err(format!(
@@ -2682,6 +2938,7 @@ async fn create_task_with_options(
         // Built in memory, so its subagent maps are here rather than on disk.
         hydrated: true,
         docker: None,
+        sandbox: None,
     };
     let startup = Item::new(
         "notice",
@@ -5691,6 +5948,15 @@ async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
     for r in next.project_docs.iter_mut() {
         r.path = agent::trust::norm_path(&r.path);
     }
+    // Same for the projects that keep memory in the project, and deduplicated:
+    // the list is a set, and the UI toggles by normalized path.
+    let mut seen = std::collections::HashSet::new();
+    next.memory_in_project = next
+        .memory_in_project
+        .iter()
+        .map(|p| agent::trust::norm_path(p))
+        .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+        .collect();
     next.providers = providers;
     next.spend = spend;
     next.accounts = accts;
@@ -7447,8 +7713,8 @@ fn build_guard_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::
         agent::pcguard::BANNER,
         WebviewUrl::App("guard.html".into()),
     )
-    .title("OpenLeash is controlling your PC")
-    .inner_size(420.0, 62.0)
+    .title("OpenLeash is controlling your computer · Esc to stop")
+    .inner_size(560.0, 62.0)
     .position(0.0, 0.0)
     .resizable(false)
     .decorations(false)
@@ -7999,6 +8265,27 @@ pub fn run() {
             container_remove,
             task_change_folder,
             docker_rebuild,
+            sandbox_list,
+            sandbox_prepare,
+            sandbox_image_set,
+            sandbox_create,
+            sandbox_update,
+            sandbox_start,
+            sandbox_stop,
+            sandbox_reset,
+            sandbox_delete,
+            sandbox_clone,
+            sandbox_snapshot,
+            sandbox_restore,
+            sandbox_snapshot_delete,
+            sandbox_control,
+            sandbox_thumb,
+            sandbox_files,
+            sandbox_files_import,
+            sandbox_files_export,
+            sandbox_files_delete,
+            task_set_sandbox,
+            sandbox_publish,
             docker_push_branch,
             workspaces_list,
             workspace_prune,

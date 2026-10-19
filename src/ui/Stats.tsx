@@ -577,19 +577,6 @@ export function StatsTab() {
       {gap && <div className="snote">Per-model history starts {new Date(perSince + "T00:00").toLocaleDateString()}; earlier days only have totals for all models, so this range undercounts. "All" is exact.</div>}
       {/* Numbers below are from the last poll that worked; say so rather than let them read as live. */}
       {err && <div className="snote" role="status">Not updating · {err}</div>}
-      <div className="settings-section-label">Time in OpenLeash</div>
-      <div className="stiles">
-        <Tile i={0} label="Open" value={dur(presence.open_ms)} sub={`${data.launches ?? 0} launches · all time`} />
-        <Tile i={1} label="Focused" value={dur(presence.focused_ms)} sub={`${pctOf(presence.focused_ms, presence.open_ms)} of open time`} />
-        <Tile i={2} label="In background" value={dur(away)} sub="minimised, hidden or another app in front" />
-        <Tile i={3} label="Agents working" value={dur(presence.working_ms)} sub={`${dur(presence.unattended_ms)} while you were away`} />
-      </div>
-      <div className="stiles small">
-        <Tile i={0} label="This session" value={dur(data.session_ms ?? 0)} sub="since the app started" />
-        <Tile i={1} label="Longest session" value={dur(data.longest_session_ms ?? 0)} sub="one run of the app" />
-        <Tile i={2} label="Avg per day" value={dur(Object.keys(data.presence_daily ?? {}).length ? Object.values(data.presence_daily ?? {}).reduce((a, p) => a + p.open_ms, 0) / Object.keys(data.presence_daily ?? {}).length : 0)} sub="over days the app was open" />
-        <Tile i={3} label="Tokens per focused hour" value={presence.focused_ms ? fmtK(Math.round(tokens(tot) / (presence.focused_ms / 3_600_000))) : "-"} sub={rangeLabel} />
-      </div>
       <div className="settings-section-label">Tokens</div>
       <div className="stiles">
         <Tile i={0} label="Total" value={fmtK(tokens(tot))} sub={`${fmtK(tot.requests)} requests`} />
@@ -613,6 +600,19 @@ export function StatsTab() {
       <HourlyChart pts={hourly} />
       <ModelTable rows={rows} sel={sel} toggle={toggle} />
       <CostByModel rows={rows} />
+      <div className="settings-section-label">Time in OpenLeash</div>
+      <div className="stiles">
+        <Tile i={0} label="Open" value={dur(presence.open_ms)} sub={`${data.launches ?? 0} launches · all time`} />
+        <Tile i={1} label="Focused" value={dur(presence.focused_ms)} sub={`${pctOf(presence.focused_ms, presence.open_ms)} of open time`} />
+        <Tile i={2} label="In background" value={dur(away)} sub="minimised, hidden or another app in front" />
+        <Tile i={3} label="Agents working" value={dur(presence.working_ms)} sub={`${dur(presence.unattended_ms)} while you were away`} />
+      </div>
+      <div className="stiles small">
+        <Tile i={0} label="This session" value={dur(data.session_ms ?? 0)} sub="since the app started" />
+        <Tile i={1} label="Longest session" value={dur(data.longest_session_ms ?? 0)} sub="one run of the app" />
+        <Tile i={2} label="Avg per day" value={dur(Object.keys(data.presence_daily ?? {}).length ? Object.values(data.presence_daily ?? {}).reduce((a, p) => a + p.open_ms, 0) / Object.keys(data.presence_daily ?? {}).length : 0)} sub="over days the app was open" />
+        <Tile i={3} label="Tokens per focused hour" value={presence.focused_ms ? fmtK(Math.round(tokens(tot) / (presence.focused_ms / 3_600_000))) : "-"} sub={rangeLabel} />
+      </div>
       <div className="sgroup">
         <div className="srowx">
           <div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Keep stats for deleted chats</div><div className="desc">When off, deleting a chat also removes its row here. Totals by model and day are unaffected.</div></div>

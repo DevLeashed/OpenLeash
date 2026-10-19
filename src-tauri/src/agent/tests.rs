@@ -401,6 +401,7 @@ pub(crate) fn task(id: &str, model: &str) -> Task {
         // rather than leaving them on disk.
         hydrated: true,
         docker: None,
+        sandbox: None,
     }
 }
 

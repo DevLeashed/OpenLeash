@@ -47,7 +47,7 @@ function Banner() {
     <div className={"bar" + (s.objected ? " objected" : "")} data-tauri-drag-region>
       <span className={"dot" + (s.active && !s.objected ? " pulse" : "")} />
       <div className="txt">
-        <div className="t1">{s.objected ? "Screen control stopped" : "OpenLeash is controlling your PC"}</div>
+        <div className="t1">{s.objected ? "Screen control stopped" : "OpenLeash is controlling your computer · Esc to stop"}</div>
         <div className="t2">
           {s.objected
             ? "You pressed Esc. The agent was told to stop."
@@ -58,11 +58,11 @@ function Banner() {
         className="stop"
         onClick={stop}
         onMouseDown={(e) => e.stopPropagation()}
-        title="Stop this run (Esc twice also stops it)"
+        title="Stop the current agent run (Esc stops screen control; Esc twice also stops the run)"
       >
-        Stop
+        Stop run
       </button>
-      <div className="esc">esc</div>
+      <div className="esc" title="Press Esc to stop the current screen-control batch; press it twice to stop the entire run">Esc to stop</div>
     </div>
   );
 }
@@ -102,9 +102,9 @@ const css = `
   }
   .stop:hover { background: #e98585; border-color: #e98585; color: #161618; }
   .esc {
-    flex: none; font: 500 9.5px/1 "Geist Mono", monospace; color: #d4d4d8;
+    flex: none; font: 500 9px/1 "Geist Mono", monospace; color: #d4d4d8;
     background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1);
-    padding: 4px 5px; border-radius: 5px; text-transform: uppercase;
+    padding: 4px 5px; border-radius: 5px; white-space: nowrap;
   }
 `;
 

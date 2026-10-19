@@ -2,11 +2,12 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ArtifictWorkspace } from "./ArtifictWorkspace";
+import { resetStudioViews } from "./studioViewState";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke, convertFileSrc: (id: string) => `http://openleash-viz.localhost/${id}` }));
 vi.mock("./Visualization", () => ({ Visualization: () => <div>Preview</div> }));
-afterEach(() => { cleanup(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); vi.clearAllMocks(); resetStudioViews(); });
 
 /** Comment the way a user does: turn on comment mode and click the sheet. jsdom
  *  has no layout, so the sheet is given a box for the click to land in. */

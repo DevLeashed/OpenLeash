@@ -4,121 +4,277 @@ Notable changes to OpenLeash, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.3] - 2026-10-18
-
-0.1.3 gives OpenLeash more to work with and more ways to reach it: a real
-browser for the agent, Discord, Telegram and Slack chats, service plugins,
-best-of-N races, model routers, schedules, and tools for finding what broke.
+## [Unreleased]
 
 ### Added
 
-#### Reaching your agent
-
-- **Discord, Telegram and Slack.** Message your agent from a channel, thread or
-  DM. Each conversation is a chat on your machine, replies come back as the
-  agent writes them, and approvals and questions are relayed (`yes`, `always`,
-  `no`, or an option's number). `/new`, `/stop`, `/status` and `/help` work
-  everywhere (Slack uses `!` instead of `/`). Only the user ids you list can
-  reach the bot, groups are off by default, and new chats default to
-  **Auto-edit**.
-- **Phone approvals with ntfy.** With remote control on, approvals and questions
-  can arrive as ntfy notifications. The link carries a one-use grant that
-  expires after 15 minutes.
-- **Linear, Jira, Slack, Notion and GitLab plugins.** Service plugins the agent
-  can call, switched on in Settings → Plugins.
-
-#### Agents
-
-- **Browser.** A headless Chrome or Edge the agent can drive, on by default and
-  never using your everyday profile. It reads pages as text or as a compact
-  snapshot with stable element refs, and handles forms, tabs, dialogs,
-  downloads, uploads, emulation and PDF. A **shared Browser view** lets you
-  watch it, and **Annotate** lets you click an element or drag a region and
-  leave a comment for the agent.
-- **Best-of-N race.** Turn on **Race** in the composer (or type `/race`) to send
-  one prompt to 2-6 attempts, each in its own worktree with its own model. Check
-  output is collected and a tool-less judge ranks the attempts. You merge only
-  the one you pick.
-- **Routers.** Settings → Routers picks the model for each request with rules
-  (who is asking, context size, repeated failures) ahead of the fallback chain.
-  It has presets, a test panel, an activity view and import/export. Usage caps
-  and account pools still apply.
-- **Schedules.** Send a prompt to a new chat every N minutes or hours, daily or
-  weekly. A run is skipped if the last one is still going, missed runs are
-  caught up at most once, and a folder without a trust decision is refused.
-  Show the screen with Settings → Tabs → Show Schedules.
-- **Spend quota before it resets.** Optional backlog of low-priority prompts
-  that runs in a worktree on subscription quota about to be forfeited. Off by
-  default and never past your cap.
-- **Find the breaking edit.** Review → **Find breaking edit…** binary-searches
-  the chat's edits with a test command and reports the first bad step, with
-  **Jump to message** and **Revert this file**. The agent has the same
-  `bisect_edits` tool, under the same permission checks as `bash`.
-- **`http_request` tool.** One HTTP request to an API, local dev server or
-  webhook. `GET`/`HEAD` to public hosts run without asking; other methods and
-  any private-network target ask.
-- **Code intelligence (`lsp`).** Definitions, references, hover, symbols,
-  diagnostics and call hierarchy from the project's language server
-  (rust-analyzer, typescript-language-server, pyright, gopls, clangd).
-- **Waiting on more events.** `wait_for_event` can now park on a file, a
-  background job (optionally a matching output line) or another chat.
-- **Save a chat as a skill.** Right-click a chat → **Save as skill…** drafts a
-  `SKILL.md` for you to edit and save globally or to the project. Only you can
-  start it.
-- **Agent memory.** Global and per-project notes the agent keeps in plain
-  markdown and loads into new chats.
-- **Ultrathread.** `/ultra` lets the main agent run a tree of nested subagents;
-  `/ultrawt` gives each worker its own worktree.
-
-#### Interface
-
-- **Run timeline.** A Gantt view of where a chat spent time and money: model
-  requests, retries, tool calls, waits on you, and subagent lanes.
-- **Stats.** Settings → Stats shows tokens, cost, time and errors by model, a
-  per-chat panel, and a monthly budget gate.
-- **Welcome tour** for new installs, reopenable from the command palette.
-- **Archive races.** **Archive race** puts a race and its attempt chats away
-  (with Undo); Settings → Chats lists them with **Restore**.
-- **Race attempt cards** show **Stats** (tokens, cache hit rate, context used,
-  cost per changed line, time, model price) and **Open folder**. The sidebar
-  group shows progress (`Running 2/3`).
-- **Edit artificts yourself.** Press **Edit** (`E`) on an HTML artifict and
-  click an element to change its text, colours, font size, weight, padding or
-  corner radius. **Save** keeps it as a new version marked `author: "user"`.
-  **Edit source** works on any kind, and **Restore** puts an older version back
-  on top.
-- **Export artificts** as standalone HTML, SVG, Markdown, text, JSON or an
-  embedded picture.
+- **Memory in the project.** A per-project switch under Settings → General → Memory keeps
+  that project's notes in `<project>/.openleash/memory/` so they can be committed. Notes
+  already there are always read and merged with the ones in `~/.openleash`, which win a
+  name clash. Only used for trusted folders; writes follow plan mode and the file-write
+  rules.
+- **Sandboxes: computers of the agent's own.** Artificts → **Sandboxes** is the artifict
+  studio for containers: a card with a live thumbnail per sandbox (a Linux desktop in
+  Docker), a live view you can **Take over** (the agent pauses), start/stop, rename,
+  **snapshot**, **restore**, **clone**, **reset** and **delete**, memory/CPU caps,
+  per-sandbox switches for what an agent may do, and a shared folder to move files in and
+  out. A chat can use any sandbox and be switched or detached at any time. Agents can
+  `list`, `create` or `use` a sandbox themselves, drive its screen, run commands in it,
+  and `publish` a screenshot or file to the Artificts tab. See `docs/sandboxes.md`.
+- **Archive races.** **Archive race** in the comparison view puts a race and its
+  attempt chats away (with Undo); Settings → Chats lists archived races with
+  **Restore**. A chat you had archived yourself stays archived on restore.
+- **Race attempt cards** gained **Stats** (tokens, cache hit rate, context used,
+  cost per changed line, time, model price) and **Open folder** for the attempt's
+  worktree. The race header shows total cost, and the sidebar group shows progress
+  (`Running 2/3`) while attempts run.
+- **Edit artificts yourself.** Press **Edit** (`E`) on an HTML artifict and click
+  an element to change its text, colours, font size, weight, padding or corner
+  radius. Changes show live, and **Save** keeps them as a new version. **Edit
+  source** does the same for the source of any kind. **Restore** puts an older
+  version back as a new version on top of the latest. Versions you write are
+  marked as yours (`author: "user"`), and the agent is told to build on them.
+- **Export artificts.** Save the version on screen through the system save
+  dialog: a standalone HTML page, SVG, Markdown, text, JSON, or an embedded
+  picture.
 - **Project design system.** `.openleash/DESIGN.md` is read like the other
-  instruction files (trusted folders only, listed in the trust manifest,
-  switchable in Settings).
+  project instruction files: trusted folders only, listed in the trust manifest,
+  and switchable in Settings. The agent builds visual artificts from it.
 - **Ask the agent.** One-click requests in the Artificts studio: review the
-  design, explore three directions, implement it in the project, and set up or
-  check the design system.
+  design (score it, then fix the must-fix issues), explore three directions,
+  implement it in the project, and set up or check the design system.
 
 ### Changed
 
-- **Web search is one tool.** The main agent's `web_search` takes 1-5 queries in
-  one call and replaces "Deep search" (`web_search_deep`). Each query runs
-  against DuckDuckGo and Brave, results are merged and ranked, and the best
-  pages are read. Subagents keep the single-query `web_search`.
-- **Tool schema deferral.** `tool_search` holds back MCP tool schemas until the
-  agent searches for one; **Also defer plugin tools** and per-server `defer`
-  switches are in Settings → MCP servers.
-- **Compaction summaries** ask for exact verification commands, scope, exit
-  codes and evidence paths, and keep unresolved failures and pending decisions.
-- Markdown tables with `Total` and `Implemented` / `Tested` / `Verified` /
-  `Accepted` columns show a separate progress bar per stage.
+- **Web search is one tool.** The main agent's `web_search` now takes 1-5 queries
+  in one call. It replaces the separate "Deep search" tool (`web_search_deep`). Each
+  query runs against DuckDuckGo and Brave, the results are merged and ranked, and
+  the best pages are read. A single query still works. Subagents keep the
+  single-query `web_search` they had before.
+
+## [0.1.2] - 2026-10-16
+
+0.1.2 is the release that lets OpenLeash leave the window it runs in: drive it
+from a phone, run agents on another machine, work on a project over SSH or inside
+WSL, or run a task in a container. It also adds a headless mode and an editor
+(ACP) server.
+
+> **Read before updating:** the in-app updater no longer verifies a signature.
+> See [Security](#security). The `.openleash/artifacts/` folder is now
+> `.openleash/artificts/` and existing artifacts are not carried over. See
+> [Changed](#changed).
+
+### Added
+
+#### Remote connectivity
+
+- **Remote control** (Settings → Remote). OpenLeash serves its full interface to
+  paired browsers, with no reduced mobile mode: chats, approvals, questions, plan
+  review and settings all work. Pair with a QR code or a five-minute, single-use
+  six-digit code. Each device has its own session that you can revoke, there is a
+  *Sign out all devices* button, and the titlebar shows a chip whenever a device
+  is connected. It is off by default and listens on loopback unless you choose
+  *Network*. Details in `docs/remote.md`.
+- **Other machines over SSH.** Add a machine by SSH alias or `user@host` and
+  press *Connect*. OpenLeash forwards a port and opens that machine's OpenLeash
+  in your browser, already paired. Agents there keep running if your laptop
+  sleeps.
+- **Send a chat to another machine** (right-click a chat → *Send to another
+  machine…*). *Copy* or *Move* a conversation to one of your saved SSH machines,
+  optionally continuing it there. Only the conversation travels, not the code,
+  and the dialog warns about uncommitted or unpushed work. The receiving machine
+  rebuilds its own prompt, tools and trust, and caps the permission level at its
+  own default.
+- **Open over SSH** (project menu). Open a folder on another machine as a project,
+  VS Code Remote-SSH style. The agent runs here and its file tools, shell and git
+  run on the host, over your own `ssh` client and SFTP. Needs a POSIX shell and
+  SFTP on the host, not OpenLeash. Writes are checked against the host's
+  `realpath`, so a symlink that points out of the project counts as outside it.
+  Checkpoints, worktree and docker workspaces, artificts and project-level
+  skills/agents/hooks/MCP servers are not available for SSH projects yet, and each
+  refuses clearly instead of falling back to a local folder.
+- **Open from WSL** (Windows). Pick a distro and a folder, or type a
+  `\\wsl.localhost\…` path. Shell commands, background jobs, hooks and git run
+  inside the distro with `wsl.exe --exec`, and the agent is told it is on Linux.
+
+#### Projects and workspaces
+
+- **Docker workspaces.** A task can work in a private copy of the project, with
+  its commands run in a container built from `.openleash_docker/`. The harness
+  builds the image (and rebuilds it when that folder changes), starts the
+  container when you message the chat, stops it when idle and removes it with the
+  chat. The chat header has start/stop and *Push branch*. Only offered for
+  trusted folders. Podman works via `OPENLEASH_DOCKER=podman`. Details in
+  `docs/workspaces.md`.
+- **Settings → Workspaces** lists every worktree and container OpenLeash created,
+  finds leftovers whose chat is gone, and removes them.
+- **Clone repository…** in the project menu. Accepts GitHub links, `https://` /
+  `ssh://` URLs and `git@host:owner/repo`, clones into `~/openleash/<repo>`, and
+  opens an existing checkout of the same repository instead of cloning again.
+- **Import another tool's rules and subagents**, read-only scan first and applied
+  only when you accept. Never writes over your instruction file, is idempotent,
+  and only runs for trusted folders.
+- **Path-scoped rules.** Instruction files in `.openleash/rules/` or
+  `.claude/rules/` can declare the paths they apply to, so a rule for
+  `src/**/*.ts` is not injected into work on anything else.
+
+#### Agents
+
+- **Headless mode.** The new `openleash-headless` binary runs one task to
+  completion with no window, writing newline-delimited JSON to stdout (session
+  event, per-step events, then a result with provider-reported token usage and
+  cost). Supports `--resume <id>` and a documented exit-code contract.
+- **ACP server.** The new `openleash-acp` binary speaks the Agent Client Protocol
+  over stdio, so ACP-capable editors (Zed, JetBrains, VS Code, Neovim, …) can
+  drive the same harness. Sessions are ordinary chats and show up in the desktop
+  app. Permission requests go to the client, and a declined tool does not run.
+- **Other chats** (Settings → Chats, off by default). A chat's main agent gets
+  `list_chats` and `message_chat` to see what your other chats are doing and send
+  them a note. See [Security](#security).
+- **Reviewer permission mode.** Behaves like *Allowlist only*, except that a
+  second, cheaper model answers the approval prompt. It fails closed, so an
+  unreachable or unclear reviewer asks you.
+- **Usage caps.** Double-click a usage line in Settings → Accounts, or a
+  provider's aggregated line, to cap it. The harness then stops using that account
+  once the window reaches the cap. A cap can be permanent or lift after 1, 4 or 24
+  hours. Chats fall through to other accounts, and a chat with nowhere to go
+  pauses and resumes when the cap lifts.
+- **Resume choices for a stopped chat:** *Continue*, *Summarise and continue*, or
+  *Wrap up*.
+- **Opt-in trace export.** Setting a trace endpoint sends one OTLP/HTTP span per
+  model request and per tool call, using OpenTelemetry GenAI conventions. Off
+  until you set a destination, and it can never delay or fail a run.
+- **Computer use** shows multi-display layouts. Only the primary display takes
+  input, and the agent is refused rather than clicking the right place on the
+  wrong screen. It can also zoom into a region and hold keys or buttons across
+  actions.
+- **Plans are saved as artificts.** `exit_plan_mode` files the plan as a Markdown
+  artifict before asking you to approve it. Refining it appends a revision, and
+  the approval card has *Open in Artificts*.
+
+#### Interface
+
+- **Context attribution.** The context meter can show what is filling the window
+  (system prompt, project instructions, skills, tool schemas, attachments,
+  conversation, compaction summary). It is off until you enable it at Settings →
+  General → *Context breakdown*.
+- **Artificts workspace.** Comment mode lets you click a point in a preview to pin
+  a comment or select text to quote it. An *Ask for…* menu stages a request, and
+  **Send** is the one action that shares it with the agent.
+- **Keyboard shortcut reference** in the command palette, and *Send message with*
+  (Enter or Ctrl Enter) under Settings → General.
+- **Light / dark / system theme** switch under Settings → Theme.
+- **Undo for archiving.** The toast carries the way back, and the sidebar's
+  automatic trim says what it did.
+- **Sidebar shortcut button** (beside the usage bar) can point at any settings
+  page, not only Accounts.
+- **Saved prompts follow the current project**, with a sort control when *show all
+  chats* is on.
+- **Unknown settings are kept and reported.** A key in `settings.json` that this
+  build doesn't recognise is preserved on the next write and named in a warning,
+  so a typo no longer looks like a setting that did nothing.
+- Tool-schema deferral (`tool_search`, plugin tools and per-server overrides) is
+  configurable under Settings → MCP servers.
+
+#### Models and providers
+
+- Model metadata (context length, output limit) is read from provider list
+  responses when present, and per-model details are fetched where a provider only
+  lists IDs.
+- DeepSeek-style thinking models get their reasoning replayed on each turn, which
+  fixes the hard 400 they return on tool-using conversations.
+- A gateway reporting that its upstream endpoint is down is retried a few times
+  rather than cooling the account and pausing the chain.
+- Free-named models may use an account that is benched only for paid-usage limits.
+- `.env` read denial is a switch under Settings → Permissions.
+
+#### Build and release
+
+- `build-linux-arm64.sh` builds natively on an aarch64 Ubuntu machine.
+- Download builds are staged to release names by `scripts/stage-downloads.py`,
+  which refuses a partial set.
+
+### Changed
+
+- **"Artifacts" is now "Artificts"**, including the tools, the UI and the project
+  folder, which moved from `.openleash/artifacts/` to `.openleash/artificts/`.
+  **Existing artifacts in the old folder are not read or migrated.** Move them
+  across by hand if you want them. Artificts can now also be text and image
+  deliverables.
+- The shared Browser view now lives inside the Artificts workspace, not a separate
+  dialog.
+- The command palette reaches every settings page and the open chat's lifecycle
+  (pin, rename, duplicate, archive).
+- Instruction files over the size cap are marked with the cap and the number of
+  characters dropped, instead of being silently cut.
+- Bulk *delete archived chats* uses one backend call and reports what it actually
+  removed.
+- Confirmation dialogs and the API-key prompt use the app's own dialogs, not
+  `window.confirm` / `window.prompt`.
+- A chat that fails to open says why and offers a retry, rather than showing the
+  same "Task not found" as a chat that doesn't exist.
+- The streaming reply is announced to screen readers when it finishes.
+- macOS is distributed as a DMG, with no in-app install. The release workflow no
+  longer assembles updater assets.
+
+### Fixed
+
+- A chat's context breakdown no longer keeps pre-compaction categories after the
+  conversation is compacted, forked or rewound.
+- Removing a worktree goes through the repository that owns it, and a clean
+  worktree is no longer confused with a failed commit.
+
+### Removed
+
+- **Archive by age**: the *archive chats you have not used in* window under
+  Settings → Chats and the *Archive idle chats now* sweep. Archiving by hand and
+  the sidebar's own trim past 100 chats are unchanged.
+- Updater signature verification and the updater signing workflow
+  (`scripts/assemble-updater.py`, `scripts/updater_assets.py`,
+  `tauri.updater.conf.json`). See [Security](#security).
 
 ### Security
 
-- Nothing in this release relaxes a permission decision. New tools (`http_request`,
-  `bisect_edits`, browser, `lsp`, service plugins) go through deny rules, plan
-  mode, read-only subagent limits and the reviewer mode like existing ones.
-- **Chat connectors are allowlists.** Nobody can use a bot until you list their
-  user id, and connector messages cannot create skills or change settings.
-- **The agent's browser is not your browser.** It uses its own profile and
-  cannot control your desktop.
+- **In-app updates are not signature-verified.** Released packages are unsigned.
+  The only protection is TLS plus the pinned `DevLeashed/OpenLeash` release path
+  that `src-tauri/src/updates.rs` enforces before any bytes are fetched. Whatever
+  can serve the update manifest also decides what the app will run. Installing and
+  restarting is always an explicit action and is refused while agent or background
+  work is active. Portable Windows, macOS and non-AppImage Linux builds only
+  announce releases. They are not Authenticode-signed or notarized, so
+  SmartScreen and Gatekeeper warnings still apply.
+- **A paired device is you.** Remote control has full parity with the desktop
+  window: a paired browser can approve tool calls, change settings and read files.
+  Treat a pairing link or code like a password and revoke devices you no longer
+  use. Every request needs a session cookie even on loopback, WebSocket upgrades
+  check `Origin`, and only hashes of session secrets are stored. *Network* mode is
+  plain HTTP, so prefer loopback plus an SSH tunnel, or a private overlay such as
+  Tailscale.
+- **SSH and WSL are not sandboxes.** The permission layer applies as it does
+  locally, but reads are unconfined and an approved command can do anything your
+  account on that host can. OpenLeash uses your own `ssh` with `BatchMode=yes` and
+  never handles keys, passwords or host-key decisions. Trust is per host and per
+  path, and a trusted remote project contributes instruction files only.
+  `ssh://` strings are never passed to local file or process APIs.
+- **A docker workspace is isolation for the project, not a sandbox for the
+  agent.** File tools still run on the host. OpenLeash never passes
+  `--privileged`, extra capabilities, the Docker socket or host networking, and
+  `openleash.json` cannot add them. Published ports bind `127.0.0.1` only.
+- **A transferred chat is untrusted data.** The import rebuilds or drops anything
+  the app would act on, including the system prompt, tool list, read-before-write
+  timestamps and revert contents, and caps the permission level. Trust and
+  approvals never travel in a bundle.
+- **Other chats is off by default.** A message arrives as a note from another
+  agent, never as your words. It cannot approve, answer or unpause anything, and
+  paused or archived chats refuse. The receiving chat still obeys its own
+  permissions, plan mode and deny rules, but an agent allowed to edit files can be
+  asked by another agent to edit them. `message_chat` goes through the permission
+  gate.
+- **The GitHub connector's token only goes to GitHub.** A raw `api` call to a
+  path off `api.github.com` is treated as a write and asks first.
+- The reviewer mode only ever replaces the click. Deny rules, the read-only
+  shortcut, allow rules, plan mode and the refusal of chained commands all decide
+  first, and a reviewer's approval is one-shot and never writes a rule.
 
 ## How to read this file
 

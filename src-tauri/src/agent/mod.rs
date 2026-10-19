@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod mcp_oauth;
 pub mod memory;
 pub mod pcguard;
+pub mod sandbox;
 pub mod permissions;
 pub mod plugin_gitlab;
 pub mod plugin_jira;
@@ -45,6 +46,7 @@ pub mod plugin_notion;
 pub mod plugin_services;
 pub mod plugin_slack;
 pub mod plugins;
+mod procwatch;
 pub mod projects;
 pub mod prompt;
 pub mod proof;
@@ -84,6 +86,8 @@ mod reviewer_mcp;
 #[cfg(test)]
 mod reviewer_memory_scope;
 #[cfg(test)]
+mod reviewer_message_model;
+#[cfg(test)]
 mod reviewer_review;
 // #[cfg(test)]
 // mod reviewer_modes;
@@ -107,6 +111,8 @@ mod reviewer_runtime;
 mod reviewer_runtime_wake;
 #[cfg(test)]
 mod reviewer_sandbox;
+#[cfg(test)]
+mod reviewer_sandbox_tool;
 #[cfg(test)]
 mod reviewer_service_plugins;
 #[cfg(test)]
@@ -471,6 +477,11 @@ pub struct Task {
     /// `cwd` is then the task's private copy of the project on the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<docker::DockerEnv>,
+    /// The sandbox (a desktop of the agent's own, see `sandbox.rs`) this chat
+    /// is attached to. Independent of `docker`; the user or the agent can
+    /// change it between turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     pub model: String,
     /// Backend-installed restriction, persisted before startup is dispatched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -990,6 +1001,22 @@ pub fn chat_model_of(t: &Task) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|m| !m.is_empty())
         .map(String::from)
+}
+
+/// Refused wording for a message or a new chat with no model picked. Shown as
+/// the send's error, so the composer keeps the draft and the user can pick one.
+pub const NO_MODEL_PICKED: &str =
+    "Pick a model first. This chat has no model yet, so the message was not sent.";
+
+/// Whether a user message may go to the model: the model its next message runs
+/// on (a queued swap, else the chat's own) must be set. An empty model would
+/// otherwise build a request with no model id, which fails far from the cause.
+pub fn require_chat_model(t: &Task) -> Result<(), String> {
+    let model = chat_model_of(t).unwrap_or_else(|| t.model.clone());
+    if model.trim().is_empty() {
+        return Err(NO_MODEL_PICKED.into());
+    }
+    Ok(())
 }
 
 /// The reasoning effort one agent runs at right now (0 = Max … 4 = Low), for

@@ -118,15 +118,48 @@ export function parseAttachments(text: string): ShownAttachment[] {
   return out;
 }
 
+/** One staged copy as the backend records it on a user item's `attachments`. */
+export interface StagedRef { path: string; name: string; size: number }
+
+/** What a user item carries, as far as its attachments go. */
+export interface AttachmentData { images?: unknown; images_dropped?: unknown; attachments?: unknown }
+
+/**
+ * A sent message's staged copies, split into the pictures and the other files.
+ *
+ * The backend stages a message's images first and its files after them, in one
+ * list on the item's `attachments` field (`stage_user_attachments`). The visible
+ * text no longer carries the `<openleash-attachments>` note, which goes to the
+ * model only, so this list is the only record of what went out. `images` are the
+ * entries whose picture is still on the item; a picture the timeline has since
+ * dropped to save memory (`images_dropped`) counts as a file here, so the bubble
+ * still names it and an edit still resends its staged copy by path.
+ */
+export function stagedAttachments(data: AttachmentData | undefined): { images: StagedRef[]; files: StagedRef[] } {
+  const raw = Array.isArray(data?.attachments) ? (data.attachments as unknown[]) : [];
+  const staged: StagedRef[] = raw
+    .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
+    .map((a, i) => ({
+      path: typeof a.path === "string" ? a.path : "",
+      name: typeof a.name === "string" && a.name ? a.name : `attachment-${i + 1}`,
+      size: typeof a.size === "number" ? a.size : 0,
+    }));
+  const shown = Array.isArray(data?.images) ? data.images.length : 0;
+  return { images: staged.slice(0, shown), files: staged.slice(shown) };
+}
+
 /**
  * The files a message carried, shown the way the composer shows its own chips.
  *
  * The staged-path block itself never reaches the screen: it is scaffolding the
  * agent reads, and a path in a hidden temp folder tells the user nothing they can
  * act on. What they can act on is *which files* went out, so that is the card.
+ * Images still on the item show as thumbnails instead, so they get no chip.
  */
-export function AttachmentChips({ text }: { text: string }) {
-  const files = parseAttachments(text);
+export function AttachmentChips({ text, data }: { text: string; data?: AttachmentData }) {
+  const recorded = stagedAttachments(data).files;
+  // Older messages (from before the item recorded its copies) only have the note in their text.
+  const files: ShownAttachment[] = Array.isArray(data?.attachments) ? recorded : parseAttachments(text);
   if (!files.length) return null;
   return (
     <div className="ubattach">
