@@ -221,11 +221,12 @@ pub fn schemas(sub: Option<&str>, plugins: &super::plugins::PluginsCfg) -> Vec<V
         }),
         json!({
             "name": "send_message",
-            "description": "Send a message to another agent in this task: `main` (the main agent), a subagent id from list_agents, or `all` (every running agent except you). It arrives on their next step as a note from you; it doesn't interrupt their current tool call. Use it to share findings others need, hand off work, or coordinate (\"I'm editing src/api.ts, don't touch it\"). Keep it short and self-contained. For a question you need answered before continuing, subagents should use `ask` instead.",
+            "description": "Send a message to another agent in this task: `main` (the main agent), a subagent id from list_agents, or `all` (every running agent except you). It arrives on their next step as a note from you; it doesn't interrupt their current tool call. Use it to share findings others need, hand off work, or coordinate (\"I'm editing src/api.ts, don't touch it\"). Keep it short and self-contained. To show a picture, put the file's path in `image_paths`: the receiver gets the picture itself, so it can judge it rather than guess from your description. For a question you need answered before continuing, subagents should use `ask` instead.",
             "input_schema": {"type":"object","properties":{
                 "to":{"type":"string","description":"`main`, a subagent id, or `all`"},
-                "message":{"type":"string"}},
-                "required":["to","message"]}
+                "message":{"type":"string","description":"The message. Optional only when `image_paths` carries a picture to show."},
+                "image_paths":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"Paths of image files to show the receiver (PNG, JPEG, GIF or WebP) — e.g. a picture the user attached, whose staged copy path is in the attachment note. The receiver gets the picture itself, so it can judge it rather than guess from your description."}},
+                "required":["to"]}
         }),
         json!({
             // Main agent only, and not merely refused at dispatch: a subagent
@@ -484,12 +485,13 @@ pub fn schemas(sub: Option<&str>, plugins: &super::plugins::PluginsCfg) -> Vec<V
         }));
         v.push(json!({
             "name": "task",
-            "description": "Launch a subagent with a fresh context to handle a self-contained job, and get back its final report. Use it to keep your own context clean: broad codebase searches, investigating a question across many files, or independent pieces of work. The agent types you may use right now are listed in the latest <system-reminder> about subagents (the list can change mid-conversation; always use the most recent one). Launch several in one response to run them in parallel. The subagent can't see this conversation — write a complete brief: goal, relevant paths, what you already know, what to return. It already has the project instructions (AGENTS.md etc.), environment info and skills from the harness, so don't tell it to read those. It may send you questions while it works; answer them from what you know.",
+            "description": "Launch a subagent with a fresh context to handle a self-contained job, and get back its final report. Use it to keep your own context clean: broad codebase searches, investigating a question across many files, or independent pieces of work. The agent types you may use right now are listed in the latest <system-reminder> about subagents (the list can change mid-conversation; always use the most recent one). Launch several in one response to run them in parallel. The subagent can't see this conversation — write a complete brief: goal, relevant paths, what you already know, what to return. It already has the project instructions (AGENTS.md etc.), environment info and skills from the harness, so don't tell it to read those. To show it a picture, put the file's path in `image_paths`: the subagent receives the picture itself, so it can judge the picture rather than guess from your description of it. It may send you questions while it works; answer them from what you know.",
             "input_schema": {"type":"object","properties":{
                 "description":{"type":"string","description":"3-6 word label"},
                 "prompt":{"type":"string","description":"Full, standalone brief"},
                 "subagent_type":{"type":"string","description":"An agent id from the latest subagent list, e.g. `explore`"},
-                "images":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"`data:<mime>;base64,<data>` URLs of images to show the subagent (e.g. a screenshot or mockup the user shared). Only use it for pictures the subagent must actually see; if it only needs the file, give it the path in the prompt instead."},
+                "images":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"`data:<mime>;base64,<data>` URLs of images to show the subagent. Use this only for a picture you already hold as base64 (e.g. one a tool returned); for a file on disk, use `image_paths` instead."},
+                "image_paths":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"Paths of image files to show the subagent (PNG, JPEG, GIF or WebP). Use this for a picture the user attached — the staged copy path is in the attachment note — or any image file you can see the path of. The subagent receives the picture itself, not just the path, so it can judge it directly."},
                 "run_in_background":{"type":"boolean","description":"Return immediately and keep working; the report is delivered to you when it finishes. Use for long independent jobs."}},
                 "required":["description","prompt","subagent_type"]}
         }));
@@ -499,6 +501,7 @@ pub fn schemas(sub: Option<&str>, plugins: &super::plugins::PluginsCfg) -> Vec<V
             "input_schema": {"type":"object","properties":{
                 "id":{"type":"string","description":"Subagent id (list_agents)"},
                 "message":{"type":"string","description":"Follow-up work. Omit it to just continue where it left off; a message counts as a fresh turn, so the subagent picks it up on its next step."},
+                "image_paths":{"type":"array","maxItems":8,"items":{"type":"string"},"description":"Paths of image files to show the resumed agent (PNG, JPEG, GIF or WebP) — e.g. the current state it should be looking at. It receives the picture itself, so it can judge it rather than guess from your description."},
                 "background":{"type":"boolean","description":"Return immediately instead of waiting for the report (default false)"}},
                 "required":["id"]}
         }));
@@ -739,6 +742,19 @@ pub fn media_type_by_ext(ext: &str) -> Option<&'static str> {
         Some("webp") => Some("image/webp"),
         _ => None,
     }
+}
+
+/// Whether a media type is one a model can be handed as an image block.
+///
+/// This is deliberately narrower than `image/*`. An SVG is an image to a
+/// browser and not to a provider: sent as an image block it is refused by the
+/// API (or arrives as something the model cannot look at). It belongs in the
+/// request as a file path the agent opens, and the same goes for any other
+/// image type outside these four.
+pub fn is_model_image(media_type: &str) -> bool {
+    ["image/png", "image/jpeg", "image/gif", "image/webp"]
+        .iter()
+        .any(|m| media_type.eq_ignore_ascii_case(m))
 }
 
 pub fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -1805,6 +1821,32 @@ fn rank(h: &Hit, question: &str) -> i32 {
     h.queries.len() as i32 * 10 + h.engines.len() as i32 * 4 + overlap * 2
 }
 
+/// How long one engine gets, headers and body together. `Harness::http` has no
+/// default timeout on purpose (a provider stream may legitimately run for
+/// minutes), so every non-model request has to bring its own. Without one, an
+/// engine that accepts the connection and then stalls — a captive portal, a
+/// corporate proxy, a rate limiter that never answers — hung the whole turn on
+/// "Searching the web…" with no result and no way out but Stop.
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Send one request and read its body under a single deadline, so a peer that
+/// sends headers and then goes quiet cannot hold the task either.
+async fn fetch_page(
+    req: reqwest::RequestBuilder,
+    deadline: std::time::Duration,
+) -> Result<(reqwest::StatusCode, String), String> {
+    let work = async {
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        Ok((status, body))
+    };
+    match tokio::time::timeout(deadline, work).await {
+        Ok(out) => out,
+        Err(_) => Err(format!("no answer within {deadline:?}")),
+    }
+}
+
 /// One engine, one query. DuckDuckGo first, then Brave's public search page as
 /// a second opinion — two engines find different things, which is the point of
 /// a fan-out, and neither needs an API key.
@@ -1816,26 +1858,29 @@ async fn search_one(http: &reqwest::Client, engine: &'static str, query: &str) -
     };
     let res = match engine {
         "duckduckgo" => {
-            http.get("https://lite.duckduckgo.com/lite/")
-                .query(&[("q", q)])
-                .send()
-                .await
+            fetch_page(
+                http.get("https://lite.duckduckgo.com/lite/")
+                    .query(&[("q", q)]),
+                SEARCH_TIMEOUT,
+            )
+            .await
         }
         "brave" => {
-            http.get("https://search.brave.com/search")
-                .query(&[("q", q), ("source", "web")])
-                .send()
-                .await
+            fetch_page(
+                http.get("https://search.brave.com/search")
+                    .query(&[("q", q), ("source", "web")]),
+                SEARCH_TIMEOUT,
+            )
+            .await
         }
         _ => return none(false),
     };
-    let Ok(resp) = res.map_err(|e| format!("{engine}: {e}")) else {
+    let Ok((status, html)) = res else {
         return none(false);
     };
     // 429/403 are the HTTP-shaped rate limits, and 202 is the one DuckDuckGo
     // actually uses for its challenge page — so the status alone cannot decide.
     // The body is fetched either way and `is_challenge` is the real test.
-    let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN
     {
         return none(true);
@@ -1843,9 +1888,6 @@ async fn search_one(http: &reqwest::Client, engine: &'static str, query: &str) -
     if !status.is_success() {
         return none(false);
     }
-    let Ok(html) = resp.text().await else {
-        return none(false);
-    };
     let hits = if engine == "brave" {
         parse_brave(&html, 8)
     } else {
@@ -2521,6 +2563,34 @@ fn html_to_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine that accepts the connection and then says nothing used to hang
+    /// the whole turn: `Harness::http` carries no default timeout, because a
+    /// provider stream may legitimately run for minutes. The deadline has to be
+    /// brought by the request itself, and it has to cover the body too.
+    #[tokio::test]
+    async fn a_stalled_engine_is_cut_off_at_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept, hold the socket open, never answer. Dropped with the test.
+        let _hold = tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let started = std::time::Instant::now();
+        let err = fetch_page(
+            http.get(format!("http://{addr}/")),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a peer that never answers must time out");
+        assert_eq!(err, "no answer within 200ms");
+        // And it returns rather than hanging: the point of the deadline.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn discovered_images_resolve_relative_urls_and_reject_private_targets() {

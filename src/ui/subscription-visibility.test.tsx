@@ -5,7 +5,7 @@
 // accounts or models screens, and a chat already on a hidden model must still
 // count as usable, or sending would be blocked by a sign we chose to hide.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -34,6 +34,15 @@ const apiKey: ProviderView = {
   id: "anthropic", name: "Anthropic", icon: "anthropic", mono: "A", color: "#e8967a", base_url: "https://api.anthropic.com", env: "ANTHROPIC_API_KEY", chip: "",
   kind: "anthropic", custom: false, insist: false, connected: true, has_key: true, key_hint: "…abcd", key_hints: [], key_pool: false,
   base_url_override: "", enabled: true, local: false, account: null,
+} as unknown as ProviderView;
+
+/** Kimi Code: a subscription whose credential is a pasted console key, with
+ * no CLI login file behind it — the connect dialog is paste-only. */
+const kimiCode: ProviderView = {
+  id: "kimi-code", name: "Kimi Code", icon: "moonshot", mono: "Ki", color: "#60a5fa", base_url: "https://api.kimi.ai/coding/v1", env: "KIMI_API_KEY", chip: "",
+  kind: "openai", custom: false, insist: false, connected: false, has_key: false,
+  key_hint: "", key_hints: [], key_pool: false, base_url_override: "", enabled: true, local: false,
+  account: { display_name: "Kimi Code", short_name: "Kimi", login_file: "", login_command: "create a key at kimi.com/code/console", paste_hint: "Paste a Kimi Code API key", setup_command: "", token_prefix: "", warning: "", terms_gate: null, key_login: true },
 } as unknown as ProviderView;
 
 describe("which providers and accounts the UI may show", () => {
@@ -113,6 +122,41 @@ describe("the accounts screen", () => {
     expect(text.toLowerCase()).not.toContain("claude");
     expect(document.querySelectorAll(".acct")).toHaveLength(1);
     expect(text).toContain("ChatGPT (Codex)");
+  });
+
+  it("shows Antigravity's single CLI-managed login without an account import flow", () => {
+    set({
+      providers: [{ ...apiKey, id: "antigravity", name: "Antigravity", icon: "antigravity", local: true, connected: true }],
+      accounts: [],
+      settingsTab: "accounts",
+    });
+    render(<AccountsTab />);
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Google Antigravity (agy)");
+    expect(text).toContain("Checking CLI login…");
+    expect(button$("Add")).toBeUndefined();
+  });
+
+  it("offers Kimi Code like any other subscription, not a hidden one", () => {
+    set({ providers: [kimiCode], accounts: [], settingsTab: "accounts" });
+    render(<AccountsTab />);
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Kimi Code");
+    expect(text).toContain("No accounts yet");
+    expect(button$("Add")).toBeDefined();
+  });
+
+  it("connects Kimi Code by pasted key alone — there is no CLI login to import", () => {
+    set({ providers: [kimiCode], accounts: [], settingsTab: "accounts" });
+    const view = render(<AccountsTab />);
+    fireEvent.click(view.getByRole("button", { name: "Add" }));
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Connect Kimi Code");
+    expect(text).toContain("Paste your Kimi API key");
+    expect(text).toContain("Connect key");
+    // The local-import block must be gone, not merely disabled: its button
+    // would try to read a login file that never exists for this kind.
+    expect(text).not.toContain("Import");
   });
 });
 

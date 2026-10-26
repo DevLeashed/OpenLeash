@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
-import { clampEffort, EFFORTS, effortLabel, effortLevel, effortLevels, effortSteps } from "./api";
+import { clampEffort, EFFORTS, EFFORT_LADDER, effortLabel, effortLadder, effortLevel, effortLevels, effortSteps } from "./api";
 
 const model = (reasoning_levels: string[], reasoning_param = "reasoning_effort") => ({ reasoning_levels, reasoning_param });
 
@@ -86,5 +86,38 @@ describe("clampEffort", () => {
 describe("the generic ladder still covers models with nothing to say", () => {
   it("keeps EFFORTS as the fallback name source", () => {
     expect(EFFORTS).toEqual(["Max", "Extra High", "High", "Medium", "Low"]);
+  });
+});
+
+describe("the ladder is drawn Low first, Max last", () => {
+  // The pickers read as a scale that climbs, like every other slider. The
+  // stored value is untouched (0 = Max … 4 = Low, the contract with Rust's
+  // `pick_level`), so only the order things are shown in changes.
+  it("reverses the generic ladder for display", () => {
+    expect(EFFORT_LADDER.map((e) => e.label)).toEqual(["Low", "Medium", "High", "Extra High", "Max"]);
+    // Each entry keeps the stored effort it belongs to.
+    expect(EFFORT_LADDER.map((e) => e.value)).toEqual([4, 3, 2, 1, 0]);
+  });
+
+  it("draws a model's own rungs low to high, with their own names", () => {
+    const claude = model(["low", "medium", "high", "xhigh", "max"], "anthropic_effort");
+    expect(effortLadder(claude).map((o) => o.label)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(effortLadder(claude).map((o) => o.value)).toEqual([4, 3, 2, 1, 0]);
+  });
+
+  it("draws a thinking budget by its token count, smallest first", () => {
+    const haiku = model(["0", "4000", "8000", "16000", "32000"], "thinking_budget");
+    expect(effortLadder(haiku).map((o) => o.label)).toEqual(["0", "4000", "8000", "16000", "32000"]);
+    // The budget the request carries is unchanged by the redraw.
+    expect(effortLadder(haiku).map((o) => effortLevel(haiku, o.value))).toEqual(["0", "4000", "8000", "16000", "32000"]);
+  });
+
+  it("draws a model with fewer levels low to high too", () => {
+    expect(effortLadder(model(["low", "medium", "high"])).map((o) => o.label)).toEqual(["low", "medium", "high"]);
+    expect(effortLadder(model(["low", "medium", "high"])).map((o) => o.value)).toEqual([4, 2, 0]);
+  });
+
+  it("offers nothing for a model with no reasoning control", () => {
+    expect(effortLadder(model([], "none"))).toEqual([]);
   });
 });

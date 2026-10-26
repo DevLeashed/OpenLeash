@@ -36,7 +36,6 @@ export function AgentNotice({ it, taskId, chatTitle, exiting = false }: { it: It
         <Icon size={16} strokeWidth={1.8} aria-hidden="true" />
         <div className="agent-notice-heading">
           <div className="agent-notice-title">{it.data?.title || "Agent notice"}</div>
-          <div className="agent-notice-hint">{warning ? "Warning · " : ""}No reply needed · the agent isn't waiting</div>
         </div>
         <Button variant="ghost" disabled={closing} onClick={() => void dismiss()} aria-label="Dismiss notice"><X size={13} /> Dismiss</Button>
       </div>

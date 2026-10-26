@@ -267,3 +267,47 @@ fn the_model_still_gets_its_own_images() {
         "the request the model receives must keep its image block"
     );
 }
+
+#[tokio::test]
+async fn queued_notes_do_not_pile_up_unbounded() {
+    // The text sibling of `inbox_images`, and the bigger one in practice: a
+    // subagent report is tens of KB, and a chat that is parked or paused never
+    // drains its notes at all.
+    let h = harness();
+    for i in 0..INBOX_NOTES * 3 {
+        h.note("t", "main", format!("note {i}")).await;
+    }
+    let rt = h.runtime("t");
+    let q = rt.inbox.lock().await;
+    let kept = q.get("main").expect("the buffer exists");
+    assert_eq!(
+        kept.len(),
+        INBOX_NOTES,
+        "the buffer must stop at the cap, not track every note"
+    );
+    assert_eq!(
+        kept.last().unwrap(),
+        &format!("note {}", INBOX_NOTES * 3 - 1),
+        "the note queued a moment ago is the one the next request needs"
+    );
+    assert!(!kept.iter().any(|n| n == "note 0"), "the oldest went first");
+}
+
+#[tokio::test]
+async fn the_note_cap_is_per_agent() {
+    // A swarm's agents each keep their own queue; one chat's flood of background
+    // notes must not spend the room a subagent's report needs.
+    let h = harness();
+    for i in 0..INBOX_NOTES * 2 {
+        h.note("t", "main", format!("main {i}")).await;
+        h.note("t", "sub1", format!("sub {i}")).await;
+    }
+    let rt = h.runtime("t");
+    let q = rt.inbox.lock().await;
+    assert_eq!(q.get("main").unwrap().len(), INBOX_NOTES);
+    assert_eq!(q.get("sub1").unwrap().len(), INBOX_NOTES);
+    assert_eq!(
+        q.get("sub1").unwrap().last().unwrap(),
+        &format!("sub {}", INBOX_NOTES * 2 - 1)
+    );
+}

@@ -2,7 +2,7 @@
 // each with its own model, effort and fanout. Six empty pickers is a feature
 // nobody turns on, so it opens on a preset the user can edit down.
 import { useMemo, useState } from "react";
-import { EFFORTS, effortLabel, effortSteps, ModelInfo, ProviderView, UltraX, UltraXLayer, X_DEFAULT_RUNNING, X_DEFAULT_TOTAL, X_MAX_FANOUT, X_MAX_LAYERS, defaultX, emptyXLayer, xDepth } from "../api";
+import { effortLadder, ModelInfo, ProviderView, UltraX, UltraXLayer, X_DEFAULT_RUNNING, X_DEFAULT_TOTAL, X_MAX_FANOUT, X_MAX_LAYERS, defaultX, emptyXLayer, xDepth } from "../api";
 import { flash, get, isConnected, modelInfo, set, shownProviders, useStore } from "../store";
 import { setOpts } from "./Composer";
 import { Dropdown, Modal, Segmented } from "./primitives";
@@ -17,13 +17,9 @@ type PresetId = (typeof PRESETS)[number]["id"];
 
 /** Effort rungs for one layer's model, or the full ladder when the layer has
  *  no model of its own and runs on the chat's. */
-const EFFORT_NAMES: string[] = EFFORTS;
-
-/** Effort rungs for one layer's model, or the full ladder when the layer has
- *  no model of its own and runs on the chat's. */
 function effortOptions(l: UltraXLayer, chatModel: string) {
   const mi = modelInfo(l.model || chatModel);
-  return effortSteps(mi).map((value) => ({ value: String(value), label: effortLabel(mi, value) ?? EFFORT_NAMES[value] ?? "" }));
+  return effortLadder(mi).map((o) => ({ value: String(o.value), label: o.label }));
 }
 
 /** The cheapest connected model, used to fill the worker layers in "smart". */
@@ -186,7 +182,7 @@ export function UltraXDialog({ x, chatModel, onSave, onClose }: { x: UltraX; cha
  *  chat (or the new-chat defaults), so the pill, the menu and /ultrax all land here. */
 export function UltraXEditor() {
   const open = useStore((s) => s.ultraXOpen);
-  const task = useStore((s) => (s.view !== "home" && s.task ? s.tasks[s.task] : null));
+  const task = useStore((s) => (s.view === "session" && s.task ? s.tasks[s.task] : null));
   useStore((s) => s.home);
   const close = () => set({ ultraXOpen: false });
   if (!open) return null;

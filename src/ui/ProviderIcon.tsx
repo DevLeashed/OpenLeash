@@ -1,5 +1,6 @@
 import { Server } from "lucide-react";
 import anthropic from "@lobehub/icons-static-svg/icons/anthropic.svg?raw";
+import antigravity from "@lobehub/icons-static-svg/icons/antigravity.svg?raw";
 import claude from "@lobehub/icons-static-svg/icons/claude.svg?raw";
 import gemini from "@lobehub/icons-static-svg/icons/gemini.svg?raw";
 import ollama from "@lobehub/icons-static-svg/icons/ollama.svg?raw";
@@ -26,6 +27,7 @@ import { get } from "../store";
 const ICON_ASSETS = new Map<string, string>(
   Object.entries({
     anthropic,
+    antigravity,
     claude,
     gemini,
     ollama,

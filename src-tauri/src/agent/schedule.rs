@@ -1891,6 +1891,7 @@ mod tests {
                     &h,
                     "scheduled-project",
                     "scheduled-model",
+                    2,
                     crate::CreateTaskOptions::Background,
                 )
                 .await;
@@ -1912,6 +1913,7 @@ mod tests {
             &h,
             "interactive-project",
             "interactive-model",
+            2,
             crate::CreateTaskOptions::Interactive,
         )
         .await;

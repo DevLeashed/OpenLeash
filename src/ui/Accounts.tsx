@@ -1,7 +1,7 @@
 // Settings: Accounts (subscription logins + live usage), Routing (fallback
 // chains) and Subagents (custom agent definitions).
-import { Fragment, useLayoutEffect, useRef, useState } from "react";
-import { AccountProviderInfo, AccountView, AgentDef, api, EFFORTS, effortLabel, effortSteps, isRequiredAgent, ProviderView, Route, until, UsageCap, Window, withRequiredAgents } from "../api";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { AccountProviderInfo, AccountView, AgentDef, AntigravityStatus, api, effortLadder, isRequiredAgent, ProviderView, Route, until, UsageCap, Window, withRequiredAgents } from "../api";
 import { flash, get, isConnected, modelInfo, saveSettings, set, shownProviders, useNow, useStore, zoom } from "../store";
 import { copyText } from "./clipboard";
 import { Dropdown, Opt } from "./primitives";
@@ -152,7 +152,10 @@ function AccountRow({ a, i, n, revealed, onCap }: { a: AccountView; i: number; n
             <Tooltip content="Double-click to rename"><span style={{ fontWeight: 600 }} onDoubleClick={() => setEdit(true)}>{a.label}</span></Tooltip>
           )}
           {revealed && <span className="mono" style={{ fontSize: 11.5, color: "var(--mut3)", overflowWrap: "anywhere" }}>
-            {a.kind === "opencode-go" ? a.key_hint || "No key fragment available" : a.email.trim() || "No email recorded"}
+            {/* Key-login accounts identify by key fragment, OAuth ones by
+                address; a Kimi account falls back to its email when the
+                gateway reported one and the key fragment is somehow absent. */}
+            {a.key_hint || a.email.trim() || "Nothing recorded"}
           </span>}
           <span style={{ fontSize: 11.5, color: "var(--mut3)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
             {a.usage?.plan || ""}
@@ -464,18 +467,23 @@ function ImportDialog({ provider, onClose }: { provider: ProviderView; onClose: 
     <Modal onClose={onClose} style={{ width: "min(520px, 100%)" }}>
         <div className="mh"><ProviderIcon provider={kind} size={18} /><span style={{ flex: 1 }}>Connect {meta.display_name}</span><IconButton label="Close" onClick={onClose}>{I.close()}</IconButton></div>
         <div className="mb">
-          <div className="sgroup">
-            <div className="srowx" style={{ alignItems: "flex-start" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 500 }}>{meta.key_login ? "Import OpenCode key" : "Import CLI login"}</div>
-                <div className="desc"><span className="mono">{meta.login_file}</span>{meta.key_login ? " · API key created with your Go subscription" : <> · run <span className="mono">{meta.login_command}</span> first</>}</div>
-                {meta.setup_command && <div className="desc"><TextButton link onClick={() => setGuide(true)}>Use a setup token instead<ChevronRight size={11} /></TextButton></div>}
+          {/* A key-login provider with no local login file (Kimi Code) offers
+              the paste box only: its credential is created in a web console,
+              not stored by a CLI this app could read. */}
+          {meta.login_file && (
+            <div className="sgroup">
+              <div className="srowx" style={{ alignItems: "flex-start" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 500 }}>{meta.key_login ? `Import ${meta.short_name} key` : "Import CLI login"}</div>
+                  <div className="desc"><span className="mono">{meta.login_file}</span>{meta.key_login ? ` · API key created with your ${meta.display_name} subscription` : <> · run <span className="mono">{meta.login_command}</span> first</>}</div>
+                  {meta.setup_command && <div className="desc"><TextButton link onClick={() => setGuide(true)}>Use a setup token instead<ChevronRight size={11} /></TextButton></div>}
+                </div>
+                <Button variant="primary" disabled={busy} onClick={() => run(() => api.accountImportLocal(kind))}>{busy && <Loader size={13} />}Import</Button>
               </div>
-              <Button variant="primary" disabled={busy} onClick={() => run(() => api.accountImportLocal(kind))}>{busy && <Loader size={13} />}Import</Button>
             </div>
-          </div>
+          )}
           <div className="field">
-            <label>{meta.key_login ? "Or paste an API key" : "Or paste credentials"}</label>
+            <label>{meta.key_login ? `Paste your ${meta.short_name} API key` : "Or paste credentials"}</label>
             <TextArea className="input mono" style={{ height: 88, padding: 10, fontSize: 11, resize: "vertical" }} value={text} placeholder={meta.paste_hint} onChange={(e) => setText(e.currentTarget.value)} />
           </div>
           {meta.warning && <div className="secondary-text">{meta.warning}</div>}
@@ -486,6 +494,35 @@ function ImportDialog({ provider, onClose }: { provider: ProviderView; onClose: 
           <Button variant="primary" disabled={!text.trim() || busy} onClick={() => run(() => api.accountImport(kind, text))}>{busy && <Loader size={13} />}{meta.key_login ? "Connect key" : "Connect"}</Button>
         </div>
     </Modal>
+  );
+}
+
+function AntigravityAccountCard() {
+  const [status, setStatus] = useState<AntigravityStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const refreshStatus = async () => {
+    setBusy(true);
+    try {
+      const next = await api.antigravityStatus();
+      setStatus(next);
+      if (next.found && next.authed) set({ models: await api.models() });
+    }
+    catch (e) { flash(String(e)); }
+    finally { setBusy(false); }
+  };
+  useEffect(() => { void refreshStatus(); }, []);
+  return (
+    <div className="sgroup account-group">
+      <div className="srowx">
+        <ProviderIcon provider="antigravity" size={18} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 600 }}>Google Antigravity (agy)</div>
+          <div className="desc">{status === null ? "Checking CLI login…" : !status.found ? "agy is not installed or not on PATH" : status.authed ? `Signed in · ${status.models} models available` : "Not signed in — sign in with agy in a terminal"}</div>
+        </div>
+        <Button disabled={busy} onClick={() => void refreshStatus()}>{busy && <Loader size={13} />}Refresh status</Button>
+      </div>
+      {status?.error && <div style={{ padding: "0 10px 8px", fontSize: 11.5, color: "#ff8a8a" }}>{status.error}</div>}
+    </div>
   );
 }
 
@@ -570,9 +607,10 @@ export function AccountsTab() {
           </div>
         );
       })}
+      {shownProviders(providers).some((p) => p.id === "antigravity") && <AntigravityAccountCard />}
       {revealWarning && <Modal onClose={() => setRevealWarning(false)} style={{ width: "min(480px, 100%)" }}>
         <div className="mh"><CircleAlert size={16} /><span style={{ flex: 1 }}>Reveal account details?</span><IconButton label="Close" onClick={() => setRevealWarning(false)}>{I.close()}</IconButton></div>
-        <div className="mb">This will display account emails and partial OpenCode keys beside account names. Anyone viewing your screen, screenshots, or screen sharing will be able to see them. Full keys are never displayed. Emails are only available when recorded by the login.</div>
+        <div className="mb">This will display account emails and partial API keys beside account names. Anyone viewing your screen, screenshots, or screen sharing will be able to see them. Full keys are never displayed. Emails are only available when recorded by the login.</div>
         <div className="mf"><div style={{ flex: 1 }} /><Button variant="ghost" onClick={() => setRevealWarning(false)}>Cancel</Button><Button variant="primary" onClick={() => { setRevealWarning(false); setRevealed(true); }}>Reveal details</Button></div>
       </Modal>}
       {activeProvider && (dialog!.gate === "terms"
@@ -717,8 +755,8 @@ function AgentDialog({ init, onClose }: { init: AgentDef | null; onClose: () => 
   // This subagent may run on a model of its own, and a different model takes a
   // different set of levels: an empty pick means the chat's model decides.
   const effMi = modelInfo(d.model || get().home.model);
-  // `effortSteps` returns positions in 0..4, the same range `EFFORTS` indexes.
-  const effortOpts = effortSteps(effMi).map((value) => ({ value, label: effortLabel(effMi, value) ?? EFFORTS[value]! }));
+  // `effortLadder` returns the rungs in drawn order — Low first, Max last.
+  const effortOpts = effortLadder(effMi);
   const save = async () => {
     const s = get().settings!;
     const id = d.id || d.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");

@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { DragDropEvent } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { api, ASSISTS, Assist, clampEffort, countOptionalAgents, defaultX, DEFAULT_PERM, EFFORTS, effortLabel, effortSteps, FileRef, fmt$, fmtK, Item, normPath, Perm, PERMS, ResumeMode, TaskPatch, TaskSummary, UltraX, withRequiredAgents, xDepth, xOn } from "../api";
+import { api, ASSISTS, Assist, clampEffort, countOptionalAgents, defaultX, DEFAULT_PERM, EFFORTS, effortLadder, effortLabel, effortSteps, FileRef, fmt$, fmtK, Item, normPath, Perm, PERMS, ResumeMode, Settings, TaskPatch, TaskSummary, UltraX, withRequiredAgents, xDepth, xOn } from "../api";
 import { remoteApi } from "../remote";
 import { enterSendsMessage, messageSendKey } from "../keys";
 import { chatModel, defaultRoute, flash, get, go, isConnected, isPhoneClient, Menu, modelInfo, NEW_CHAT_ECHO, newerSummary, persistDraft, requestPause, savePrompt, saveSettings, set, settleNewChatEcho, shownProviders, type State, useStore, zoom } from "../store";
@@ -73,7 +73,11 @@ export interface Opts { plan: boolean; ultra: boolean; ultra_wt: boolean; ultra_
 
 export function currentTask() {
   const s = get();
-  return s.view !== "home" && s.task && s.tasks[s.task] ? s.tasks[s.task] : null;
+  // Only the session view is a chat. Settings is not, even though the last
+  // chat is still in `s.task`: the model picker is opened there by "Default
+  // for new tasks", and a pick made there has to change that default, not
+  // retarget a chat the user is not looking at.
+  return s.view === "session" && s.task && s.tasks[s.task] ? s.tasks[s.task] : null;
 }
 
 export function currentOpts(): Opts {
@@ -118,9 +122,25 @@ export async function setOpts(patch: TaskPatch): Promise<OptsResult> {
     set((st) => ({ tasks: { ...st.tasks, [next.id]: next } }));
     return { ok: true, task: next };
   }
-  // New-chat permission choices are defaults, not just a transient toggle:
-  // boot restores them from settings. Leave the UI unchanged if saving fails.
-  if (patch.perm !== undefined && !await saveSettings({ perm: patch.perm })) {
+  // New-chat choices are defaults, not just a transient toggle: boot restores
+  // them from settings. Leave the UI unchanged if saving fails.
+  //
+  // The model is in that set for the same reason `perm` is: the new-task screen
+  // has to come up on the model the user last worked with, rather than on
+  // whatever the build shipped as a default. The pick used to live only in the
+  // store, so it was gone on the next launch and the user had to choose a model
+  // again for every new task.
+  //
+  // The effort is deliberately not in this set. It is a slider, so this is one
+  // write per arrow key: two quick presses would race each other's answers and
+  // the slower one would win, leaving the level the user can see disagreeing
+  // with the one on disk. The backend records the effort of the task that
+  // actually ran instead (see `remember_task_creation`), so the level that
+  // mattered is still the one that comes back.
+  const persisted: Partial<Settings> = {};
+  if (patch.perm !== undefined) persisted.perm = patch.perm;
+  if (patch.model !== undefined) persisted.model = patch.model;
+  if (Object.keys(persisted).length && !await saveSettings(persisted)) {
     return { ok: false, task: null };
   }
   const { now: _n, apply_pending: _a, ...rest } = patch;
@@ -257,7 +277,7 @@ function localSlash(text: string, mode: "home" | "session"): boolean {
     case "/mcp": go("settings", { settingsTab: "mcp" }); return true;
     case "/clear": case "/new": go("home"); return true;
     case "/review": if (task) go("diff"); return true;
-    case "/stop": if (task) api.interrupt(task.id).catch((e) => flash(String(e))); return true;
+    case "/stop": if (task) api.stop(task.id).catch((e) => flash(String(e))); return true;
     case "/models": set({ swap: true }); return true;
     case "/cost":
       if (task) flash(`${fmt$(task.usage.cost)} · ${fmtK(task.usage.input + task.usage.output + task.usage.cache_read)} tokens · context ${fmtK(task.usage.last_context)}/${fmtK(task.context_window)}`);
@@ -279,7 +299,8 @@ function localSlash(text: string, mode: "home" | "session"): boolean {
       const name = (s: number) => effortLabel(mi, s) ?? EFFORTS[s]!;
       const i = steps.find((s) => name(s).toLowerCase() === r) ?? EFFORT_ALIASES[r];
       if (i === undefined || !steps.includes(i)) {
-        flash(steps.length ? `Effort for ${mi.name}: ${steps.map(name).join(", ")}` : `${mi.name} has no effort control`);
+        // Listed the way the pickers draw them: Low first, Max last.
+        flash(steps.length ? `Effort for ${mi.name}: ${effortLadder(mi).map((o) => o.label).join(", ")}` : `${mi.name} has no effort control`);
         return true;
       }
       void setOpts({ effort: clampEffort(steps, i) }); return true;
@@ -357,9 +378,19 @@ export function overComposer(e: { payload: DragDropEvent }) {
   return x >= el.left && x <= el.right && y >= el.top && y <= el.bottom;
 }
 
+/** The picture formats a model can actually see, as image blocks.
+ *
+ *  `image/svg+xml` is an image to a browser and not to a provider: an SVG sent as
+ *  an image block is refused by the API (or arrives as something the model cannot
+ *  look at), so an SVG is handled as the file it is — the agent opens it and reads
+ *  the markup. Everywhere a picture can arrive (paste, drop, the message editor)
+ *  the same four types count, so nothing takes one route on a drop and another on
+ *  a paste. */
+export const isModelImage = (type: string) => /^image\/(png|jpeg|gif|webp)$/i.test(type);
+
 /** Read image files (paste or drop) into the pending attachments for this composer. */
 export function addImages(key: string, files: File[]) {
-  const imgs = files.filter((f) => f.type.startsWith("image/"));
+  const imgs = files.filter((f) => isModelImage(f.type));
   for (const f of imgs) {
     if (f.size > MAX_IMAGE) { flash(`${f.name || "Image"} is over 5 MB`); continue; }
     const r = new FileReader();
@@ -372,6 +403,72 @@ export function addImages(key: string, files: File[]) {
     r.readAsDataURL(f);
   }
   return imgs.length > 0;
+}
+
+/** The name a pasted file is staged under.
+ *
+ *  A clipboard `File` can have no name — copying an image out of a drawing app
+ *  often gives an empty one — and an attachment is a path the agent opens by
+ *  name. The type is then the only clue to the extension, and without it the
+ *  staged SVG would be a nameless file the agent has to guess at. A real name
+ *  is kept as it is unless it has no extension at all. */
+function pastedFileName(file: File): string {
+  const media = file.type.split(";")[0]!.trim().toLowerCase();
+  const known: Record<string, string> = {
+    "image/svg+xml": "svg", "image/bmp": "bmp", "image/x-ms-bmp": "bmp", "image/avif": "avif",
+    "image/tiff": "tiff", "image/heic": "heic", "image/heif": "heif", "application/pdf": "pdf",
+  };
+  const ext = known[media] ?? (media.startsWith("image/") ? media.slice(6).replace(/[^a-z0-9].*$/, "") : "");
+  const name = file.name.trim();
+  if (!name) return ext ? `pasted.${ext}` : "pasted-file";
+  const current = /\.([a-z0-9]+)$/i.exec(name)?.[1]?.toLowerCase();
+  if (!ext || current === ext) return name;
+  // The clipboard's name and its type disagree. The type is what the source
+  // app said the bytes are, and a `.png` holding SVG sends the agent to
+  // `view_image`, so the extension follows the type.
+  return current ? `${name.slice(0, -(current.length + 1))}.${ext}` : `${name}.${ext}`;
+}
+
+/** Stage one pasted file into OpenLeash's attachment folder and describe it as a
+ *  file attachment, or explain why not.
+ *
+ *  A paste hands over a browser `File`, which deliberately has no path, and an
+ *  attachment *is* a path the agent opens with its own tools. The bytes therefore
+ *  go through the same staging command a phone's upload uses, which returns a
+ *  real path. That is what makes a pasted SVG end up exactly like the same file
+ *  dragged in: one file chip, one staged path in the message's attachment note,
+ *  and no image block anywhere.
+ *
+ *  `image` is forced off rather than taken from the backend's extension guess:
+ *  this route is only for what the model cannot see, and a file the UI believed
+ *  was inlined would be dropped from the paths at submit and never sent at all. */
+export async function stagePastedFile(key: string, file: File): Promise<FileRef | null> {
+  if (file.size > MAX_FILE_BYTES) { flash(`${file.name || "That file"} is over 64 MB`); return null; }
+  // The new-task composer has no chat yet, so its bytes stage under the selected
+  // project folder — the same scoping the phone's upload and the file dialog use.
+  const id = key === "new-chat" ? (get().settings?.project ?? "") : key;
+  if (!id) { flash("Pick a project folder before attaching files"); return null; }
+  try {
+    const ref = await api.stageBytes(id, pastedFileName(file), await file.arrayBuffer());
+    return { path: ref.path, name: ref.name, size: ref.size, isDir: false, image: false };
+  } catch (e) {
+    flash(String(e));
+    return null;
+  }
+}
+
+/** Attach pasted files that are not pictures the model can see — an SVG, a PDF.
+ *  Dragging the same file in takes this route already; this is the paste doing
+ *  the same thing rather than inlining it as an image block. */
+export async function addPastedFiles(key: string, files: File[]) {
+  for (const file of files) {
+    if ((get().attachFiles[key] ?? []).length >= MAX_FILES) { flash(`Only ${MAX_FILES} files at a time`); break; }
+    const ref = await stagePastedFile(key, file);
+    if (!ref) continue;
+    // Another paste or a drop may have landed during the staging round trip.
+    if ((get().attachFiles[key] ?? []).length >= MAX_FILES) { flash(`Only ${MAX_FILES} files at a time`); break; }
+    set((s) => ({ attachFiles: { ...s.attachFiles, [key]: [...(s.attachFiles[key] ?? []), ref] } }));
+  }
 }
 
 export async function addRemoteFiles(key: string, files: File[]) {
@@ -532,6 +629,10 @@ export async function submit(mode: "home" | "session", later = false, stayOnHome
         ...imageNames.map((name) => ({ path: "", name, size: 0 })),
         ...files.filter((f) => !f.image).map((f) => ({ path: f.path, name: f.name, size: f.size })),
       ],
+      // How many of those are pictures, as the backend records it. Without it
+      // the bubble has to guess from the blobs, and a message whose blobs the
+      // transcript has since dropped would show its picture as a file chip.
+      image_attachments: images.length,
     }
     : {};
   if (text.startsWith("/") && localSlash(text, mode)) return clear();
@@ -851,7 +952,22 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
         </div>
       )}
       <TextArea ref={ref} className={dropAt ? "dropping" : ""} value={draft} onChange={(e) => onDraft(e.currentTarget.value)} onKeyDown={onKey} placeholder={ph} rows={mode === "home" ? 3 : 2}
-        onPaste={(e) => { const pasted = Array.from(e.clipboardData.files); if (addImages(akey, pasted)) e.preventDefault(); else if (isPhoneClient() && pasted.length) { e.preventDefault(); void addRemoteFiles(akey, pasted); } }} />
+        onPaste={(e) => {
+          const pasted = Array.from(e.clipboardData.files);
+          if (!pasted.length) return;
+          // A picture the model can see goes in as an image block; anything else
+          // the clipboard holds as a file — an SVG, a PDF — goes in as a file,
+          // which is what dragging the same file in already does. Either way the
+          // clipboard's own paste is suppressed, so the file never also lands in
+          // the draft.
+          e.preventDefault();
+          const pictures = pasted.filter((f) => isModelImage(f.type));
+          const others = pasted.filter((f) => !isModelImage(f.type));
+          if (pictures.length) addImages(akey, pictures);
+          // A phone's UI runs in a browser on another device, so its bytes have to
+          // travel to the host before they can have a path.
+          if (others.length) { if (isPhoneClient()) void addRemoteFiles(akey, others); else void addPastedFiles(akey, others); }
+        }} />
       <div className={"bar" + (studioOpen || (mode === "home" && home.artificts) ? " artbar" : "")}>
         <div className="bl">
           {/* Beside an open studio the bar is pared down to what a message to
@@ -933,7 +1049,7 @@ export function Composer({ mode }: { mode: "home" | "session" }) {
           ) : running && !has ? (
             <>
               <RoundButton label="Pause · Esc · lets the current command finish, then freezes. Resume carries on as if nothing happened." className="pausebtn" onClick={() => task && requestPause(task.id)?.catch((e) => flash(String(e)))}>{I.pause(10)}</RoundButton>
-              <RoundButton label="Stop · Esc Esc · cancels everything in flight, including background commands (dev servers, watchers). The agent is told what got cut off." className="stop" onClick={() => task && api.interrupt(task.id).catch((e) => flash(String(e)))}>{I.close(12)}</RoundButton>
+              <RoundButton label="Stop · Esc Esc · freezes the chat and every subagent where they are, killing the commands they were running (dev servers, watchers). Each agent is told what it lost, and Resume carries on from there." className="stop" onClick={() => task && api.stop(task.id).catch((e) => flash(String(e)))}>{I.close(12)}</RoundButton>
             </>
           ) : (
             // The tooltip names the sending key only when a key does send: on a

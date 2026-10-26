@@ -1,7 +1,7 @@
 // Settings: Models - providers (built-in + custom), their models, and the
 // add/edit model dialog with smart configuration.
 import { useEffect, useMemo, useState } from "react";
-import { api, EFFORTS, effortLabel, effortLevel, effortSteps, fmtK, ModelInfo, ProviderView, RemoteModel } from "../api";
+import { api, AntigravityStatus, effortLadder, effortLabel, effortLevel, fmtK, ModelInfo, ProviderView, RemoteModel } from "../api";
 import { flash, get, isConnected, modelInfo, saveSettings, set, shownProviders, useStore } from "../store";
 import { openMenu } from "./Composer";
 import { I } from "./icons";
@@ -318,7 +318,7 @@ function ModelDialog({ prov, edit, onClose }: { prov: ProviderView; edit: ModelI
                   // and the wire agree by construction instead of by a copy that
                   // can drift. The guard above proves the model has levels, so it
                   // never returns null here.
-                  <div style={{ fontSize: 11, color: "var(--dim)" }}>Slider maps: {effortSteps(m).map((e) => `${effortLabel(m, e) ?? EFFORTS[e]} = ${effortLevel(m, e)}`).join(" · ")}</div>
+                  <div style={{ fontSize: 11, color: "var(--dim)" }}>Slider maps: {effortLadder(m).map((o) => `${o.label} = ${effortLevel(m, o.value)}`).join(" · ")}</div>
                 )}
               </div>
               <div className="field">
@@ -421,6 +421,57 @@ function ProviderDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+/** The Antigravity card: install state, model refresh, and the honest caveat.
+ *
+ *  There is no key field because there is no key — the CLI holds the login and
+ *  OpenLeash never reads it. What the user does need to read here is the
+ *  consequence: turns are delegated to `agy`'s own agent loop with its own
+ *  tools, so this app's approvals, plan mode and checkpoints do not apply
+ *  inside them. */
+function CliProviderPanel({ p }: { p: ProviderView }) {
+  const [st, setSt] = useState<AntigravityStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const check = async (refresh: boolean) => {
+    setBusy(true);
+    try {
+      const s = await api.antigravityStatus();
+      setSt(s);
+      if (refresh) set({ models: await api.models() });
+      if (s.error) flash(s.error);
+      else if (refresh) flash(s.models ? `${s.models} models from agy ${s.version}` : "No models reported");
+    } catch (e) {
+      flash(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => { void check(false); }, []);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--mut)" }}>
+        <span style={{ flex: 1 }}>
+          {st === null ? "Checking for the Antigravity CLI…" : !st.found ? (
+            <span style={{ color: "#ff8a8a" }}>agy is not installed or not on PATH</span>
+          ) : (
+            <><span className="mono" style={{ fontSize: 11 }}>agy {st.version || "?"}</span>{st.authed ? ` · signed in · ${st.models} models` : " · not signed in yet"}</>
+          )}
+        </span>
+        <Button disabled={busy} onClick={() => void check(true)}>{busy && <Loader size={13} />}Refresh models</Button>
+      </div>
+      {st?.path && <div className="mono" style={{ fontSize: 10.5, color: "var(--dim)", overflowWrap: "anywhere" }}>{st.path}</div>}
+      {st?.error && <div style={{ fontSize: 11.5, color: "#ff8a8a" }}>{st.error}</div>}
+      <div style={{ fontSize: 11.5, color: "var(--mut3)", lineHeight: 1.5 }}>
+        Turns on {p.name} are delegated to <span className="mono">agy</span>, which runs its own tools with full access.
+        OpenLeash's approvals, plan mode, read-before-write and checkpoints do not apply inside them. OpenLeash never reads or
+        stores the CLI's sign-in — the login is Google's, kept by the CLI.
+      </div>
+      <div style={{ fontSize: 11, color: "var(--mut3)" }}>
+        agy's own permission rules live in <span className="mono">{st?.settings_path || "~/.gemini/antigravity-cli/settings.json"}</span>. OpenLeash leaves that file alone.
+      </div>
+    </div>
+  );
+}
+
 function ProviderCard({ p, onAddModel, onEdit, i }: { p: ProviderView; onAddModel: () => void; onEdit: (m: ModelInfo) => void; i: number }) {
   const models = useStore((s) => s.models);
   const accts = useStore((s) => s.accounts);
@@ -483,7 +534,7 @@ function ProviderCard({ p, onAddModel, onEdit, i }: { p: ProviderView; onAddMode
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}>{p.name}{p.custom && <span className="branchtag" style={{ height: 17, fontSize: 10 }}>custom</span>}{p.insist && <span className="branchtag" style={{ height: 17, fontSize: 10, color: "#fbbf24" }}>insist</span>}</div>
           <div className="desc" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {list.length} model{list.length === 1 ? "" : "s"} · {pool ? `${nAcct} account${nAcct === 1 ? "" : "s"}` : p.has_key ? (p.local ? "local" : p.key_pool ? (p.key_hints?.length ? `${p.key_hints.length} key${p.key_hints.length === 1 ? "" : "s"}` : "no keys") : p.key_hint ? `key ${p.key_hint}` : p.custom ? "no key" : "key set") : <span style={{ color: "#ff8a8a" }}>no key{p.env ? ` · or set ${p.env}` : ""}</span>}
+            {list.length} model{list.length === 1 ? "" : "s"} · {pool ? `${nAcct} account${nAcct === 1 ? "" : "s"}` : p.kind === "cli" ? "external CLI · own tools · full access" : p.has_key ? (p.local ? "local" : p.key_pool ? (p.key_hints?.length ? `${p.key_hints.length} key${p.key_hints.length === 1 ? "" : "s"}` : "no keys") : p.key_hint ? `key ${p.key_hint}` : p.custom ? "no key" : "key set") : <span style={{ color: "#ff8a8a" }}>no key{p.env ? ` · or set ${p.env}` : ""}</span>}
           </div>
         </div>
         <Switch label={`${p.enabled ? "Disable" : "Enable"} ${p.name}`} checked={p.enabled} onChange={async (enabled, e) => { e.stopPropagation(); set({ providers: await api.provider(p.id, { enabled }) }); }} />
@@ -493,6 +544,8 @@ function ProviderCard({ p, onAddModel, onEdit, i }: { p: ProviderView; onAddMode
         <div style={{ borderTop: "1px solid rgba(255,255,255,0.05)", padding: "10px 14px 12px", display: "flex", flexDirection: "column", gap: 10, animation: "olFade .25s ease both" }}>
           {pool ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--mut)" }}>Requests rotate across your {p.name} accounts by priority.<div style={{ flex: 1 }} /><Button onClick={() => set({ settingsTab: "accounts" })}>Manage accounts</Button></div>
+          ) : p.kind === "cli" ? (
+            <CliProviderPanel p={p} />
           ) : !p.local && p.key_pool ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {(p.key_hints ?? []).map((hint, idx) => (

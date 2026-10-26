@@ -72,6 +72,7 @@ async fn burner_request_never_attempts_the_next_account() {
         effort: 2,
         max_tokens: 32,
         cache_key: "test".into(),
+        cwd: String::new(),
     };
     let _ = router::request(&h, who, "codex/gpt-5", &req, &mut |_| {}, &cancel).await;
     let requests = mock.reqs();

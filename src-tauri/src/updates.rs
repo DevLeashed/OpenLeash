@@ -1,6 +1,7 @@
 //! App updates are separate from agent tools: no URL, key, installer arguments or
 //! executable path can be supplied by the webview. Only explicit install applies
 //! a package. Release text is never interpreted as code or shell arguments.
+use crate::agent::store::Settings;
 use crate::agent::Harness;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,45 @@ use tokio::sync::{Mutex, RwLock};
 const RELEASE_API: &str = "https://api.github.com/repos/DevLeashed/OpenLeash/releases/latest";
 const RELEASE_PAGE: &str = "https://github.com/DevLeashed/OpenLeash/releases/latest";
 const EVENT: &str = "ol://app-update";
+
+/// How often the background pass wakes up.
+///
+/// The pass only reaches the network when the settings allow it, so this is
+/// how quickly a settings change takes effect rather than how often GitHub is
+/// contacted. A check itself runs at most once per [`CHECK_INTERVAL`].
+const POLICY_POLL: Duration = Duration::from_secs(30);
+/// How often a background check may contact GitHub.
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// What the settings allow the app to do on its own.
+///
+/// Downloading implies checking: the app cannot fetch a release it never
+/// looked for, and `settings.json` can be hand-edited into a state that asks
+/// for one without the other. So `check` is true when either switch is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoPolicy {
+    /// Look for a newer release without being asked.
+    pub check: bool,
+    /// Download a newer release in the background once one is found.
+    pub download: bool,
+    /// Install the downloaded release by itself once nothing is running.
+    ///
+    /// This is the one switch that closes the app without the user clicking
+    /// anything, so it is gated on `has_active_work`: a chat mid-turn, a
+    /// subagent or a background command all keep the update waiting until the
+    /// app is genuinely idle.
+    pub install: bool,
+}
+
+impl AutoPolicy {
+    pub fn from_settings(s: &Settings) -> Self {
+        Self {
+            check: s.auto_check_updates || s.auto_update,
+            download: s.auto_update,
+            install: s.auto_update,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UpdateStatus {
@@ -33,6 +73,9 @@ pub struct Updates {
     // Status has its own lock so observers can see progress during network I/O.
     status: RwLock<UpdateStatus>,
     operation: Mutex<Pending>,
+    /// Wakes the background pass when the update settings change, so turning
+    /// the automatic check on takes effect now rather than at the next poll.
+    policy: Arc<tokio::sync::Notify>,
 }
 
 impl Default for Updates {
@@ -45,6 +88,7 @@ impl Default for Updates {
                 can_install: installation_capable(),
             }),
             operation: Mutex::new(Pending::default()),
+            policy: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -71,7 +115,7 @@ impl Updates {
         error
     }
 
-    async fn check(&self, app: &AppHandle) -> Result<UpdateStatus, String> {
+    async fn check(&self, app: &AppHandle, auto_download: bool) -> Result<UpdateStatus, String> {
         let mut pending = self
             .operation
             .try_lock()
@@ -81,7 +125,7 @@ impl Updates {
         }
         pending.update = None;
         self.transition(app, "checking").await;
-        match self.check_inner(app, &mut pending).await {
+        match self.check_inner(app, &mut pending, auto_download).await {
             Ok(view) => Ok(self.publish(app, view).await),
             Err(error) => Err(self.fail(app, error).await),
         }
@@ -91,6 +135,7 @@ impl Updates {
         &self,
         app: &AppHandle,
         pending: &mut Pending,
+        auto_download: bool,
     ) -> Result<UpdateStatus, String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -164,12 +209,16 @@ impl Updates {
         }
         let previous = self.status.read().await.version.clone();
         if previous.as_deref() != view.version.as_deref() {
+            // Say what is actually about to happen. A check that is not
+            // followed by a download must not claim one is coming.
             notify(
                 app,
-                if view.can_install {
+                if !view.can_install {
+                    "A new OpenLeash release is available. Download it from GitHub Releases."
+                } else if auto_download {
                     "A new OpenLeash release is available. Downloading in the background."
                 } else {
-                    "A new OpenLeash release is available. Download it from GitHub Releases."
+                    "A new OpenLeash release is available. Download it in Settings to install."
                 },
             );
         }
@@ -214,6 +263,47 @@ impl Updates {
             }
         }
     }
+
+    /// One click: find the release if it has not been found, fetch it if it has
+    /// not been fetched, then apply it and restart.
+    ///
+    /// The install is the one step that closes the app, so it obeys the same
+    /// rule as every other path (see [`ready_to_apply`]). When work is active
+    /// the download is still kept, and the ordinary "Restart to update" button
+    /// finishes the job once the user is ready, so one click can never cut a
+    /// running turn short.
+    async fn update_now(&self, app: &AppHandle, h: &Arc<Harness>) -> Result<UpdateStatus, String> {
+        let status = self.status.read().await.clone();
+        // From `idle`, `current` or a stale error the click is also the check:
+        // the user asked for the update, not for a report about one.
+        let status = if matches!(status.status, "available" | "ready") {
+            status
+        } else {
+            self.check(app, false).await?
+        };
+        // Only an installable release has a package to fetch; a build that
+        // cannot install itself stops here and shows the manual link instead.
+        let status = if status.status == "available" && status.can_install {
+            self.download(app).await?
+        } else {
+            status
+        };
+        if !ready_to_apply(&status, has_active_work(h).await) {
+            return Ok(status);
+        }
+        self.install_now(app, h).await?;
+        Ok(status)
+    }
+}
+
+/// Whether a downloaded release may be applied right now.
+///
+/// The button, the background pass and the one-click update all ask this, so
+/// they cannot disagree about when the app may close itself: only a downloaded,
+/// installable release and no running work — no chat mid-turn, no subagent, no
+/// background command.
+fn ready_to_apply(status: &UpdateStatus, active_work: bool) -> bool {
+    status.can_install && status.status == "ready" && !active_work
 }
 
 /// Fetch the release asset the manifest points at.
@@ -399,14 +489,12 @@ pub async fn app_update_check(
     app: AppHandle,
     updates: State<'_, Updates>,
 ) -> Result<UpdateStatus, String> {
-    let view = updates.check(&app).await?;
-    if view.status == "available" && view.can_install {
-        let owned = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = owned.state::<Updates>().download(&owned).await;
-        });
-    }
-    Ok(view)
+    // A manual check only *finds* the release. It does not start a download:
+    // fetching a package is the step that puts bytes on the machine, and the
+    // user asked to be told about a new version, not to have it fetched for
+    // them. The download is a separate button, and the automatic download only
+    // happens on the background pass with `auto_update` on.
+    updates.check(&app, false).await
 }
 
 #[tauri::command]
@@ -423,69 +511,266 @@ pub async fn app_update_install(
     updates: State<'_, Updates>,
     h: State<'_, Arc<Harness>>,
 ) -> Result<(), String> {
-    let pending = updates
-        .operation
-        .try_lock()
-        .map_err(|_| "An update operation is already in progress".to_string())?;
-    if !installation_capable() {
-        return Err("This installation requires a manual update from GitHub Releases".into());
-    }
-    let update = pending
-        .update
-        .as_ref()
-        .ok_or("No installable update is available")?;
-    let bytes = pending
-        .bytes
-        .as_ref()
-        .ok_or("Download the update before installing")?;
-    if has_active_work(&h).await {
-        return Err(
-            "Stop all active tasks, subagents and background commands before installing an update"
-                .into(),
-        );
-    }
-    // Flush durable state first. On Windows plugin install launches the signed
-    // installer and exits the process directly; the installer relaunches the app.
-    // macOS/AppImage replace the bundle then need an explicit restart below.
-    let ids: Vec<String> = h.tasks.read().await.keys().cloned().collect();
-    for id in ids {
-        h.save_task_now(&id).await;
-    }
-    h.save_settings_now().await;
-    h.stats.flush();
-    if has_active_work(&h).await {
-        return Err("Work started while preparing the update; stop it before installing".into());
-    }
-    if let Err(error) = update.install(bytes) {
-        let mut view = updates.status.read().await.clone();
-        view.status = "ready";
-        view.error = Some(error.to_string());
-        view.can_install = true;
-        updates.publish(&app, view).await;
-        return Err(error.to_string());
-    }
-    app.restart();
+    updates.install_now(&app, &h).await
 }
 
-pub fn start(app: AppHandle) {
+/// The single click: find, fetch and apply a release.
+///
+/// The frontend has no way to make the app install something it did not ask
+/// for: this command takes no arguments, and every step it chains is the same
+/// one the individual buttons call.
+#[tauri::command]
+pub async fn app_update_now(
+    app: AppHandle,
+    updates: State<'_, Updates>,
+    h: State<'_, Arc<Harness>>,
+) -> Result<UpdateStatus, String> {
+    updates.update_now(&app, &h).await
+}
+
+impl Updates {
+    /// Install the downloaded release and restart. Shared by the button and the
+    /// automatic path, so "Restart to update" and an unattended update cannot
+    /// disagree about what they check before closing the app.
+    pub async fn install_now(&self, app: &AppHandle, h: &Arc<Harness>) -> Result<(), String> {
+        let pending = self
+            .operation
+            .try_lock()
+            .map_err(|_| "An update operation is already in progress".to_string())?;
+        if !installation_capable() {
+            return Err("This installation requires a manual update from GitHub Releases".into());
+        }
+        let update = pending
+            .update
+            .as_ref()
+            .ok_or("No installable update is available")?;
+        let bytes = pending
+            .bytes
+            .as_ref()
+            .ok_or("Download the update before installing")?;
+        if has_active_work(h).await {
+            return Err(
+                "Stop all active tasks, subagents and background commands before installing an update"
+                    .into(),
+            );
+        }
+        // Flush durable state first. On Windows plugin install launches the signed
+        // installer and exits the process directly; the installer relaunches the app.
+        // macOS/AppImage replace the bundle then need an explicit restart below.
+        let ids: Vec<String> = h.tasks.read().await.keys().cloned().collect();
+        for id in ids {
+            h.save_task_now(&id).await;
+        }
+        h.save_settings_now().await;
+        h.stats.flush();
+        if has_active_work(h).await {
+            return Err(
+                "Work started while preparing the update; stop it before installing".into(),
+            );
+        }
+        if let Err(error) = update.install(bytes) {
+            let mut view = self.status.read().await.clone();
+            view.status = "ready";
+            view.error = Some(error.to_string());
+            view.can_install = true;
+            self.publish(app, view).await;
+            return Err(error.to_string());
+        }
+        app.restart();
+        #[allow(unreachable_code)]
+        Ok(())
+    }
+}
+
+/// The background update pass.
+///
+/// It only reaches the network when the settings allow it: with both
+/// `auto_check_updates` and `auto_update` off — the default — this sleeps
+/// forever without asking GitHub anything, and the only way a release is
+/// found is the user pressing "Check for updates".
+///
+/// With `auto_update` on it goes all the way: find, download, and install once
+/// the app is idle (`has_active_work`), which restarts it. One attempt per
+/// version, so a failing installer reports once instead of notifying every
+/// thirty seconds.
+pub fn start(app: AppHandle, h: Arc<Harness>) {
     tauri::async_runtime::spawn(async move {
         // Let the webview and notification identity finish initialization first.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        loop {
+        let mut last_check: Option<tokio::time::Instant> = None;
+        // The version an unattended install was already attempted for.
+        let mut installed: Option<String> = None;
+        // Held outside the loop: `app.state` borrows the handle, and a
+        // temporary inside the `select!` would be dropped while still borrowed.
+        let policy_changed = {
             let updates = app.state::<Updates>();
-            if let Ok(view) = updates.check(&app).await {
+            updates.policy.clone()
+        };
+        loop {
+            let settings = h.settings.read().await;
+            let policy = AutoPolicy::from_settings(&settings);
+            drop(settings);
+            if policy.check {
+                let due = last_check.is_none_or(|t| t.elapsed() >= CHECK_INTERVAL);
+                if due {
+                    last_check = Some(tokio::time::Instant::now());
+                    let updates = app.state::<Updates>();
+                    let _ = updates.check(&app, policy.download).await;
+                }
+            }
+            // The download is its own step, not a part of the check: a release
+            // may have been found by a check that ran before the download
+            // switch was turned on, and the user asking for the download means
+            // it should not wait for the next check hours later.
+            if policy.download {
+                let updates = app.state::<Updates>();
+                let view = updates.status.read().await.clone();
                 if view.status == "available" && view.can_install {
                     let _ = updates.download(&app).await;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+            // The install is its own step too, and the one that closes the app
+            // without a click: it waits for the app to be genuinely idle. A chat
+            // mid-turn, a subagent, a dev server, a foreground command — any of
+            // them keeps the update pending, and the first pass after they
+            // finish takes it. `installed` is what stops a failing installer
+            // from notifying every thirty seconds.
+            if policy.install {
+                let updates = app.state::<Updates>();
+                let view = updates.status.read().await.clone();
+                let version = view.version.clone().unwrap_or_default();
+                if view.status == "ready"
+                    && view.can_install
+                    && !version.is_empty()
+                    && installed.as_deref() != Some(version.as_str())
+                    && !has_active_work(&h).await
+                {
+                    installed = Some(version.clone());
+                    notify(
+                        &app,
+                        &format!("Installing OpenLeash v{version} and restarting."),
+                    );
+                    let _ = updates.install_now(&app, &h).await;
+                }
+            }
+            // Wait on the notify as well as the poll: turning the switches on
+            // in Settings should take effect now, not at the next tick. The
+            // notify is the one that wakes it early; the poll is the backstop
+            // that keeps it alive.
+            tokio::select! {
+                _ = tokio::time::sleep(POLICY_POLL) => {}
+                _ = policy_changed.notified() => {}
+            }
         }
     });
+}
+
+/// Wake the background pass after the update settings changed.
+///
+/// Called when `settings_update` writes the file, so a switch the user just
+/// flipped is in force without waiting for the next poll.
+pub fn notify_policy(app: &AppHandle) {
+    if let Some(updates) = app.try_state::<Updates>() {
+        updates.policy.notify_waiters();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_updates_are_off_until_the_user_asks_for_them() {
+        // The default is the point: neither a background check nor a
+        // background download happens until the user turns one on.
+        let s = Settings::default();
+        assert!(!s.auto_check_updates);
+        assert!(!s.auto_update);
+        let policy = AutoPolicy::from_settings(&s);
+        assert!(
+            !policy.check,
+            "a fresh install must not contact GitHub on its own"
+        );
+        assert!(
+            !policy.download,
+            "a fresh install must not download anything"
+        );
+        assert!(
+            !policy.install,
+            "a fresh install must never restart itself"
+        );
+    }
+
+    #[test]
+    fn the_download_switch_implies_the_check() {
+        // `settings.json` can be hand-edited, so the two switches can be set
+        // in any combination. Downloading needs a release to have been found,
+        // so asking for a download without asking for a check still checks.
+        let s = Settings {
+            auto_update: true,
+            ..Default::default()
+        };
+        let policy = AutoPolicy::from_settings(&s);
+        assert!(policy.check);
+        assert!(policy.download);
+        assert!(policy.install, "the automatic update goes all the way");
+
+        let s = Settings {
+            auto_check_updates: true,
+            ..Default::default()
+        };
+        let policy = AutoPolicy::from_settings(&s);
+        assert!(policy.check);
+        assert!(
+            !policy.download,
+            "checking alone must not start fetching a package"
+        );
+        assert!(
+            !policy.install,
+            "checking alone must never close the app"
+        );
+    }
+
+    #[test]
+    fn one_click_never_applies_an_update_under_running_work() {
+        // The one-click button chains a download into an install. The install
+        // is still refused while a chat, subagent or command is running, so a
+        // click can never cut a turn short.
+        let ready = UpdateStatus {
+            status: "ready",
+            version: Some("2.0.0".into()),
+            error: None,
+            can_install: true,
+        };
+        assert!(ready_to_apply(&ready, false));
+        assert!(!ready_to_apply(&ready, true));
+        for status in [
+            "idle",
+            "checking",
+            "available",
+            "downloading",
+            "current",
+            "error",
+        ] {
+            assert!(
+                !ready_to_apply(
+                    &UpdateStatus {
+                        status,
+                        ..ready.clone()
+                    },
+                    false
+                ),
+                "{status}"
+            );
+        }
+        assert!(!ready_to_apply(
+            &UpdateStatus {
+                can_install: false,
+                ..ready.clone()
+            },
+            false
+        ));
+    }
 
     #[test]
     fn only_newer_stable_versions_are_offered() {

@@ -894,7 +894,6 @@ th[aria-sort="ascending"] .rt-arrow, th[aria-sort="descending"] .rt-arrow { opac
 .agent-notice.warning .agent-notice-head > svg { color: #fbbf24; }
 .agent-notice-heading { flex: 1; min-width: 0; }
 .agent-notice-title { font-size: 12.5px; font-weight: 600; color: var(--fg2); overflow-wrap: anywhere; }
-.agent-notice-hint { font-size: 11px; line-height: 1.4; color: var(--mut2); margin-top: 3px; }
 .agent-notice-head > button { flex: none; font-size: 11px; }
 .agent-notice-message { margin-top: 8px; font-size: 12.5px; line-height: 1.5; color: var(--fg2); white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-notice-chat { margin-top: 8px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
@@ -1160,6 +1159,13 @@ th[aria-sort="ascending"] .rt-arrow, th[aria-sort="descending"] .rt-arrow { opac
 /* A chat that could not be opened. Replaces the whole transcript, so it is a
    centred full-view state rather than the inline `.empty` row above. */
 .chat-open-failed { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 48px 24px; text-align: center; color: var(--hint); }
+/* A view whose render threw, standing in for it. Deliberately plain: the message
+   is a bug report, and the buttons are the whole recovery path. */
+.viewcrash { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 48px 24px; text-align: center; color: var(--hint); }
+.viewcrash-title { color: var(--fg); font-weight: 600; font-size: 13px; }
+.viewcrash-note { max-width: 460px; line-height: 1.5; }
+.viewcrash-msg { max-width: min(640px, 100%); margin: 0; padding: 8px 10px; border-radius: 8px; background: var(--ov-55); color: var(--fg2); font-family: var(--mono); font-size: 11.5px; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.viewcrash-actions { display: flex; gap: 8px; margin-top: 4px; }
 
 /* in-app attention notices: the focused-window counterpart to the OS toast */
 /* Sits below the 40px titlebar, which owns the window controls in that corner. */
@@ -1734,10 +1740,14 @@ th[aria-sort="ascending"] .rt-arrow, th[aria-sort="descending"] .rt-arrow { opac
 .send.cont:hover { background: var(--red); color: #161618; transform: scale(1.08); }
 
 /* subagent direct messages / background */
-.subinput { display: flex; align-items: flex-end; gap: 6px; margin: 0 10px 10px; padding: 6px 6px 6px 10px; border-radius: 12px; background: var(--ov-35); border: 1px solid var(--ov-70); transition: border-color .25s, box-shadow .3s; }
+.subinput { display: flex; align-items: flex-end; gap: 6px; margin: 0 10px 10px; padding: 6px 6px 6px 10px; border-radius: 12px; background: var(--ov-35); border: 1px solid var(--ov-70); transition: border-color .25s, box-shadow .3s; flex-wrap: wrap; }
 .subinput:focus-within { border-color: rgba(var(--accent-rgb), 0.45); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.1); }
 .subinput textarea { flex: 1; min-width: 0; resize: none; border: 0; outline: 0; background: transparent; color: var(--fg); font: inherit; font-size: 12.5px; line-height: 1.45; padding: 4px 0; max-height: 120px; }
 .subinput .send { width: 24px; height: 24px; }
+/* The pictures queued for the subagent sit on their own line above the box, so
+   they do not squeeze the text field. The composer's own row is padded for a
+   wider bar, so the padding is reset here. */
+.subinput .attachrow { order: -1; flex-basis: 100%; padding: 0 0 4px; }
 /* a background command, tagged inside the swarm's agent tree — the mode's violet */
 .bgtag { font-size: 9.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 1px 5px; border-radius: 4px; color: var(--ultra2); background: rgba(var(--ultra-rgb), 0.14); }
 
@@ -2902,3 +2912,55 @@ th[aria-sort="ascending"] .rt-arrow, th[aria-sort="descending"] .rt-arrow { opac
 
 .sbx-section { margin-top: 8px; font-size: 12px; font-weight: 600; color: var(--fg2); }
 .sbx-section .desc { font-weight: 400; margin-left: 6px; }
+
+/* ── Motion layer (safe) ──────────────────────────────────────────────────
+   One-shot entrances and press feedback only: nothing loops, nothing moves on
+   hover, no focus colours. Remove this block to undo. */
+@keyframes olCardIn { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: none; } }
+.card-q, .card-a { animation: olCardIn .32s var(--out) both; }
+.artifict-card { animation: olCardIn .3s var(--out) both; }
+.artifict-card:nth-child(2) { animation-delay: .03s; }
+.artifict-card:nth-child(3) { animation-delay: .06s; }
+.artifict-card:nth-child(4) { animation-delay: .09s; }
+.artifict-card:nth-child(n+5) { animation-delay: .12s; }
+.modal .mb > * { animation: olRise .3s var(--out) both; }
+.modal .mb > :nth-child(2) { animation-delay: .03s; }
+.modal .mb > :nth-child(3) { animation-delay: .06s; }
+.modal .mb > :nth-child(n+4) { animation-delay: .09s; }
+.seg > .knob { transition: transform .3s var(--spring), width .2s var(--ease); }
+.seg > .o:active { transform: scale(.94); transition: transform .06s; }
+.chip:active .ico, .btn:active .ico { transform: scale(.85); transition: transform .06s; }
+
+/* Answered question send-off (see `ghostOut` in Question.tsx): the copy flares,
+   tears into jittering slices with an RGB split, flickers through scanlines and a
+   rising beam, then collapses upward. Stepped timing keeps it harsh, not smooth. */
+.q-ghost-frame { position: fixed; z-index: 60; overflow: hidden; pointer-events: none; }
+.q-ghost { position: absolute; margin: 0; box-sizing: border-box; overflow: hidden; animation: olQExit .72s steps(24, jump-none) forwards !important; }
+.q-ghost * { animation: none !important; transition: none !important; }
+.q-ghost::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(var(--accent-rgb), .22) 0 1px, transparent 1px 3px), linear-gradient(90deg, rgba(255,0,80,.18), transparent 30%, transparent 70%, rgba(0,220,255,.18)); opacity: 0; animation: olQScan .72s steps(18, jump-none) forwards; }
+.q-ghost::after { content: ""; position: absolute; left: 0; right: 0; height: 40%; pointer-events: none; background: linear-gradient(0deg, transparent, rgba(var(--accent-rgb), .55) 85%, rgba(255,255,255,.9) 100%); mix-blend-mode: screen; animation: olQBeam .72s cubic-bezier(.55,0,.2,1) forwards; }
+@keyframes olQExit {
+  0%   { opacity: 1; transform: none; filter: none; clip-path: inset(0 0 0 0 round 12px); box-shadow: 0 0 0 0 rgba(var(--accent-rgb), 0); }
+  8%   { opacity: 1; transform: translateX(-6px) skewX(-4deg); filter: brightness(1.5) saturate(1.6) drop-shadow(4px 0 0 rgba(255,0,80,.75)) drop-shadow(-4px 0 0 rgba(0,220,255,.75)); clip-path: inset(0 0 55% 0); box-shadow: 0 0 0 1px rgba(var(--accent-rgb), .8), 0 0 30px rgba(var(--accent-rgb), .55); }
+  16%  { opacity: .9; transform: translateX(7px) skewX(3deg); filter: brightness(1.2) hue-rotate(40deg) drop-shadow(-5px 0 0 rgba(255,0,80,.7)) drop-shadow(5px 0 0 rgba(0,220,255,.7)); clip-path: inset(40% 0 20% 0); }
+  24%  { opacity: 1; transform: translateX(-3px) translateY(-3px) scale(1.02); filter: brightness(1.7) saturate(1.8) drop-shadow(3px 0 0 rgba(255,0,80,.8)) drop-shadow(-3px 0 0 rgba(0,220,255,.8)); clip-path: inset(0 0 0 0); }
+  32%  { opacity: .35; transform: translateX(9px) skewX(-6deg); filter: invert(.85) hue-rotate(160deg); clip-path: inset(10% 0 60% 0); }
+  40%  { opacity: 1; transform: translateX(-8px) translateY(-6px); filter: brightness(1.4) drop-shadow(6px 0 0 rgba(255,0,80,.8)) drop-shadow(-6px 0 0 rgba(0,220,255,.8)); clip-path: inset(55% 0 5% 0); }
+  50%  { opacity: .8; transform: translateX(4px) translateY(-10px) scale(1.01, .94); filter: brightness(2) contrast(1.4); clip-path: inset(0 0 30% 0); }
+  60%  { opacity: .25; transform: translateX(-10px) translateY(-16px) skewX(8deg); filter: hue-rotate(-60deg) blur(1px) drop-shadow(8px 0 0 rgba(255,0,80,.7)); clip-path: inset(25% 0 40% 0); }
+  72%  { opacity: .6; transform: translateX(6px) translateY(-22px) scale(.98, .8); filter: brightness(2.2) blur(2px); clip-path: inset(0 0 60% 0); }
+  86%  { opacity: .2; transform: translateX(-4px) translateY(-30px) scale(.96, .5); filter: blur(4px) brightness(2.4); clip-path: inset(0 0 85% 0); }
+  100% { opacity: 0; transform: translateY(-36px) scale(.95, .2); filter: blur(6px) brightness(2.6); clip-path: inset(0 0 100% 0); box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0), 0 0 40px rgba(var(--accent-rgb), 0); }
+}
+@keyframes olQScan { 0% { opacity: 0; transform: translateY(0); } 15% { opacity: 1; } 35% { opacity: .3; } 50% { opacity: 1; transform: translateY(-3px); } 70% { opacity: .4; } 100% { opacity: .7; transform: translateY(-6px); } }
+@keyframes olQBeam { from { top: 100%; opacity: 0; } 20% { opacity: 1; } to { top: -40%; opacity: .2; } }
+/* The answer line glitches in as the card tears away. */
+.resolved.fresh { animation: olQIn .5s steps(10, jump-none) .14s both; }
+@keyframes olQIn {
+  0%   { opacity: 0; transform: translateX(-8px); filter: brightness(2) drop-shadow(3px 0 0 rgba(255,0,80,.8)) drop-shadow(-3px 0 0 rgba(0,220,255,.8)); clip-path: inset(0 0 80% 0); }
+  20%  { opacity: 1; transform: translateX(6px) skewX(-6deg); clip-path: inset(30% 0 20% 0); }
+  40%  { opacity: .5; transform: translateX(-4px); filter: brightness(1.6) hue-rotate(50deg) drop-shadow(-3px 0 0 rgba(255,0,80,.8)); clip-path: inset(0 0 0 0); }
+  60%  { opacity: 1; transform: translateX(3px); filter: drop-shadow(2px 0 0 rgba(0,220,255,.7)); }
+  80%  { opacity: .85; transform: translateX(-1px); filter: brightness(1.2); }
+  100% { opacity: 1; transform: none; filter: none; clip-path: none; }
+}

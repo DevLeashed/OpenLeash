@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect } from "react";
 import "./App.css";
 import { api } from "./api";
-import { boot, disposeBoot, flash, get, go, requestPause, set, stepZoom, useStore, zoom, zoomFactor } from "./store";
+import { boot, disposeBoot, flash, get, go, isPhoneClient, requestPause, set, stepZoom, useStore, zoom, zoomFactor } from "./store";
 import { isRemoteClient } from "./remote";
 import { applyMode } from "./theme";
 import { AppUpdateBanner } from "./ui/AppUpdate";
@@ -13,7 +13,7 @@ import { Paused } from "./ui/Paused";
 import { Session } from "./ui/Session";
 import { RemotePicker } from "./ui/RemotePicker";
 import { SelectionNoteLayer } from "./ui/SelectionNote";
-import { Loader, LightboxProvider } from "./ui/primitives";
+import { ErrorBoundary, Loader, LightboxProvider } from "./ui/primitives";
 
 // Views that are never on screen at launch load on first visit, so their code
 // (Settings pulls in every settings panel) stays out of the bundle the window
@@ -120,13 +120,29 @@ export default function App() {
   useEffect(() => {
     void boot();
     window.addEventListener("keydown", onKey);
-    const rs = () => { if (window.innerWidth / zoom() < 1100 && get().details) set({ details: false }); };
+    // Only a desktop window being made *narrower* closes the rail. A phone is
+    // narrow by definition and its keyboard resizes the viewport, so this used to
+    // close the rail — and with it a subagent's panel and message box — the
+    // moment you tapped in to type. Height-only resizes are not the window being
+    // made smaller either, and must not take the rail away.
+    let lastWidth = window.innerWidth;
+    const rs = () => {
+      if (isPhoneClient() || window.innerWidth === lastWidth) return;
+      lastWidth = window.innerWidth;
+      if (window.innerWidth / zoom() < 1100 && get().details) set({ details: false });
+    };
     window.addEventListener("resize", rs);
     // No global clock tick: it replaced the root state object every 30s, so
     // every mounted selector re-ran and the sidebar and home screen re-sorted
     // the whole chat list. Components that show relative times use `useNow`.
     return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("resize", rs); disposeBoot(); };
   }, []);
+
+  // A screen whose render threw is replaced by the boundary's panel; navigating
+  // changes this key, which gives the next view a fresh attempt rather than a
+  // panel that outlives the screen it belonged to. The chat id is part of it for
+  // the same reason it is part of the subtree key: another chat is another view.
+  const viewKey = view === "session" || view === "diff" ? view + get().task : view;
 
   if (err) return <div className="app" style={{ display: "grid", placeItems: "center", color: "#ff8a8a" }}>Failed to start the harness: {err}</div>;
 
@@ -144,22 +160,32 @@ export default function App() {
         <Sidebar />
         <main className="main">
           {!ready ? <Loader className="app-loader" size={18} label="Starting…" /> : (
-            <div className="viewwrap" key={view === "session" || view === "diff" ? view + get().task : view}>
-              <Suspense fallback={<Loader className="app-loader" size={18} />}>
-              {view === "home" && <Home />}
-              {view === "session" && <Session />}
-              {view === "diff" && <Review />}
-              {view === "saved" && <Saved />}
-              {view === "paused" && <Paused />}
-              {view === "settings" && <SettingsView />}
-              {view === "schedules" && <Schedules />}
-              {view === "race" && <RaceScreen />}
-              </Suspense>
+            <div className="viewwrap" key={viewKey}>
+              {/* One view's render throw used to unmount everything: a blank
+                  window, no composer, and the turn still running behind it.
+                  The boundary keeps the sidebar and the chat usable. */}
+              <ErrorBoundary resetKey={viewKey} onBack={() => go("home")}>
+                <Suspense fallback={<Loader className="app-loader" size={18} />}>
+                {view === "home" && <Home />}
+                {view === "session" && <Session />}
+                {view === "diff" && <Review />}
+                {view === "saved" && <Saved />}
+                {view === "paused" && <Paused />}
+                {view === "settings" && <SettingsView />}
+                {view === "schedules" && <Schedules />}
+                {view === "race" && <RaceScreen />}
+                </Suspense>
+              </ErrorBoundary>
             </div>
           )}
         </main>
       </div>
-      <Overlays z={z} />
+      {/* Overlays are siblings of the view, not children of it, so they need
+          their own catch: a crashing palette or confirmation panel would
+          otherwise take the window down with the transcript behind it. */}
+      <ErrorBoundary>
+        <Overlays z={z} />
+      </ErrorBoundary>
       <RemotePicker />
       {/* Outside the zoomed view tree but inside the app root: the note pill is
           placed from a selection rect in unzoomed window pixels, and it has to

@@ -18,6 +18,7 @@ describe("application updater", () => {
     receiveAppUpdate(update("available", false));
     render(<AppUpdateBanner />);
     expect(screen.queryByRole("button", { name: "Restart to update" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Update now" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Open latest release" }));
     expect(openUrl).toHaveBeenCalledWith(RELEASES_URL);
     expect(invoke).not.toHaveBeenCalled();
@@ -63,9 +64,53 @@ describe("application updater", () => {
   it("allows retrying a download without installing", async () => {
     receiveAppUpdate(update("available"));
     render(<AppVersion />);
-    fireEvent.click(screen.getByRole("button", { name: "Retry download" }));
+    fireEvent.click(screen.getByRole("button", { name: "Download only" }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("app_update_download"));
     expect(invoke).not.toHaveBeenCalledWith("app_update_install");
+  });
+  it("offers a separate download action once a check finds a release", async () => {
+    // A check only finds the release. Fetching the package is a separate
+    // step the user asks for, so the two are two buttons.
+    receiveAppUpdate(update("available"));
+    render(<AppVersion />);
+    expect(screen.getByRole("button", { name: "Update now" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Download only" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry download" })).toBeNull();
+  });
+  it("updates with one click through a single backend call", async () => {
+    // The check, the download and the restart are chained inside the backend so
+    // they cannot interleave with the background pass or a second click. The
+    // click must not assemble the sequence out of separate commands itself.
+    receiveAppUpdate(update("available"));
+    vi.mocked(invoke).mockResolvedValue(update("ready"));
+    render(<AppVersion />);
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("app_update_now"));
+    expect(invoke).not.toHaveBeenCalledWith("app_update_check");
+    expect(invoke).not.toHaveBeenCalledWith("app_update_download");
+    expect(invoke).not.toHaveBeenCalledWith("app_update_install");
+    await waitFor(() => expect(get().appUpdate.status).toBe("ready"));
+  });
+  it("leaves the restart to the user when the one click could only download", async () => {
+    // The backend refuses to close the app while work is running and answers
+    // with the downloaded release, so the click ends on the explicit restart.
+    vi.mocked(invoke).mockResolvedValue(update("ready"));
+    receiveAppUpdate(update("available"));
+    render(<AppUpdateBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("app_update_now"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restart to update" })).toBeTruthy());
+    expect(invoke).not.toHaveBeenCalledWith("app_update_install");
+  });
+  it("does not start a download when the user asks to check for updates", async () => {
+    // The check command is the only thing the user pressed. Nothing may be
+    // fetched on the strength of it.
+    vi.mocked(invoke).mockResolvedValue(update("available"));
+    receiveAppUpdate(update("idle"));
+    render(<AppVersion />);
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("app_update_check"));
+    expect(invoke).not.toHaveBeenCalledWith("app_update_download");
   });
   it("retains ready state and reports an authoritative backend install rejection", async () => {
     vi.mocked(invoke).mockRejectedValue("Finish or stop tasks first");

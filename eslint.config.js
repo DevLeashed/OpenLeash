@@ -31,6 +31,8 @@ export default tseslint.config(
       "compiled/**",
       "src-tauri/**",
       "src/gen/**",
+      // Private cargo target directories, kept out of the checkout.
+      ".cargo-target-*/**",
     ],
   },
 

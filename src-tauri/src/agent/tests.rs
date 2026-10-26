@@ -484,6 +484,7 @@ fn req() -> ChatRequest {
         effort: 2,
         max_tokens: 1000,
         cache_key: "ol-t1".into(),
+        cwd: String::new(),
     }
 }
 
@@ -2236,8 +2237,13 @@ async fn stopping_a_chat_kills_its_background_commands() {
     let cwd = dir.to_string_lossy().to_string();
 
     let id =
-        h.bg.spawn("t1", &format!("cd '{}' && echo up && sleep 120", cwd), &cwd)
-            .expect("spawn");
+        h.bg.spawn(
+            "t1",
+            "",
+            &format!("cd '{}' && echo up && sleep 120", cwd),
+            &cwd,
+        )
+        .expect("spawn");
     // Wait for the job to register as running before stopping anything.
     for _ in 0..100 {
         if h.bg.list("t1").iter().any(|b| b.running) {
@@ -3391,10 +3397,16 @@ fn routes_pick_dedicated_over_generic_and_chain_after_the_chosen_model() {
 }
 
 /// Esc (or an app close) cut a subagent off mid-job. Continuing the chat
-/// continues the subagent from its saved conversation, and the main agent
-/// receives the real report instead of "stopped".
+/// continues the subagent from its saved conversation — in the background, so
+/// the main turn answers straight away and the report arrives as a message.
+///
+/// The main turn used to drive these inline and await them as its very first
+/// step, which is what a chat that "never answers" was: three resumed workers
+/// doing Unity builds held it on "Thinking" for ~40 minutes with nothing sent,
+/// and every message typed meanwhile was steered into a turn that never reached
+/// a model call to read it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stopped_subagents_continue_on_resume() {
+async fn stopped_subagents_continue_in_the_background_on_resume() {
     let dir = std::env::temp_dir().join(format!("openleash-subres-{}", std::process::id()));
     let _home = super::store::test_home(&dir);
     let m = Mock::start().await;
@@ -3440,23 +3452,41 @@ async fn stopped_subagents_continue_on_resume() {
     let (h, _) = harness(s, vec![t]);
 
     m.push(openai_ok("X is in src/x.rs:1")); // the subagent, continued
-    m.push(openai_ok("Found it: src/x.rs:1")); // the main agent
+    m.push(openai_ok("On it — the explorer is back in the background.")); // the main agent
+    m.push(openai_ok("Noted.")); // the turn its report starts
     runner::resume(&h, "t3", None).await.unwrap();
     wait_idle(&h, "t3").await;
+    // The resumed worker is detached now, so its own request lands whenever it
+    // gets there; wait for it to finish rather than assume the order.
+    for _ in 0..500 {
+        if h.task("t3").await.unwrap().lock().await.subs[0].status == "done" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
-    let reqs = m.reqs();
-    assert_eq!(reqs.len(), 2);
-    let sub = reqs[0].body["messages"].to_string();
+    // Which request is whose is a race now that the worker no longer holds the
+    // turn, so each is found by the one thing only it can contain.
+    let bodies: Vec<String> = m
+        .reqs()
+        .iter()
+        .map(|r| r.body["messages"].to_string())
+        .collect();
+    let sub = bodies
+        .iter()
+        .find(|b| b.contains("looking in src"))
+        .expect("the resumed subagent's request");
     assert!(
-        sub.contains("Find X (brief)")
-            && sub.contains("looking in src")
-            && sub.contains("You were interrupted"),
+        sub.contains("Find X (brief)") && sub.contains("You were interrupted"),
         "continues its own conversation"
     );
-    let main = reqs[1].body["messages"].to_string();
+    let main = bodies
+        .iter()
+        .find(|b| b.contains("find X") && !b.contains("looking in src"))
+        .expect("the main agent's request");
     assert!(
-        main.contains("X is in src/x.rs:1"),
-        "main gets the real report"
+        main.contains("is resuming in the background from its saved conversation"),
+        "the turn is told the worker is running again instead of waiting for it"
     );
     assert!(
         !main.contains("Subagent stopped"),
@@ -3465,7 +3495,10 @@ async fn stopped_subagents_continue_on_resume() {
     let t = h.task("t3").await.unwrap();
     let t = t.lock().await;
     assert_eq!(t.subs[0].status, "done");
-    assert_eq!(t.status, "done");
+    assert!(
+        t.subs[0].background,
+        "a resumed `task` call is background work from here on"
+    );
     drop(t);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -3518,6 +3551,297 @@ async fn task_tool_hands_images_to_the_subagent() {
     assert!(
         body.contains("image_url"),
         "as a real image part, not a caption: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A picture the user attached can be handed to a subagent by *path*.
+///
+/// This is the case that used to be impossible. `images` takes a `data:` URL,
+/// which the model has to reproduce as base64 — and a model cannot reproduce a
+/// picture the *user* attached, because it never held the bytes as text. So a
+/// brief saying "check this screenshot" was a dead end: the picture existed
+/// only in the parent's context.
+///
+/// `image_paths` names the file instead, and the harness reads it and hands the
+/// subagent the picture itself. The test drives the real `task` tool with a
+/// picture on disk, because the path is what the model is told about and the
+/// thing that has to work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_tool_hands_an_image_path_to_the_subagent() {
+    let _m = MODELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("openleash-subimgpath-{}", std::process::id()));
+    let _home = super::store::test_home(&dir);
+    let m = Mock::start().await;
+    let (cp, key) = custom("pi", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let mut t = task("timgp", "pi/m");
+    t.status = "idle".into();
+    // A real PNG on disk: the bytes decide what the file is, so a picture has
+    // to be an actual picture for the read to succeed.
+    let shot = dir.join("shot.png");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        &shot,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (h, _) = harness(s, vec![t]);
+    const SUB: &str = "subagent (`explore`)";
+
+    m.push(openai_call(
+        "task",
+        json!({
+            "description": "check mockup",
+            "prompt": "Does this match?",
+            "subagent_type": "explore",
+            "image_paths": [shot.to_string_lossy()],
+        }),
+    ));
+    m.push(openai_ok("Launched."));
+    m.push_for(SUB, openai_ok("The header is off by 8px."));
+    runner::send(h.clone(), "timgp".into(), "check this mockup".into())
+        .await
+        .unwrap();
+    wait_idle(&h, "timgp").await;
+
+    let sub = m
+        .reqs()
+        .into_iter()
+        .find(|r| {
+            r.body["messages"][0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains(SUB)
+        })
+        .expect("the subagent made a request");
+    let body = sub.body.to_string();
+    assert!(
+        body.contains("image_url"),
+        "the picture reached the subagent as a real image part, not a caption: {body}"
+    );
+    // The picture's own bytes, so it is the file that was handed over and not
+    // some other image that happened to be in the conversation.
+    assert!(
+        body.contains("iVBORw0KGgo"),
+        "the subagent received the file that was named: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A path that is not a readable picture is refused with a reason, rather than
+/// being dropped and leaving the subagent to report on a picture it never saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_tool_refuses_an_image_path_that_is_not_a_picture() {
+    let _m = MODELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("openleash-subimgbad-{}", std::process::id()));
+    let _home = super::store::test_home(&dir);
+    let m = Mock::start().await;
+    let (cp, key) = custom("pi", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let mut t = task("timgb", "pi/m");
+    t.status = "idle".into();
+    std::fs::create_dir_all(&dir).unwrap();
+    let not_a_picture = dir.join("notes.txt");
+    std::fs::write(&not_a_picture, b"just text").unwrap();
+    let (h, _) = harness(s, vec![t]);
+
+    m.push(openai_call(
+        "task",
+        json!({
+            "description": "check mockup",
+            "prompt": "Does this match?",
+            "subagent_type": "explore",
+            "image_paths": [not_a_picture.to_string_lossy()],
+        }),
+    ));
+    m.push(openai_ok("Launched."));
+    runner::send(h.clone(), "timgb".into(), "check this mockup".into())
+        .await
+        .unwrap();
+    wait_idle(&h, "timgb").await;
+
+    // The launch failed, so no subagent was created: a refused picture must
+    // not leave a half-created agent behind.
+    let subs = h.task("timgb").await.unwrap().lock().await.subs.clone();
+    assert!(
+        subs.is_empty(),
+        "a bad image path must not spawn a subagent: {subs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A picture can be handed to an agent that is already working, not only to
+/// one being launched. `send_message` is how a coordinator tells a running
+/// worker what it just found — and a picture is often the finding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_message_carries_an_image_path_to_a_running_subagent() {
+    let _m = MODELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("openleash-submsgimg-{}", std::process::id()));
+    let _home = super::store::test_home(&dir);
+    let m = Mock::start().await;
+    let (cp, key) = custom("pm", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let mut t = task("tmsg", "pm/m");
+    t.status = "idle".into();
+    // A worker that is still going, so the message is delivered to it.
+    t.subs = vec![SubInfo {
+        id: "s1".into(),
+        role: "explore".into(),
+        task: "look around".into(),
+        status: "running".into(),
+        call_id: "call_0".into(),
+        item_id: "i1".into(),
+        ..Default::default()
+    }];
+    std::fs::create_dir_all(&dir).unwrap();
+    let shot = dir.join("shot.png");
+    std::fs::write(
+        &shot,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (h, _) = harness(s, vec![t]);
+
+    m.push(openai_call(
+        "send_message",
+        json!({
+            "to": "s1",
+            "message": "look at this",
+            "image_paths": [shot.to_string_lossy()],
+        }),
+    ));
+    m.push(openai_ok("Sent."));
+    runner::send(h.clone(), "tmsg".into(), "go".into())
+        .await
+        .unwrap();
+    wait_idle(&h, "tmsg").await;
+
+    // The picture is queued in the worker's inbox, where its next request
+    // picks it up.
+    let queued = h
+        .runtime("tmsg")
+        .inbox_images
+        .lock()
+        .await
+        .get("s1")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the picture reached the worker: {queued:?}"
+    );
+    assert_eq!(queued[0].0, "image/png");
+    assert!(
+        queued[0].1.contains("iVBORw0KGgo"),
+        "and it is the file that was named: {}",
+        queued[0].1
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A stopped subagent that is resumed can be given a picture too — the state
+/// it should be looking at now is often the one thing it cannot have seen when
+/// it stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn task_resume_carries_an_image_path_to_the_subagent() {
+    let _m = MODELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("openleash-subresimg-{}", std::process::id()));
+    let _home = super::store::test_home(&dir);
+    let m = Mock::start().await;
+    let (cp, key) = custom("pr", &m.base, false);
+    let mut s = Settings::default();
+    s.custom_providers.push(cp);
+    s.providers.insert(key.0, key.1);
+    let mut t = task("tres", "pr/m");
+    t.status = "idle".into();
+    t.subs = vec![SubInfo {
+        id: "s1".into(),
+        role: "explore".into(),
+        task: "find X".into(),
+        status: "done".into(),
+        report: "X is in src/x.rs".into(),
+        call_id: "call_0".into(),
+        item_id: "i1".into(),
+        ..Default::default()
+    }];
+    t.sub_msgs.insert(
+        "s1".into(),
+        vec![
+            Message::user_text("Find X (brief)"),
+            Message {
+                role: "assistant".into(),
+                content: vec![json!({"type":"text","text":"looking in src"})],
+                model: String::new(),
+            },
+        ],
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    let shot = dir.join("shot.png");
+    std::fs::write(
+        &shot,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (h, _) = harness(s, vec![t]);
+    const SUB: &str = "subagent (`explore`)";
+
+    m.push(openai_call(
+        "task_resume",
+        json!({
+            "id": "s1",
+            "message": "now check this",
+            "image_paths": [shot.to_string_lossy()],
+        }),
+    )); // main
+    m.push_for(SUB, openai_ok("Checked."));
+    m.push(openai_ok("Resumed."));
+    runner::send(h.clone(), "tres".into(), "go".into())
+        .await
+        .unwrap();
+    wait_idle(&h, "tres").await;
+
+    let sub = m
+        .reqs()
+        .into_iter()
+        .find(|r| {
+            r.body["messages"][0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains(SUB)
+        })
+        .expect("the subagent made a request");
+    let body = sub.body.to_string();
+    assert!(
+        body.contains("image_url"),
+        "the resumed agent received the picture: {body}"
+    );
+    assert!(
+        body.contains("iVBORw0KGgo"),
+        "and it is the file that was named: {body}"
     );
 
     let _ = std::fs::remove_dir_all(dir);
@@ -4852,7 +5176,7 @@ async fn force_pause_all_freezes_chats_and_owes_the_agent_a_rerun() {
     let (h, ev) = harness(Settings::default(), vec![busy, idle, archived]);
     // A real command, so the sweep has something in flight to cut: `fg` is what the
     // runner uses for a foreground shell, and it is what the sweep keys on.
-    let bg = h.bg.spawn("busy", "echo hi", ".").unwrap();
+    let bg = h.bg.spawn("busy", "", "echo hi", ".").unwrap();
     h.runtime("busy")
         .fg
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5315,7 +5639,7 @@ async fn a_background_job_does_not_hold_the_pausing_banner_open() {
     let dir = std::env::temp_dir().join(format!("openleash-busybg-{}", std::process::id()));
     let _home = super::store::test_home(&dir);
     let (h, _) = harness(Settings::default(), vec![task("t1", "m1")]);
-    let id = h.bg.spawn("t1", "sleep 30", ".").unwrap();
+    let id = h.bg.spawn("t1", "", "sleep 30", ".").unwrap();
     h.pause_task("t1", "manual", "Paused by you").await;
     assert_eq!(
         h.task("t1").await.unwrap().lock().await.busy,

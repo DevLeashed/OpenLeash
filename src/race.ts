@@ -11,12 +11,14 @@
 import { useSyncExternalStore } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { MAX_RACE_ATTEMPTS, MIN_RACE_ATTEMPTS, raceApi, type NewRace, type Race, type RaceAttemptSpec, type RaceEvent, type TaskSummary } from "./api";
-import { back, flash, get as getApp, go, set as setApp } from "./store";
+import { back, flash, forgetTask, get as getApp, go, set as setApp, type State } from "./store";
 
 /** The composer's race options. `attempts`/`judge` null means "follow the
  *  composer's own model and effort", so a model switched after turning race on
  *  is the one the attempts run on unless the user picked them by hand. */
 export interface RaceConfig { on: boolean; n: number; attempts: RaceAttemptSpec[] | null; judge: RaceAttemptSpec | null;
+  /** Optional attempt-specific prompt overrides; missing/blank entries use the composer prompt. */
+  prompts?: (string | null)[];
   /** Where each attempt works: a git worktree (default) or a docker workspace. */
   workspace?: "worktree" | "docker" }
 
@@ -32,7 +34,7 @@ export interface RaceStore {
 }
 
 export const DEFAULT_RACE_N = 3;
-const freshConfig = (): RaceConfig => ({ on: false, n: DEFAULT_RACE_N, attempts: null, judge: null, workspace: "worktree" });
+const freshConfig = (): RaceConfig => ({ on: false, n: DEFAULT_RACE_N, attempts: null, judge: null, prompts: [], workspace: "worktree" });
 
 let state: RaceStore = { races: {}, open: null, setup: false, config: freshConfig(), collapsed: {} };
 const subs = new Set<() => void>();
@@ -215,7 +217,7 @@ export async function startRace(req: Omit<NewRace, "attempts" | "judge_model" | 
   if (!getApp().projectInfo?.git) throw new Error("Race needs a git repo");
   const cfg = state.config;
   const judge = resolveJudge(cfg, model, effort);
-  const r = await raceApi.create({ ...req, workspace: cfg.workspace ?? "worktree", attempts: resolveAttempts(cfg, model, effort), judge_model: judge.model, judge_effort: judge.effort });
+  const r = await raceApi.create({ ...req, workspace: cfg.workspace ?? "worktree", attempts: resolveAttempts(cfg, model, effort).map((a, i) => ({ ...a, prompt: cfg.prompts?.[i]?.trim() || undefined })), judge_model: judge.model, judge_effort: judge.effort });
   setApp((st) => ({ tasks: { ...st.tasks, ...Object.fromEntries(r.tasks.map((t) => [t.id, t])) } }));
   // One-shot, like plan mode: the next new task is a plain one again. The
   // picked models are kept, so a second race starts from the same lineup.
@@ -258,6 +260,47 @@ export async function archiveRace(id: string, archived = true) {
     setRaces((s) => ({ races: applyRaceEvent(s.races, race), ...(archived && s.open === id ? { open: null } : {}) }));
     if (archived) flash("Race archived", { label: "Undo", run: () => { void archiveRace(id, false); } });
     else flash("Race restored");
+    return true;
+  } catch (e) {
+    flash(String(e));
+    return false;
+  }
+}
+
+/** Delete an archived race for good, with the attempt chats that are still
+ *  archived with it. The chats are deleted here rather than by the caller, so
+ *  the backend decides what goes: a chat the user restored on its own stays a
+ *  chat of its own. Their worktrees are kept on disk unless `removeWorktree`. */
+export async function deleteRace(id: string, removeWorktree = false) {
+  try {
+    const r = await raceApi.delete(id, removeWorktree);
+    // The race is gone: drop it from the store here rather than waiting for
+    // the `ol://race` event, so the list the user is looking at updates with
+    // the click.
+    setRaces((s) => {
+      const races = applyRaceEvent(s.races, { id, removed: true });
+      return { races, ...(s.open === id ? { open: null } : {}) };
+    });
+    // The deleted chats leave the chat store too, or the sidebar would keep
+    // showing rows for chats that are gone. `forgetTask` drops the whole chat
+    // — transcript, drafts, notes — not just its summary.
+    const gone = r.deleted_chats;
+    if (gone.length) {
+      setApp((s) => {
+        let next = s;
+        for (const t of gone) next = { ...next, ...forgetTask(next, t) } as State;
+        return next === s ? {} : (next as unknown as Partial<State>);
+      });
+      // An open chat that was just deleted must not stay on screen.
+      const open = getApp().task;
+      if (open && gone.includes(open) && (getApp().view === "session" || getApp().view === "diff")) go("home");
+    }
+    const kept = r.kept_chats.length;
+    flash(
+      `Race deleted · ${r.deleted_chats.length} chat${r.deleted_chats.length === 1 ? "" : "s"} deleted`
+      + (kept ? ` · ${kept} chat${kept === 1 ? "" : "s"} kept (restored earlier)` : "")
+      + (r.kept_worktrees ? ` · ${r.kept_worktrees} worktree${r.kept_worktrees === 1 ? "" : "s"} kept on disk` : ""),
+    );
     return true;
   } catch (e) {
     flash(String(e));

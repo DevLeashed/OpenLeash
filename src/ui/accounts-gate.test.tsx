@@ -181,8 +181,8 @@ describe("adding an account behind a terms gate", () => {
     await clickAdd("OpenCode Go");
 
     expect(document.body.textContent).toContain("Import OpenCode key");
-    expect(document.body.textContent).toContain("API key created with your Go subscription");
-    expect(document.body.textContent).toContain("Or paste an API key");
+    expect(document.body.textContent).toContain("API key created with your OpenCode Go subscription");
+    expect(document.body.textContent).toContain("Paste your OpenCode API key");
     expect(document.body.textContent).toContain("Connect key");
     expect(document.body.textContent).not.toContain("setup-token");
     expect(document.body.textContent).not.toContain("own risk");

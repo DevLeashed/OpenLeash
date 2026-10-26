@@ -2,6 +2,7 @@ export * from "./ColorPicker";
 export * from "./Confirm";
 export * from "./Controls";
 export * from "./Dropdown";
+export * from "./ErrorBoundary";
 export * from "./escape";
 export * from "./Lightbox";
 export * from "./Loader";

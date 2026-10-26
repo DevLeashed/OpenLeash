@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from "react-dom";
 import {
   ChevronLeft, Download, Info, LayoutGrid, MessageSquare, PenLine, RotateCcw, SlidersHorizontal, SquarePen, ChevronRight, Code2, Columns2, Copy, Layers, Maximize2, MessageSquarePlus, Minimize2, Monitor, MousePointer2,
-  RefreshCw, Scan, Send, Smartphone, Sparkles, Tablet, Trash2, WandSparkles, X,
+  Globe, RefreshCw, Scan, Send, Smartphone, Sparkles, Tablet, Trash2, WandSparkles, X,
 } from "lucide-react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -114,7 +114,9 @@ function Tool({ label, pressed, onClick, disabled, children, className }: { labe
  *  values and state are host-entered, untrusted data; only the explicit Send
  *  makes them agent-readable, and that submission is also what starts the
  *  agent turn. */
-export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpandedChange, toolbarSlot, browseOnly = false, startInGallery = false }: { taskId: string; taskTitle: string; initialSelection?: { artifictId: string; versionId: string } | null; onExpandedChange?: (expanded: boolean) => void; toolbarSlot?: HTMLElement | null;
+export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpandedChange, toolbarSlot, browseOnly = false, startInGallery = false, onBrowser }: { taskId: string; taskTitle: string; initialSelection?: { artifictId: string; versionId: string } | null; onExpandedChange?: (expanded: boolean) => void; toolbarSlot?: HTMLElement | null;
+  /** Switch the surface to the browser plugin's view; the mode switch offers it only when given. */
+  onBrowser?: () => void;
   /** Looking, not acting: the new-task screen borrows another chat's studio to
    *  show the design, so nothing here may comment, tweak or send to that chat. */
   browseOnly?: boolean; startInGallery?: boolean }) {
@@ -602,6 +604,7 @@ export function ArtifictWorkspace({ taskId, taskTitle, initialSelection, onExpan
       {(gallery || sbx || rows.length === 0) && <div className="studio-bar-group studio-seg" role="group" aria-label="Studio mode">
         <button type="button" aria-pressed={!sbx} className={!sbx ? "on" : ""} onClick={() => setSbx(false)}><Layers size={12} aria-hidden="true" />Artificts</button>
         <button type="button" aria-pressed={sbx} className={sbx ? "on" : ""} onClick={() => setSbx(true)}><Monitor size={12} aria-hidden="true" />Sandboxes</button>
+        {onBrowser && <button type="button" aria-pressed={false} onClick={onBrowser}><Globe size={12} aria-hidden="true" />Browser</button>}
       </div>}
       {!gallery && !sbx && detail && current && <div className="studio-bar-group studio-versions" aria-label="Versions">
         <Tool label="Previous version ( [ )" disabled={busy || position <= 0} onClick={() => chooseVersion(versions[position - 1]!.id)}><ChevronLeft size={14} /></Tool>

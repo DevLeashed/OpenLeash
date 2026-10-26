@@ -62,6 +62,7 @@ fn req() -> ChatRequest {
         effort: 2,
         max_tokens: 1000,
         cache_key: "ol-rr".into(),
+        cwd: String::new(),
     }
 }
 
@@ -717,6 +718,7 @@ async fn first_large_context_request_routes_before_compacting() {
         effort: 2,
         max_tokens: 1000,
         cache_key: "ol-first-context".into(),
+        cwd: String::new(),
     };
     let who = Who {
         task_id: "first-context",

@@ -123,6 +123,56 @@ describe("Composer native image attachments", () => {
     expect(get().attachFiles["new-chat"]).toBeUndefined();
   });
 
+  it("attaches a pasted SVG as a file, never as an image block", async () => {
+    set({ settings: { project: "C:/proj" } as never });
+    const stage = vi.spyOn(api, "stageBytes").mockResolvedValue({ path: "C:/stage/drawing.svg", name: "drawing.svg", size: 12, isDir: false, image: false });
+    mount();
+    fireEvent.paste(document.querySelector("textarea")!, { clipboardData: { files: [new File(["<svg/>"], "drawing.svg", { type: "image/svg+xml" })] } });
+    await waitFor(() => expect(get().attachFiles["new-chat"]).toHaveLength(1));
+    // One attachment, and it is the file: no image block for a model that cannot
+    // read an SVG, and no second copy of the same paste.
+    expect(get().attach["new-chat"] ?? []).toEqual([]);
+    expect(document.querySelectorAll(".attach")).toHaveLength(0);
+    expect(document.querySelectorAll(".filechip")).toHaveLength(1);
+    expect(screen.getByText("drawing.svg")).toBeTruthy();
+    // A paste has no path, so the bytes are staged under the project the new-task
+    // composer is scoped to, exactly as a phone's upload and the file dialog do.
+    expect(stage.mock.calls[0]![0]).toBe("C:/proj");
+  });
+
+  it("names a pasted file from its type when the clipboard has no name", async () => {
+    set({ settings: { project: "C:/proj" } as never });
+    const stage = vi.spyOn(api, "stageBytes").mockResolvedValue({ path: "C:/stage/pasted.svg", name: "pasted.svg", size: 6, isDir: false, image: false });
+    mount();
+    // Copying an SVG out of a drawing app can leave a `File` with no name at
+    // all; the type is then the only clue to the extension the agent opens by.
+    fireEvent.paste(document.querySelector("textarea")!, { clipboardData: { files: [new File(["<svg/>"], "", { type: "image/svg+xml" })] } });
+    await waitFor(() => expect(get().attachFiles["new-chat"]).toHaveLength(1));
+    expect(stage.mock.calls[0]![1]).toBe("pasted.svg");
+    expect(screen.getByText("pasted.svg")).toBeTruthy();
+  });
+
+  it("fixes a pasted file's extension when its name and type disagree", async () => {
+    set({ settings: { project: "C:/proj" } as never });
+    const stage = vi.spyOn(api, "stageBytes").mockResolvedValue({ path: "C:/stage/image.svg", name: "image.svg", size: 6, isDir: false, image: false });
+    mount();
+    fireEvent.paste(document.querySelector("textarea")!, { clipboardData: { files: [new File(["<svg/>"], "image.png", { type: "image/svg+xml" })] } });
+    await waitFor(() => expect(get().attachFiles["new-chat"]).toHaveLength(1));
+    expect(stage.mock.calls[0]![1]).toBe("image.svg");
+    expect(screen.getByText("image.svg")).toBeTruthy();
+  });
+
+  it("attaches a pasted file that is not a picture at all the same way", async () => {
+    set({ settings: { project: "C:/proj" } as never });
+    vi.spyOn(api, "stageBytes").mockResolvedValue({ path: "C:/stage/report.pdf", name: "report.pdf", size: 9, isDir: false, image: false });
+    mount();
+    fireEvent.paste(document.querySelector("textarea")!, { clipboardData: { files: [new File(["%PDF"], "report.pdf", { type: "application/pdf" })] } });
+    await waitFor(() => expect(get().attachFiles["new-chat"]).toHaveLength(1));
+    expect(get().attachFiles["new-chat"]![0]!.image).toBe(false);
+    expect(get().attach["new-chat"] ?? []).toEqual([]);
+    expect(screen.getByText("report.pdf")).toBeTruthy();
+  });
+
   it("does not display an inert chip when conversion fails and accepts a retry", async () => {
     vi.mocked(api.fileDataUrl).mockRejectedValueOnce(new Error("bad image"));
     mount();

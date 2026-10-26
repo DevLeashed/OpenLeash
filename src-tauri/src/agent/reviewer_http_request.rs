@@ -10,8 +10,8 @@
 //! * An SSRF problem. The model picks the URL, so the cloud metadata service,
 //!   link-local addresses and their many spellings (decimal, hex, octal,
 //!   IPv4-mapped IPv6) are refused on every rung, a loopback/private target is
-//!   only ever reached through an explicit approval, and redirects and DNS
-//!   answers are re-checked rather than trusted.
+//!   only ever reached through an explicit approval below Full Access, and
+//!   redirects and DNS answers are re-checked rather than trusted.
 //!
 //! The permission tests call the pure `permissions::check`; the network tests
 //! use pure helpers plus a hand-rolled server bound to 127.0.0.1 (the same
@@ -317,7 +317,7 @@ fn a_deny_rule_wins_over_allow_rules_reads_and_full_access() {
 }
 
 #[test]
-fn loopback_and_private_targets_ask_even_for_get_and_even_in_full_access() {
+fn loopback_and_private_targets_ask_below_full_access_and_run_on_full_access() {
     for url in [
         "http://localhost:3000/api/health",
         "http://LOCALHOST:3000/",
@@ -337,10 +337,17 @@ fn loopback_and_private_targets_ask_even_for_get_and_even_in_full_access() {
         "http://printer.local/",
         "http://wiki.corp.internal/",
     ] {
-        for perm in ["ask", "reviewer", "auto", "turbo", "full"] {
+        for perm in ["ask", "reviewer", "auto"] {
             for method in ["GET", "HEAD", "POST"] {
                 let d = decide(perm, false, &[], method, url);
                 assert!(is_ask(&d), "{perm} {method} {url}: {}", show(&d));
+            }
+        }
+        // Full Access is the "ask me nothing" mode: every target class runs.
+        for perm in ["turbo", "full", ""] {
+            for method in ["GET", "HEAD", "POST"] {
+                let d = decide(perm, false, &[], method, url);
+                assert!(is_allow(&d), "{perm} {method} {url}: {}", show(&d));
             }
         }
         // Plan mode: a local read still asks; a local write is refused.
@@ -352,31 +359,32 @@ fn loopback_and_private_targets_ask_even_for_get_and_even_in_full_access() {
             "{url}"
         );
     }
-    // An explicit, per-host+port+method rule is how a dev server stops asking.
+    // An explicit, per-host+port+method rule is how a dev server stops asking
+    // on the rungs that ask.
     let allow = [rule("http_request:GET http://localhost:3000")];
     assert!(is_allow(&decide(
-        "turbo",
+        "ask",
         false,
         &allow,
         "GET",
         "http://localhost:3000/x"
     )));
     assert!(is_ask(&decide(
-        "turbo",
+        "ask",
         false,
         &allow,
         "GET",
         "http://localhost:3001/x"
     )));
     assert!(is_ask(&decide(
-        "turbo",
+        "ask",
         false,
         &allow,
         "POST",
         "http://localhost:3000/x"
     )));
     assert!(is_ask(&decide(
-        "turbo",
+        "ask",
         false,
         &allow,
         "GET",
@@ -387,14 +395,14 @@ fn loopback_and_private_targets_ask_even_for_get_and_even_in_full_access() {
     // hostname: these may be different local services.
     let secure = [rule("http_request:GET https://localhost:443")];
     assert!(is_allow(&decide(
-        "turbo",
+        "ask",
         false,
         &secure,
         "GET",
         "https://localhost/"
     )));
     assert!(is_ask(&decide(
-        "turbo",
+        "ask",
         false,
         &secure,
         "GET",
@@ -419,13 +427,13 @@ fn loopback_and_private_targets_ask_even_for_get_and_even_in_full_access() {
 
 #[test]
 fn the_reason_line_says_why_a_local_call_asks() {
-    match decide("turbo", false, &[], "GET", "http://localhost:3000/") {
+    match decide("auto", false, &[], "GET", "http://localhost:3000/") {
         Decision::Ask { reason, .. } => {
             assert!(reason.to_lowercase().contains("this machine"), "{reason}")
         }
         d => panic!("{}", show(&d)),
     }
-    match decide("turbo", false, &[], "GET", "http://192.168.1.1/") {
+    match decide("auto", false, &[], "GET", "http://192.168.1.1/") {
         Decision::Ask { reason, .. } => {
             assert!(
                 reason.to_lowercase().contains("private network"),
@@ -729,29 +737,35 @@ fn ips(v: &[&str]) -> Vec<IpAddr> {
 fn resolved_addresses_are_checked_against_what_was_approved() {
     // A public-looking name that resolves somewhere local is DNS rebinding or
     // an internal DNS entry: it was auto-approved as public, so it is refused.
-    assert!(check_resolved(Target::Public, &ips(&["93.184.216.34"])).is_ok());
-    assert!(check_resolved(Target::Public, &ips(&["127.0.0.1"])).is_err());
-    assert!(check_resolved(Target::Public, &ips(&["93.184.216.34", "10.0.0.1"])).is_err());
-    assert!(check_resolved(Target::Public, &ips(&["::ffff:192.168.0.1"])).is_err());
-    assert!(check_resolved(Target::Public, &[]).is_err());
+    assert!(check_resolved(Target::Public, &ips(&["93.184.216.34"]), false).is_ok());
+    assert!(check_resolved(Target::Public, &ips(&["127.0.0.1"]), false).is_err());
+    assert!(check_resolved(Target::Public, &ips(&["93.184.216.34", "10.0.0.1"]), false).is_err());
+    assert!(check_resolved(Target::Public, &ips(&["::ffff:192.168.0.1"]), false).is_err());
+    assert!(check_resolved(Target::Public, &[], false).is_err());
+    // Full Access approved every target class, so a local answer is allowed —
+    // but only for the local classes, never for a blocked one.
+    assert!(check_resolved(Target::Public, &ips(&["127.0.0.1"]), true).is_ok());
+    assert!(check_resolved(Target::Public, &ips(&["10.0.0.1"]), true).is_ok());
     // An approved local target may resolve locally, never to metadata.
-    assert!(check_resolved(Target::Loopback, &ips(&["127.0.0.1", "::1"])).is_ok());
-    assert!(check_resolved(Target::Private, &ips(&["10.0.0.7"])).is_ok());
+    assert!(check_resolved(Target::Loopback, &ips(&["127.0.0.1", "::1"]), false).is_ok());
+    assert!(check_resolved(Target::Private, &ips(&["10.0.0.7"]), false).is_ok());
     for t in [Target::Public, Target::Loopback, Target::Private] {
-        assert!(
-            check_resolved(t, &ips(&["169.254.169.254"])).is_err(),
-            "{t:?}"
-        );
-        assert!(
-            check_resolved(t, &ips(&["fd00:ec2::254"])).is_err(),
-            "{t:?}"
-        );
+        for allow_local in [false, true] {
+            assert!(
+                check_resolved(t, &ips(&["169.254.169.254"]), allow_local).is_err(),
+                "{t:?} allow_local={allow_local}"
+            );
+            assert!(
+                check_resolved(t, &ips(&["fd00:ec2::254"]), allow_local).is_err(),
+                "{t:?} allow_local={allow_local}"
+            );
+        }
     }
 }
 
 fn hop(origin: &str, method: &str, status: u16, location: &str) -> Hop {
     let o = parse_url(origin).unwrap();
-    redirect_step(&o, &o, method, status, location)
+    redirect_step(&o, &o, method, status, location, false)
 }
 
 #[test]
@@ -819,6 +833,26 @@ fn an_approved_local_target_may_only_redirect_within_its_own_origin() {
                 hop("http://localhost:3000/login", "GET", 302, loc),
                 Hop::Refuse(_)
             ),
+            "{loc}"
+        );
+    }
+}
+
+#[test]
+fn full_access_follows_a_redirect_into_local_space_but_never_into_metadata() {
+    let o = parse_url("http://localhost:3000/login").unwrap();
+    match redirect_step(&o, &o, "GET", 302, "http://127.0.0.1:4000/other", true) {
+        Hop::Follow { url, .. } => assert_eq!(url.as_str(), "http://127.0.0.1:4000/other"),
+        other => panic!("{other:?}"),
+    }
+    // A blocked target is out of reach on Full Access too.
+    for loc in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[fd00:ec2::254]/",
+        "http://metadata.google.internal/",
+    ] {
+        assert!(
+            matches!(redirect_step(&o, &o, "GET", 302, loc, true), Hop::Refuse(_)),
             "{loc}"
         );
     }
@@ -989,6 +1023,7 @@ fn routes(line: &str, raw: &str, port: u16) -> Vec<u8> {
 fn opts() -> Options<'static> {
     Options {
         keep_spill: false,
+        allow_local: false,
         check_hop: &|_, _| Ok(()),
     }
 }
@@ -1075,6 +1110,7 @@ fn redirect_hops_reapply_the_effective_method_and_scoped_host_denies() {
         };
         let opts = Options {
             keep_spill: false,
+            allow_local: false,
             check_hop: &check,
         };
         let hop = opts.redirect_step(&origin, &origin, method, status, location);

@@ -799,6 +799,7 @@ fn with_output_cap<'a>(req: Cow<'a, ChatRequest>, cap: u64) -> Cow<'a, ChatReque
             effort: r.effort,
             max_tokens: cap,
             cache_key: r.cache_key.clone(),
+            cwd: r.cwd.clone(),
         }),
     }
 }
@@ -1058,6 +1059,7 @@ fn with_effort(req: &ChatRequest, effort: usize) -> Cow<'_, ChatRequest> {
         effort,
         max_tokens: req.max_tokens,
         cache_key: req.cache_key.clone(),
+        cwd: req.cwd.clone(),
     })
 }
 
@@ -1078,6 +1080,7 @@ fn with_fitted_images(req: &ChatRequest) -> Cow<'_, ChatRequest> {
         effort: req.effort,
         max_tokens: req.max_tokens,
         cache_key: req.cache_key.clone(),
+        cwd: req.cwd.clone(),
     })
 }
 
@@ -1249,7 +1252,7 @@ pub async fn request(
                 continue;
             }
             let insist = providers::insist(&settings, prov);
-            'target: for mut t in list {
+            for mut t in list {
                 let mut tries = 0u32;
                 let mut refreshed = false;
                 loop {
@@ -1258,8 +1261,15 @@ pub async fn request(
                         match accounts::fresh(h, &a.id, false).await {
                             Ok(a) => t.account = Some(a),
                             Err(e) => {
+                                // This account's token could not be refreshed.
+                                // The other accounts of this step are separate
+                                // logins with their own tokens, so failing over
+                                // is the whole point of having several: ending
+                                // the walk here parked the chat with an untried
+                                // healthy account behind it, which read as
+                                // "it will not switch accounts".
                                 last_err = e;
-                                break 'target;
+                                break;
                             }
                         }
                     }

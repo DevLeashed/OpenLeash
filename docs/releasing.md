@@ -35,7 +35,7 @@ Downloads are unsigned, so Windows SmartScreen and macOS Gatekeeper will warn us
 
 ## In-app updates
 
-The app checks the latest stable `DevLeashed/OpenLeash` GitHub release on startup and every six hours. Install-capable builds (Windows NSIS and Linux AppImage) download newer releases in the background. The user chooses when to restart and install, and installing is refused while agent work is active. Portable Windows builds, macOS DMGs and Debian packages show a link to the release instead.
+The app checks the latest stable `DevLeashed/OpenLeash` GitHub release on startup and every six hours. Install-capable builds (Windows NSIS and Linux AppImage) update in one click: **Update now** finds the release if needed, downloads it, and restarts into it — never while agent work is active, where it keeps the downloaded package and leaves the restart to the user. With the automatic switches on, the app does the same without being asked, up to installing once nothing is running. Portable Windows builds, macOS DMGs and Debian packages show a link to the release instead.
 
 **Update packages are not signature-verified.** `src-tauri/tauri.conf.json` contains a minisign public key, but the update path does not check a signature against it. Until verification is re-enabled in `src-tauri/src/updates.rs`, anything able to serve the release manifest also decides what the app runs. See [security model](security-model.md#app-updates). The update notice's wording should not be read as a signature check.
 

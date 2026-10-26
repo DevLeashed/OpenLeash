@@ -8,7 +8,7 @@
 // than as a bare paste or as an item id the model cannot resolve.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MockInstance } from "vitest";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -18,7 +18,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 import { api } from "../api";
 import { get, set } from "../store";
 import { submit } from "./Composer";
-import { ANNOTATION_MARKER, ANNOTATION_PREFIX, annotationBlock, Annotations, AttachmentChips, contextBlock, parseAnnotationBlock, parseAttachments, pillPlace, SelectionNoteLayer, SentAnnotationMessage, splitContextBlocks, stripHarnessBlocks } from "./SelectionNote";
+import { ANNOTATION_MARKER, ANNOTATION_PREFIX, annotationBlock, Annotations, AttachmentChips, contextBlock, parseAnnotationBlock, parseAttachments, pillPlace, SelectionNoteLayer, SentAnnotationMessage, splitContextBlocks, stagedAttachments, stripHarnessBlocks } from "./SelectionNote";
 import type { Note } from "../store";
 import type { Item, TaskSummary } from "../api";
 import { UserMsg } from "./Session";
@@ -487,10 +487,49 @@ describe("a sent message's attachments come from the item", () => {
     expect(container.textContent).not.toContain("/tmp/ol");
   });
 
-  it("names a picture the timeline has dropped, so the bubble still says it went out", () => {
-    const { container } = render(<UserMsg it={item({ images: [], images_dropped: 1, attachments: staged })} task={task} />);
+  it("names a picture the timeline has dropped, so the bubble still says it went out", async () => {
+    // The copy cannot be read here (the backend refuses it), so the picture is
+    // named rather than drawn — but it is still a picture, not a file.
+    vi.spyOn(api, "stagedImageUrl").mockRejectedValue(new Error("gone"));
+    const only = [
+      { path: "/tmp/ol/gone/01-shot.png", name: "shot.png", size: 3 },
+      { path: "/tmp/ol/gone/02-report.pdf", name: "report.pdf", size: 2048 },
+    ];
+    const { container } = render(<UserMsg it={item({ images: [], images_dropped: 1, attachments: only })} task={task} />);
+    // The read settles before the picture can be named, so the chip comes later.
+    await waitFor(() => expect(container.querySelectorAll(".ubatchip").length).toBe(2));
     const chips = [...container.querySelectorAll(".ubatchip")].map((c) => c.textContent ?? "");
     expect(chips.map((c) => c.replace(/\d.*$/, ""))).toEqual(["shot.png", "report.pdf"]);
+  });
+
+  it("draws a picture the timeline has dropped, by reading its staged copy back", async () => {
+    // The blob was dropped to bound memory, but the copy the backend staged is
+    // still on disk: the picture the user sent is read back and shown as a
+    // picture, not as a paperclip chip with a size.
+    const url = "data:image/png;base64,BBB";
+    vi.spyOn(api, "stagedImageUrl").mockResolvedValue(url);
+    const only = [
+      { path: "/tmp/ol/read/01-shot.png", name: "shot.png", size: 3 },
+      { path: "/tmp/ol/read/02-report.pdf", name: "report.pdf", size: 2048 },
+    ];
+    const { container } = render(<UserMsg it={item({ images: [], images_dropped: 1, attachments: only })} task={task} />);
+    await waitFor(() => expect(container.querySelector(".ubimgs img")).toBeTruthy());
+    const img = container.querySelector<HTMLImageElement>(".ubimgs img")!;
+    expect(img.getAttribute("src")).toBe(url);
+    // Only the real file is a chip now; the picture is not.
+    const chips = [...container.querySelectorAll(".ubatchip")].map((c) => c.textContent ?? "");
+    expect(chips.map((c) => c.replace(/\d.*$/, ""))).toEqual(["report.pdf"]);
+  });
+
+  it("draws a dropped picture from the recorded count, even with no blob count at all", async () => {
+    // A message saved after the count existed records how many of its copies
+    // are pictures, so the split does not depend on the blobs being there.
+    const url = "data:image/png;base64,CCC";
+    vi.spyOn(api, "stagedImageUrl").mockResolvedValue(url);
+    const only = [{ path: "/tmp/ol/count/01-shot.png", name: "shot.png", size: 3 }];
+    const { container } = render(<UserMsg it={item({ images: [], image_attachments: 1, attachments: only })} task={task} />);
+    await waitFor(() => expect(container.querySelector(".ubimgs img")).toBeTruthy());
+    expect(container.querySelector(".ubatchip"), "the picture is not a file chip").toBeNull();
   });
 
   it("still reads the old in-text note for messages saved before the field existed", () => {
@@ -510,6 +549,41 @@ describe("a sent message's attachments come from the item", () => {
     expect(container.querySelectorAll(".filechip")).toHaveLength(1);
     await act(async () => { fireEvent.click(view.getByText("Send")); });
     expect(send).toHaveBeenCalledWith("t1", "look at these", false, [png], ["/tmp/ol/b/02-report.pdf"], ["shot.png"]);
+  });
+});
+
+// The split between a message's pictures and its other files is what decides
+// whether a picture is drawn or shown as a paperclip chip. It used to be
+// guessed from the blobs still on the item, which is zero once the transcript
+// has dropped them — and a picture the user sent became a file with a size.
+describe("splitting a message's staged copies into pictures and files", () => {
+  const staged = [
+    { path: "/tmp/ol/b/01-shot.png", name: "shot.png", size: 3 },
+    { path: "/tmp/ol/b/02-report.pdf", name: "report.pdf", size: 2048 },
+  ];
+
+  it("uses the recorded count, so a dropped picture is still a picture", () => {
+    const { images, files } = stagedAttachments({ images: [], image_attachments: 1, attachments: staged });
+    expect(images.map((a) => a.name)).toEqual(["shot.png"]);
+    expect(files.map((a) => a.name)).toEqual(["report.pdf"]);
+  });
+
+  it("falls back to the blobs plus the ones that went, for messages saved before the count existed", () => {
+    const { images, files } = stagedAttachments({ images: [], images_dropped: 1, attachments: staged });
+    expect(images.map((a) => a.name)).toEqual(["shot.png"]);
+    expect(files.map((a) => a.name)).toEqual(["report.pdf"]);
+  });
+
+  it("counts a message that kept its blobs as they are", () => {
+    const { images, files } = stagedAttachments({ images: ["data:image/png;base64,AAA"], attachments: staged });
+    expect(images.map((a) => a.name)).toEqual(["shot.png"]);
+    expect(files.map((a) => a.name)).toEqual(["report.pdf"]);
+  });
+
+  it("treats every copy as a file when the message carried no pictures", () => {
+    const { images, files } = stagedAttachments({ attachments: staged });
+    expect(images).toEqual([]);
+    expect(files.map((a) => a.name)).toEqual(["shot.png", "report.pdf"]);
   });
 });
 

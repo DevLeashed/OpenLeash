@@ -122,21 +122,28 @@ Native webview implementations matter here. On Windows, WebView2 may inject Taur
 
 The in-app updater is separate from the agent's tools.
 
-**App updates are separate from agent tools.** The app checks the public
-`DevLeashed/OpenLeash` GitHub latest release on startup and periodically; these
+**App updates are separate from agent tools.** With the **Check for updates
+automatically** switch off — the default — the app contacts GitHub about releases
+never, and a release is found only by pressing **Check for updates**. That button
+reports the version and offers a separate **Download update**; a check does not
+fetch a package by itself. **Check for updates automatically** looks for a newer
+stable release every few hours. **Update automatically** goes further: it
+downloads a newer release, installs it by itself and restarts the app, but only
+once no chat, subagent or command is running — it never interrupts active work,
+and it is refused while work is active exactly as the button is. Either way these
 requests disclose the usual network metadata/IP address to GitHub, not task
-transcripts or provider credentials. Install-capable builds download newer stable
-updates in the background. **Released update packages are not signed and the app
-does not verify an update signature**: the only protection on that path is TLS
-plus the pinned `DevLeashed/OpenLeash` release path that `src-tauri/src/updates.rs`
-enforces before any bytes are fetched, so whatever can serve the update manifest
-also decides what the app will run. Re-enable minisign verification before
-treating in-app updates as authenticated. Applying an update and restarting
-requires an explicit user action and is refused while agent/background work is
-active. Portable Windows, macOS and non-AppImage Linux builds announce releases
-instead of installing them. See [Releases](releasing.md) for setup and supported
-packages. Unsigned updates are also not Windows Authenticode signing or macOS
-signing/notarization, and neither removes SmartScreen or Gatekeeper warnings.
+transcripts or provider credentials. **Released update packages are not signed
+and the app does not verify an update signature**: the only protection on that
+path is TLS plus the pinned `DevLeashed/OpenLeash` release path that
+`src-tauri/src/updates.rs` enforces before any bytes are fetched, so whatever can
+serve the update manifest also decides what the app will run — which is why the
+automatic install switch is off by default, and why turning it on is the user
+handing that decision to GitHub. Re-enable minisign verification before treating
+in-app updates as authenticated. Portable Windows, macOS and non-AppImage Linux
+builds announce releases instead of installing them. See [Releases](releasing.md)
+for setup and supported packages. Unsigned updates are also not Windows
+Authenticode signing or macOS signing/notarization, and neither removes
+SmartScreen or Gatekeeper warnings.
 
 **The GitHub connector's token only goes to GitHub.** A raw `api` call to a path that is not on `api.github.com` is treated as a write, so it asks — otherwise a prompt-injected repository could post your token to any host without a prompt.
 
@@ -161,19 +168,21 @@ IPv4 written in decimal, hex, octal or short form is normalized by the WHATWG UR
 | --- | --- | --- | --- | --- | --- |
 | `GET`/`HEAD`, public | allow | allow | allow | allow | allow |
 | Other method, public | deny | ask | ask | allow | deny |
-| Any method, loopback or private | deny | ask | ask | ask, never silent | `GET`/`HEAD` ask, others deny |
+| Any method, loopback or private | deny | ask | ask | allow | `GET`/`HEAD` ask, others deny |
 | Any method, blocked target | deny | deny | deny | deny | deny |
 | Invalid method, invalid URL, or userinfo in the URL | deny | deny | deny | deny | deny |
+
+**Full Access covers every target class.** It is the "ask me nothing" mode, so a request to `localhost`, to a LAN address or to a private name runs without a card there, exactly as a public one does. Below Full Access a loopback or private target always asks, because that rung was granted for *this* project's work and the router admin page or another local service is not obviously that — an explicit per-host rule (`http_request:GET http://localhost:3000`) is what makes a dev server stop asking. The blocked targets are out of reach on every rung, Full Access included: there is no legitimate agent use for the cloud metadata service, and it is the classic SSRF prize.
 
 **Allow rules are exact.** **Always allow** on the card records `http_request:<METHOD> <scheme>://<host>:<effective-port>`, for example `http_request:POST https://api.example.com:443` or `http_request:POST http://localhost:3000`. The effective port is always written, including the default, and scheme is part of the key: a grant for `https://localhost:443` cannot authorize `http://localhost:80`. It matches that method, scheme, host and port only: never a subdomain, another host or another method, and no wildcard allow rule is honoured. Deny rules remain method-and-host patterns: `!http_request` or `!http_request *` refuses the whole tool, and `!http_request:POST api.example.com`, `!http_request:* api.example.com` or `!http_request:DELETE *` refuse matching calls, case-insensitively. Denies are re-applied to the effective method and authority at every redirect hop, so a hop to a host denied by `!http_request:* b.example.com` is refused. A deny always wins, over Full Access and over a `GET` that would otherwise run without asking.
 
 **Every call takes the ordinary gate.** Plan mode, the deny tier, doom-loop protection and reviewer mode apply to it like any other tool. Read-only subagents are offered only `GET` and `HEAD`, and any other method is refused at dispatch as well, so a schema the model ignores does not widen it. Other subagents get every method through the same gate. The tool is not exposed over MCP. In an SSH project the request leaves from the computer running OpenLeash, so `localhost` and the private network are yours, not the SSH host's.
 
-**The address is checked again when the request is made.** The hostname is resolved before connecting and every resolved address is classified. A blocked address is always refused, and a URL that looked public but resolves to a loopback or private address is refused, which closes the DNS-rebinding and internal-DNS gap `web_fetch` still has. The connection is pinned to the addresses that were checked, so a second DNS answer cannot move it. System proxy settings are ignored, because a proxy would resolve the name itself and defeat the check; the tool therefore does not work on networks that only allow traffic through a proxy.
+**The address is checked again when the request is made.** The hostname is resolved before connecting and every resolved address is classified. A blocked address is always refused, and a URL that looked public but resolves to a loopback or private address is refused — that closes the DNS-rebinding and internal-DNS gap `web_fetch` still has. On Full Access the gate approved every target class, so a local answer is allowed there too. The connection is pinned to the addresses that were checked, so a second DNS answer cannot move it. System proxy settings are ignored, because a proxy would resolve the name itself and defeat the check; the tool therefore does not work on networks that only allow traffic through a proxy.
 
-**Redirects are followed by hand, one checked hop at a time.** Each hop is re-validated and re-resolved. A redirect to a blocked target is refused. A redirect to a loopback or private target is refused unless it stays on the approved request's origin (scheme, host and port). A `307` or `308` that would resend a non-`GET` method and body to a different origin is not followed: the 3xx response is returned, and the agent has to make a new request that is approved on its own. A `301`, `302` or `303` after a non-`GET` becomes a `GET` without a body. `Authorization`, `Cookie` and API-key-like headers are dropped on any cross-origin hop.
+**Redirects are followed by hand, one checked hop at a time.** Each hop is re-validated and re-resolved. A redirect to a blocked target is refused. A redirect to a loopback or private target is refused unless it stays on the approved request's origin (scheme, host and port), or the chat is on Full Access, which approved every target class. A `307` or `308` that would resend a non-`GET` method and body to a different origin is not followed: the 3xx response is returned, and the agent has to make a new request that is approved on its own. A `301`, `302` or `303` after a non-`GET` becomes a `GET` without a body. `Authorization`, `Cookie` and API-key-like headers are dropped on any cross-origin hop.
 
-**Secrets are redacted where you look at the call.** The approval card, the stored input of the transcript row (which is also what ACP clients see), the doom-loop card and the reviewer model's prompt all show redacted values. `Authorization` and `Proxy-Authorization` keep only their scheme (`Bearer [redacted]`). `Cookie`, `Set-Cookie` and any header whose name contains `token`, `secret`, `key`, `auth`, `password`, `session`, `signature`, `credential` or `cookie` become `[redacted]`, and so do query parameters with such names (and `code` and `sig`). JSON body keys with such names are redacted recursively, and form-encoded bodies the same way. A URL path segment or query value that looks like a random token (24+ letters and digits, e.g. the secret part of a Slack or Discord webhook URL) is redacted too; UUIDs are left alone.
+**Secrets are redacted where you look at the call.** The approval card, the stored input of the transcript row (which is also what ACP clients see), the doom-loop card and the reviewer model's prompt all show redacted values. `Authorization` and `Proxy-Authorization` keep only their scheme (`Bearer [redacted]`). `Cookie`, `Set-Cookie` and any header whose name contains `token`, `secret`, `key`, `auth`, `password`, `session`, `signature`, `credential` or `cookie` become `[redacted]`, and so do query parameters with such names (and `code` and `sig`). JSON body keys with such names are redacted recursively, and form-encoded bodies the same way. A URL path segment or query value that looks like a random token (24+ letters and digits, e.g. the secret part of a Slack or Discord webhook URL) is redacted too; UUIDs are left alone. The transcript row stores the redacted copy, so the request's credentials do not end up in the chat's saved conversation on disk.
 
 **What this does not protect against:**
 
@@ -182,9 +191,24 @@ IPv4 written in decimal, hex, octal or short form is normalized by the WHATWG UR
 - Trusted `pre_tool` and `post_tool` hooks receive the raw input.
 - A `GET` to a public host runs without asking, as `web_fetch` does, so it can carry data out in the URL or headers to any public host just as `web_fetch` can. Deny rules are the control for that.
 - An approved loopback request can still change local state, such as a dev server's database.
+- On Full Access, a loopback or private request is not approved by a human at all — it runs on the strength of the mode alone, so it can reach a local service that holds real state. Use a deny rule if that matters.
 - Response bodies are untrusted data, the same as a fetched page.
 - TLS errors cannot be bypassed: there is no insecure option.
 - None of this is a sandbox.
+
+## Antigravity
+
+**It is a delegate, not a model backend, and the difference is the whole point.** OpenLeash never signs into Google and never reads, stores, refreshes or sends an Antigravity credential. The accounts Google suspended were suspended for pulling that OAuth token out of the vendor's own files and replaying it from a third-party client, so that is exactly what this integration does not do: the official `agy` CLI holds the sign-in in its own keyring, and OpenLeash only runs that binary and reads its documented headless output (`src-tauri/src/agent/antigravity.rs`). There is no login screen here because there is nothing here to log into.
+
+**A turn on this provider runs inside `agy`, outside the permission layer.** `agy` is an agent, not a model: it has its own tools (`run_command`, `write_to_file`, browser control, subagents) and does not accept a tool schema from us, so it decides how the work gets done. Your allow and deny rules, plan mode, read-before-write check, checkpoints and approval prompts **do not apply inside a delegated turn**. What runs is governed by the CLI's own settings in `~/.gemini/antigravity-cli/settings.json`, which OpenLeash shows the path of and never writes.
+
+**The posture is full access, deliberately and visibly.** Headless mode soft-denies every tool that would need approval, which would leave a delegate that can edit but not verify, so OpenLeash passes `--dangerously-skip-permissions` (`antigravity::args`). Every step the CLI takes is streamed into the transcript as its own kind of card (`StreamEvent::Step`) — never dressed up as an OpenLeash tool call, because that would claim an approval that never happened.
+
+**Requests with no workspace are read-only.** OpenLeash's own one-shots — a chat title, a compaction summary, a commit message, a reviewer classification — carry no project. They run `agy` with `--mode plan` in a scratch directory rather than inheriting this app's working directory with full access (`antigravity::run`).
+
+**Remote projects are refused.** `agy` runs on this machine, so a chat whose workspace is `ssh://…` gets a clear error instead of a delegate that silently edits nothing.
+
+**What it does not protect against.** A delegated turn can do anything `agy` can do as your user, within whatever its own rules allow. OpenLeash cannot approve, deny, record or undo it, and the tool steps in the transcript are a report from the CLI rather than a log this app controls. Treat Antigravity chats like a terminal running `agy`, and use a model provider when you want the approval layer.
 
 ## Other chats
 

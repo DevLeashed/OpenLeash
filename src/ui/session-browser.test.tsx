@@ -57,3 +57,21 @@ it("offers the Browser view by default, before any plugin setting has been saved
   fireEvent.click(screen.getByRole("button", { name: "Browser" }));
   expect(screen.getByText("Browser for default-chat")).toBeTruthy();
 });
+it("puts Browser in the studio's mode switch beside Sandboxes, with no tab row of its own", () => {
+  (globalThis as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver = class { observe() {} disconnect() {} unobserve() {} } as unknown as typeof ResizeObserver;
+  vi.spyOn(api, "review").mockResolvedValue({ git: false, files: [] });
+  const task = { id: "seg-chat", title: "Chat", status: "stopped", model: "test/model", project: "D:/dummy", subs: [], pending: {}, todos: [], cost: 0, tokens: {}, artifict_open: true, usage: { cost: 0, last_context: 0, cache_read: 0 }, context_window: 200000 } as unknown as TaskSummary;
+  set({ task: task.id, tasks: { [task.id]: task }, items: { [task.id]: [] }, settings: {} as unknown as Settings, details: false, find: false });
+  const { container } = render(<Session />);
+  expect(container.querySelector(".workspace-tabs")).toBeNull();
+  const seg = () => screen.getByRole("group", { name: "Studio mode" });
+  const names = () => Array.from(seg().querySelectorAll("button")).map((b) => b.textContent);
+  expect(names()).toEqual(["Artificts", "Sandboxes", "Browser"]);
+  fireEvent.click(screen.getByRole("button", { name: "Browser" }));
+  expect(screen.getByText("Browser for seg-chat")).toBeTruthy();
+  // The switch stays in the header while the browser is up, so the way back is there.
+  expect(names()).toEqual(["Artificts", "Sandboxes", "Browser"]);
+  fireEvent.click(screen.getByRole("button", { name: "Sandboxes" }));
+  expect(screen.queryByText("Browser for seg-chat")).toBeNull();
+  expect(screen.getByRole("button", { name: "Sandboxes" }).getAttribute("aria-pressed")).toBe("true");
+});

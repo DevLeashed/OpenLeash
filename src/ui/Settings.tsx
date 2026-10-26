@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { DENY_PREFIX, isDenyRule, normPath, PERMS, type CustomCommand } from "../api";
+import { DENY_PREFIX, isDenyRule, normPath, PERMS, type CustomCommand, type Race } from "../api";
 import { flash, isNarrow, saveSettings, set, useStore } from "../store";
 import { ago } from "../api";
 import { archiveTask, deleteArchivedTasks, deleteTask, exportArchived, exportTasks, importTasks } from "./Chrome";
@@ -18,11 +18,11 @@ import { ChecksTab } from "./Hooks";
 import { RemoteTab } from "./Remote";
 import { WorkspacesTab } from "./Workspaces";
 import { defaultMode } from "../workspaces";
-import { archiveRace, useRaces } from "../race";
+import { archiveRace, deleteRace, useRaces } from "../race";
 import { SLASH } from "./Composer";
 import { stepZoom, DEFAULT_ZOOM, ZOOMS } from "../store";
 import { Minus, Plus, Trash2 } from "lucide-react";
-import { Dropdown, Button, ChoiceRow, IconButton, Input, NavTab, Pressable, Segmented, Switch, MorphText } from "./primitives";
+import { Dropdown, Button, ChoiceRow, ConfirmDialog, IconButton, Input, NavTab, Pressable, Segmented, Switch, MorphText } from "./primitives";
 import { SAVED_SORT_OPTIONS, savedSortOf } from "./Saved";
 import { HIDDEN_SETTINGS_TABS, SETTINGS_TABS, settingsTabDef } from "./settingsTabs";
 
@@ -434,16 +434,49 @@ function Perms() {
 }
 
 
+/** The last step before an archived race is deleted for good.
+ *
+ *  A race is a group of real chats, so deleting one takes work away that the
+ *  user may still want. The dialog names what goes (the race and the chats
+ *  still archived with it) and offers the worktree choice, because a kept
+ *  worktree is a checkout the user has to clean up by hand. */
+function RaceDeleteDialog({ race, removeWorktree, onRemoveWorktree, onConfirm, onClose }: {
+  race: Race;
+  removeWorktree: boolean;
+  onRemoveWorktree: (v: boolean) => void;
+  onConfirm: (removeWorktree: boolean) => void | Promise<void>;
+  onClose: () => void;
+}) {
+  const attempts = race.attempts.length;
+  return (
+    <ConfirmDialog title="Delete this race for good?" confirm="Delete forever" danger onClose={onClose} onConfirm={() => void onConfirm(removeWorktree)}
+      body={<div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div className="desc">
+          The race record and its ranking are dropped, along with the {attempts} attempt chat{attempts === 1 ? "" : "s"} still archived with it. This cannot be undone.
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--mut3)", fontSize: 11.5 }}>
+          <Switch label="Also permanently remove the attempt worktrees" checked={removeWorktree} small onChange={onRemoveWorktree} />
+          <span>Also remove their worktrees and any uncommitted files in them; branches remain.</span>
+        </div>
+        {!removeWorktree && <div style={{ fontSize: 11, color: "var(--dim)" }}>Their worktrees stay on disk.</div>}
+      </div>} />
+  );
+}
+
 function ChatsTab() {
   const tasks = useStore((st) => st.tasks);
   const s = useStore((st) => st.settings)!;
   const [arm, setArm] = useState<string | null>(null);
   const [removeWorktree, setRemoveWorktree] = useState<string | null>(null);
   const [armAll, setArmAll] = useState(false);
+  const [armRace, setArmRace] = useState<string | null>(null);
+  const [raceWorktree, setRaceWorktree] = useState(false);
+  const [deletingRace, setDeletingRace] = useState<string | null>(null);
   const all = Object.values(tasks);
   const archived = all.filter((t) => t.archived).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   const raceMap = useRaces((st) => st.races);
   const archivedRaces = Object.values(raceMap).filter((r) => r.archived).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const armedRace = deletingRace ? archivedRaces.find((r) => r.id === deletingRace) : undefined;
   return (
     <>
       <div className="settings-head"><div className="settings-head-main settings-title">Chats</div></div>
@@ -487,13 +520,19 @@ function ChatsTab() {
         <div className="settings-section-label">Archived races · {archivedRaces.length}</div>
         <div className="sgroup">
           {archivedRaces.map((r) => (
-            <div key={r.id} className="srowx agentrow" style={{ minHeight: 42 }}>
+            <div key={r.id} className="srowx agentrow" style={{ minHeight: 42 }} onMouseLeave={() => { if (armRace === r.id) setArmRace(null); }}>
               <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>Race · {r.prompt}</div><div className="desc">{r.attempts.length} attempts · {baseName(r.project)}{r.winner ? (r.merged ? " · merged" : " · winner picked") : ""}</div></div>
               <Button variant="ghost" style={{ height: 26 }} onClick={() => void archiveRace(r.id, false)}>Restore</Button>
+              {armRace === r.id
+                ? <Button variant="primary" style={{ height: 26, background: "#ff8a8a" }} onClick={() => { setArmRace(null); setRaceWorktree(false); setDeletingRace(r.id); }}>Delete forever</Button>
+                : <Button variant="ghost" style={{ height: 26, color: "#ff8a8a" }} onClick={() => setArmRace(r.id)}>Delete…</Button>}
             </div>
           ))}
         </div>
       </>}
+      {deletingRace && armedRace && <RaceDeleteDialog race={armedRace} removeWorktree={raceWorktree} onRemoveWorktree={setRaceWorktree}
+        onClose={() => { setDeletingRace(null); setRaceWorktree(false); }}
+        onConfirm={async (removeWorktree) => { setDeletingRace(null); setRaceWorktree(false); await deleteRace(deletingRace, removeWorktree); }} />}
       {archived.length ? <div className="sgroup">
         {archived.map((t) => (
           <div key={t.id} className="srowx agentrow" style={{ minHeight: 42 }} onMouseLeave={() => { if (arm === t.id) setArm(null); if (removeWorktree === t.id) setRemoveWorktree(null); }}>

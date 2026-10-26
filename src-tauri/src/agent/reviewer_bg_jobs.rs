@@ -52,7 +52,7 @@ async fn a_live_job_is_named_in_the_summary_and_leaves_when_it_exits() {
     );
 
     // Long-lived on purpose: this is the shape the banner has to own up to.
-    let id = h.bg.spawn("t1", "sleep 30", ".").unwrap();
+    let id = h.bg.spawn("t1", "", "sleep 30", ".").unwrap();
     h.refresh_busy("t1").await;
     let s = t.lock().await.summary();
     assert_eq!(
@@ -95,7 +95,7 @@ async fn a_paused_chat_still_names_the_jobs_its_pause_does_not_stop() {
     let dir = std::env::temp_dir().join(format!("openleash-bgpause-{}", std::process::id()));
     let _home = super::store::test_home(&dir);
     let (h, _events) = harness(Settings::default(), vec![task("t1", "m1")]);
-    let id = h.bg.spawn("t1", "sleep 30", ".").unwrap();
+    let id = h.bg.spawn("t1", "", "sleep 30", ".").unwrap();
 
     // No recount of our own: the pause's own recount is what has to fill the
     // list, since that is the instant the banner appears.

@@ -4,7 +4,7 @@
 // shows what the backend last published on `ol://schedules`.
 import { useEffect, useMemo, useState } from "react";
 import {
-  ago, api, baseName, clampEffort, EFFORTS, effortLabel, effortSteps, normPath, PERMS, permId,
+  ago, api, baseName, clampEffort, effortLadder, effortSteps, normPath, PERMS, permId,
   type Perm, type Schedule, type ScheduleDraft, type ScheduleRun, type ScheduleTiming, type Settings, type Weekday,
 } from "../api";
 import { defaultMode } from "../workspaces";
@@ -191,7 +191,7 @@ export function ScheduleForm({ initial, onClose }: { initial: ScheduleDraft; onC
 
   const mi = modelInfo(d.model);
   const steps = effortSteps(mi);
-  const effortOpts = steps.map((v) => ({ value: String(v), label: effortLabel(mi, v) ?? EFFORTS[v] ?? String(v) }));
+  const effortOpts = effortLadder(mi).map((o) => ({ value: String(o.value), label: o.label }));
   const perm = PERMS.find((p) => p.id === permId(d.perm));
 
   const save = async () => {

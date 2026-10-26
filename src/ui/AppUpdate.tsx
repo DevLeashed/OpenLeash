@@ -14,7 +14,7 @@ export function appUpdateText(update: AppUpdateStatus) {
     case "ready": return `OpenLeash${version} is ready to install.`;
     case "current": return "OpenLeash is up to date.";
     case "error": return "Could not update OpenLeash.";
-    default: return "Updates are checked automatically. Installation always requires your approval.";
+    default: return "Updates are checked and downloaded only when you ask for them. One click on Update now installs the new version and restarts.";
   }
 }
 export function AppUpdateActions({ check = false }: { check?: boolean }) {
@@ -25,7 +25,15 @@ export function AppUpdateActions({ check = false }: { check?: boolean }) {
   const working = busy || update.status === "checking" || update.status === "downloading";
   return <div className="app-update-actions">
     {check && <Button disabled={working} onClick={() => void runAppUpdate("check")}>Check for updates</Button>}
-    {(update.status === "available" || update.status === "error") && update.can_install && <Button disabled={working} onClick={() => void runAppUpdate("download")}>Retry download</Button>}
+    {update.status === "available" && update.can_install && <>
+      {/* One click does the whole thing: the backend checks if it has to,
+          downloads, and applies the release once nothing is running. Fetching
+          the package separately stays available for whoever wants the restart
+          later instead. */}
+      <Button variant="primary" disabled={working} onClick={() => void runAppUpdate("now")}>Update now</Button>
+      <Button variant="ghost" disabled={working} onClick={() => void runAppUpdate("download")}>Download only</Button>
+    </>}
+    {update.status === "error" && update.can_install && <Button disabled={working} onClick={() => void runAppUpdate("download")}>Retry download</Button>}
     {update.status === "ready" && update.can_install && <>
       <span className="desc">Save your work before restarting.</span>
       {actionError && <span className="app-update-error" role="alert">{actionError}</span>}

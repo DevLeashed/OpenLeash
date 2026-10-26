@@ -28,6 +28,10 @@ export function ReplyTable({ children }: { children?: ReactNode }) {
   if (sort) filtered.sort((a, b) => {
     const left = a.cells[sort.column] ?? "", right = b.cells[sort.column] ?? "";
     const ln = number(left), rn = number(right);
+    // A cell that is not a number ("—", a label) has no magnitude to reverse,
+    // so it sorts after every number in both directions.
+    const group = (ln === null ? 1 : 0) - (rn === null ? 1 : 0);
+    if (group) return group;
     const order = ln !== null && rn !== null ? ln - rn : left.localeCompare(right);
     return (sort.descending ? -order : order) || a.index - b.index;
   });

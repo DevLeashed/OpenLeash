@@ -23,7 +23,8 @@ mod win;
 use agent::providers::{self, ModelInfo};
 use agent::store::{self, AgentDef, CustomProvider, McpServerCfg, Settings, SkillDef};
 use agent::{
-    accounts, checkpoint, git, router, runner, Checkpoint, Harness, Item, Task, TaskSummary,
+    accounts, antigravity, checkpoint, git, router, runner, Checkpoint, Harness, Item, Task,
+    TaskSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -183,7 +184,13 @@ fn provider_views(s: &Settings) -> Vec<ProviderView> {
             providers::api_key(s, id)
         };
         let accts = s.accounts.iter().filter(|a| a.kind == id).count();
-        let connected = custom || !key.is_empty() || accts > 0 || (local && cfg.is_some());
+        // A CLI-backed provider is "connected" only when the binary is actually
+        // there: its credential lives in the vendor's own login, so there is no
+        // key to check, and claiming it works without the CLI would put models in
+        // every picker that fail on the first turn.
+        let cli_ready = kind != "cli" || antigravity::locate().is_some();
+        let connected =
+            custom || !key.is_empty() || accts > 0 || (local && cfg.is_some() && cli_ready);
         let key_hints: Vec<String> = if pool_enabled {
             keys.iter()
                 .map(|k| providers::key_hint(k))
@@ -423,6 +430,21 @@ fn file_data_url(path: String) -> Result<String, String> {
     let p = PathBuf::from(&path);
     let img = agent::tools::view_image(&p)?;
     Ok(format!("data:{};base64,{}", img.media_type, img.data_b64))
+}
+
+/// Read one of OpenLeash's own staged attachment copies back as a `data:` URL.
+///
+/// The transcript drops a message's picture blobs once a chat grows, to bound
+/// what it holds in memory. The picture itself is not lost: the copy the
+/// backend staged on disk is still there, and this reads it back so the bubble
+/// can show the picture the user sent rather than a chip naming a file.
+///
+/// Only copies inside OpenLeash's staging folder are read — the path arrives
+/// from the transcript, and the transcript is data the agent can put words
+/// into, so it is not allowed to name a file anywhere on the disk.
+#[tauri::command]
+fn staged_image_url(path: String) -> Result<String, String> {
+    agent::attachments::staged_image_data_url(&path)
 }
 
 /// A picture an agent put in its reply (`![chart](out/chart.png)` or an absolute
@@ -2609,7 +2631,7 @@ async fn race_create(h: H<'_>, req: agent::race::NewRace) -> Result<Value, Strin
         let docker = req.uses_docker();
         async move {
             let task = NewTask {
-                prompt: spec.prompt,
+                prompt: a.prompt,
                 project: spec.project,
                 model: a.model,
                 effort: a.effort,
@@ -2631,7 +2653,7 @@ async fn race_create(h: H<'_>, req: agent::race::NewRace) -> Result<Value, Strin
                 ultra_wt: false,
                 ultra_x: None,
             };
-            let mut summary = create_task(h.clone(), task, None).await?;
+            let mut summary = create_task_external(h.clone(), task, None).await?;
             let id = summary.id.clone();
             // `titled` keeps the numbering: the agent's `set_title` is refused
             // on a chat with a fixed name, and "Race 2/3" is how the group reads.
@@ -2737,6 +2759,85 @@ async fn race_forget(h: H<'_>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Delete an archived race for good: the race record, its ranking, and the
+/// attempt chats that are still put away with it. The chats go through the
+/// same purge a chat's own "Delete forever" uses, so their transcripts, drafts,
+/// attachments and worktrees are handled exactly as they are there.
+///
+/// Only an archived race can be deleted this way. A race that is still in the
+/// sidebar may have attempts that are running, and dropping those would kill
+/// work the user never asked to stop; archiving is the user's own "put this
+/// away" before a permanent delete.
+///
+/// A chat the user restored on its own is left alone: it is a plain chat in the
+/// sidebar now, with its own history, and the race is only the grouping that
+/// was put away. It is named in the result so the UI can say so.
+#[tauri::command]
+async fn race_delete(h: H<'_>, id: String, remove_worktree: bool) -> Result<Value, String> {
+    let h = h.inner().clone();
+    // Purging runs git and file IO, which must not block the async runtime.
+    tokio::task::spawn_blocking(move || delete_race(&h, &id, remove_worktree))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn delete_race(h: &Harness, id: &str, remove_worktree: bool) -> Result<Value, String> {
+    let race = agent::race::get(id)?;
+    if !race.archived {
+        return Err("Archive the race before deleting it for good.".into());
+    }
+    let mut deleted = vec![];
+    let mut kept = vec![];
+    let mut failed = vec![];
+    // The worktrees that stay on disk are counted before anything is purged: a
+    // kept worktree is a folder the user has to clean up by hand, so the toast
+    // has to name it.
+    let mut kept_worktrees = 0usize;
+    for a in &race.attempts {
+        let Some(task) = h.tasks.blocking_read().get(&a.task_id).cloned() else {
+            // A chat the user already deleted is not a failure: there is nothing
+            // left to purge.
+            continue;
+        };
+        let (archived, worktree, workers) = {
+            let t = task.blocking_lock();
+            (
+                t.archived,
+                t.worktree,
+                t.subs.iter().filter(|s| !s.cwd.is_empty()).count(),
+            )
+        };
+        if !archived {
+            // Restored by hand: it is a chat of its own again, not part of the
+            // archive the user is deleting.
+            kept.push(a.task_id.clone());
+            kept_worktrees += worktree as usize + workers;
+            continue;
+        }
+        match purge_task(h, &a.task_id, remove_worktree) {
+            Ok(()) => deleted.push(a.task_id.clone()),
+            Err(e) => failed.push(format!("{}: {e}", a.task_id)),
+        }
+    }
+    if !failed.is_empty() {
+        // The race record stays, so the user can see what is left and retry.
+        return Err(format!(
+            "Couldn't delete every chat of this race: {}",
+            failed.join("; ")
+        ));
+    }
+    // The record goes last: a failure above must leave the race in place, so
+    // its remaining chats can still be reached.
+    agent::race::remove(id)?;
+    agent::race::emit_removed(h, id);
+    Ok(json!({
+        "id": id,
+        "deleted_chats": deleted,
+        "kept_chats": kept,
+        "kept_worktrees": if remove_worktree { 0 } else { kept_worktrees },
+    }))
+}
+
 /// Create a chat and start its first prompt. `display`, when given, is what the
 /// transcript shows (and the title is drawn from) while `req.prompt` is what the
 /// model receives: a connector frames a chat message with where it came from,
@@ -2757,19 +2858,64 @@ async fn strict_task_worktree_ready(h: &Harness, id: &str) -> bool {
     strict_worktree_ready(true, task.worktree, &task.cwd, &task.project)
 }
 
-async fn create_task(h: Arc<Harness>, req: NewTask, display: Option<String>) -> Result<TaskSummary, String> {
-    create_task_with_policy(h, req, display, TaskCreationPolicy::default()).await
+async fn create_task(
+    h: Arc<Harness>,
+    req: NewTask,
+    display: Option<String>,
+) -> Result<TaskSummary, String> {
+    create_task_with_policy(
+        h,
+        req,
+        display,
+        TaskCreationPolicy::default(),
+        CreateTaskOptions::Interactive,
+    )
+    .await
+}
+
+/// A task started by something other than the composer — a chat connector, a
+/// race attempt, the quota burner.
+///
+/// It is created exactly like an interactive one, but it does not move the
+/// new-task default: the model a chat that arrived from Slack happens to run on
+/// is not the model the user wants their next new task to start on.
+pub(crate) async fn create_task_external(
+    h: Arc<Harness>,
+    req: NewTask,
+    display: Option<String>,
+) -> Result<TaskSummary, String> {
+    create_task_with_policy(
+        h,
+        req,
+        display,
+        TaskCreationPolicy::default(),
+        CreateTaskOptions::External,
+    )
+    .await
 }
 
 pub(crate) async fn create_task_with_policy(
-    h: Arc<Harness>, req: NewTask, display: Option<String>, policy: TaskCreationPolicy,
+    h: Arc<Harness>,
+    req: NewTask,
+    display: Option<String>,
+    policy: TaskCreationPolicy,
+    options: CreateTaskOptions,
 ) -> Result<TaskSummary, String> {
-    create_task_with_options(h, req, display, CreateTaskOptions::Interactive, policy).await
+    create_task_with_options(h, req, display, options, policy).await
 }
 
 #[derive(Clone, Copy)]
-enum CreateTaskOptions {
+pub(crate) enum CreateTaskOptions {
+    /// A new task the user started from the composer. The model it runs on is
+    /// remembered as the default for the next new task.
     Interactive,
+    /// A task started by something other than the composer: a chat connector,
+    /// a race attempt, the quota burner. It still records the project and the
+    /// recently-used models, but it does *not* move the new-task default — the
+    /// model a background chat happens to run on is not the model the user
+    /// wants their next new task to start on.
+    External,
+    /// A scheduled run. Writes nothing at all.
     Background,
 }
 
@@ -2777,6 +2923,7 @@ async fn remember_task_creation(
     h: &Harness,
     project: &str,
     model: &str,
+    effort: usize,
     options: CreateTaskOptions,
 ) {
     // Background creation must never write interactive choices, even briefly:
@@ -2788,6 +2935,27 @@ async fn remember_task_creation(
     s.recent_models.retain(|m| m != model);
     s.recent_models.insert(0, model.to_string());
     s.recent_models.truncate(5);
+    // The model the last new task actually ran on is the model the next new
+    // task should start on. `settings.model` is what the new-task screen reads
+    // on boot, and it used to only ever hold the build's default — so the pick
+    // the user made was remembered in `recent_models` and nowhere else, and
+    // the next new task came up on a model the user had never chosen. Writing
+    // it here is what makes "the model I used last" the one that is
+    // preselected, rather than something to pick again every time.
+    //
+    // Only an interactive task may move it: a chat that arrived from Slack, or
+    // one attempt of a race, is not the user choosing a model for their next
+    // task, and letting it write this field made the new-task screen come up
+    // on a model nobody picked there.
+    if matches!(options, CreateTaskOptions::Interactive) && !model.trim().is_empty() {
+        s.model = model.to_string();
+        // The reasoning level goes with the model. It is recorded here rather
+        // than on every slider step because the slider is a control, not a
+        // choice: one write per arrow key would let two quick presses race
+        // each other's answers. The level of the task that actually ran is the
+        // one the user meant, and it is what comes back on the next new task.
+        s.effort = effort.min(4);
+    }
     if !s.projects.iter().any(|p| p == project) {
         s.projects.insert(0, project.to_string());
     }
@@ -2958,7 +3126,7 @@ async fn create_task_with_options(
         .await
         .insert(id.clone(), Arc::new(Mutex::new(task)));
     h.save_task(&id).await;
-    remember_task_creation(&h, &project, &req.model, options).await;
+    remember_task_creation(&h, &project, &req.model, req.effort, options).await;
     start_new_task_prompt(
         h.clone(),
         NewTaskStartup {
@@ -3166,6 +3334,21 @@ async fn task_interrupt(h: H<'_>, id: String) -> Result<(), String> {
     runner::interrupt(&h, &id).await;
     // Stopping is the user acting on this chat, so it comes to the top. (The
     // task may already be settling, which is fine: this is its last word.)
+    h.touch(&id).await;
+    Ok(())
+}
+
+/// Stop, the way the Stop button and `/stop` mean it: a force pause.
+///
+/// The run is frozen where it stands rather than cancelled, so a swarm is not
+/// thrown away by the keystroke meant to stop it: every subagent keeps its own
+/// transcript, the turn resumes at its next request, and each agent is told
+/// which of its own background commands the stop killed. `task_interrupt` is
+/// still the outright cancellation, and is what the paths that need the run
+/// *ended* (`pcguard_stop`, dismissing a pause, archiving a paused chat) use.
+#[tauri::command]
+async fn task_stop(h: H<'_>, id: String) -> Result<(), String> {
+    runner::stop(&h, &id).await;
     h.touch(&id).await;
     Ok(())
 }
@@ -3469,12 +3652,6 @@ async fn sub_set_effort(
 #[tauri::command]
 async fn stats_get(h: H<'_>) -> Result<agent::stats::StatsData, String> {
     Ok(h.stats.snapshot())
-}
-
-#[tauri::command]
-async fn stats_reset(h: H<'_>) -> Result<(), String> {
-    h.stats.reset();
-    Ok(())
 }
 
 /// One chat's stats, by id.
@@ -3948,6 +4125,8 @@ async fn add_account_with(
     // otherwise only surface as every chat failing later.
     if a.kind == "claude" && a.refresh_token.is_empty() {
         accounts::claude_probe(h, &a).await?;
+    } else if a.kind == "kimi-code" {
+        accounts::kimi_probe(h, &a).await?;
     } else if accounts::key_only(&a.kind) {
         accounts::go_probe(h, &a).await?;
     }
@@ -4063,6 +4242,23 @@ async fn account_import_local(
 ) -> Result<Vec<accounts::AccountView>, String> {
     let p = match path.filter(|p| !p.trim().is_empty()) {
         Some(p) => std::path::PathBuf::from(p),
+        // A key-login provider with no local login file (Kimi Code) refuses
+        // here with the fix named, rather than "no home directory" — the UI
+        // hides the button for it, but this command is reachable from the
+        // SDK and the phone browser too.
+        None
+            if providers::provider(&kind)
+                .and_then(|p| p.account)
+                .is_some_and(|a| a.login_file.is_empty()) =>
+        {
+            let name = providers::provider(&kind)
+                .and_then(|p| p.account)
+                .map(|a| a.display_name)
+                .unwrap_or(kind.as_str());
+            return Err(format!(
+                "{name} has no local login to import — paste a key instead."
+            ));
+        }
         None => accounts::default_path(&kind).ok_or("no home directory")?,
     };
     let text = std::fs::read_to_string(&p).map_err(|_| {
@@ -4334,6 +4530,100 @@ const EXPORT_FORMAT: &str = "openleash-chats";
 /// Chats as a portable JSON file (full history, timeline, subagent transcripts).
 fn export_json(tasks: Vec<Task>) -> Result<String, String> {
     serde_json::to_string_pretty(&json!({"format": EXPORT_FORMAT, "version": 1, "exported_at": chrono::Utc::now(), "tasks": tasks})).map_err(|e| e.to_string())
+}
+
+/// Fine-tuning conversation as JSONL. OpenRouter-compatible chat format keeps
+/// Fine-tuning conversation as JSONL.
+///
+/// Two shapes, because the two targets ask for different ones:
+///   * `openrouter` — the chat-completion shape, system prompt inside
+///     `messages` as its own turn. This is what OpenAI-style trainers and
+///     OpenRouter's own dataset tooling expect.
+///   * `claude` — the Anthropic shape, system prompt in the top-level `system`
+///     field, and `messages` holding only user/assistant turns.
+///
+/// Only visible text survives: tool calls, tool results and the model's
+/// hidden reasoning are dropped, because a text-only trainer has no way to
+/// represent them and a half-represented tool turn trains the model to invent
+/// tool calls. The user's own attachments survive as their text; images do
+/// not, since that would need a content-block shape the two formats spell
+/// differently.
+///
+/// The alternating rule is enforced for Claude (its trainer rejects two turns
+/// of the same role) and repaired rather than rejected for OpenRouter, which
+/// tolerates it.
+fn training_jsonl(task: &Task, system: &str, format: &str) -> Result<String, String> {
+    if format != "openrouter" && format != "claude" {
+        return Err("Unknown training export format".into());
+    }
+    let mut messages = Vec::<Value>::new();
+    for message in &task.messages {
+        if message.role != "user" && message.role != "assistant" { continue; }
+        let text = message.content.iter().filter_map(|block| {
+            (block["type"] == "text").then(|| block["text"].as_str()).flatten()
+        }).collect::<Vec<_>>().join("\n");
+        if text.trim().is_empty() { continue; }
+        messages.push(json!({"role":message.role, "content":text}));
+    }
+    // Consecutive turns of the same role: one turn with the two texts joined.
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or("").to_string();
+        if merged.last().and_then(|l| l["role"].as_str()) == Some(role.as_str()) {
+            let prior = merged.last().unwrap()["content"].as_str().unwrap_or("").to_string();
+            let next = m["content"].as_str().unwrap_or("").to_string();
+            merged.last_mut().unwrap()["content"] = json!(format!("{prior}\n\n{next}"));
+        } else {
+            merged.push(m);
+        }
+    }
+    // Claude wants the first turn from the user and the last from the
+    // assistant; drop a leading assistant turn rather than fail the export.
+    if format == "claude" {
+        while merged.first().and_then(|m| m["role"].as_str()) == Some("assistant") {
+            merged.remove(0);
+        }
+        // Claude's Bedrock trainer requires the example to end with an
+        // assistant turn too. An unfinished final user turn cannot teach a
+        // target response, so omit it rather than write an invalid example.
+        while merged.last().and_then(|m| m["role"].as_str()) == Some("user") {
+            merged.pop();
+        }
+    }
+    if merged.iter().all(|m| m["role"] != "assistant") {
+        return Err("This chat has no assistant text to export".into());
+    }
+    let mut example = json!({"messages":merged});
+    match format {
+        "claude" => {
+            if !system.trim().is_empty() { example["system"] = json!(system); }
+        }
+        _ => {
+            if !system.trim().is_empty() {
+                example["messages"].as_array_mut().unwrap().insert(0, json!({"role":"system", "content":system}));
+            }
+        }
+    }
+    Ok(format!("{}\n", serde_json::to_string(&example).map_err(|e| e.to_string())?))
+}
+
+/// Write one chat as a training dataset.
+///
+/// The command is a thin wrapper so the work can be tested against a plain
+/// `&Harness` — `tauri::State` can't be built outside the app.
+#[tauri::command]
+async fn task_training_export(h: H<'_>, id: String, path: String, format: String) -> Result<(), String> {
+    training_export(h.inner(), &id, &path, &format).await
+}
+
+async fn training_export(h: &Harness, id: &str, path: &str, format: &str) -> Result<(), String> {
+    let task = h.task(id).await?.lock().await.clone();
+    // The cached system prompt on a task is dropped when the chat is loaded, so
+    // most chats carry none; rebuild it from the project files as they are
+    // now, so the export carries the instructions the agent worked under.
+    let system = runner::system_prompt(h, &task).await;
+    let jsonl = training_jsonl(&task, &system, format)?;
+    std::fs::write(path, jsonl).map_err(|e| format!("Couldn't write {path}: {e}"))
 }
 
 /// Put many chats away at once. Returns how many were actually archived.
@@ -4687,6 +4977,9 @@ fn purge_task(h: &Harness, id: &str, remove_worktree: bool) -> Result<(), String
     // Safe now and only now: the tokens are cancelled and the background
     // processes are dead, so nothing can still be holding this chat's runtime.
     h.forget_runtime(id);
+    // Their entries as well as their processes: the map is keyed independently
+    // of the runtime and nothing else ever removes a deleted chat's jobs.
+    h.bg.forget_task(id);
     store::delete_task(id);
     store::save_draft(id, "");
     // The shadow store holds a full copy of that chat's files; leaving it would
@@ -4695,34 +4988,9 @@ fn purge_task(h: &Harness, id: &str, remove_worktree: bool) -> Result<(), String
     // Its proof clips and visual-diff screenshots are pictures of that chat's
     // work; they go with it.
     agent::proof::forget_task(id);
-    // Kept by default (the spend is real); dropped only when the user opted out.
-    // `try_read` is fine here: the setting changes rarely and a missed read
-    // errs on the side of keeping the numbers.
-    if h.settings
-        .try_read()
-        .map(|s| !s.keep_chat_stats)
-        .unwrap_or(false)
-    {
-        h.stats.forget_chat(id);
-    }
+    // Its stats do not go with it. The spend is real whether the chat is or
+    // not, and a usage ledger that shrinks as you tidy up stops adding up.
     Ok(())
-}
-
-/// Drop the per-chat stats rows of chats that were deleted or archived.
-///
-/// Only the per-chat rows go; the tokens and cost stay in the model, day and
-/// account totals. A chat still in the list and not archived is never touched.
-#[tauri::command]
-async fn stats_prune_chats(h: H<'_>) -> Result<usize, String> {
-    let mut live = std::collections::HashSet::new();
-    let refs: Vec<_> = h.tasks.read().await.values().cloned().collect();
-    for r in refs {
-        let t = r.lock().await;
-        if !t.archived {
-            live.insert(t.id.clone());
-        }
-    }
-    Ok(h.stats.retain_chats(|id| live.contains(id)))
 }
 
 #[tauri::command]
@@ -5907,7 +6175,11 @@ async fn bg_kill(h: H<'_>, task_id: String, bg_id: String) -> Result<(), String>
 }
 
 #[tauri::command]
-async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
+async fn settings_update(
+    app: tauri::AppHandle,
+    h: H<'_>,
+    patch: Value,
+) -> Result<Settings, String> {
     let mut s = h.settings.write().await;
     let mut cur = serde_json::to_value(&*s).map_err(|e| e.to_string())?;
 
@@ -6022,6 +6294,12 @@ async fn settings_update(h: H<'_>, patch: Value) -> Result<Settings, String> {
     if mcp_changed {
         let h2 = h.inner().clone();
         tauri::async_runtime::spawn(async move { h2.mcp.sync(&cfgs).await });
+    }
+    // The update switches are read by the background pass, so a change to
+    // them has to wake that pass: turning the automatic check on should take
+    // effect now rather than at the next poll.
+    if patch.get("auto_check_updates").is_some() || patch.get("auto_update").is_some() {
+        updates::notify_policy(&app);
     }
     Ok(out)
 }
@@ -7007,6 +7285,17 @@ struct NewProvider {
     builtin: Option<String>,
 }
 
+/// Install and login state of the Antigravity CLI, plus a live model refresh.
+///
+/// The refresh pushes the CLI's own model list into the catalog, so the UI calls
+/// this when the provider card opens and re-reads models afterwards. It is also
+/// the only honest way to answer "is it signed in?" — `agy models` needs a
+/// working login, so a list coming back is the proof.
+#[tauri::command]
+async fn antigravity_status() -> antigravity::Status {
+    antigravity::status().await
+}
+
 #[tauri::command]
 async fn provider_add(h: H<'_>, p: NewProvider) -> Result<Vec<ProviderView>, String> {
     if let Some(b) = p
@@ -7661,7 +7950,11 @@ async fn watch_accounts(h: Arc<Harness>) {
                         if providers::is_pool(prov) {
                             accounts::pool(&h, &s.accounts, prov)
                                 .iter()
-                                .any(|a| h.accts.usable(a))
+                                // `usable_for_model`, not `usable`: the router
+                                // admits an exhausted account for a *free* model
+                                // in the chain, so the stricter check here left
+                                // a chat parked that a Resume would have served.
+                                .any(|a| h.accts.usable_for_model(a, step))
                         } else if providers::key_pool(&s, prov) {
                             s.providers.get(prov).is_some_and(|c| {
                                 c.api_keys
@@ -8163,7 +8456,7 @@ pub fn run() {
             app.manage(agent::schedule::Scheduler::start(h.clone()));
             // The PC-control guard needs the harness (to tell the agent about
             // an objection) and its own always-on-top window.
-            agent::pcguard::set_harness(h);
+            agent::pcguard::set_harness(h.clone());
             agent::pcguard::install_esc_hook();
             // The guard owns the policy; the app owns the window. It listens for
             // the same event the frontend does and shows/hides the banner, so a
@@ -8189,7 +8482,7 @@ pub fn run() {
             build_tray(app)?;
             set_taskbar_icon(app.handle());
             install_toast_click_handler(app.handle());
-            updates::start(app.handle().clone());
+            updates::start(app.handle().clone(), h.clone());
             // Remote control is off unless the user turned it on; when it is,
             // it comes back with the app so a paired phone keeps working.
             let remote = remote::Remote::load();
@@ -8292,6 +8585,7 @@ pub fn run() {
             updates::app_update_check,
             updates::app_update_download,
             updates::app_update_install,
+            updates::app_update_now,
             updates::app_update_status,
             visualization::visualization_publish,
             visualization::visualization_read,
@@ -8326,11 +8620,13 @@ pub fn run() {
             race_merge,
             race_archive,
             race_forget,
+            race_delete,
             route_dry_run,
             route_situation,
             route_log,
             task_send,
             task_interrupt,
+            task_stop,
             pcguard_state,
             pcguard_stop,
             task_respond,
@@ -8339,7 +8635,7 @@ pub fn run() {
             task_update,
             task_delete,
             tasks_delete_archived,
-            stats_prune_chats,
+            stats_get,
             tasks_archive,
             tasks_export,
             task_rewind,
@@ -8368,8 +8664,6 @@ pub fn run() {
             sub_set_effort,
             sub_send,
             draft_get,
-            stats_get,
-            stats_reset,
             stats_chat,
             task_run_timeline,
             draft_set,
@@ -8379,6 +8673,7 @@ pub fn run() {
             remote_stage_upload,
             files_attach,
             file_data_url,
+            staged_image_url,
             reply_image,
             task_force_pause,
             force_pause_all,
@@ -8409,6 +8704,7 @@ pub fn run() {
             skill_save_from_chat,
             pool_models_refresh,
             task_export,
+            task_training_export,
             tasks_export_all,
             agent::transfer::tasks_import,
             task_duplicate,
@@ -8422,6 +8718,7 @@ pub fn run() {
             provider_set,
             models_list,
             provider_add,
+            antigravity_status,
             provider_remove,
             model_save,
             model_remove,
@@ -8502,7 +8799,83 @@ mod tests {
     use super::*;
     use crate::agent::runner;
     use crate::agent::store::Route;
-    use crate::agent::QueuedMsg;
+    use crate::agent::{Message, QueuedMsg};
+
+    /// The model a new task starts on is the model the last new task ran on.
+    ///
+    /// It used to be only the build's default: `settings.model` was written by
+    /// the model swap dialog and by nothing else, so the model the user picked
+    /// in the composer was remembered in `recent_models` and nowhere else. The
+    /// new-task screen then came up on a model the user had never chosen, and
+    /// had to be told which model to use again for every new task.
+    ///
+    /// Only an *interactive* task may move it. A chat that arrived from a
+    /// connector, or one attempt of a race, runs on a model the user did not
+    /// pick for their next task, and letting it write this field put the
+    /// new-task screen on a model nobody chose there.
+    #[tokio::test]
+    async fn the_last_new_tasks_model_becomes_the_default_for_the_next_one() {
+        let dir = std::env::temp_dir().join("openleash-last-model");
+        let _g = crate::agent::store::test_home(&dir);
+        let settings = crate::agent::store::Settings {
+            model: "anthropic/claude-opus-5".into(),
+            ..Default::default()
+        };
+        let (h, _) = crate::agent::tests::harness(settings, vec![]);
+
+        // A task the user started from the composer, on a model they chose.
+        remember_task_creation(
+            &h,
+            "D:/work/app",
+            "openrouter/some/model",
+            1,
+            CreateTaskOptions::Interactive,
+        )
+        .await;
+        {
+            let s = h.settings.read().await;
+            assert_eq!(s.model, "openrouter/some/model");
+            assert_eq!(s.effort, 1);
+            assert_eq!(s.recent_models[0], "openrouter/some/model");
+        }
+
+        // A task that arrived from somewhere else does not move it.
+        remember_task_creation(
+            &h,
+            "D:/work/app",
+            "codex/some/other-model",
+            0,
+            CreateTaskOptions::External,
+        )
+        .await;
+        {
+            let s = h.settings.read().await;
+            assert_eq!(
+                s.model, "openrouter/some/model",
+                "a connector's or race's model must not become the new-task default"
+            );
+            assert_eq!(s.effort, 1, "and neither must its reasoning level");
+            // It is still remembered as recently used, which is what that list is.
+            assert_eq!(s.recent_models[0], "codex/some/other-model");
+        }
+
+        // A scheduled run writes nothing at all.
+        remember_task_creation(
+            &h,
+            "D:/work/app",
+            "claude/some/scheduled-model",
+            3,
+            CreateTaskOptions::Background,
+        )
+        .await;
+        {
+            let s = h.settings.read().await;
+            assert_eq!(s.model, "openrouter/some/model");
+            assert_eq!(s.effort, 1);
+            assert_eq!(s.recent_models[0], "codex/some/other-model");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A timeline with `n` items named `m0..m{n}`, oldest first.
     fn timeline(n: usize) -> Vec<Item> {
@@ -10415,6 +10788,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// An SVG in the image list is a file, not a picture. A saved prompt or an
+    /// older edited message can still carry one; it must reach the agent as a
+    /// staged path and never as an image block, because a provider refuses
+    /// `image/svg+xml` and fails the whole request every turn.
+    #[tokio::test]
+    async fn an_svg_attachment_reaches_the_agent_as_a_file_not_an_image_block() {
+        let dir = std::env::temp_dir().join(format!("openleash-svg-{}", std::process::id()));
+        let _home = store::test_home(&dir);
+        let h = Arc::new(harness(vec![running_task()]));
+        as_running(&h);
+        let svg = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=";
+
+        runner::send_attachments(
+            h.clone(),
+            "q".into(),
+            "here is the drawing".into(),
+            vec![svg.into()],
+            vec![],
+            vec!["drawing.svg".into()],
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Nothing waits as an image: the picture-only inbox is empty, and the
+        // model was told where the file was staged instead.
+        let imgs = h
+            .runtime("q")
+            .inbox_images
+            .lock()
+            .await
+            .get("main")
+            .cloned()
+            .unwrap_or_default();
+        assert!(imgs.is_empty(), "no image block for an SVG: {imgs:?}");
+        let notes = h
+            .runtime("q")
+            .inbox
+            .lock()
+            .await
+            .get("main")
+            .cloned()
+            .unwrap_or_default();
+        let model_text = notes.concat();
+        assert!(model_text.contains("here is the drawing"));
+        assert!(
+            model_text.contains("<openleash-attachments>") && model_text.contains("drawing.svg"),
+            "the model is told the staged file: {model_text}"
+        );
+
+        let t = h.task("q").await.unwrap();
+        let t = t.lock().await;
+        let row = t
+            .items
+            .iter()
+            .find(|i| i.kind == "user")
+            .expect("the user's message is on the timeline");
+        assert_eq!(row.data["images"], json!([]), "no blob to send as an image");
+        assert_eq!(row.data["image_attachments"], json!(0));
+        let atts = row.data["attachments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(atts.len(), 1, "the staged copy is recorded on the item");
+        assert_eq!(atts[0]["name"], "drawing.svg");
+        let path = atts[0]["path"].as_str().unwrap();
+        assert!(path.ends_with("drawing.svg"), "staged as a file: {path}");
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+            "the file holds the SVG bytes"
+        );
+
+        let _ = super::agent::attachments::remove_task(".", "q");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Same for the list: an Alt-Enter photo is queued whole, so sending it later
     /// hands over the image too rather than a message about a missing picture.
     #[tokio::test]
@@ -11249,6 +11699,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A race record over the given attempt chats, for the delete tests.
+    fn race_stub(id: &str, chats: &[&str], archived: bool) -> agent::race::Race {
+        agent::race::Race {
+            id: id.into(),
+            prompt: "fix the bug".into(),
+            project: ".".into(),
+            base_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+            attempts: chats
+                .iter()
+                .map(|t| agent::race::RaceAttempt {
+                    task_id: (*t).into(),
+                    model: "m".into(),
+                    prompt: "fix the bug".into(),
+                    effort: 2,
+                    checks: vec![],
+                    checked: false,
+                })
+                .collect(),
+            judge_model: "m".into(),
+            judge_effort: 2,
+            state: "judged".into(),
+            judge: None,
+            winner: None,
+            merged: None,
+            error: None,
+            archived,
+            archived_chats: vec![],
+        }
+    }
+
+    /// An archived race can be deleted for good, and the chats still archived
+    /// with it go with it. A race that is not archived is refused: it may have
+    /// attempts that are running right now.
+    #[tokio::test]
+    async fn deleting_an_archived_race_takes_its_archived_chats_with_it() {
+        let dir =
+            std::env::temp_dir().join(format!("openleash-del-race-{}", std::process::id()));
+        let _home = store::test_home(&dir);
+        let mut a = chat("a");
+        let mut b = chat("b");
+        a.archived = true;
+        b.archived = true;
+        let live = chat("live");
+        for t in [&a, &b, &live] {
+            store::save_task(t);
+        }
+        agent::race::upsert(&race_stub("r1", &["a", "b"], true)).unwrap();
+        agent::race::upsert(&race_stub("r2", &["live"], false)).unwrap();
+
+        let h = Arc::new(harness(vec![a, b, live]));
+        // The race that is still in the sidebar is refused: its attempts may be
+        // running, and dropping them would stop work the user never asked to stop.
+        let h2 = h.clone();
+        let err = tokio::task::spawn_blocking(move || delete_race(&h2, "r2", false))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("Archive the race"), "{err}");
+        assert!(
+            agent::race::get("r2").is_ok(),
+            "the refused race is still there"
+        );
+        assert!(h.tasks.read().await.contains_key("live"));
+
+        let h2 = h.clone();
+        let out = tokio::task::spawn_blocking(move || delete_race(&h2, "r1", false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["deleted_chats"], json!(["a", "b"]));
+        assert_eq!(out["kept_chats"], json!([]));
+        assert!(agent::race::get("r1").is_err(), "the race record is gone");
+        assert!(!h.tasks.read().await.contains_key("a"));
+        assert!(!h.tasks.read().await.contains_key("b"));
+        assert!(!dir.join("tasks").join("a.json").exists());
+        assert!(!dir.join("tasks").join("b.json").exists());
+        // The chat that was never part of the race stays.
+        assert!(h.tasks.read().await.contains_key("live"));
+        assert!(dir.join("tasks").join("live.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A chat the user restored on its own is a chat of its own again, so
+    /// deleting the race leaves it alone and says so.
+    #[tokio::test]
+    async fn deleting_a_race_keeps_a_chat_the_user_restored_on_its_own() {
+        let dir =
+            std::env::temp_dir().join(format!("openleash-del-race-kept-{}", std::process::id()));
+        let _home = store::test_home(&dir);
+        let mut a = chat("a");
+        a.archived = true;
+        let mut b = chat("b");
+        // "b" was restored by hand: it is out of the archive.
+        b.archived = false;
+        for t in [&a, &b] {
+            store::save_task(t);
+        }
+        agent::race::upsert(&race_stub("r1", &["a", "b"], true)).unwrap();
+
+        let h = Arc::new(harness(vec![a, b]));
+        let h2 = h.clone();
+        let out = tokio::task::spawn_blocking(move || delete_race(&h2, "r1", false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["deleted_chats"], json!(["a"]));
+        assert_eq!(out["kept_chats"], json!(["b"]));
+        assert!(!h.tasks.read().await.contains_key("a"));
+        assert!(
+            h.tasks.read().await.contains_key("b"),
+            "the restored chat is not the race's to delete"
+        );
+        assert!(agent::race::get("r1").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// An ultrathread worker's own checkout belongs to its chat: it must not be
     /// listed as a leftover worth deleting while that chat exists, and deleting
     /// the chat with its files must take the worker checkouts with it. Before
@@ -11357,6 +11924,7 @@ mod tests {
         let attempt = |t: &str| agent::race::RaceAttempt {
             task_id: t.into(),
             model: "m".into(),
+            prompt: "p".into(),
             effort: 2,
             checks: vec![],
             checked: false,
@@ -11546,6 +12114,201 @@ mod tests {
                 .is_err(),
             "nothing to write is an error, not an empty file"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The training export keeps the conversation and nothing else: the visible
+    /// text of each turn, the system prompt where the target wants it, and no
+    /// tool traffic or hidden reasoning.
+    #[test]
+    fn training_export_keeps_text_and_drops_tool_traffic() {
+        let mut t = chat("t");
+        t.system = "PROJECT RULES".into();
+        t.messages = vec![
+            Message::user_text("do the thing"),
+            serde_json::from_value(json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "secret reasoning"},
+                    {"type": "text", "text": "here is the answer"},
+                    {"type": "tool_use", "id": "c1", "name": "bash", "input": {"command": "ls"}}
+                ]
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "(no output)"}]
+            }))
+            .unwrap(),
+            Message::user_text("and now this"),
+            Message::user_text("more of the same turn"),
+        ];
+
+        let or = training_jsonl(&t, &t.system, "openrouter").unwrap();
+        let lines: Vec<&str> = or.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 1, "one conversation per line");
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "PROJECT RULES");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "do the thing");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "here is the answer");
+        let whole = lines[0];
+        assert!(!whole.contains("secret reasoning"));
+        assert!(!whole.contains("tool_use"));
+        assert!(!whole.contains("(no output)"));
+
+        // Claude wants the system prompt outside `messages`.
+        let cl = training_jsonl(&t, &t.system, "claude").unwrap();
+        let v: Value = serde_json::from_str(cl.trim_end()).unwrap();
+        assert_eq!(v["system"], "PROJECT RULES");
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "user", "no system turn inside messages");
+        assert!(
+            msgs.windows(2).all(|w| w[0]["role"] != w[1]["role"]),
+            "Claude's trainer rejects two turns of the same role"
+        );
+        assert_eq!(msgs[1]["content"], "here is the answer");
+    }
+
+    /// A chat with nothing the model said is not training data.
+    #[test]
+    fn training_export_needs_an_assistant_turn() {
+        let mut t = chat("t");
+        t.messages = vec![Message::user_text("just me talking")];
+        assert!(training_jsonl(&t, "", "openrouter").is_err());
+        assert!(training_jsonl(&t, "", "claude").is_err());
+        assert!(training_jsonl(&t, "", "nonsense").is_err());
+    }
+
+    /// The whole path: a chat on disk becomes a JSONL file, with the project
+    /// instructions in it.
+    #[tokio::test]
+    async fn training_export_writes_a_file_with_the_project_instructions() {
+        let dir = std::env::temp_dir().join(format!("openleash-train-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _home = store::test_home(&dir.join("home"));
+        // A project with its own rules, which the system prompt must carry.
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("AGENTS.md"), "RULE ONE: never touch the physics folder.").unwrap();
+
+        let mut t = chat("a");
+        t.project = proj.to_string_lossy().to_string();
+        t.cwd = proj.to_string_lossy().to_string();
+        t.messages = vec![Message::user_text("hello"), Message::user_text("more")];
+        t.messages.push(serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi there"}]
+        })).unwrap());
+        let h = harness(vec![t]);
+
+        // A folder nobody has decided about is untrusted, and an untrusted
+        // folder's own instructions are not injected — into the prompt or into
+        // a training set built from it. So the test trusts it first, which is
+        // also what the user has to have done for the agent to have worked
+        // under those rules in the first place.
+        let _trust = crate::agent::trust::TRUST_LOCK.lock().unwrap();
+        crate::agent::trust::set_trust(&[crate::agent::trust::TrustDecision {
+            path: crate::agent::trust::norm_path(&proj.to_string_lossy()),
+            kind: crate::agent::trust::TrustKind::Folder,
+            decision: crate::agent::trust::TrustState::Trusted,
+            decided_at: chrono::Utc::now(),
+        }]);
+
+        let path = dir.join("train.jsonl");
+        training_export(&h, "a", &path.to_string_lossy(), "openrouter").await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(text.trim_end()).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(
+            msgs[0]["content"].as_str().unwrap().contains("RULE ONE"),
+            "the project's own instructions travel with the training data: {}",
+            msgs[0]["content"]
+        );
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hello\n\nmore");
+        assert_eq!(msgs[2]["role"], "assistant");
+
+        // A chat that isn't there is an error, not an empty file.
+        assert!(training_export(&h, "ghost", &path.to_string_lossy(), "openrouter").await.is_err());
+
+        crate::agent::trust::set_trust(&[]);
+        drop(_trust);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The exporter, run against a chat that went through the app's own file
+    /// format rather than a hand-built fixture: the shapes that matter (a tool
+    /// call in the middle, a tool result, two turns of the same role) all show
+    /// up in a real transcript, and a fixture with only the easy cases proves
+    /// nothing about the hard ones.
+    #[tokio::test]
+    async fn training_export_of_a_saved_chat_is_well_formed() {
+        let dir = std::env::temp_dir().join(format!("openleash-trainreal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _home = store::test_home(&dir.join("home"));
+        let mut t = chat("real");
+        t.messages = vec![
+            Message::user_text("first question"),
+            serde_json::from_value(json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "on it"},
+                    {"type": "tool_use", "id": "c1", "name": "read_file", "input": {"path": "a.rs"}}
+                ]
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "fn main() {}"}]
+            }))
+            .unwrap(),
+            Message::user_text("second question"),
+            Message::user_text("third question, same turn"),
+            serde_json::from_value(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "here is the answer"}]
+            }))
+            .unwrap(),
+        ];
+        let h = harness(vec![t]);
+        // Write it the way the app does, so the file round-trip is part of what
+        // is under test rather than a fixture that skipped the disk entirely.
+        let snapshot = h.task("real").await.unwrap().lock().await.clone();
+        store::save_task(&snapshot);
+
+        let path = dir.join("real.jsonl");
+        training_export(&h, "real", &path.to_string_lossy(), "claude").await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 1, "one conversation per line");
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert!(
+            msgs.windows(2).all(|w| w[0]["role"] != w[1]["role"]),
+            "Claude's trainer rejects two turns of the same role: {msgs:?}"
+        );
+        assert_eq!(msgs.first().unwrap()["role"], "user", "Claude starts with a user turn");
+        assert_eq!(msgs.last().unwrap()["role"], "assistant", "Claude ends with an assistant turn");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "first question");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "on it");
+        assert!(
+            !lines[0].contains("tool_use") && !lines[0].contains("fn main"),
+            "tool traffic is not training data: {}",
+            lines[0]
+        );
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "assistant");
+        assert_eq!(last["content"], "here is the answer");
 
         let _ = std::fs::remove_dir_all(dir);
     }

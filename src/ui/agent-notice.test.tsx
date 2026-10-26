@@ -35,7 +35,7 @@ describe("non-blocking informational notices", () => {
   it("shows the full message with a dismiss action, never a question or form", () => {
     render(<AgentNotice it={notice()} taskId="t1" />);
     expect(screen.getByText("Unity Editor")).toBeTruthy();
-    expect(screen.getByText(/No reply needed.*isn't waiting/)).toBeTruthy();
+    expect(screen.queryByText(/No reply needed/)).toBeNull();
     expect(screen.getByText(/Dismiss the Unity modal/)).toBeTruthy();
     expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual([" Dismiss"]);
     expect(screen.queryByRole("textbox")).toBeNull();

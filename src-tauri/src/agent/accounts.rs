@@ -168,9 +168,17 @@ impl AccountRt {
                     kind: a.kind.clone(),
                     label: a.label.clone(),
                     email: a.email.clone(),
-                    // OpenCode imports can also contain OAuth logins. Only expose
-                    // a hint for the recognized workspace-key shape, not those tokens.
-                    key_hint: if key_only(&a.kind) && looks_like_opencode_key(&a.access_token) {
+                    // A key-login account identifies by key fragment. That is
+                    // by construction for Kimi Code (the parse path only
+                    // accepts a pasted key there, and there is no local OAuth
+                    // import to muddy it), but NOT for Go: its auth.json can
+                    // also carry an OAuth login for the same provider id, and
+                    // hinting a fragment of a session token is exactly the
+                    // leak the shape check below refuses. OAuth kinds get
+                    // nothing: their tokens are sessions, not keys.
+                    key_hint: if key_only(&a.kind)
+                        && (a.kind == "kimi-code" || looks_like_opencode_key(&a.access_token))
+                    {
                         super::providers::key_hint(&a.access_token)
                     } else {
                         String::new()
@@ -710,13 +718,14 @@ fn s(v: &Value, keys: &[&str]) -> String {
 
 /// Accounts whose "login" is a long-lived API key rather than OAuth tokens.
 ///
-/// OpenCode Go is the odd one out: you subscribe, copy a workspace key, and
-/// paste it. It never expires and there is no refresh endpoint, so every piece
-/// of the OAuth machinery — expiry accounting, `fresh`'s refresh call, writing
-/// rotated tokens back to the CLI's file — has to skip it rather than fail on
-/// it. Kept as one predicate so the three call sites cannot drift apart.
+/// OpenCode Go and Kimi Code are the odd ones out: you subscribe, copy a key
+/// the vendor documents for third-party tools, and paste it. Neither expires
+/// and neither has a refresh endpoint, so every piece of the OAuth machinery —
+/// expiry accounting, `fresh`'s refresh call, writing rotated tokens back to
+/// the CLI's file — has to skip them rather than fail on them. Kept as one
+/// predicate so the call sites cannot drift apart.
 pub fn key_only(kind: &str) -> bool {
-    kind == "opencode-go"
+    kind == "opencode-go" || kind == "kimi-code"
 }
 
 /// Parse a pasted file/token. `hint` = codex | claude | opencode-go | "" (guess).
@@ -770,11 +779,19 @@ pub fn parse(text: &str, hint: &str, source: &str) -> Result<Account, String> {
     } else if text.starts_with("sk-ant-oat") {
         a.kind = "claude".into();
         a.access_token = text.into();
-    } else if hint == "opencode-go" || looks_like_opencode_key(text) {
-        // A pasted Go workspace key. Only when the hint says so or the shape is
-        // unmistakable: `parse` is also the path for pasting a bare Codex JWT,
-        // so a loose match here would steal that login.
-        a.kind = "opencode-go".into();
+    } else if hint == "opencode-go" || hint == "kimi-code" || looks_like_opencode_key(text) {
+        // A pasted key-login credential: Go's workspace key, or a Kimi Code
+        // key from the console. Only when the hint names the provider (the
+        // connect dialog is per-provider) or the shape is unmistakably Go's:
+        // `parse` is also the path for pasting a bare Codex JWT, so a loose
+        // shape match here would steal that login — which is also why this
+        // branch sits ahead of the two-dot JWT heuristic below. Kimi keys
+        // have no documented shape to match, so there the hint is what makes
+        // the paste unambiguous, and the probe on import is what proves the
+        // key works. The kind follows the *matched* reason, not the hint, so
+        // a Go-shaped key pasted into the Claude dialog still errors instead
+        // of being accepted as a Claude account.
+        a.kind = if hint == "kimi-code" { "kimi-code" } else { "opencode-go" }.into();
         a.access_token = text.into();
     } else if text.matches('.').count() == 2 && text.len() > 100 {
         a.kind = "codex".into();
@@ -821,6 +838,12 @@ pub fn default_path(kind: &str) -> Option<std::path::PathBuf> {
             .unwrap_or_else(|_| home.join(".local").join("share"))
             .join("opencode")
             .join("auth.json"),
+        // The Kimi Code CLI keeps an OAuth session under `~/.kimi-code/`, but
+        // that is the CLI's own login, not a credential OpenLeash may replay —
+        // the same line the Antigravity integration refuses to cross, and
+        // Kimi's terms tie the client identity to the account. The importable
+        // credential is the key the console hands out for exactly this use.
+        "kimi-code" => return None,
         _ => home.join(".claude").join(".credentials.json"),
     })
 }
@@ -1113,6 +1136,111 @@ pub async fn go_probe(h: &Harness, a: &Account) -> Result<(), String> {
     Ok(())
 }
 
+/// The Kimi Code gateway root, honoring the provider's base URL override —
+/// the two region hosts serve the same API and a key works on one of them,
+/// so the override is also how a key bought on the other region gets used.
+/// The settings are cloned rather than held across the request: every model
+/// request reads them, and holding the lock across I/O stalls other chats.
+async fn kimi_base(h: &Harness) -> String {
+    let settings = h.settings.read().await.clone();
+    super::providers::base_url(&settings, "kimi-code")
+}
+
+/// The probe's verdict for one HTTP status: `None` accepts the key, `Some`
+/// refuses it with the message the user sees.
+///
+/// 404 counts as acceptance-eligible (the caller retries `/models`): a gateway
+/// that simply does not publish the usage endpoint says nothing about whether
+/// the key works, and refusing a working key over a missing monitor endpoint
+/// would lock the account out at import.
+fn kimi_auth_error(status: u16) -> Option<String> {
+    match status {
+        200..=299 | 404 => None,
+        401 | 403 => Some(
+            "Kimi rejected that key. Create a fresh one in the Kimi Code console \
+             (kimi.com/code/console) — and if your plan is on the other region's \
+             host, point the provider's base URL there first."
+                .into(),
+        ),
+        s => Some(format!("Kimi answered HTTP {s} checking that key.")),
+    }
+}
+
+async fn kimi_get(h: &Harness, base: &str, path: &str, a: &Account) -> Result<u16, String> {
+    Ok(h
+        .http
+        .get(format!("{base}{path}"))
+        .bearer_auth(&a.access_token)
+        .header("user-agent", super::providers::KIMI_CODE_UA)
+        .header("accept", "application/json")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| format!("couldn't reach Kimi: {e}"))?
+        .status()
+        .as_u16())
+}
+
+/// Prove a Kimi Code key works before saving it, and read its limits in the
+/// same call — the usage endpoint is the cheapest thing that authenticates,
+/// exactly as on Go. The endpoint lives on the gateway the provider's base
+/// URL points at, so a key from the other region's host fails here with the
+/// fix in the message rather than a bare 401.
+pub async fn kimi_probe(h: &Harness, a: &Account) -> Result<(), String> {
+    let base = kimi_base(h).await;
+    let mut status = kimi_get(h, &base, "/usages", a).await?;
+    // A 404 says nothing about the key (see `kimi_auth_error`): fall back to
+    // /models, the cheapest other authenticated read, before refusing. The
+    // usage row reports the same after the account is saved.
+    if status == 404 {
+        status = kimi_get(h, &base, "/models", a).await?;
+    }
+    match kimi_auth_error(status) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Parse Kimi Code's `/usages` payload into usage windows.
+///
+/// `{"usages": {"limit_5h": {"used_ratio": 0..1, "reset_time": ISO}, …}}` —
+/// the same windows the official CLI's `/usage` reads. The weekly window
+/// exists only on legacy plans, and the monthly total is the whole Kimi
+/// membership's shared quota, not a coding-specific one. `used_ratio` arrives
+/// as a number or a numeric string; either way it is a fraction, not the
+/// percent the other kinds report, so it is scaled here where the scaling
+/// cannot be forgotten.
+pub fn parse_kimi_usage(v: &Value, u: &mut AcctUsage) {
+    for (k, label) in [
+        ("limit_5h", "5h"),
+        ("limit_7d", "Week"),
+        ("limit_month_total", "Month"),
+    ] {
+        let w = &v["usages"][k];
+        if w.is_null() {
+            continue;
+        }
+        let ratio = w["used_ratio"]
+            .as_f64()
+            .or_else(|| w["used_ratio"].as_str().and_then(|s| s.parse::<f64>().ok()))
+            .filter(|r| r.is_finite());
+        let Some(ratio) = ratio else {
+            continue;
+        };
+        u.windows.push(Window {
+            label: label.into(),
+            used: (ratio * 100.0).clamp(0.0, 100.0),
+            resets_at: iso(&w["reset_time"]),
+        });
+    }
+    u.limited = u.windows.iter().any(|w| w.used >= 99.5);
+    // The usage payload names no plan, and `/me`'s level fields are
+    // gamification tiers rather than the membership plan, so "Kimi Code"
+    // is all that can honestly be said here — the same rule that has Go
+    // reporting "Go".
+    u.plan = "Kimi Code".into();
+}
+
 pub async fn fetch_usage(h: &Harness, id: &str) -> Result<AcctUsage, String> {
     let res = fetch_usage_inner(h, id).await;
     // Never lose an error: the Accounts screen shows it on the account.
@@ -1153,6 +1281,12 @@ async fn fetch_usage_inner(h: &Harness, id: &str) -> Result<AcctUsage, String> {
             .get(go_url("usage"))
             .bearer_auth(&a.access_token)
             .header("user-agent", crate::agent::providers::OPENCODE_UA)
+    } else if a.kind == "kimi-code" {
+        h.http
+            .get(format!("{}/usages", kimi_base(h).await))
+            .bearer_auth(&a.access_token)
+            .header("user-agent", super::providers::KIMI_CODE_UA)
+            .header("accept", "application/json")
     } else {
         h.http
             .get(format!("{}/api/oauth/usage", anthropic_base()))
@@ -1187,6 +1321,9 @@ async fn fetch_usage_inner(h: &Harness, id: &str) -> Result<AcctUsage, String> {
         fresh(h, id, true).await?;
         return Err(if a.kind == "opencode-go" {
             "OpenCode rejected this key. Check it in the OpenCode console, or import auth.json again."
+                .into()
+        } else if a.kind == "kimi-code" {
+            "Kimi rejected this key. Check it in the Kimi Code console, or import it again."
                 .into()
         } else {
             "Login was stale; refreshed it. Hit Refresh again.".to_string()
@@ -1258,6 +1395,8 @@ async fn fetch_usage_inner(h: &Harness, id: &str) -> Result<AcctUsage, String> {
         }
         u.limited = rl["limit_reached"].as_bool().unwrap_or(false)
             || rl["allowed"].as_bool() == Some(false);
+    } else if a.kind == "kimi-code" {
+        parse_kimi_usage(&v, &mut u);
     } else {
         for (k, label) in [
             ("five_hour", "5h"),
@@ -1347,6 +1486,15 @@ pub async fn fetch_pool_models(h: &Harness, kind: &str) -> Result<usize, String>
             .get(go_url("models"))
             .bearer_auth(&key)
             .header("user-agent", super::providers::OPENCODE_UA)
+    } else if kind == "kimi-code" {
+        let settings = h.settings.read().await.clone();
+        h.http
+            .get(format!(
+                "{}/models",
+                super::providers::base_url(&settings, "kimi-code")
+            ))
+            .bearer_auth(&key)
+            .header("user-agent", super::providers::KIMI_CODE_UA)
     } else {
         h.http
             .get(format!("{}/v1/models?limit=100", anthropic_base()))
@@ -1371,6 +1519,7 @@ pub async fn fetch_pool_models(h: &Harness, kind: &str) -> Result<usize, String>
     let models = match kind {
         "codex" => super::providers::parse_codex_models(&v),
         "opencode-go" => super::providers::parse_go_models(&v),
+        "kimi-code" => super::providers::parse_kimi_models(&v),
         _ => super::providers::parse_claude_models(&v),
     };
     let n = models.len();
@@ -1433,17 +1582,26 @@ mod tests {
     }
 
     #[test]
-    fn account_views_only_expose_masked_opencode_workspace_keys() {
+    fn account_views_only_expose_masked_keys_for_key_login_kinds() {
         let key = format!("sk-{}AB12", "x".repeat(60));
+        let kimi = format!("kimi-{}XY90", "k".repeat(60));
         let accounts: Vec<Account> = [
             ("opencode-go", key.as_str()),
             ("codex", "dummy-codex-oauth-access"),
             ("claude", "sk-ant-oat-dummy-claude-access"),
+            // Go's auth.json can carry an OAuth login for the same provider
+            // id; hinting a fragment of a session token is exactly the leak
+            // the shape check refuses, so an unrecognized token gets nothing.
             ("opencode-go", "dummy-opencode-oauth-access"),
             ("opencode-go", "short"),
             ("opencode-go", ""),
             ("opencode-go", "sk-😀dummy-unrecognized-key"),
             ("codex", key.as_str()),
+            // Kimi Code's credential is a pasted console key by construction
+            // (parse accepts nothing else for the kind, and there is no local
+            // OAuth import), so the hint applies without a shape check.
+            ("kimi-code", kimi.as_str()),
+            ("kimi-code", "short"),
         ]
         .into_iter()
         .enumerate()
@@ -1458,7 +1616,11 @@ mod tests {
         .collect();
         let views = AccountRt::default().views(&accounts);
         assert_eq!(views[0].key_hint, "…AB12");
-        assert!(views[1..].iter().all(|view| view.key_hint.is_empty()));
+        assert!(views[1..8].iter().all(|view| view.key_hint.is_empty()));
+        assert_eq!(views[8].key_hint, "…XY90");
+        // Under the 4-char-preview threshold `key_hint` itself stays silent —
+        // the UI falls back to the email, not to a hint of nothing.
+        assert!(views[9].key_hint.is_empty());
         let serialized = serde_json::to_string(&views).unwrap();
         for (account, view) in accounts.iter().zip(&views) {
             assert_eq!(view.email, account.email);
@@ -1653,7 +1815,45 @@ mod tests {
         assert!(looks_like_opencode_key(&key));
         // A key-login account never takes the OAuth path.
         assert!(key_only("opencode-go"));
+        assert!(key_only("kimi-code"));
         assert!(!key_only("codex") && !key_only("claude"));
+    }
+
+    /// Kimi Code is the second key-login kind, and the only one with no
+    /// documented key shape: the connect dialog's hint is what makes a paste
+    /// unambiguous, so the kind follows the hint there — while a Go-shaped key
+    /// pasted into some other provider's dialog still refuses rather than
+    /// being adopted by whichever box it landed in.
+    #[test]
+    fn parses_kimi_code_keys_only_through_their_hint() {
+        // Any non-JSON text pasted into the Kimi dialog is that dialog's key;
+        // the probe on import is what proves it actually works.
+        assert_eq!(
+            parse("kimi-console-key-dummy", "kimi-code", "")
+                .unwrap()
+                .kind,
+            "kimi-code"
+        );
+        // A Go-shaped key pasted into the Kimi dialog belongs to the dialog:
+        // the hint named Kimi, and guessing Go instead would save a Kimi
+        // account whose credential is a foreign key.
+        assert_eq!(
+            parse(&format!("sk-{}", "a".repeat(64)), "kimi-code", "")
+                .unwrap()
+                .kind,
+            "kimi-code"
+        );
+        // The reverse: a Go-shaped key pasted into the Claude dialog matches
+        // the shape branch, but the kind follows the matched reason — so the
+        // hint check refuses it instead of saving it as a Claude account.
+        assert!(parse(&format!("sk-{}", "a".repeat(64)), "claude", "").is_err());
+        // JSON stays JSON: the Kimi dialog is not a license to claim a Codex
+        // or Claude file, which the JSON branch classifies first and the hint
+        // check then rejects.
+        assert!(parse(r#"{"access_token":"x"}"#, "kimi-code", "").is_err());
+        // And with no hint at all, an unrecognized paste still refuses —
+        // Kimi keys have no shape to guess from.
+        assert!(parse("kimi-console-key-dummy", "", "").is_err());
     }
 
     /// The Go endpoints hang off the gateway root, not the inference base: a
@@ -1666,6 +1866,64 @@ mod tests {
             assert_eq!(go_url("usage"), "https://opencode.ai/zen/go/v1/usage");
             assert_eq!(go_url("models"), "https://opencode.ai/zen/go/v1/models");
         }
+    }
+
+    /// Kimi's `/usages` reports fractions (0..1), not percents, and names no
+    /// plan — the scaling and the honest "Kimi Code" label happen in the
+    /// parser, where a mistake would read as a 100× under-report on the row.
+    #[test]
+    fn kimi_usage_scales_fractions_and_skips_missing_windows() {
+        let v = json!({
+            "usages": {
+                "limit_5h": {"used_ratio": 0.42, "reset_time": "2030-01-01T00:00:00Z"},
+                "limit_7d": {"used_ratio": "0.25", "reset_time": "2030-01-06T00:00:00Z"},
+                "limit_month_total": {"used_ratio": 1, "reset_time": "2030-02-01T00:00:00Z"}
+            }
+        });
+        let mut u = AcctUsage::default();
+        parse_kimi_usage(&v, &mut u);
+        assert_eq!(u.plan, "Kimi Code");
+        assert!(u.limited, "a full window is the limit-reached signal");
+        assert_eq!(
+            u.windows
+                .iter()
+                .map(|w| (w.label.as_str(), w.used))
+                .collect::<Vec<_>>(),
+            [("5h", 42.0), ("Week", 25.0), ("Month", 100.0)]
+        );
+        // The reset times parse through the shared ISO helper.
+        assert!(u.windows.iter().all(|w| w.resets_at > 0));
+        // A current plan reports no weekly window, and a junk ratio is
+        // skipped rather than read as zero — a fake 0% would hide real usage.
+        let mut u = AcctUsage::default();
+        parse_kimi_usage(
+            &json!({"usages": {"limit_5h": {"used_ratio": "not-a-number"}}}),
+            &mut u,
+        );
+        assert!(u.windows.is_empty() && !u.limited);
+        // An empty payload (the 404-fallback world) is no windows, but the
+        // plan label still identifies the account kind.
+        let mut u = AcctUsage::default();
+        parse_kimi_usage(&json!({}), &mut u);
+        assert!(u.windows.is_empty());
+        assert_eq!(u.plan, "Kimi Code");
+    }
+
+    /// The probe's status handling, without HTTP: 404 must not read as "bad
+    /// key" (the caller retries /models), and 401/403 must name the console
+    /// and the region fix rather than a bare code.
+    #[test]
+    fn kimi_probe_verdicts() {
+        assert!(kimi_auth_error(200).is_none());
+        assert!(
+            kimi_auth_error(404).is_none(),
+            "404 means try /models, not bad key"
+        );
+        let e = kimi_auth_error(401).unwrap();
+        assert!(e.contains("kimi.com/code/console"));
+        assert!(e.contains("base URL"), "the other-region fix is named");
+        assert_eq!(kimi_auth_error(403), kimi_auth_error(401));
+        assert!(kimi_auth_error(500).unwrap().contains("500"));
     }
 
     // ── caps ──────────────────────────────────────────────────────────────

@@ -49,3 +49,7 @@ lcov-report/
 .openleash_docker
 tmp
 temp
+
+# Private cargo target directories, used to keep concurrent builds off a
+# shared checkout's own target dir.
+.cargo-target-*/

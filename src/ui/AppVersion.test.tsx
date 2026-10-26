@@ -20,7 +20,7 @@ describe("app version", () => {
     render(<AppVersion />);
     await waitFor(() => expect(screen.getByRole("status", { name: "App version" }).textContent).toBe("v2.3.4-beta.1"));
     expect(getVersion).toHaveBeenCalledOnce();
-    expect(screen.getByText(/Restart only when you choose/)).toBeTruthy();
+    expect(screen.getAllByText(/only when you ask for them/i).length).toBeGreaterThan(0);
   });
 
   it("uses canonical package metadata in a browser preview", async () => {

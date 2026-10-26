@@ -561,6 +561,7 @@ fn a_job_watcher_reads_from_its_own_position_across_a_trim() {
     let job = shell::BgJob {
         id: "bg_t".into(),
         task_id: "t".into(),
+        sub_id: String::new(),
         cmd: "dev".into(),
         started: chrono::Utc::now(),
         buf: Arc::new(Mutex::new("old line\n".into())),

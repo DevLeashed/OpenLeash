@@ -963,11 +963,6 @@ pub struct Settings {
     pub cache_keepalive: bool,
     #[serde(default = "keepalive_pings_default")]
     pub cache_keepalive_pings: u32,
-    /// Keep a chat's row in the stats after the chat is deleted. On by default:
-    /// the spend happened either way, and the row is what explains a total no
-    /// live chat accounts for. Off drops the row when the chat is deleted.
-    #[serde(default = "t")]
-    pub keep_chat_stats: bool,
     #[serde(default = "t")]
     pub tool_search: bool,
     #[serde(default)]
@@ -995,6 +990,22 @@ pub struct Settings {
     /// before this field existed loads with it off and an empty queue.
     #[serde(default)]
     pub burner: super::burner::BurnerCfg,
+    /// Check GitHub for a newer release on a timer, without being asked.
+    ///
+    /// Off by default, and the default is the point: a check discloses the
+    /// machine's IP address to GitHub on a schedule the user never asked for, so
+    /// it is opt-in rather than a thing the app just does. A settings file
+    /// written before this field existed loads with it off.
+    #[serde(default)]
+    pub auto_check_updates: bool,
+    /// Download a newer release in the background once it has been found.
+    ///
+    /// Off by default, and off is the honest default: a downloaded package is
+    /// one this build chose to fetch and would install, so the download is the
+    /// step that needs the user's say-so. The update is only ever *applied* by
+    /// an explicit restart, so with this on the app still never restarts itself.
+    #[serde(default)]
+    pub auto_update: bool,
     /// Every key of `settings.json` this build has no field for.
     ///
     /// A catch-all, not a rejection: `deny_unknown_fields` is deliberately off
@@ -1137,7 +1148,6 @@ impl Default for Settings {
             git_commit_verify: false,
             cache_keepalive: false,
             cache_keepalive_pings: keepalive_pings_default(),
-            keep_chat_stats: true,
             tool_search: true,
             defer_plugins: false,
             checkpoints: true,
@@ -1145,6 +1155,11 @@ impl Default for Settings {
             // install has none, so this starts off and stays off until they do.
             trace_endpoint: String::new(),
             burner: Default::default(),
+            // Both off: a background check and a background download are the
+            // app reaching out on the user's behalf, so neither happens until
+            // they ask for it.
+            auto_check_updates: false,
+            auto_update: false,
             // A fresh install has no file, so nothing can be unrecognised. The
             // catch-all is filled only by `load_settings`, from a file this
             // build did not write.
@@ -1200,6 +1215,11 @@ pub fn unknown_settings_warning(s: &Settings) -> Option<String> {
 pub fn load_settings() -> Settings {
     let raw = std::fs::read_to_string(data_dir().join("settings.json")).unwrap_or_default();
     let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
+    // `keep_chat_stats` is gone: stats are never deleted, so there is no
+    // setting left to turn. The key has to be dropped from the file rather
+    // than left to the catch-all, or every install that had it would report a
+    // setting this build does not recognise — and would carry it back.
+    s.unknown.remove("keep_chat_stats");
     // A mistyped or newer-build key is not an error — the file has to keep
     // loading — but silence is not an answer either: say which keys this build
     // ignored, and in `Settings::unknown` keep them so the next save cannot
@@ -2734,6 +2754,10 @@ mod tests {
         // An unset saved-prompt order is the stored one: a settings file written
         // before the field existed must not come back as some other order.
         assert!(old.saved_sort.is_empty());
+        // An install that predates the update switches must not start
+        // contacting GitHub or fetching packages on its own after an upgrade.
+        assert!(!old.auto_check_updates);
+        assert!(!old.auto_update);
         let on: Settings = serde_json::from_str(
             r#"{"ui_size":"v2","ui_zoom":110,"needs_you":true,"all_projects":true,"saved_sort":"folder"}"#,
         )
@@ -2741,6 +2765,26 @@ mod tests {
         assert!(on.needs_you);
         assert!(on.all_projects);
         assert_eq!(on.saved_sort, "folder");
+    }
+
+    #[test]
+    fn the_update_switches_round_trip_through_a_settings_file() {
+        // The switches are the only thing standing between a fresh install and
+        // a background network fetch, so what the user chose has to survive a
+        // save and a load unchanged — in both directions.
+        let mut s = Settings::default();
+        s.auto_check_updates = true;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_check_updates);
+        assert!(!back.auto_update);
+
+        let mut s = Settings::default();
+        s.auto_update = true;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_update);
+        assert!(!back.auto_check_updates);
     }
 
     #[test]
@@ -3008,6 +3052,51 @@ mod tests {
         assert_eq!(
             via_value.unknown.get("frm_the_future"),
             Some(&serde_json::json!(true))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `keep_chat_stats` is gone: stats are never deleted, so there is no
+    /// switch left to turn. An install that had it must not be told it has a
+    /// setting this build does not recognise, and must not carry the dead key
+    /// back out on the next save.
+    #[test]
+    fn the_removed_keep_chat_stats_setting_is_dropped_silently() {
+        let root = std::env::temp_dir().join(format!(
+            "ol-keep-chat-stats-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _home = test_home(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("settings.json");
+        // The old switch could only ever turn the keeping off, so `false` is
+        // the value worth checking: an install that had opted out of keeping
+        // its chat rows.
+        std::fs::write(
+            &file,
+            r#"{"ui_size":"v2","ui_zoom":110,"keep_chat_stats":false}"#,
+        )
+        .unwrap();
+
+        let s = load_settings();
+        assert!(
+            !unknown_settings_keys(&s)
+                .iter()
+                .any(|k| k == "keep_chat_stats"),
+            "a removed setting must not be reported as unknown"
+        );
+        assert!(
+            unknown_settings_warning(&s).is_none(),
+            "a removed setting must not warn"
+        );
+        // And it is gone from the file, not just ignored: the next save must
+        // not write a key this build has no field for.
+        save_settings(&s);
+        let raw = std::fs::read_to_string(&file).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            on_disk.get("keep_chat_stats").is_none(),
+            "the dead key came back on save: {raw}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

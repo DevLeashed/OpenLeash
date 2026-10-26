@@ -2,8 +2,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { X } from "lucide-react";
 import { api, fmt$, fmtK, UsageView } from "../api";
-import { flash, modelColor, modelInfo, saveSettings, useStore } from "../store";
-import { MorphText, Loader, Tooltip, Button, Dropdown, Input, Segmented, Switch } from "./primitives";
+import { modelColor, modelInfo, saveSettings, useStore } from "../store";
+import { MorphText, Loader, Tooltip, Dropdown, Input, Segmented, Switch } from "./primitives";
 import { openChatStats } from "./ChatStats";
 
 export interface Counter {
@@ -435,10 +435,9 @@ export function StatsTab() {
   const [range, setRange] = useState<Range>(30);
   const [sel, setSel] = useState<string[]>([]);
   const [budget, setBudget] = useState(String(s.budget));
-  const [arm, setArm] = useState(false);
   const [err, setErr] = useState("");
-  // The budget ledger: what the cap actually pauses on. `stats_get` cannot say
-  // it — "Reset stats" clears that history but not this one.
+  // The budget ledger: what the cap actually pauses on. It is kept separately
+  // from the stats, so the cap still knows what a month cost.
   const [usage, setUsage] = useState<UsageView | null>(null);
   useEffect(() => {
     // Poll, but a failure clears the message the first time it happens and stays
@@ -537,7 +536,6 @@ export function StatsTab() {
   const chatRows = Object.entries(data.chats ?? {}).map(([id, c]) => ({ id, c }))
     .filter((r) => r.c.total.requests || r.c.total.errors)
     .sort((a, b) => tokens(b.c.total) - tokens(a.c.total));
-  const staleChats = chatRows.filter((r) => !tasks[r.id] || tasks[r.id]?.archived).length;
   const ev = data.events;
   // The cap's own ledger for this calendar month, biggest day first.
   const spendDays = spendMonth(usage?.spend ?? {}, day(new Date()).slice(0, 7)).sort((a, b) => b.v - a.v)
@@ -613,18 +611,6 @@ export function StatsTab() {
         <Tile i={2} label="Avg per day" value={dur(Object.keys(data.presence_daily ?? {}).length ? Object.values(data.presence_daily ?? {}).reduce((a, p) => a + p.open_ms, 0) / Object.keys(data.presence_daily ?? {}).length : 0)} sub="over days the app was open" />
         <Tile i={3} label="Tokens per focused hour" value={presence.focused_ms ? fmtK(Math.round(tokens(tot) / (presence.focused_ms / 3_600_000))) : "-"} sub={rangeLabel} />
       </div>
-      <div className="sgroup">
-        <div className="srowx">
-          <div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Keep stats for deleted chats</div><div className="desc">When off, deleting a chat also removes its row here. Totals by model and day are unaffected.</div></div>
-          <Switch label="Keep stats for deleted chats" hint="Off: a deleted chat's own stats row goes with it" checked={s.keep_chat_stats ?? true} onChange={(checked) => void saveSettings({ keep_chat_stats: checked })} />
-        </div>
-        <div className="srowx">
-          <div style={{ flex: 1 }}><div style={{ fontWeight: 500 }}>Clear stats of deleted and archived chats</div><div className="desc">{staleChats} {staleChats === 1 ? "chat" : "chats"} no longer in your list. Chats you can still open are kept.</div></div>
-          <Button variant="ghost" disabled={staleChats === 0} onClick={async () => {
-            try { const n = await api.statsPruneChats(); flash(`Cleared stats of ${n} ${n === 1 ? "chat" : "chats"}`); setData(await api.stats()); } catch (e) { flash(String(e)); }
-          }}>Clear</Button>
-        </div>
-      </div>
       {chatRows.length > 0 && <ChatsPanel rows={chatRows} onOpen={openChatStats} />}
       <div className="settings-section-label">Everything else · all models</div>
       <div className="cgrid">
@@ -657,25 +643,14 @@ export function StatsTab() {
       </div>
       </div>
       {/* What the cap counts: the spend ledger, not the chart's day totals. It
-          records every billed request and survives a stats reset, so this is the
-          only place a day the reset cleared still shows up. */}
+          records every billed request, and it is the same ledger the stats
+          page reads — so the two agree on what a month cost. */}
       {usage && spendDays.length > 0 && <BarList title="Spend this month" unit="what the cap counts" rows={spendDays} />}
       <div className="stiles small">
         <Tile i={0} label="Cap" value={cap > 0 ? fmt$(cap) : "Off"} sub={cap > 0 ? `${pct(spent / cap)} of it spent` : "set a cap to pause before the money runs out"} />
         <Tile i={1} label="Spent" value={fmt$(usage?.month ?? month)} sub={cap > 0 ? `${fmt$(Math.max(0, spent - cap))} left` : "no cap set"} />
         <Tile i={2} label="Billable tokens" value={fmtK(usage?.tokens ?? 0)} sub="input + output, all requests" />
         <Tile i={3} label="Days billed" value={String(spendDays.length)} sub={`in ${new Date().toLocaleString(undefined, { month: "long", year: "numeric" })}`} />
-      </div>
-      <div style={{ display: "flex", justifyContent: "flex-end" }}>
-        {arm ? <Button variant="primary" onClick={async () => {
-          try {
-            await api.statsReset();
-            setArm(false);
-            setData(await api.stats());
-            setErr("");
-          } catch (e) { setErr(String(e)); flash(String(e)); }
-        }}>Clear all stats</Button>
-          : <Button variant="ghost" style={{ color: "var(--mut3)" }} onClick={() => setArm(true)}>Reset stats…</Button>}
       </div>
     </>
   );

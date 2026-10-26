@@ -1,5 +1,6 @@
 
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ContainerChip } from "./Workspaces";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -15,9 +16,10 @@ import { FindBar } from "./Find";
 import { openRunTimeline } from "./RunTimeline";
 import { api, ago, effortLabel, fmt$, Bg, FileRef, Item, ItemData, ToolAction, ToolInput, SubInfo, TaskSummary, xDepth, xOn } from "../api";
 import { flash, get, go, isPhoneClient, loadPreviousHistory, loadSubTranscript, chatModel, modelColor, modelInfo, newerSummary, openTask, requestPause, set, subModel, useStore, useThrottled, zoom } from "../store";
-import { Composer, humanBytes, MAX_FILES, MAX_IMAGE, PendingStar } from "./Composer";
+import { Composer, humanBytes, isModelImage, MAX_FILES, MAX_IMAGE, PendingStar, stagePastedFile } from "./Composer";
 import { openSwap } from "./ModelSwap";
 import { Annotations, AttachmentChips, SentAnnotationMessage, splitContextBlocks, stagedAttachments, stripHarnessBlocks } from "./SelectionNote";
+import { useStagedImages } from "./StagedImage";
 import { heldByGlobal, isPaused } from "./Paused";
 import { enterSendsMessage, messageSendKey } from "../keys";
 import { I, StatusIcon, chatStatus } from "./icons";
@@ -30,7 +32,7 @@ import { QueueList } from "./session/QueueList";
 import { Rewind } from "./Rewind";
 import { swarmCounts, swarmGlow, swarmState } from "./session/Swarm";
 import { ContextRing } from "./session/ContextRing";
-import { Bot, Brain, Check, CircleAlert, CircleCheckBig, CircleQuestionMark, Clock, CornerDownLeft, ExternalLink, FilePenLine, FileText, GitBranch, GitFork, Globe, Image, Info, Megaphone, MessagesSquare, Monitor, Network, Plug, Search, Send, Square, Terminal, Webhook, X } from "lucide-react";
+import { Bot, Brain, Check, CircleAlert, CircleCheckBig, CircleQuestionMark, Clock, CornerDownLeft, ExternalLink, FilePenLine, FileText, GitBranch, GitFork, Globe, Image, Info, Layers, Megaphone, MessagesSquare, Monitor, Network, Plug, Search, Send, Square, Terminal, Webhook, X } from "lucide-react";
 
 const li = (C: typeof Search, size = 14) => <C aria-hidden="true" size={size} strokeWidth={1.7} />;
 
@@ -62,26 +64,36 @@ const Md = memo(function Md({ text, interactive = false, streaming = false }: { 
   ), [shown, interactive, streaming]);
 });
 
-/** An agent reply with a hover copy button (copies the markdown source); right-click shows which model wrote it. */
-function Reply({ it, streaming = false }: { it: Item; streaming?: boolean }) {
+/** An agent reply with a hover copy button (copies the markdown source); right-click shows which model wrote it, and — when the reply has reasoning of its own — offers the one-message switch for it. */
+function Reply({ it, streaming = false, think = false }: { it: Item; streaming?: boolean; think?: boolean }) {
   const [ctx, setCtx] = useState<{ x: number; y: number; sel: string } | null>(null);
   const text = it.text;
   return (
     <div className="reply" onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, sel: window.getSelection()?.toString() ?? "" }); }}>
       <Md text={text} interactive streaming={streaming} />
       <div className="msgacts"><span onClick={() => copyText(text)}>Copy</span></div>
-      {ctx && <ReplyMenu it={it} x={ctx.x} y={ctx.y} sel={ctx.sel} close={() => setCtx(null)} />}
+      {ctx && <ReplyMenu it={it} x={ctx.x} y={ctx.y} sel={ctx.sel} think={think} close={() => setCtx(null)} />}
     </div>
   );
 }
 
-function ReplyMenu({ it, x, y, sel, close }: { it: Item; x: number; y: number; sel: string; close: () => void }) {
+function ReplyMenu({ it, x, y, sel, think, close }: { it: Item; x: number; y: number; sel: string; think: boolean; close: () => void }) {
   const model: string | undefined = it.data?.model;
   const run = (f: () => void) => () => { close(); f(); };
   const ref = useRef<HTMLDivElement>(null);
-  const [h, setH] = useState(76);
-  useLayoutEffect(() => { setH(ref.current?.offsetHeight || 76); }, []);
-  return (
+  // Measured after paint, but the first paint needs a plausible height or a menu
+  // near the bottom edge flips upwards and then back. A model header plus three
+  // rows is the tallest form this menu takes.
+  const [h, setH] = useState(think ? 120 : 76);
+  useLayoutEffect(() => { setH(ref.current?.offsetHeight || (think ? 120 : 76)); }, [think]);
+  // Revealed for *this* reply only: one answer's reasoning is often the part
+  // worth reading while every other turn stays folded.
+  const revealed = useStore((s) => s.thinkFor[it.id] === true);
+  // A portal, like every other right-click menu in the app. Rendered inside the
+  // reply, this layer inherited the app's zoom on top of the one it carries
+  // itself, and the feed's own clipping and stacking sat over it — which is why
+  // the menu could open hundreds of pixels from the pointer, or not show at all.
+  return createPortal(
     <div style={menuLayer(zoom())}>
       <MenuScrim layer={90} onClick={close} onContextMenu={(e) => { e.preventDefault(); close(); }} />
       {/* The chat is inside the zoomed app root, so this menu carries the same zoom:
@@ -93,10 +105,16 @@ function ReplyMenu({ it, x, y, sel, close }: { it: Item; x: number; y: number; s
           {it.data?.via && <span className="mm-via">{it.data.via}</span>}
         </div>
         <div className="msep" />
+        {think && <MenuRow onClick={run(() => set((s) => ({ thinkFor: { ...s.thinkFor, [it.id]: !s.thinkFor[it.id] } })))}>
+          <span className="cico">{I.sparkles(12)}</span>
+          <span style={{ flex: 1 }}>{revealed ? "Hide thinking" : "Show thinking"}</span>
+          <span className="mm-via">this message</span>
+        </MenuRow>}
         {sel.trim() && <MenuRow onClick={run(() => copyText(sel, "Selection copied"))}><span className="cico">{I.copy(12)}</span><span style={{ flex: 1 }}>Copy selection</span></MenuRow>}
         <MenuRow onClick={run(() => copyText(it.text, "Message copied"))}><span className="cico">{I.copy(12)}</span><span style={{ flex: 1 }}>Copy message</span></MenuRow>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -633,7 +651,9 @@ async function stopAndSettle(id: string) {
  *  wrong here: this editor belongs to one message, and the composer's chips must
  *  not gain rows because someone pasted a photo into a message being edited. */
 function pastedImages(files: File[]): Promise<string[]> {
-  const imgs = files.filter((f) => f.type.startsWith("image/"));
+  // Only the pictures a model can see become image blocks: an SVG is a file the
+  // agent reads, exactly as it is in the composer.
+  const imgs = files.filter((f) => isModelImage(f.type));
   if (!imgs.length) return Promise.resolve([]);
   const over = imgs.filter((f) => f.size > MAX_IMAGE);
   if (over.length) flash(`${over.length} image${over.length > 1 ? "s are" : " is"} over 5 MB`);
@@ -656,11 +676,118 @@ async function pickFiles(): Promise<string[]> {
 
 /** The staged temp copies the backend made for a message, as pickable file refs,
  *  so an edited message can be resent with the attachments it went out with.
- *  Only the files: the pictures still on the message are resent as image blocks
- *  from `data.images`, and listing their staged copies here as well sent every
- *  picture twice, once as an image and once as a path. */
+ *
+ *  A picture the transcript still holds is resent as an image block, so its
+ *  staged copy is not listed here — that would send the picture twice, once as
+ *  an image and once as a path. A picture whose blob the transcript has dropped
+ *  has no image block to send, so its copy goes as a path. */
 function stagedFiles(data: ItemData | undefined): FileRef[] {
-  return stagedAttachments(data).files.map((a) => ({ path: a.path, name: a.name, size: a.size, isDir: false, image: false }));
+  const { images, files } = stagedAttachments(data);
+  const blobs = Array.isArray(data?.images) ? (data.images as string[]).length : 0;
+  const dropped = images.slice(blobs);
+  return [...files, ...dropped].map((a) => ({ path: a.path, name: a.name, size: a.size, isDir: false, image: false }));
+}
+
+/**
+ * The pictures a sent message went out with, as thumbnails.
+ *
+ * The blobs on `data.images` are what the transcript draws, but the transcript
+ * drops them from older messages to bound memory — and a picture the user sent
+ * must not become a paperclip chip because of that. The staged copies are still
+ * on disk, so a picture whose blob is gone is read back from there and shown
+ * as the picture it is.
+ *
+ * The backend stages a message's pictures first and its files after them, and
+ * the blobs are those same pictures in the same order, so the n-th picture of
+ * the message is the n-th blob and the n-th staged picture.
+ *
+ * A picture whose copy cannot be read (the staging folder was cleaned up) is
+ * not drawn and is named instead, so the bubble still says what went out.
+ */
+function useMessagePictures(it: Item): { shown: string[]; unread: { name: string; size: number }[] } {
+  const blobs = Array.isArray(it.data?.images) ? (it.data.images as string[]) : [];
+  const staged = stagedAttachments(it.data).images;
+  // The staged copies of the pictures whose blob the transcript has dropped:
+  // the blobs still on the item come first, so the rest are the dropped ones.
+  const dropped = staged.slice(blobs.length);
+  // Only a copy with a path can be read back, and each is read in the order it
+  // appears in `dropped` — so the answer for one picture is the answer for that
+  // picture, not for the next one along.
+  const readable = dropped.map((a, i) => ({ a, i })).filter((r) => !!r.a.path);
+  const read = useStagedImages(readable.map((r) => r.a.path));
+  const at = new Map(readable.map((r, j) => [r.i, j]));
+  // The pictures to draw: the blobs first, then the ones read back.
+  const shown = [...blobs];
+  const unread: { name: string; size: number }[] = [];
+  for (const [i, a] of dropped.entries()) {
+    if (!a.path) {
+      // A copy with no path was never staged, so it cannot be read back.
+      unread.push({ name: a.name, size: a.size });
+      continue;
+    }
+    const j = at.get(i)!;
+    const url = read[j]?.url;
+    if (url) shown.push(url);
+    else if (read[j]?.failed) unread.push({ name: a.name, size: a.size });
+  }
+  return { shown, unread };
+}
+
+/**
+ * The pictures a sent message carried, as thumbnails.
+ *
+ * Each one opens the lightbox over the whole set of the message's pictures, so
+ * a message with several of them can be paged through.
+ */
+function MessagePictures({ sources }: { sources: string[] }) {
+  if (!sources.length) return null;
+  const items = sources.map((src, i) => ({ src, alt: `Attached image ${i + 1}` }));
+  return (
+    <div className="ubimgs">
+      {sources.map((src, i) => <Thumb key={i} src={src} items={items} index={i} alt={`Attached image ${i + 1}`} />)}
+    </div>
+  );
+}
+
+/**
+ * The brief the main agent handed a subagent, with any pictures it came with.
+ *
+ * The pictures are drawn because they are the point: a brief that says "check
+ * this screenshot" and shows nothing leaves the user guessing whether the
+ * subagent was given the right one.
+ */
+function Brief({ it }: { it: Item }) {
+  const pics = Array.isArray(it.data?.images) ? (it.data.images as string[]) : [];
+  return (
+    <div className="brief">
+      <div className="label" style={{ marginBottom: 4 }}>Brief from the main agent</div>
+      <MessagePictures sources={pics} />
+      <Md text={it.text} />
+    </div>
+  );
+}
+
+/**
+ * The pictures of a message that could not be read back, named instead of
+ * drawn.
+ *
+ * Their staged copy is gone — the staging folder was cleaned up — so there is
+ * nothing to show. The name is still worth showing: it is the only trace that
+ * the message went out with a picture at all.
+ */
+function UnreadPictures({ pictures }: { pictures: { name: string; size: number }[] }) {
+  if (!pictures.length) return null;
+  return (
+    <div className="ubattach">
+      {pictures.map((f, i) => (
+        <span key={i} className="ubatchip" title={f.name}>
+          <span className="ubatico" aria-hidden="true">{I.paperclip(12)}</span>
+          <span className="ubatname">{f.name}</span>
+          {f.size > 0 && <span className="ubatsize">{humanBytes(f.size)}</span>}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 /** One user message: the bubble, its attachments, and the editor it becomes when
@@ -683,6 +810,9 @@ export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: Tas
   // own), so the editor holds its own copies and sends them with the text.
   const [imgs, setImgs] = useState<string[]>(() => (Array.isArray(it.data?.images) ? (it.data.images as string[]) : []));
   const [files, setFiles] = useState<FileRef[]>(() => stagedFiles(it.data));
+  // The pictures the bubble draws, including the ones the transcript has
+  // dropped from memory and reads back from their staged copy.
+  const { shown: pics, unread } = useMessagePictures(it);
   // The agent-only context stays out of the editor and goes back on the message when it is resent.
   const agentContext = splitContextBlocks(it.text).context;
   const box = useRef<HTMLTextAreaElement>(null);
@@ -704,6 +834,18 @@ export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: Tas
     const shots = await Promise.all(fresh.filter((r) => r.image).map((r) => api.fileDataUrl(r.path).catch(() => "")));
     const inlined = shots.filter(Boolean);
     if (inlined.length) setImgs((x) => [...x, ...inlined]);
+  };
+  /** Stage files pasted into this editor, which are not pictures the model can
+   *  see, as attachments of the message being edited. */
+  const addEditPasted = async (pastedFiles: File[]) => {
+    let count = files.length;
+    for (const file of pastedFiles) {
+      if (count >= MAX_FILES) { flash(`Only ${MAX_FILES} files at a time`); break; }
+      const ref = await stagePastedFile(task.id, file);
+      if (!ref) continue;
+      count++;
+      setFiles((f) => [...f, ref]);
+    }
   };
   const resend = async () => {
     const body = draft.trim();
@@ -758,12 +900,17 @@ export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: Tas
           <textarea ref={box} value={draft} onChange={(e) => setDraft(e.currentTarget.value)}
             onPaste={(e) => {
               // A photo pasted into the message being edited is an attachment
-              // of that message, and lands in this editor's own list.
-              const shots = Array.from(e.clipboardData.files);
-              if (shots.some((f) => f.type.startsWith("image/"))) {
-                e.preventDefault();
-                void pastedImages(shots).then((add) => add.length && setImgs((x) => [...x, ...add]));
-              }
+              // of that message, and lands in this editor's own list. Anything
+              // else the clipboard holds as a file (an SVG, a PDF) is staged and
+              // attached as a file, so it goes out as a path the agent opens
+              // rather than as an image block it cannot see.
+              const pasted = Array.from(e.clipboardData.files);
+              if (!pasted.length) return;
+              e.preventDefault();
+              const pictures = pasted.filter((f) => isModelImage(f.type));
+              const others = pasted.filter((f) => !isModelImage(f.type));
+              if (pictures.length) void pastedImages(pictures).then((add) => add.length && setImgs((x) => [...x, ...add]));
+              if (others.length) void addEditPasted(others);
             }}
             onKeyDown={(e) => {
               if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setEditing(false); }
@@ -792,7 +939,7 @@ export const UserMsg = memo(function UserMsg({ it, task }: { it: Item; task: Tas
       {!live && <IconButton label="Rewind to here: pick a checkpoint and choose whether to put back the conversation, the files, or both." className="rw" onClick={() => setRwOpen(true)}>{I.rewind()}</IconButton>}
       {rwOpen && <Rewind taskId={task.id} itemId={it.id} onClose={() => setRwOpen(false)} />}
       <div className="ucol">
-      <div className="ubub">{Array.isArray(it.data?.images) && it.data.images.length > 0 && <div className="ubimgs">{it.data.images.map((src: string, i: number) => <Thumb key={i} src={src} items={(it.data.images as string[]).map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />)}</div>}<AttachmentChips text={it.text} data={it.data} /><SentAnnotationMessage text={stripHarnessBlocks(it.text, it.data)} /></div>
+      <div className="ubub"><MessagePictures sources={pics} /><UnreadPictures pictures={unread} /><AttachmentChips text={it.text} data={it.data} /><SentAnnotationMessage text={stripHarnessBlocks(it.text, it.data)} /></div>
       <div className="msgacts">
         <span onClick={() => copyText(stripHarnessBlocks(it.text, it.data))}>Copy</span>
         <span onClick={startEdit}>Edit</span>
@@ -889,14 +1036,43 @@ function eventSum(it: Item): string | null {
   return null;
 }
 
+/** Nothing revealed. One module-level instance, so the default parameter does
+ *  not allocate a fresh Set on every call and throw away the row memo. */
+const NO_REVEALED: ReadonlySet<string> = new Set();
+
+/** The thinking items a reply's own "Show thinking" reveals: the contiguous run
+ *  of thinking directly before it, which is the reasoning behind that answer. */
+function revealedThinking(items: Item[], want: Record<string, boolean>): Set<string> {
+  const out = new Set<string>();
+  items.forEach((it, i) => {
+    if (it.kind !== "text" || !want[it.id]) return;
+    for (let j = i - 1; j >= 0 && items[j]!.kind === "thinking"; j--) out.add(items[j]!.id);
+  });
+  return out;
+}
+
+/** Replies that have reasoning of their own, so the menu offers the switch only
+ *  where flipping it does something. */
+function hasThinkingBefore(items: Item[]): Set<string> {
+  const out = new Set<string>();
+  items.forEach((it, i) => {
+    if (it.kind === "text" && i > 0 && items[i - 1]!.kind === "thinking") out.add(it.id);
+  });
+  return out;
+}
+
 /** Merge back-to-back tool calls into one group; hidden thinking doesn't break a run.
  *  Commands and settled subagents stay in that group when they end, so completion
  *  doesn't split the surrounding actions or reset an open fold. A subagent that is
- *  still running keeps its own row: it is the one thing there still worth watching. */
-function groupFeed(items: Item[], showThinking: boolean): FeedEntry[] {
+ *  still running keeps its own row: it is the one thing there still worth watching.
+ *
+ *  `revealed` is the set of thinking items the user turned on from a single
+ *  message's menu — they are kept exactly as `showThinking` would keep them,
+ *  without the global setting that turns every turn's reasoning on. */
+function groupFeed(items: Item[], showThinking: boolean, revealed: ReadonlySet<string> = NO_REVEALED): FeedEntry[] {
   const out: FeedEntry[] = [];
   for (const it of items) {
-    if (it.kind === "thinking" && !showThinking) continue;
+    if (it.kind === "thinking" && !showThinking && !revealed.has(it.id)) continue;
     // A blank text/thinking block renders as nothing but would still end the run
     // before it: free routed models emit one between every parallel call, which
     // left each call in its own one-line group instead of one folded line. The
@@ -937,7 +1113,8 @@ function summarize(tools: Item[], cwd: string, bgs: Bg[]) {
   let add = 0, del = 0, failed = 0;
   const from: string[] = [];
   let sent = 0;
-  let routes = 0;
+  // Never incremented: the "switched model" phrase below is unreachable today.
+  const routes = 0;
   let routed = 0;
   let asks = 0;
   let answered = 0;
@@ -1184,13 +1361,19 @@ export const FeedRows = memo(function FeedRows({ items, task, showThinking, bgs,
   // Read once here for the same reason: the freeze is a property of the chat, and
   // a subagent pill or a tool row that asks for itself cannot know it.
   const held = isPaused(task, useStore((s) => s.settings?.paused_all ?? false));
-  const rows = useMemo(() => groupFeed(sent, showThinking), [sent, showThinking]);
+  // Per-message thinking, read once here for the same reason as the two above.
+  // The map is keyed by reply id; the reasoning it reveals is the thinking row
+  // directly before that reply.
+  const thinkFor = useStore((s) => s.thinkFor);
+  const revealed = useMemo(() => revealedThinking(sent, thinkFor), [sent, thinkFor]);
+  const thinks = useMemo(() => hasThinkingBefore(sent), [sent]);
+  const rows = useMemo(() => groupFeed(sent, showThinking, revealed), [sent, showThinking, revealed]);
   return (
     <>
       {rows.map((e) =>
         "tools" in e
           ? <div key={e.key} className="it" data-item={e.key}><ToolGroup tools={e.tools} task={task} held={held} bgs={jobs} /></div>
-          : <Row key={e.key} it={e.it} task={task} showThinking={showThinking} held={held} streaming={e.it.id === streamingItemId} onOpenArtifict={onOpenArtifict} />)}
+          : <Row key={e.key} it={e.it} task={task} showThinking={showThinking || revealed.has(e.it.id)} think={thinks.has(e.it.id)} held={held} streaming={e.it.id === streamingItemId} onOpenArtifict={onOpenArtifict} />)}
     </>
   );
 }, (a, b) => sameItems(a.items, b.items) && a.showThinking === b.showThinking && a.bgs === b.bgs && a.streamingItemId === b.streamingItemId && a.onOpenArtifict === b.onOpenArtifict && feedTaskEqual(a.task, b.task, a.items));
@@ -1225,12 +1408,12 @@ function Feed({ items, task, live, showThinking, onOpenArtifict }: { items: Item
 
 /** A feed row. Memoized, because the timeline re-renders on every streamed delta
  *  and most rows are already-finished text that cannot have changed. */
-const Row = memo(function Row({ it, task, showThinking, held, streaming = false, onOpenArtifict }: { it: Item; task: TaskSummary; showThinking: boolean; held: boolean; streaming?: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
+const Row = memo(function Row({ it, task, showThinking, think = false, held, streaming = false, onOpenArtifict }: { it: Item; task: TaskSummary; showThinking: boolean; think?: boolean; held: boolean; streaming?: boolean; onOpenArtifict?: (selection: ArtifictWorkspaceSelection) => void }) {
   if (it.kind === "thinking" && !showThinking) return null;
   return (
     <div className="it" data-item={it.id}>
-      {it.kind === "user" && (it.data?.brief ? <div className="brief"><div className="label" style={{ marginBottom: 4 }}>Brief from the main agent</div><Md text={it.text} /></div> : <UserMsg it={it} task={task} />)}
-      {it.kind === "text" && <Reply it={it} streaming={streaming} />}
+      {it.kind === "user" && (it.data?.brief ? <Brief it={it} /> : <UserMsg it={it} task={task} />)}
+      {it.kind === "text" && <Reply it={it} streaming={streaming} think={think} />}
       {it.kind === "thinking" && <Thinking text={it.text} />}
       {it.kind === "tool" && (hasArtifictCardSlot(it)
         ? <InlineArtifictCard item={it} taskId={task.id} onOpenArtifict={onOpenArtifict} />
@@ -1246,7 +1429,7 @@ const Row = memo(function Row({ it, task, showThinking, held, streaming = false,
   );
 // The chat summary is a new object on every agent step; a row compares only the
 // parts of it the row reads (see `feedTaskEqual`).
-}, (a, b) => a.it === b.it && a.showThinking === b.showThinking && a.held === b.held && a.streaming === b.streaming && a.onOpenArtifict === b.onOpenArtifict && feedTaskEqual(a.task, b.task, [a.it]));
+}, (a, b) => a.it === b.it && a.showThinking === b.showThinking && a.think === b.think && a.held === b.held && a.streaming === b.streaming && a.onOpenArtifict === b.onOpenArtifict && feedTaskEqual(a.task, b.task, [a.it]));
 
 function useStick(dep: unknown) {
   const ref = useRef<HTMLDivElement>(null);
@@ -1378,18 +1561,45 @@ export function SubInput({ task, sub }: { task: TaskSummary; sub: SubInfo }) {
   const sendKey = messageSendKey(isPhoneClient(), sendWith, phoneEnterSends);
   const send = () => {
     const t = text.trim();
-    if (!t) return;
+    // A picture on its own is a message: the subagent is being shown something.
+    if (!t && !attachedImages.length) return;
     setText("");
-    void api.subSend(task.id, sub.id, t, attachedImages, attachedImages.map((_, i) => `image-${i + 1}`)).catch((e) => flash(String(e)));
+    const imgs = attachedImages;
+    setAttachedImages([]);
+    void api.subSend(task.id, sub.id, t, imgs, imgs.map((_, i) => `image-${i + 1}`)).catch((e) => flash(String(e)));
   };
   return (
     <div className="subinput">
-      <TextArea className="" rows={1} value={text} placeholder={running ? `Message ${sub.role} directly…` : `Follow up with ${sub.role}…`} onChange={(e) => setText(e.currentTarget.value)} onPaste={(e) => { const pasted = Array.from(e.clipboardData.files); if (pasted.some((f) => f.type.startsWith("image/"))) { e.preventDefault(); void pastedImages(pasted).then((images) => { if (images.length) setAttachedImages((old) => [...old, ...images]); }); } }}
+      {/* The pictures that will go with the message. Without them the box looks
+          empty after a paste, and the user has no way to tell that a photo is
+          queued for the subagent — or to take it back. */}
+      {attachedImages.length > 0 && (
+        <div className="attachrow">
+          {attachedImages.map((src, i) => (
+            <div key={i} className="attach">
+              <Thumb src={src} items={attachedImages.map((s: string, j: number) => ({ src: s, alt: `Attached image ${j + 1}` }))} index={i} alt={`Attached image ${i + 1}`} />
+              <IconButton label="Remove image" className="attach-x" onClick={() => setAttachedImages((old) => old.filter((_, j) => j !== i))}>{I.close(10)}</IconButton>
+            </div>
+          ))}
+        </div>
+      )}
+      <TextArea className="" rows={1} value={text} placeholder={running ? `Message ${sub.role} directly…` : `Follow up with ${sub.role}…`} onChange={(e) => setText(e.currentTarget.value)}
+        onPaste={(e) => {
+          // A subagent's box carries pictures only, so a file it cannot see — an
+          // SVG, a PDF — is named rather than pasted as an image block the model
+          // would be handed and could not read.
+          const pasted = Array.from(e.clipboardData.files);
+          if (!pasted.length) return;
+          e.preventDefault();
+          const pictures = pasted.filter((f) => isModelImage(f.type));
+          if (pictures.length) void pastedImages(pictures).then((images) => { if (images.length) setAttachedImages((old) => [...old, ...images]); });
+          if (pictures.length < pasted.length) flash("Only pictures can be pasted here — attach other files in the chat's composer");
+        }}
         onKeyDown={(e) => { if (e.key !== "Enter" || e.nativeEvent.isComposing) return; if (enterSendsMessage(sendKey, e)) { e.preventDefault(); send(); } }} />
       {/* The label names the sending key only when a key sends: on a phone with
           Enter-to-send off, promising Enter would teach the opposite of what
           Enter does. */}
-      <RoundButton label={`Send${sendKey ? ` · ${sendKey}` : ""}`} className={text.trim() ? "ready" : ""} onClick={send}>{I.up(11)}</RoundButton>
+      <RoundButton label={`Send${sendKey ? ` · ${sendKey}` : ""}`} className={text.trim() || attachedImages.length ? "ready" : ""} onClick={send}>{I.up(11)}</RoundButton>
     </div>
   );
 }
@@ -2320,6 +2530,14 @@ export function Session() {
             chat's status icon and title stay, and so does Resume on a paused
             chat — that one is never safe to hide. */}
         {workspaceOpen && workspaceTab === "artificts" && <div className="shdr-studio" ref={setStudioSlot} />}
+        {/* The Browser view has no studio toolbar, so the header carries the same
+            mode switch the studio shows; its Artificts / Sandboxes choices hand
+            the studio its mode through the saved view, which it reads on mount. */}
+        {workspaceOpen && workspaceTab === "browser" && browserEnabled && <div className="shdr-studio"><div className="studio-bar-group studio-seg" role="group" aria-label="Studio mode">
+          <button type="button" aria-pressed={false} onClick={() => { patchStudioView(task.id, { sbx: false }); setWorkspaceTab("artificts"); }}><Layers size={12} aria-hidden="true" />Artificts</button>
+          <button type="button" aria-pressed={false} onClick={() => { patchStudioView(task.id, { sbx: true, gallery: false }); setWorkspaceTab("artificts"); }}><Monitor size={12} aria-hidden="true" />Sandboxes</button>
+          <button type="button" aria-pressed className="on"><Globe size={12} aria-hidden="true" />Browser</button>
+        </div></div>}
         {!workspaceOpen && <div className="shdr-optional"><TodoChip todos={task.todos} /></div>}
         {task.ultra && task.subs.length > 0 && !workspaceOpen && <div className="shdr-optional"><SwarmChip task={task} held={paused} /></div>}
         {(live || paused) && (
@@ -2346,7 +2564,7 @@ export function Session() {
           {find && <FindBar onClose={() => set({ find: false })} />}
           <CFloat task={task} />
         </div>
-        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}>{browserEnabled && <div className="workspace-tabs" aria-label="Workspace views"><Button variant={workspaceTab === "artificts" ? "primary" : "ghost"} aria-pressed={workspaceTab === "artificts"} onClick={() => setWorkspaceTab("artificts")}>Artificts</Button><Button variant={workspaceTab === "browser" ? "primary" : "ghost"} aria-pressed={workspaceTab === "browser"} onClick={() => setWorkspaceTab("browser")}><Globe size={13} aria-hidden="true" />Browser</Button></div>}<div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div>{workspaceTab === "browser" && browserEnabled ? <BrowserPanel embedded key={task.id} taskId={task.id} onClose={() => setWorkspaceTab("artificts")} onExpandedChange={setWorkspaceExpanded} /> : <ArtifictWorkspace key={`${task.id}:${workspaceSelection?.artifictId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} onExpandedChange={setWorkspaceExpanded} toolbarSlot={studioSlot} />}</div>}
+        {workspaceOpen && <div className="session-pane collaboration-workspace" style={{ flex: 1, minWidth: 380, position: "relative", display: "flex", flexDirection: "column" }}><div className="workspace-notices"><AgentNoticeList taskId={task.id} /></div>{workspaceTab === "browser" && browserEnabled ? <BrowserPanel embedded key={task.id} taskId={task.id} onClose={() => setWorkspaceTab("artificts")} onExpandedChange={setWorkspaceExpanded} /> : <ArtifictWorkspace key={`${task.id}:${workspaceSelection?.artifictId ?? ""}:${workspaceSelection?.versionId ?? ""}`} taskId={task.id} taskTitle={task.title} initialSelection={workspaceSelection} onExpandedChange={setWorkspaceExpanded} toolbarSlot={studioSlot} onBrowser={browserEnabled ? () => setWorkspaceTab("browser") : undefined} />}</div>}
         {/* The record surface owns the width while it is open, so the
             subagent/background rail stands down with its own toggle. */}
         {!workspaceOpen && <Details task={task} />}

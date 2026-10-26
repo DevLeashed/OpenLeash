@@ -55,6 +55,7 @@ async fn every_request_attempt_and_its_backoff_is_recorded() {
         effort: 2,
         max_tokens: 1000,
         cache_key: "ol-rt".into(),
+        cwd: String::new(),
     };
     router::request(
         &h,

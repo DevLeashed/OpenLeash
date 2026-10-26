@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, clampEffort, EFFORTS, effortLabel, effortSteps } from "../api";
+import { api, clampEffort, effortLadder, effortSteps } from "../api";
 import { Button, Dropdown, Modal, Switch } from "./primitives";
 import { defaultRoute, flash, get, isConnected, modelInfo, set, shownProviders, useStore } from "../store";
 
@@ -186,11 +186,12 @@ export function ModelSwap() {
                   // picker you cannot trust to change.
                   style={{ width: 140, color: effDiff ? "#c4b5fd" : undefined }}
                   onChange={(v) => setEffort({ ...effort, [rowKey(r)]: Number(v) })}
-                  // `effortSteps` returns positions in 0..4, the same range `EFFORTS` indexes.
-                  options={steps.map((e) => ({
-                    value: String(e),
-                    label: effortLabel(mi, e) ?? EFFORTS[e]!,
-                    hint: e === clampEffort(steps, r.effort) ? "current" : undefined,
+                  // `effortLadder` returns the rungs in drawn order — Low first,
+                  // Max last — each with the stored effort it belongs to.
+                  options={effortLadder(mi).map((o) => ({
+                    value: String(o.value),
+                    label: o.label,
+                    hint: o.value === clampEffort(steps, r.effort) ? "current" : undefined,
                   }))}
                 />
               ) : (

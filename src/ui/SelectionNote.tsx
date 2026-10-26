@@ -122,7 +122,22 @@ export function parseAttachments(text: string): ShownAttachment[] {
 export interface StagedRef { path: string; name: string; size: number }
 
 /** What a user item carries, as far as its attachments go. */
-export interface AttachmentData { images?: unknown; images_dropped?: unknown; attachments?: unknown }
+export interface AttachmentData { images?: unknown; images_dropped?: unknown; attachments?: unknown; image_attachments?: unknown }
+
+/**
+ * How many of a message's staged copies are pictures, for a message saved before
+ * the backend recorded the count.
+ *
+ * The blobs on `images` are dropped from older messages to bound memory
+ * (`prune_item_images`), and the count of what went is left behind as
+ * `images_dropped`. So the blobs still on the item plus the ones that went is
+ * the number of pictures the message carried — which is what the split needs.
+ */
+function pictureCount(data: AttachmentData | undefined): number {
+  const blobs = Array.isArray(data?.images) ? data.images.length : 0;
+  const dropped = typeof data?.images_dropped === "number" ? data.images_dropped : 0;
+  return blobs + dropped;
+}
 
 /**
  * A sent message's staged copies, split into the pictures and the other files.
@@ -130,10 +145,18 @@ export interface AttachmentData { images?: unknown; images_dropped?: unknown; at
  * The backend stages a message's images first and its files after them, in one
  * list on the item's `attachments` field (`stage_user_attachments`). The visible
  * text no longer carries the `<openleash-attachments>` note, which goes to the
- * model only, so this list is the only record of what went out. `images` are the
- * entries whose picture is still on the item; a picture the timeline has since
- * dropped to save memory (`images_dropped`) counts as a file here, so the bubble
- * still names it and an edit still resends its staged copy by path.
+ * model only, so this list is the only record of what went out.
+ *
+ * How many of the staged copies are pictures comes from the item's own
+ * `image_attachments` count, *not* from the number of blobs still on `images`:
+ * the transcript drops those blobs from older messages to bound memory
+ * (`prune_item_images`), and counting what survived emptied the count to zero,
+ * which turned every picture into a file chip. A picture the timeline has
+ * dropped is still a picture, so it is still separated from the files — it just
+ * has no blob to draw, and the bubble reads its staged copy back from disk.
+ *
+ * Messages saved before the count existed fall back to the blobs still on the
+ * item plus the ones that went, and to the note in the text for the oldest ones.
  */
 export function stagedAttachments(data: AttachmentData | undefined): { images: StagedRef[]; files: StagedRef[] } {
   const raw = Array.isArray(data?.attachments) ? (data.attachments as unknown[]) : [];
@@ -144,8 +167,10 @@ export function stagedAttachments(data: AttachmentData | undefined): { images: S
       name: typeof a.name === "string" && a.name ? a.name : `attachment-${i + 1}`,
       size: typeof a.size === "number" ? a.size : 0,
     }));
-  const shown = Array.isArray(data?.images) ? data.images.length : 0;
-  return { images: staged.slice(0, shown), files: staged.slice(shown) };
+  const pictures = typeof data?.image_attachments === "number"
+    ? data.image_attachments
+    : pictureCount(data);
+  return { images: staged.slice(0, pictures), files: staged.slice(pictures) };
 }
 
 /**

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { chord } from "../keys";
-import { api, ASSISTS, baseName, clampEffort, EFFORTS, effortLabel, effortSteps, isRequiredAgent, ModelInfo, PERMS, TaskSummary, withRequiredAgents, xOn } from "../api";
+import { api, ASSISTS, baseName, clampEffort, EFFORT_LADDER, effortLadder, effortSteps, isRequiredAgent, ModelInfo, PERMS, TaskSummary, withRequiredAgents, xOn } from "../api";
 import { matchesTaskQuery, taskSearchDetail } from "./task-search";
 import { chatModel, defaultRoute, flash, get, go, isConnected, modelColor, modelInfo, openProject, requestPause, saveSettings, set, shownProviders, stepZoom, subModel, useStore, DEFAULT_ZOOM, ZOOMS } from "../store";
 import { afterChange, openUltraXEditor, setOpts, togglePlan, toggleUltra, toggleUltraWt, ULTRA_X_SHOWN } from "./Composer";
@@ -15,6 +15,7 @@ import { ChatStatsPanel } from "./ChatStats";
 import { RunTimelinePanel } from "./RunTimeline";
 import { SendToMachine } from "./SendToMachine";
 import { openSaveAsSkill, SaveAsSkill } from "./SaveAsSkill";
+import { TrainingExport } from "./TrainingExport";
 import { MoveChat, openMove } from "./MoveChat";
 import { ModelSwap, openSwap } from "./ModelSwap";
 import { Notices } from "./Notices";
@@ -63,7 +64,7 @@ function SmallMenu({ z }: { z: number }) {
   const info = useStore((s) => s.projectInfo);
   const agents = useStore((s) => s.agents);
   const home = useStore((s) => s.home);
-  const task = useStore((s) => (s.view !== "home" && s.task ? s.tasks[s.task] : null));
+  const task = useStore((s) => (s.view === "session" && s.task ? s.tasks[s.task] : null));
   const [newBranch, setNewBranch] = useState(false);
   const [branchName, setBranchName] = useState("");
   const [branchError, setBranchError] = useState("");
@@ -230,7 +231,13 @@ function ModelPicker({ z }: { z: number }) {
   const accounts = useStore((s) => s.accounts);
   const agents = useStore((s) => s.agents);
   // Must mirror currentOpts(): on the home screen that's the new-chat options, not the last task.
-  const task = useStore((s) => (s.view !== "home" && s.task ? s.tasks[s.task] : null));
+  //
+  // Only the *session* view is a chat. Settings is not: the model picker is
+  // opened there by "Default for new tasks", which edits the default and
+  // nothing else. Reading the last chat there marked that chat's model as the
+  // current one — so the default came up with the wrong tick — and a pick
+  // retargeted the chat instead of the default the control says it changes.
+  const task = useStore((s) => (s.view === "session" && s.task ? s.tasks[s.task] : null));
   const home = useStore((s) => s.home);
   const subFor = pickFor && task ? task.subs.find((x) => x.id === pickFor.sub) : null;
   const o = task
@@ -340,14 +347,16 @@ function ModelPicker({ z }: { z: number }) {
   // with three reasoning levels gets three, an off/on model two, a Max-only one
   // a single choice, so nothing here promises an effort the request can't take.
   const steps = effortSteps(mi);
-  const stepIdx = Math.max(0, steps.indexOf(clampEffort(steps, effortVal)));
+  // Drawn Low on the left, Max on the right: the bar reads as a scale that
+  // climbs, the way every other slider does.
+  const effortOpts = effortLadder(mi);
+  // The position of the current level in the bar as drawn, so the arrow keys
+  // walk the rungs the way they look.
+  const stepIdx = Math.max(0, effortOpts.findIndex((o) => o.value === clampEffort(steps, effortVal)));
   // A model with no effort control has no rungs to step between, so this is
-  // undefined rather than a `steps[0]` that isn't there — and the handlers
+  // undefined rather than a rung that isn't there — and the handlers
   // below leave the setting alone instead of writing an `undefined` effort.
-  const stepBy = (delta: number) => steps[Math.max(0, Math.min(steps.length - 1, stepIdx + delta))];
-  // `effortSteps` only ever returns positions 0..4, which is what `EFFORTS`
-  // indexes, so the lookup can't miss.
-  const effortOpts = steps.map((value) => ({ value, label: effortLabel(mi, value) ?? EFFORTS[value]! }));
+  const stepBy = (delta: number) => effortOpts[Math.max(0, Math.min(effortOpts.length - 1, stepIdx + delta))]?.value;
   const p = provs.find((x) => x.id === (prov === "recent" || prov === "fav" ? mi.provider : prov));
   const rail = [{ id: "fav", name: "Favorites" }, { id: "recent", name: "Recently used" }, ...(routeModels.length ? [{ id: "route", name: "Routes (fallback chains)" }] : []), ...provs.filter((x) => x.enabled && isConnected(x))];
   return (
@@ -358,8 +367,8 @@ function ModelPicker({ z }: { z: number }) {
           if (e.key === "ArrowDown") { e.preventDefault(); setHi(Math.min(hi + 1, list.length - 1)); }
           else if (e.key === "ArrowUp") { e.preventDefault(); setHi(Math.max(hi - 1, 0)); }
           else if (e.key === "Enter") { e.preventDefault(); const m = list[hi]; m && pick(m.id, !e.shiftKey); }
-          else if (e.key === "ArrowLeft" && !q) { e.preventDefault(); const n = stepBy(1); if (n !== undefined) setEffort(n); }
-          else if (e.key === "ArrowRight" && !q) { e.preventDefault(); const n = stepBy(-1); if (n !== undefined) setEffort(n); }
+          else if (e.key === "ArrowLeft" && !q) { e.preventDefault(); const n = stepBy(-1); if (n !== undefined) setEffort(n); }
+          else if (e.key === "ArrowRight" && !q) { e.preventDefault(); const n = stepBy(1); if (n !== undefined) setEffort(n); }
         }}>
         {subFor && (
           <div style={{ padding: "8px 12px 0", fontSize: 11, color: "var(--mut2)" }}>
@@ -408,7 +417,6 @@ function ModelPicker({ z }: { z: number }) {
           </div>
         </div>
         <Tooltip content={steps.length ? "Effort · arrow keys to adjust · applies on the agent's next request" : "This model has no effort control"}><div style={{ padding: 6, borderTop: "1px solid rgba(255,255,255,0.06)", opacity: steps.length ? 1 : 0.35, pointerEvents: steps.length ? "auto" : "none" }}>
-          {subFor && <div style={{ fontSize: 10.5, color: "var(--dim)", padding: "0 4px 5px" }}>Effort for this subagent · default {effortLabel(mi, subDefault) ?? EFFORTS[subDefault]}{subFor.effort != null ? " · overridden" : ""}</div>}
           <Segmented label="Thinking effort" options={effortOpts} value={clampEffort(steps, effortVal)} onChange={setEffort} quiet style={{ width: "100%" }} />
         </div></Tooltip>
       </div>
@@ -517,6 +525,7 @@ function Palette() {
         { g: "Chat", icon: I.edit(12), label: "Rename this chat", run: () => set({ renaming: cur.id, sidebar: true }) },
         { g: "Chat", icon: I.copy(12), label: "Duplicate this chat", run: () => { void api.duplicate(cur.id).then((d) => set((s) => ({ tasks: { ...s.tasks, [d.id]: d } }))).catch((e) => flash(String(e))); } },
         { g: "Chat", icon: li(Sparkles), label: "Save this chat as a skill…", run: () => openSaveAsSkill(cur.id) },
+        { g: "Chat", icon: I.download(12), label: "Export this chat as training data…", run: () => set({ trainingExport: cur.id, pal: false }) },
         { g: "Chat", icon: I.archive(12), label: "Archive this chat", run: () => { void archiveTask(cur.id); } },
       ] : []),
       { g: "Action", icon: li(FolderOpen), label: "Open project folder…", k: "Ctrl O", run: pickFolder },
@@ -542,7 +551,7 @@ function Palette() {
       { g: "Go to", icon: li(UserRoundCog), label: "Accounts and usage limits", run: () => go("settings", { settingsTab: "accounts" }) },
       { g: "Go to", icon: li(Network), label: "Routers and fallbacks", run: () => go("settings", { settingsTab: "routing" }) },
       ...ASSISTS.map((a) => ({ g: "Assist", icon: li(Sparkles), label: "Assist mode: " + a.name, run: () => { void setOpts({ assist: a.id, now: true }); } })),
-      ...EFFORTS.map((e, j) => ({ g: "Effort", icon: li(BrainCircuit), label: "Effort: " + e, run: () => { void setOpts({ effort: j }); } })),
+      ...EFFORT_LADDER.map((e) => ({ g: "Effort", icon: li(BrainCircuit), label: "Effort: " + e.label, run: () => { void setOpts({ effort: e.value }); } })),
       ...PERMS.map((p) => ({ g: "Permission", icon: li(Shield), label: "Permission: " + p.name, run: () => { void setOpts({ perm: p.id }); } })),
     ];
     // The two long lists (models, chats) come last, so the nine rows on screen are
@@ -831,6 +840,7 @@ export function Overlays({ z }: { z: number }) {
       <MoveChat />
       <SendToMachine />
       <SaveAsSkill />
+      <TrainingExport />
       <ChatStatsPanel />
       <RunTimelinePanel />
       <RouterActivity />

@@ -2,11 +2,11 @@
 // setup dialog behind it. One prompt, N attempts, each on the model and effort
 // picked here; a judge model ranks them once they are done.
 import { useMemo } from "react";
-import { clampEffort, EFFORTS, effortLabel, effortSteps, MAX_RACE_ATTEMPTS, MIN_RACE_ATTEMPTS, type ModelInfo, type RaceAttemptSpec } from "../api";
+import { clampEffort, effortLadder, effortSteps, MAX_RACE_ATTEMPTS, MIN_RACE_ATTEMPTS, type ModelInfo, type RaceAttemptSpec } from "../api";
 import { isConnected, modelInfo, shownProviders, useStore } from "../store";
 import { clampRaceN, resolveAttempts, resolveJudge, setRaces, toggleRace, useRaces, type RaceConfig } from "../race";
 import { I } from "./icons";
-import { Button, Dropdown, Modal, Pressable, Segmented, Tooltip, type Opt } from "./primitives";
+import { Button, Dropdown, Modal, Pressable, Segmented, TextArea, Tooltip, type Opt } from "./primitives";
 import "./Race.css";
 
 /** Connected, enabled models, plus any model already in use so a pick that
@@ -26,7 +26,7 @@ export function useModelOptions(keep: string[]): Opt[] {
 /** The effort rungs a model really has; empty when it has no effort control. */
 export function effortOpts(model: string): Opt[] {
   const mi = modelInfo(model);
-  return effortSteps(mi).map((v) => ({ value: String(v), label: effortLabel(mi, v) ?? EFFORTS[v] ?? String(v) }));
+  return effortLadder(mi).map((o) => ({ value: String(o.value), label: o.label }));
 }
 
 /** Pick a new model for a row, keeping its effort on a rung the model has. */
@@ -77,7 +77,7 @@ function RaceSetupBody() {
       </div>
       <div className="mb" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         <div className="desc" style={{ fontSize: 11.5, color: "var(--mut3)", lineHeight: 1.55 }}>
-          Your prompt runs as {attempts.length} independent chats, each in its own {cfg.workspace === "docker" ? "docker workspace (a private clone, commands in the project's container)" : "git worktree"}. When they finish, the project's checks run on each and a
+          Your prompt runs as {attempts.length} independent chats by default. Add an optional prompt under any attempt to customize it; each works in its own {cfg.workspace === "docker" ? "docker workspace (a private clone, commands in the project's container)" : "git worktree"}. When they finish, the project's checks run on each and a
           read-only judge ranks them. You pick the winner and decide whether to merge it.
         </div>
         <div style={{ display: "flex", gap: 9, alignItems: "center", flexWrap: "wrap" }}>
@@ -93,7 +93,10 @@ function RaceSetupBody() {
           {cfg.workspace === "docker" && <span style={{ fontSize: 11, color: "var(--dim)" }}>Needs a trusted project with .openleash_docker/</span>}
         </div>
         <div className="race-setup-list">
-          {attempts.map((a, i) => <ModelEffort key={i} label={`Attempt ${i + 1}`} spec={a} options={options} onChange={(s) => setAttempt(i, s)} />)}
+          {attempts.map((a, i) => <div key={i} style={{ display: "grid", gap: 6 }}>
+            <ModelEffort label={`Attempt ${i + 1}`} spec={a} options={options} onChange={(s) => setAttempt(i, s)} />
+            <TextArea aria-label={`Prompt for attempt ${i + 1}`} placeholder="Use the composer prompt" rows={2} value={cfg.prompts?.[i] ?? ""} onChange={(e) => patch({ prompts: Object.assign([...(cfg.prompts ?? [])], { [i]: e.target.value }) as (string | null)[] })} />
+          </div>)}
           <div className="race-setup-sep" />
           <ModelEffort label="Judge" spec={judge} options={options} onChange={(s) => patch({ judge: s })} />
         </div>

@@ -979,7 +979,10 @@ pub async fn send_attachments(
         text,
         note = super::attachments::prompt_paths(&staged.model_paths)
     );
-    send_images_staged(h, task_id, text, model_text, images, later, staged).await
+    // Only pictures go on as image blocks. An SVG that arrived in the image
+    // list was staged as a file above and is named in `model_text` instead.
+    let pictures = staged.picture_urls.clone();
+    send_images_staged(h, task_id, text, model_text, pictures, later, staged).await
 }
 
 /// `send_attachments` for a message the user composed through a UI surface
@@ -1017,7 +1020,10 @@ pub async fn send_attachments_as(
         text,
         note = super::attachments::prompt_paths(&staged.model_paths)
     );
-    send_images_staged(h, task_id, display, model_text, images, later, staged).await
+    // The same split as `send_attachments`: a picture the model can see is an
+    // image block, and anything else that arrived as one is a file.
+    let pictures = staged.picture_urls.clone();
+    send_images_staged(h, task_id, display, model_text, pictures, later, staged).await
 }
 /// A user message. Starts a run, or — if one is in flight — queues it as
 /// steering that gets folded into the very next model call.
@@ -1259,6 +1265,16 @@ fn image_blocks(images: &[String]) -> Result<Vec<Value>, String> {
     let mut blocks = vec![];
     for url in images {
         let (mt, data) = parse_data_url(url)?;
+        let mt = mt.to_ascii_lowercase();
+        // An SVG is an image to a browser and not to a provider. If one still
+        // reaches here (an old message, a tool's `images` argument), refuse it
+        // here with a reason rather than let the provider reject the whole
+        // request — and leave the file path as the way to hand it over.
+        if !tools::is_model_image(&mt) {
+            return Err(format!(
+                "{mt} isn't an image a model can see (PNG, JPEG, GIF and WebP are); send the file itself instead."
+            ));
+        }
         // An image over the provider's pixel limit would fail this and every
         // later request; shrink it now, or refuse it with a reason.
         let (mt, data) = match super::imagefit::fit_b64("That image", &mt, &data) {
@@ -1270,6 +1286,35 @@ fn image_blocks(images: &[String]) -> Result<Vec<Value>, String> {
         );
     }
     Ok(blocks)
+}
+
+/// Read an image file into an Anthropic image block.
+///
+/// The same read `view_image` does, so a picture handed to a subagent is
+/// bounded and fitted exactly like one the agent looked at itself: an
+/// oversized file is shrunk rather than failing the whole request.
+pub fn image_block_from_file(path: &Path) -> Result<Value, String> {
+    let img = tools::view_image(path)?;
+    Ok(json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": img.media_type, "data": img.data_b64},
+    }))
+}
+
+/// The image blocks as `data:` URLs, for showing them back in the transcript.
+///
+/// The transcript draws the pictures that were handed over, so the user can see
+/// what the subagent was actually given rather than taking the brief's word for
+/// it.
+pub fn image_block_urls(blocks: &[Value]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|b| {
+            let mt = b["source"]["media_type"].as_str()?;
+            let data = b["source"]["data"].as_str()?;
+            Some(format!("data:{mt};base64,{data}"))
+        })
+        .collect()
 }
 
 /// The single image-sender. `display` is what the timeline shows, `text` is
@@ -1310,6 +1355,12 @@ async fn send_images_staged(
                 })
                 .collect();
             data["attachments"] = json!(refs);
+            // How many of those copies are pictures. The blobs on `images` are
+            // dropped from older messages to bound memory, and the transcript
+            // still has to know which staged copies were pictures — otherwise
+            // it shows them as file chips, and the user's picture is a
+            // paperclip and a size instead of a picture.
+            data["image_attachments"] = json!(staged.image_count);
         }
         Item::new("user", display.clone(), data)
     };
@@ -1513,6 +1564,72 @@ pub async fn interrupt(h: &Harness, task_id: &str) {
     stop_tokens(h, task_id);
     // A stop also drops any park: the chat is no longer *waiting for X*, it is
     // stopped, and the watcher must not later wake a task the user ended.
+    unpark_if_parked(h, task_id).await;
+    let killed = h.bg.kill_task_grouped(
+        task_id,
+        "the user stopped this chat before it finished — rerun it",
+    );
+    note_killed_commands(h, task_id, &killed, "The user STOPPED this task.").await;
+    h.emit(task_id, "bg", json!(h.bg.list(task_id)));
+    h.refresh_busy(task_id).await;
+}
+
+/// The user's Stop: a force pause, not the end of the run.
+///
+/// Stop used to be this plus a cancellation of the turn, and that cancellation
+/// is what made it the wrong keystroke for a swarm: ending the turn marks every
+/// subagent "stopped", throws away the request each was in the middle of, and
+/// leaves the next turn to resurrect them from saved conversations. What the
+/// user meant was "stop *doing* that" — the work should still be there when
+/// they press Resume, with every agent's own context intact.
+///
+/// So this does what a force pause does and nothing `interrupt` adds on top of
+/// it: every command in flight is cut, each agent is told which of its own
+/// commands died, and the chat is frozen where it stands. The model request in
+/// flight is cut by the pause itself — the router watches it and redoes the
+/// same attempt after `wait_unpaused` — so nothing is lost but the tokens spent
+/// on an answer nobody was going to read.
+///
+/// Foreground commands are cut through `rt.force` rather than the turn's token:
+/// the tool that was running reports "force paused" as its own result, and the
+/// turn carries on to its next request, where the pause holds it.
+pub async fn stop(h: &Harness, task_id: &str) {
+    let rt = h.runtime(task_id);
+    let fg = rt.fg.load(Ordering::SeqCst);
+    // A stop also drops any park: the chat is no longer *waiting for X*, it is
+    // stopped, and the watcher must not later wake a task the user ended.
+    unpark_if_parked(h, task_id).await;
+    let killed = h.bg.kill_task_grouped(
+        task_id,
+        "the user stopped this chat before it finished — rerun it",
+    );
+    note_killed_commands(h, task_id, &killed, "The user stopped this chat.").await;
+    // Cut what is running without touching the run's token. A tool that was
+    // mid-command returns "force paused" as its result; the turn keeps going.
+    {
+        let mut f = rt.force.lock().unwrap();
+        f.cancel();
+        *f = CancellationToken::new();
+    }
+    // Freeze the turn. Only a run that exists is worth pausing: stopping an idle
+    // chat must not leave it looking paused with nothing to resume, and a chat
+    // whose only work was a background command is already dealt with above.
+    if rt.running.load(Ordering::SeqCst) || fg > 0 {
+        h.pause_task(
+            task_id,
+            "manual",
+            "Stopped · Resume carries on from where it was",
+        )
+        .await;
+    }
+    h.emit(task_id, "bg", json!(h.bg.list(task_id)));
+    h.refresh_busy(task_id).await;
+    h.save_task(task_id).await;
+}
+
+/// Drop a park, if there is one. A park is the chat *waiting for X*; a stop is
+/// the user ending that wait, so the watcher must not wake the chat later.
+async fn unpark_if_parked(h: &Harness, task_id: &str) {
     if h.runtime(task_id).wake_state.lock().unwrap().parked {
         unpark(h, task_id);
         h.update_task(task_id, |t| {
@@ -1522,19 +1639,32 @@ pub async fn interrupt(h: &Harness, task_id: &str) {
         })
         .await;
     }
-    let killed = h.bg.kill_task_with_reasons(
-        task_id,
-        "the user stopped this chat before it finished — rerun it",
-    );
-    if !killed.is_empty() {
-        let list: Vec<String> = killed
-            .iter()
-            .map(|b| format!("`{}` ({})", b.cmd, b.id))
-            .collect();
-        h.note(task_id, "main", format!("<system-reminder>The user STOPPED this task. These background commands were killed before they finished, so whatever they were serving or watching is gone and has to be started again: {}</system-reminder>", list.join(", "))).await;
+}
+
+/// Tell each agent which of its *own* background commands a stop killed.
+///
+/// Scoped per agent on purpose. The chat-wide list was the only thing a stop
+/// ever sent, to the main agent, so a subagent that had a build or a server
+/// running went on assuming it was up: it resumed against a dead process and
+/// spent a turn or two finding out. Jobs with no owner ("") belong to the
+/// chat's own agent, which is who `main` reads the note.
+async fn note_killed_commands(
+    h: &Harness,
+    task_id: &str,
+    killed: &[(String, super::shell::BgInfo)],
+    lead: &str,
+) {
+    let mut by_agent: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    for (sub, job) in killed {
+        by_agent
+            .entry(sub.as_str())
+            .or_default()
+            .push(format!("`{}` ({})", job.cmd, job.id));
     }
-    h.emit(task_id, "bg", json!(h.bg.list(task_id)));
-    h.refresh_busy(task_id).await;
+    for (agent, list) in by_agent {
+        let who = if agent.is_empty() { "main" } else { agent };
+        h.note(task_id, who, format!("<system-reminder>{lead} These background commands were killed before they finished, so whatever they were serving or watching is gone and has to be started again: {}</system-reminder>", list.join(", "))).await;
+    }
 }
 
 /// Counts one foreground command in `Runtime::fg` for exactly as long as it lives,
@@ -1856,6 +1986,49 @@ pub async fn sub_stop(h: &Arc<Harness>, task_id: &str, sub_id: &str) -> Result<(
     match token {
         Some(c) => {
             c.cancel();
+            // Marked so nothing picks this agent back up on its own. A
+            // background agent that was cut off by a crash or a chat-wide stop
+            // is resumed on the next turn — but one the user stopped *by hand*
+            // is a decision, and the next turn quietly restarting it is the
+            // opposite of what they asked for.
+            h.update_task(task_id, |t| {
+                if let Some(x) = t.subs.iter_mut().find(|x| x.id == sub_id) {
+                    x.user_stopped = true;
+                }
+            })
+            .await;
+            // The agent's own background commands go with it. A subagent that
+            // started a dev server and was then stopped left that server
+            // running: the chat-wide Stop kills every background command, but
+            // stopping one agent did not, so a user who stopped one runaway
+            // worker kept its watcher alive with nothing to show for it.
+            //
+            // Only the commands this agent started, and only ones still
+            // running: a job that already exited is not something a stop
+            // killed, and claiming otherwise would make the agent rerun
+            // something that is already done.
+            let killed = h.bg.kill_sub_with_reasons(
+                task_id,
+                sub_id,
+                "the user stopped this subagent before it finished — rerun it",
+            );
+            if !killed.is_empty() {
+                let list: Vec<String> = killed
+                    .iter()
+                    .map(|b| format!("`{}` ({})", b.cmd, b.id))
+                    .collect();
+                h.note(
+                    task_id,
+                    sub_id,
+                    format!(
+                        "<system-reminder>The user stopped this subagent. These background commands were killed before they finished, so whatever they were serving or watching is gone and has to be started again: {}</system-reminder>",
+                        list.join(", ")
+                    ),
+                )
+                .await;
+            }
+            h.emit(task_id, "bg", json!(h.bg.list(task_id)));
+            h.refresh_busy(task_id).await;
             Ok(())
         }
         None => Err("That subagent isn't running.".into()),
@@ -1898,7 +2071,6 @@ pub async fn sub_message(
             .ok_or("That subagent is gone.")?;
         (info, t.sub_msgs.get(sub_id).cloned(), t.assist.clone())
     };
-    let img_blocks = image_blocks(&images)?;
     // A subagent shares its parent task's project and container, so the same
     // staging rules (and the same remote mount) apply.
     let (project, docker) = {
@@ -1915,13 +2087,17 @@ pub async fn sub_message(
         docker,
     )
     .await?;
+    // Only the pictures a model can see become image blocks. An SVG in the
+    // image list was staged as a file, and its path is in the note below.
+    let pictures = staged.picture_urls.clone();
+    let img_blocks = image_blocks(&pictures)?;
     let note_text = format!(
         "<system-reminder>The user sent you this message directly.</system-reminder>\n{text}{}",
         super::attachments::prompt_paths(&staged.model_paths)
     );
     let mut data = json!({"direct": true});
-    if !images.is_empty() {
-        data["images"] = json!(images);
+    if !pictures.is_empty() || !staged.model_paths.is_empty() {
+        data["images"] = json!(pictures);
         data["attachments"] = json!(staged
             .model_paths
             .iter()
@@ -1932,6 +2108,10 @@ pub async fn sub_message(
                 "size": staged.sizes.get(i).copied().unwrap_or(0),
             }))
             .collect::<Vec<_>>());
+        // How many of the staged copies are pictures, so the panel can still
+        // tell them from the files once the blobs are dropped. See
+        // `send_images_staged`.
+        data["image_attachments"] = json!(staged.image_count);
     }
     h.upsert_sub_item(task_id, sub_id, Item::new("user", text.clone(), data))
         .await;
@@ -1981,7 +2161,11 @@ pub async fn sub_message(
         h: h.clone(),
         task_id: task_id.to_string(),
         sub: None,
-        cancel: h.runtime(task_id).bg_cancel.lock().unwrap().clone(),
+        // A child of the chat's background token, for the same reason as
+        // `launch_background`: the token itself is shared by every background
+        // subagent, so cancelling it would stop all of them — and leave every
+        // later one born already cancelled.
+        cancel: h.runtime(task_id).bg_cancel.lock().unwrap().child_token(),
     };
     let (h2, tid, sid) = (h.clone(), task_id.to_string(), sub_id.to_string());
     tauri::async_runtime::spawn(async move {
@@ -2133,6 +2317,10 @@ pub async fn status_summary(h: &Arc<Harness>, task_id: &str) -> Result<Value, St
         effort: 1,
         max_tokens: 2_000,
         cache_key: format!("ol-{task_id}"),
+        // A side request, not a delegated turn: no workspace, so a CLI provider
+        // answers it read-only in a scratch directory instead of inheriting the
+        // app's own working directory.
+        cwd: String::new(),
     };
     let (text, usage, target) = match router::oneshot(
         h,
@@ -2220,6 +2408,7 @@ pub async fn btw(
         effort,
         max_tokens: 4_000.min(router::max_output(&model, "")),
         cache_key: format!("ol-btw-{task_id}"),
+        cwd: String::new(),
     };
     // `request` rather than `oneshot` so a tool_use that comes back anyway can be
     // dropped below, instead of being executed by a one-shot that ignores it.
@@ -3582,7 +3771,7 @@ async fn frozen_prefix(
 /// So this reads the cache when it is warm and rebuilds it in memory when it is
 /// not, leaving the task exactly as it found it.
 async fn prefix_for(
-    h: &Arc<Harness>,
+    h: &Harness,
     t: &Task,
 ) -> (String, Vec<Value>, super::plugins::PluginsCfg) {
     if !t.system.is_empty() {
@@ -3642,6 +3831,18 @@ async fn prefix_for(
         ));
     }
     (system, mcp, plugins)
+}
+
+/// The system prompt a task would be given right now, without touching the task.
+///
+/// The cached copy on a task is dropped when it is loaded (the project
+/// instructions may have changed since it was written), so most chats carry
+/// none — and an export that took the cached copy would therefore ship
+/// without the project's own rules most of the time. This rebuilds the prompt
+/// from the files as they are, so the instructions that go into a training set
+/// are the ones the agent actually worked under.
+pub async fn system_prompt(h: &Harness, t: &Task) -> String {
+    prefix_for(h, t).await.0
 }
 
 /// Whether the agent may rename this chat to `want`, and why not if it may not.
@@ -3742,6 +3943,7 @@ pub async fn ask_over_history(
         effort: t.effort.max(2),
         max_tokens: 16_000.min(router::max_output(model, &t.route)),
         cache_key: format!("ol-{}", t.id),
+        cwd: String::new(),
     };
     match router::oneshot(
         h,
@@ -3821,6 +4023,10 @@ pub async fn compact(
         effort: effort.max(2),
         max_tokens: 16_000.min(router::max_output(&model, &route_id)),
         cache_key: format!("ol-{task_id}"),
+        // A side request, not a delegated turn: no workspace, so a CLI provider
+        // answers it read-only in a scratch directory instead of inheriting the
+        // app's own working directory.
+        cwd: String::new(),
     };
     let res = router::oneshot(
         h,
@@ -4100,6 +4306,10 @@ pub(crate) async fn keepalive_ping(
         effort: 4,
         max_tokens: 1,
         cache_key: format!("ol-{task_id}"),
+        // A side request, not a delegated turn: no workspace, so a CLI provider
+        // answers it read-only in a scratch directory instead of inheriting the
+        // app's own working directory.
+        cwd: String::new(),
     };
     let res = router::oneshot(
         h,
@@ -4273,8 +4483,10 @@ impl Agent {
     }
 
     /// On (re)start of the main agent: subagents that were cut off (Esc, app
-    /// closed, crash) continue from their saved conversation, and their
-    /// reports replace the "stopped" results the main agent hasn't seen yet.
+    /// closed, crash) continue from their saved conversation in the background,
+    /// and the "stopped" results the main agent hasn't seen yet are replaced
+    /// with a note saying so. None of it is awaited — see the note on the
+    /// foreground loop below.
     async fn resume_subs(&self) {
         let Ok(t) = self.h.task(&self.task_id).await else {
             return;
@@ -4322,11 +4534,16 @@ impl Agent {
             }
         };
         // Background subagents that were cut off go back to the background.
+        //
+        // Except the ones the user stopped by hand: a stop is a decision, and
+        // the next turn quietly starting that agent again is the opposite of
+        // what they asked for. It was also the stickiest half of "stopping a
+        // subagent is sloppy" — the stop looked like it did nothing, because
+        // the agent was back a moment later.
         let defs0 = store::all_agents(&*self.h.settings.read().await, &project);
-        for s in subs
-            .iter()
-            .filter(|s| s.background && s.status == "stopped" && saved.contains_key(&s.id))
-        {
+        for s in subs.iter().filter(|s| {
+            s.background && s.status == "stopped" && saved.contains_key(&s.id) && !s.user_stopped
+        }) {
             let def = defs0
                 .iter()
                 .find(|d| d.id == s.role)
@@ -4355,7 +4572,15 @@ impl Agent {
             .filter(|id| cut_off(id))
             .filter_map(|id| {
                 subs.iter()
-                    .find(|s| s.call_id == id && s.status != "done" && saved.contains_key(&s.id))
+                    .find(|s| {
+                        s.call_id == id
+                            && s.status != "done"
+                            && saved.contains_key(&s.id)
+                            // Not one the user stopped by hand: that stop is a
+                            // decision, and resuming it behind their back is
+                            // the opposite of what they asked for.
+                            && !s.user_stopped
+                    })
                     .cloned()
                     .map(|s| (id, s))
             })
@@ -4363,26 +4588,71 @@ impl Agent {
         if todo.is_empty() {
             return;
         }
+        // A cut-off `task` call goes back to the background too, and the model
+        // is told that in place of the "stopped" result.
+        //
+        // Driving these inline and awaiting them (`join_all`) is what a chat
+        // that "never answers" turned out to be: this runs as the main turn's
+        // *first* step, so a resumed wave of heavy workers — three Unity builds,
+        // ~40 minutes of them — held the turn on "Thinking" with no output for
+        // the whole time, and every message sent meanwhile was steered into a
+        // turn that could not reach a model call to read it. It also made a Stop
+        // look like it did nothing, because the wave came back the instant the
+        // next message started a run. Recovery is best-effort work the turn
+        // never asked for, so it must not hold the turn hostage: the report
+        // arrives as a message, exactly like any other background subagent's.
         let defs = store::all_agents(&*self.h.settings.read().await, &project);
-        let runs = todo.iter().map(|(call_id, s)| {
-            let def = defs.iter().find(|d| d.id == s.role).cloned().unwrap_or_else(|| fallback_def(&s.role));
+        for (_, s) in &todo {
+            let def = defs
+                .iter()
+                .find(|d| d.id == s.role)
+                .cloned()
+                .unwrap_or_else(|| fallback_def(&s.role));
             let mut init = saved.get(&s.id).cloned().unwrap_or_default();
-            push_user_blocks(&mut init, vec![json!({"type": "text", "text": "<system-reminder>You were interrupted. Continue the job exactly where you left off.</system-reminder>"})]);
-            let (sid, iid, par) = (s.id.clone(), s.item_id.clone(), s.parent.clone());
-            async move { (call_id.clone(), self.drive_sub(sid, def, iid, init, (!par.is_empty()).then_some(par), self.cancel.child_token()).await) }
-        });
+            push_user_blocks(
+                &mut init,
+                vec![json!({"type": "text", "text": "<system-reminder>You were interrupted. Continue the job exactly where you left off.</system-reminder>"})],
+            );
+            let parent = (!s.parent.is_empty()).then(|| s.parent.clone());
+            // It is background work from here on — same deal as the loop above,
+            // including the next turn resuming it if it is cut off again rather
+            // than treating this one stop as final.
+            self.h
+                .patch_in(
+                    &self.task_id,
+                    parent.as_deref(),
+                    &s.item_id,
+                    |i| i.data["background"] = json!(true),
+                )
+                .await;
+            let sid = s.id.clone();
+            self.h
+                .update_task(&self.task_id, |t| {
+                    if let Some(x) = t.subs.iter_mut().find(|x| x.id == sid) {
+                        x.background = true;
+                    }
+                })
+                .await;
+            self.launch_background(s.id.clone(), def, s.item_id.clone(), init, parent);
+        }
         self.h.upsert_item(&self.task_id, Item::new("notice", format!("Resuming {} subagent{}", todo.len(), if todo.len() == 1 { "" } else { "s" }), json!({"level": "event", "sum": format!("resumed {} subagent{}", todo.len(), if todo.len() == 1 { "" } else { "s" })}))).await;
-        let results = join_all(runs).await;
         let mut t = t.lock().await;
         if t.messages.get(i + 1).is_none_or(|m| m.role != "user") {
             t.messages.insert(i + 1, Message::user(vec![]));
         }
         let slot = &mut t.messages[i + 1].content;
-        for (call_id, res) in results {
-            let mut r = json!({"type": "tool_result", "tool_use_id": call_id, "content": match &res { Ok(s) => s.clone(), Err(e) => e.clone() }});
-            if res.is_err() {
-                r["is_error"] = json!(true);
-            }
+        for (call_id, s) in &todo {
+            // Not an error, and deliberately not the "Subagent stopped" prefix:
+            // that text is what marks a call as cut off, and leaving it here
+            // would resume the same agent a second time on the next start.
+            let r = json!({
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": format!(
+                    "The `{}` subagent ({}) was cut off; it is resuming in the background from its saved conversation. Its report arrives as a message when it finishes — do not launch it again.",
+                    s.role, s.id
+                ),
+            });
             match slot
                 .iter_mut()
                 .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == call_id.as_str())
@@ -4741,6 +5011,11 @@ impl Agent {
                     effort,
                     max_tokens: router::max_output(&model, &route_id).min(64_000),
                     cache_key,
+                    // The workspace this turn belongs to. A provider that runs a
+                    // process (Antigravity) must start it here, and it is also
+                    // what tells it the request is a real delegated turn rather
+                    // than one of OpenLeash's own read-only one-shots.
+                    cwd: t.lock().await.cwd_for(self.sub_id()).0,
                 };
                 let mut ui = StreamUi::new(
                     h.clone(),
@@ -5257,6 +5532,7 @@ impl Agent {
             effort: effort.max(2),
             max_tokens: 12_000.min(router::max_output(model, route_id)),
             cache_key: format!("ol-{}-{}", self.task_id, s.id),
+            cwd: String::new(),
         };
         let (summary, usage, target) = match router::oneshot(
             &self.h,
@@ -8002,6 +8278,11 @@ impl Agent {
                 let req = super::http_tool::parse_request(input)?;
                 self.step(format!("HTTP {} {}", req.method, super::http_tool::authority(&req.url))).await;
                 let allow = h.settings.read().await.allow.clone();
+                let perm = h.task(&self.task_id).await?.lock().await.perm.clone();
+                // Full Access approved every target class, so a public-looking
+                // name may resolve to a local address and a redirect may land on
+                // one. Below Full Access only the approved origin is followed.
+                let allow_local = permissions::strength(&perm) >= permissions::strength("turbo");
                 let check_hop = |method: &str, url: &reqwest::Url| {
                     let ctx = permissions::Ctx { perm: "", plan: false, cwd: &cwd, project: &project, allow: &allow };
                     match permissions::http_hop_denial(method, url, &ctx) {
@@ -8010,7 +8291,7 @@ impl Agent {
                     }
                 };
                 let opts = super::http_tool::Options {
-                    keep_spill: !super::host::is_ssh(&cwd), check_hop: &check_hop,
+                    keep_spill: !super::host::is_ssh(&cwd), allow_local, check_hop: &check_hop,
                 };
                 let out = tokio::select! {
                     r = super::http_tool::execute(input, &opts) => r?,
@@ -8041,7 +8322,13 @@ impl Agent {
                 let q = input["query"].as_str().unwrap_or("");
                 self.step(format!("Searching the web for {q}")).await;
                 let count = input["count"].as_u64().unwrap_or(5) as usize;
-                let out = tools::web_search(&h.http, q, count).await?;
+                // The same Stop the main agent's search honours. This arm had no
+                // cancellation at all: a subagent mid-search outlived Esc, and the
+                // chat said "stopped" while the model call was still on its way.
+                let out = tokio::select! {
+                    r = tools::web_search(&h.http, q, count) => r?,
+                    _ = self.cancel.cancelled() => return Err(INTERRUPTED.into()),
+                };
                 let n = out.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit()) && l.contains(". ")).count();
                 self.set_item(item_id, |i| i.data["meta"] = json!(format!("{n} results"))).await;
                 Ok(out)
@@ -8172,10 +8459,16 @@ impl Agent {
                     super::docker::touch(&self.task_id);
                 }
                 if input["run_in_background"].as_bool().unwrap_or(false) {
+                    // Tagged with the agent that started it, so stopping that
+                    // agent can take its own commands down and leave the
+                    // chat's alone.
+                    let sub = self.sub_id().unwrap_or_default();
                     let id = match &denv {
-                        Some(denv) => h.bg.spawn_docker(denv, &self.task_id, &cmd, &cwd)?,
-                        None if super::host::is_ssh(&cwd) => h.bg.spawn_remote(&self.task_id, &cmd, &cwd).await?,
-                        None => h.bg.spawn(&self.task_id, &cmd, &cwd)?,
+                        Some(denv) => h.bg.spawn_docker(denv, &self.task_id, sub, &cmd, &cwd)?,
+                        None if super::host::is_ssh(&cwd) => {
+                            h.bg.spawn_remote(&self.task_id, sub, &cmd, &cwd).await?
+                        }
+                        None => h.bg.spawn(&self.task_id, sub, &cmd, &cwd)?,
                     };
                     self.h.emit(&self.task_id, "bg", json!(h.bg.list(&self.task_id)));
                     if let Some(job) = h.bg.get(&id) {
@@ -8597,17 +8890,44 @@ impl Agent {
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or("`message` is required")?
+            .unwrap_or_default()
             .to_string();
+        // A picture the sender wants the receiver to see. `message` may be
+        // empty when the picture is the whole point, so it is not required
+        // once an image comes along.
+        let images = self.collect_image_blocks(input).await?;
+        if msg.is_empty() && images.is_empty() {
+            return Err("`message` is required".into());
+        }
         let t = self.h.task(&self.task_id).await?;
         let subs = t.lock().await.subs.clone();
         let from = self.me();
         let note = format!("<system-reminder>Message from {from}:</system-reminder>\n{msg}");
+        // The pictures ride beside the text as real image blocks, so the
+        // receiver can judge them instead of guessing from the description.
+        let pics = images
+            .iter()
+            .filter_map(|b| {
+                Some((
+                    b["source"]["media_type"].as_str()?.to_string(),
+                    b["source"]["data"].as_str()?.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
         let mut sent: Vec<String> = vec![];
         let to_main = to == "main" || (to == "all" && !self.is_main());
         if to_main {
             if self.is_main() {
                 return Err("You are the main agent; message a subagent id or `all`.".into());
+            }
+            // The picture goes into the inbox *before* the run starts, so the
+            // main agent's first request already carries it. The other order
+            // would let the run start on the text alone and the picture would
+            // wait for the turn after that.
+            if !pics.is_empty() {
+                self.h
+                    .note_images(&self.task_id, "main", pics.clone())
+                    .await;
             }
             deliver_to_main(&self.h, &self.task_id, note.clone()).await;
             sent.push("main".into());
@@ -8620,6 +8940,9 @@ impl Agent {
             self.h
                 .note(&self.task_id, &s.id, Kinded::agent(&note).0)
                 .await;
+            if !pics.is_empty() {
+                self.h.note_images(&self.task_id, &s.id, pics.clone()).await;
+            }
             self.h
                 .upsert_sub_item(
                     &self.task_id,
@@ -9225,6 +9548,7 @@ impl Agent {
             effort,
             max_tokens: 4_000,
             cache_key: format!("ol-{}", self.task_id),
+            cwd: String::new(),
         };
         let answer = match router::oneshot(
             h,
@@ -9497,6 +9821,75 @@ impl Agent {
         ))
     }
 
+    /// The image blocks an agent is handing to another agent.
+    ///
+    /// Two ways in, because a model can only really use one of them. `images`
+    /// takes `data:` URLs, which the model has to hold as base64 — something it
+    /// cannot do for a picture the *user* attached, because reproducing
+    /// thousands of base64 characters is exactly what a model will not do.
+    /// `image_paths` names the file instead, and the picture is read here and
+    /// handed over as an image block, so the receiver sees what the sender saw.
+    ///
+    /// A path that is not a readable picture is refused with the reason rather
+    /// than silently dropped: an agent that was told to look at a picture and
+    /// got nothing is worse than an error, because it goes on to report about a
+    /// picture it never saw.
+    async fn collect_image_blocks(&self, input: &Value) -> Result<Vec<Value>, String> {
+        let mut blocks: Vec<Value> = vec![];
+        if let Some(a) = input["images"].as_array() {
+            for u in a.iter().filter_map(|x| x.as_str()) {
+                match image_blocks(&[u.to_string()]) {
+                    Ok(mut b) => blocks.append(&mut b),
+                    Err(e) => return Err(format!("That image couldn't be passed on: {e}")),
+                }
+            }
+        }
+        let paths: Vec<String> = input["image_paths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return Ok(blocks);
+        }
+        let t = self.h.task(&self.task_id).await?;
+        let (cwd, project) = {
+            let g = t.lock().await;
+            (g.cwd_for(self.sub_id()).0, g.project.clone())
+        };
+        for p in paths {
+            let block = if super::host::is_ssh(&cwd) {
+                let sp = super::tools_remote::resolve(&cwd, &p)
+                    .map_err(|e| format!("That image couldn't be passed on: {e}"))?;
+                let img = super::tools_remote::view_image(&sp)
+                    .await
+                    .map_err(|e| format!("That image couldn't be passed on: {e}"))?;
+                json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": img.media_type, "data": img.data_b64},
+                })
+            } else {
+                // A staged copy in a docker workspace is named by its *container*
+                // path, and the file itself is on the host. That mapping is
+                // tried on the raw path first: `/tmp/OpenLeash/...` is not
+                // absolute on Windows, so resolving it against the working
+                // directory first would join the two and lose the shape the
+                // mapping needs.
+                let local = super::attachments::host_path_for(&project, &p)
+                    .unwrap_or_else(|| tools::resolve(&cwd, &p));
+                image_block_from_file(&local)
+                    .map_err(|e| format!("That image couldn't be passed on: {e}"))?
+            };
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
     async fn spawn_sub(&self, input: &Value, call_id: &str) -> Result<String, String> {
         let t = self.h.task(&self.task_id).await?;
         let snapshot = t.lock().await.clone();
@@ -9592,6 +9985,11 @@ impl Agent {
             }
         }
         let sid = super::new_id();
+        // The pictures the parent hands over are collected *before* the agent is
+        // registered, so a path that turns out not to be a picture leaves no
+        // half-created agent behind: the launch either happens with its
+        // pictures or does not happen at all.
+        let images = self.collect_image_blocks(input).await?;
         // Ultrathread worktrees: each top-level worker gets its own checkout + branch; nested
         // agents share their coordinator's. Read-only agents and the fuze agent stay in the task's.
         let wt_on = snapshot.ultra && (snapshot.ultra_wt || x.is_some_and(|x| x.wt));
@@ -9677,6 +10075,7 @@ impl Agent {
             call_id: call_id.to_string(),
             item_id: iid.clone(),
             background: false,
+            user_stopped: false,
             parent: parent.clone().unwrap_or_default(),
             depth,
             effort,
@@ -9714,18 +10113,13 @@ impl Agent {
         // Images the parent hands over: the subagent sees them directly.
         // Without this the brief's "see the screenshot" is a dead end — it has
         // no way to reach an image that only exists in the parent's context.
-        let mut images: Vec<Value> = vec![];
-        if let Some(a) = input["images"].as_array() {
-            for u in a.iter().filter_map(|x| x.as_str()) {
-                match image_blocks(&[u.to_string()]) {
-                    Ok(mut b) => images.append(&mut b),
-                    Err(e) => return Err(format!("That image couldn't be passed on: {e}")),
-                }
-            }
-        }
+        // (Collected above, before the agent was registered.)
         let mut brief_data = json!({"brief": true});
         if !images.is_empty() {
             brief_data["has_images"] = json!(images.len());
+            // The pictures the subagent was actually given, so the panel shows
+            // them rather than a brief that talks about one.
+            brief_data["images"] = json!(image_block_urls(&images));
         }
         self.h
             .upsert_sub_item(
@@ -9805,13 +10199,22 @@ impl Agent {
         init: Vec<Message>,
         parent: Option<String>,
     ) {
+        // A *child* of the chat's background token, never the token itself.
+        //
+        // The token itself is shared by every background subagent in the chat,
+        // so cancelling it stopped all of them — and, worse, the token stayed
+        // cancelled: a background subagent started *after* that stop was born
+        // already cancelled and did nothing, so the agent could not spawn
+        // another one and got no error to explain why. A child token keeps the
+        // two apart: this agent can be stopped on its own, and a stop on it
+        // leaves the shared parent — and every later background agent — alive.
         let cancel = self
             .h
             .runtime(&self.task_id)
             .bg_cancel
             .lock()
             .unwrap()
-            .clone();
+            .child_token();
         let me = Agent {
             h: self.h.clone(),
             task_id: self.task_id.clone(),
@@ -9933,11 +10336,17 @@ impl Agent {
         let note = input["message"].as_str().map(str::trim).filter(|m| !m.is_empty()).map(String::from).unwrap_or_else(|| {
             "<system-reminder>You were stopped. Continue the job exactly where you left off — re-check the current state, finish what remains, and report.</system-reminder>".to_string()
         });
+        // A picture the caller wants the resumed agent to see — e.g. the state
+        // it should be looking at now, which it cannot have seen when it stopped.
+        let images = self.collect_image_blocks(input).await?;
         // Claim it and take its history in one atomic step: between reading the
         // task and marking it running, anything (the user, another agent) could
         // have started the same subagent, and two runs would then share one
         // transcript.
-        let init = t.lock().await.try_resume_sub(&id, self.sub_id(), &note);
+        let init = t
+            .lock()
+            .await
+            .try_resume_sub(&id, self.sub_id(), &note, &images);
         let Some(init) = init else {
             // Give the reason that still holds: it started in the meantime, or
             // its conversation was never saved.
@@ -10497,6 +10906,34 @@ impl StreamUi {
                 self.emit_item(&item);
                 self.done.push(item);
             }
+            // A step the vendor's own agent took (Antigravity). Rendered as a
+            // finished tool card, never as a running one: nothing here will ever
+            // pair a result with it, and it was not our permission layer's call.
+            StreamEvent::Step {
+                name,
+                input,
+                output,
+                error,
+            } => {
+                self.close();
+                let item = Item::new(
+                    "tool",
+                    "",
+                    json!({
+                        "name": name,
+                        "status": if error { "error" } else { "ok" },
+                        "input": input,
+                        "output": output,
+                        "delegate": true,
+                        // In the collapsed header, so a step never reads as one
+                        // of ours: an `agy` `read_file` is otherwise
+                        // indistinguishable from OpenLeash's own.
+                        "meta": if error { "via agy · failed" } else { "via agy" },
+                    }),
+                );
+                self.emit_item(&item);
+                self.done.push(item);
+            }
             StreamEvent::BlockEnd => self.close(),
             StreamEvent::Reset => {
                 // A failed attempt streamed partial output; take it back off the screen.
@@ -10631,6 +11068,12 @@ fn update_tool_item_data(data: &mut Value, preview: &str, content: &Value, statu
 }
 
 /// After a turn, attach each tool call's input to its timeline item.
+///
+/// An `http_request` input carries the request's credentials in its headers
+/// and URL, so the stored copy is the redacted one — the transcript row is
+/// persisted on disk and shown to ACP clients, and it must not become a
+/// credential file. The model still receives the raw input in its own
+/// context; only what is *displayed and stored* is redacted.
 pub async fn attach_inputs(
     h: &Harness,
     task_id: &str,
@@ -10642,6 +11085,11 @@ pub async fn attach_inputs(
         let tid = b["id"].as_str().unwrap_or("");
         if let Some((_, iid)) = items.iter().find(|(t, _)| t == tid) {
             let input = b["input"].clone();
+            let input = if b["name"].as_str() == Some(super::http_tool::TOOL) {
+                super::http_tool::redact_input(&input)
+            } else {
+                input
+            };
             h.patch_in(task_id, sub, iid, |i| i.data["input"] = input)
                 .await;
         }
@@ -10757,6 +11205,187 @@ mod tests {
             .await
             .expect("a second press while it winds down is harmless");
         assert!(sub_stop(&h, "tss", "nobody").await.is_err());
+    }
+
+    /// A background subagent runs on a *child* of the chat's background token,
+    /// never the token itself.
+    ///
+    /// The token itself is shared by every background subagent in the chat, so
+    /// cancelling it stopped all of them — and it stayed cancelled, so every
+    /// background subagent started *after* that stop was born already
+    /// cancelled and did nothing at all. The agent could not spawn another
+    /// one, and nothing said why.
+    ///
+    /// The user sees this as "I stopped one agent and now the agent can't
+    /// start any more".
+    #[tokio::test]
+    async fn a_stopped_background_subagent_does_not_stop_the_next_one() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tbg", "m/x")]);
+        // The shared token every background agent is a child of.
+        let shared = h.runtime("tbg").bg_cancel.lock().unwrap().clone();
+        let main = Agent {
+            h: h.clone(),
+            task_id: "tbg".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+
+        // The first background agent, launched exactly as the `task` tool
+        // launches one.
+        main.launch_background(
+            "subA".into(),
+            store::AgentDef::default(),
+            "itemA".into(),
+            vec![Message::user_text("First job")],
+            None,
+        );
+        // Wait for it to register itself as stoppable.
+        let first = loop {
+            let token = h
+                .runtime("tbg")
+                .sub_cancel
+                .lock()
+                .unwrap()
+                .get("subA")
+                .cloned();
+            if let Some(t) = token {
+                break t;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+
+        // The user stops it by hand.
+        sub_stop(&h, "tbg", "subA").await.expect("subA is running");
+
+        assert!(first.is_cancelled(), "the stopped agent is cancelled");
+        assert!(
+            !shared.is_cancelled(),
+            "the chat's shared background token was cancelled by a stop on one agent: \
+             it is the parent of every background agent, so every one started after \
+             this stop is born already cancelled and does nothing"
+        );
+
+        // The next background agent is born running, not already cancelled.
+        let next = shared.child_token();
+        assert!(
+            !next.is_cancelled(),
+            "a background agent started after the stop must be able to run"
+        );
+    }
+
+    /// A background subagent the user stopped by hand is not picked back up on
+    /// the next turn.
+    ///
+    /// A background agent that was cut off by a crash, an app close or a
+    /// chat-wide Stop is resumed on the next turn — that is what its saved
+    /// conversation is for. But one the user stopped *by hand* is a decision,
+    /// and the next turn quietly starting it again is the opposite of what they
+    /// asked for. It also made the stop look like it did nothing, because the
+    /// agent was back a moment later.
+    #[tokio::test]
+    async fn a_background_subagent_the_user_stopped_is_not_resumed_by_the_next_turn() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tbguser", "m/x")]);
+        // A background agent that was cut off, the way one is when the app
+        // closes under it — and the user stopped it by hand.
+        {
+            let tr = h.task("tbguser").await.unwrap();
+            let mut g = tr.lock().await;
+            g.subs.push(SubInfo {
+                id: "subA".into(),
+                role: "explore".into(),
+                task: "First job".into(),
+                status: "stopped".into(),
+                background: true,
+                user_stopped: true,
+                ..Default::default()
+            });
+            g.sub_msgs
+                .insert("subA".into(), vec![Message::user_text("First job")]);
+            // `resume_subs` reads the transcript to find the turn it is
+            // resuming; with no assistant turn it returns before the background
+            // agents are looked at, and the test would pass for the wrong
+            // reason.
+            g.messages
+                .push(Message::user_text("start a background job"));
+            g.messages.push(Message {
+                role: "assistant".into(),
+                content: vec![json!({"type": "text", "text": "Started it."})],
+                model: String::new(),
+            });
+        }
+        let main = Agent {
+            h: h.clone(),
+            task_id: "tbguser".into(),
+            sub: None,
+            cancel: CancellationToken::new(),
+        };
+        // The next turn: `resume_subs` runs and would pick a cut-off
+        // background agent back up.
+        main.resume_subs().await;
+
+        // It was not picked back up: no token was registered for it, and its
+        // status is still "stopped".
+        let registered = h
+            .runtime("tbguser")
+            .sub_cancel
+            .lock()
+            .unwrap()
+            .contains_key("subA");
+        assert!(
+            !registered,
+            "the subagent the user stopped was started again by the next turn"
+        );
+        let tr = h.task("tbguser").await.unwrap();
+        let g = tr.lock().await;
+        assert_eq!(g.subs[0].status, "stopped");
+    }
+
+    /// Stopping a subagent takes the background commands *that agent* started
+    /// down with it, and leaves the chat's own commands alone.
+    ///
+    /// A stopped agent that left a dev server running was the sloppy part: the
+    /// chat-wide Stop kills every background command, but stopping one agent
+    /// did not, so its watcher outlived it with nothing left to show for it.
+    /// The scoping matters just as much — one agent's stop must not take the
+    /// chat's own server down.
+    #[tokio::test]
+    async fn stopping_a_subagent_kills_only_its_own_background_commands() {
+        use crate::agent::tests::{harness, task};
+
+        let (h, _) = harness(store::Settings::default(), vec![task("tsub", "m/x")]);
+        let mine =
+            h.bg.spawn("tsub", "subA", "sleep 30", ".")
+                .expect("the subagent's own command");
+        let chats =
+            h.bg.spawn("tsub", "", "sleep 30", ".")
+                .expect("the chat's own command");
+        h.runtime("tsub")
+            .sub_cancel
+            .lock()
+            .unwrap()
+            .insert("subA".into(), CancellationToken::new());
+
+        sub_stop(&h, "tsub", "subA").await.expect("subA is running");
+
+        let killed = h.bg.get(&mine).expect("the job");
+        killed.done.cancelled().await;
+        assert!(
+            killed.exit.lock().unwrap().is_some(),
+            "the subagent's own background command was killed with it"
+        );
+        assert!(
+            h.bg.get(&chats)
+                .expect("the job")
+                .exit
+                .lock()
+                .unwrap()
+                .is_none(),
+            "the chat's own background command is untouched"
+        );
     }
 
     /// A subagent that ends, however it ends, leaves the stop registry; and a

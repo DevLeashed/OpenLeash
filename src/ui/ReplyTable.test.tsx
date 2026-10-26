@@ -34,4 +34,24 @@ describe("reply tables", () => {
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(tableRows()).toHaveLength(2);
   });
+  // The Progress column is drawn as a bar inside the cell, so the cell element
+  // the table sorts by used to hold no text at all: every sort key was the empty
+  // string, the comparator saw no difference, and clicking the column left the
+  // rows exactly where they were.
+  it("sorts the progress column by its percentage", () => {
+    const data = [
+      "one.md | 146 | 81",
+      "two.md | 161 | 109",
+      "three.md | 71 | 36",
+      "four.md | 38 | 29",
+      "five.md | 121 | 28",
+      "six.md | 0 | 16",
+    ];
+    const md = `| File | done | open |\n|---|---|---|\n${data.map(row => `| ${row} |`).join("\n")}`;
+    render(<ReactMarkdown remarkPlugins={[remarkGfm, remarkOl]} components={mdComponents}>{md}</ReactMarkdown>);
+    fireEvent.click(screen.getByRole("button", { name: /Progress/ }));
+    expect(tableRows().map(row => row[3])).toEqual(["0%", "57%", "60%", "64%", "66%", "81%"]);
+    fireEvent.click(screen.getByRole("button", { name: /Progress/ }));
+    expect(tableRows().map(row => row[3])).toEqual(["81%", "66%", "64%", "60%", "57%", "0%"]);
+  });
 });

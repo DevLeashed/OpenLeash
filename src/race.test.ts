@@ -142,12 +142,12 @@ describe("helpers", () => {
 describe("starting a race", () => {
   it("sends the composer's lineup, adds the chats and opens the comparison view", async () => {
     set({ view: "home", projectInfo: { git: true, path: "C:/p", branch: "main" } as never, tasks: {} });
-    setRaces({ config: { on: true, n: 2, attempts: null, judge: { model: "judge", effort: 3 } } });
+    setRaces({ config: { on: true, n: 2, attempts: null, judge: { model: "judge", effort: 3 }, prompts: ["different angle", ""] } });
     const tasks = [{ id: "a", title: "Race 1/2 · fix" }, { id: "b", title: "Race 2/2 · fix" }] as TaskSummary[];
     vi.mocked(invoke).mockImplementation(async (cmd) => (cmd === "race_create" ? { race: race(), tasks } : null));
     await startRace({ prompt: "fix", project: "C:/p", base_branch: "", perm: "turbo", plan: false, assist: "default", agents: ["explore", "general"], route: "" }, "opus", 1);
     const call = vi.mocked(invoke).mock.calls.find(([cmd]) => cmd === "race_create");
-    expect(call?.[1]).toEqual({ req: expect.objectContaining({ attempts: [{ model: "opus", effort: 1 }, { model: "opus", effort: 1 }], judge_model: "judge", judge_effort: 3 }) });
+    expect(call?.[1]).toEqual({ req: expect.objectContaining({ attempts: [{ model: "opus", effort: 1, prompt: "different angle" }, { model: "opus", effort: 1, prompt: undefined }], judge_model: "judge", judge_effort: 3 }) });
     expect(Object.keys(get().tasks)).toEqual(["a", "b"]);
     expect(getRaces().open).toBe("r1");
     expect(getRaces().config.on).toBe(false);

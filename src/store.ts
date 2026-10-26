@@ -42,6 +42,11 @@ export interface State {
   skills: SkillDef[];
   /** Subagent whose transcript drawer is open. */
   subOpen: string | null;
+  /** Replies whose own thinking the user revealed from the message menu, by
+   *  reply item id. Separate from the global `show_thinking` setting on purpose:
+   *  one answer's reasoning is often the only part worth reading, and turning it
+   *  on for every turn in the chat is a different decision. */
+  thinkFor: Record<string, boolean>;
   /** Task whose sidebar title is being edited. */
   renaming: string | null;
   /** Model picker target: the task's main agent, or one subagent. */
@@ -142,6 +147,9 @@ export interface State {
   /** "Save as skill…" box: the chat being distilled, or null. Only ever set
    *  from a user click (context menu, palette), never from a command. */
   skillFrom: string | null;
+  /** "Export training data…" box: the chat being written as a fine-tuning
+   *  dataset, or null. Set from a user click only. */
+  trainingExport: string | null;
   /** Router activity box: the chat whose route log is on screen, or null. */
   routerLog: string | null;
   /** Per-chat stats panel: the chat whose numbers are on screen, or null. An id
@@ -202,7 +210,7 @@ export interface Note {
 
 let state: State = {
   ready: false, bootError: null, settings: null, providers: [], providerPresets: [], models: [], shell: "", dataDir: "", monthSpend: 0, claudeAllowed: false,
-  tasks: {}, items: {}, pendingMessages: {}, bg: {}, subItems: {}, artificts: {}, bisect: {}, studioView: {}, accounts: [], agents: [], skills: [], subOpen: null, pickFor: null, renaming: null,
+  tasks: {}, items: {}, pendingMessages: {}, bg: {}, subItems: {}, artificts: {}, bisect: {}, studioView: {}, accounts: [], agents: [], skills: [], subOpen: null, thinkFor: {}, pickFor: null, renaming: null,
   view: "home", hist: [], fwd: [], task: null, settingsTab: "general", modelSetupOpen: false, ultraXOpen: false,
   draft: "", sessionDrafts: {}, attach: {}, attachFiles: {},
   home: { plan: false, ultra: false, ultra_wt: false, ultra_x: null, perm: "turbo", model: "anthropic/claude-opus-5", effort: 2, worktree: false, docker: false, branch: "", subagents: true, assist: "default", agents: ["explore", "general"], route: "" },
@@ -210,7 +218,7 @@ let state: State = {
   // A phone opens on the content: there the sidebar is a drawer over it.
   sidebar: !isNarrow(), details: typeof window === "undefined" || window.innerWidth >= 1100,
   pal: false, find: false, findSeed: "", swap: false, notes: {}, menu: null, menuAnchor: null, projCtx: null, toast: null, toastAction: null, openError: null, catalogError: null,
-  notices: [], picked: {}, selecting: false, mass: false, massAll: false, fork: null, transfer: null, move: null, skillFrom: null, routerLog: null, chatStats: null, runTimeline: null, welcome: false,
+  notices: [], picked: {}, selecting: false, mass: false, massAll: false, fork: null, transfer: null, move: null, skillFrom: null, trainingExport: null, routerLog: null, chatStats: null, runTimeline: null, welcome: false,
   appUpdate: { status: "idle", version: null, error: null, can_install: false },
   appUpdateDismissed: null, appUpdateBusy: false, appUpdateActionError: null,
   trustPrompt: false,
@@ -240,7 +248,11 @@ export function set(patch: Partial<State> | ((s: State) => Partial<State>)) {
   // here: streamed deltas are folded on a frame (`bufferDelta`/`flushDeltas`),
   // and a repeated task summary is dropped by `shallowEqualTask`. Unchanged
   // patches are discarded above so they don't run every mounted selector.
-  subs.forEach((f) => f());
+  // Copy first, and catch per subscriber: this runs *inside* a Tauri event
+  // callback, so a listener that throws would otherwise take the rest of the
+  // subscribers with it and surface as a rejection in Rust's dispatcher. One
+  // broken component must not stop the others from seeing a state change.
+  for (const f of [...subs]) { try { f(); } catch (e) { console.error("OpenLeash: a store subscriber threw", e); } }
 }
 let appUpdateRevision = 0;
 export const appUpdateKey = (status: AppUpdateStatus) => `${status.status}:${status.version ?? ""}`;
@@ -253,8 +265,12 @@ export function dismissAppUpdate() { set({ appUpdateDismissed: appUpdateKey(get(
 export function appUpdateTasksActive(tasks: Record<string, TaskSummary>) {
   return Object.values(tasks).some((t) => t.status === "running" || t.status === "waiting" || t.busy > 0);
 }
-/** Only user gestures call these commands; the backend owns periodic work. */
-export async function runAppUpdate(action: "check" | "download" | "install") {
+/** Only user gestures call these commands; the backend owns periodic work.
+ *
+ *  `now` is the one-click path: the backend chains the check, the download and
+ *  the install. It is a separate call rather than three here so the steps
+ *  cannot interleave with the background pass or a second click. */
+export async function runAppUpdate(action: "check" | "download" | "install" | "now") {
   if (get().appUpdateBusy) return;
   if (action === "install" && (appUpdateTasksActive(get().tasks) || get().appUpdate.status !== "ready" || !get().appUpdate.can_install)) return;
   set({ appUpdateBusy: true, appUpdateActionError: null });
@@ -262,7 +278,7 @@ export async function runAppUpdate(action: "check" | "download" | "install") {
   try {
     if (action === "install") await api.appUpdateInstall();
     else {
-      const status = await (action === "check" ? api.appUpdateCheck() : api.appUpdateDownload());
+      const status = await (action === "check" ? api.appUpdateCheck() : action === "download" ? api.appUpdateDownload() : api.appUpdateNow());
       if (revision === appUpdateRevision) receiveAppUpdate(status);
     }
   } catch (error) {
@@ -882,6 +898,20 @@ export function forgetTask(s: State, id: string): Partial<State> {
   // has any way to reach them, because there is no longer a chat to open.
   const notes = { ...s.notes };
   const hadNotes = delete notes[id];
+  // The same leak, three more times: messages still queued for a chat that no
+  // longer exists (they hold the prompt text and any pasted image data URLs), a
+  // review's bisect progress, and the studio's open version. None of them can be
+  // reached again once the chat is gone.
+  const pendingMessages = { ...s.pendingMessages };
+  const hadPending = delete pendingMessages[id];
+  const bisect = { ...s.bisect };
+  const hadBisect = delete bisect[id];
+  const studioView = { ...s.studioView };
+  const hadStudio = delete studioView[id];
+  // And the paging cursor, which lives in a module-level map rather than in the
+  // state. A fresh chat can reuse a deleted id, and a stale cursor would open it
+  // halfway up someone else's history.
+  historyCursor.delete(id);
   return {
     tasks,
     ...(hadItems ? { items } : {}),
@@ -892,6 +922,9 @@ export function forgetTask(s: State, id: string): Partial<State> {
     ...(hadAttach ? { attach } : {}),
     ...(hadFiles ? { attachFiles } : {}),
     ...(hadNotes ? { notes } : {}),
+    ...(hadPending ? { pendingMessages } : {}),
+    ...(hadBisect ? { bisect } : {}),
+    ...(hadStudio ? { studioView } : {}),
     ...(s.task && !tasks[s.task] ? { task: null, view: "home" as const } : {}),
   };
 }
@@ -1039,6 +1072,35 @@ const historyCursor = new Map<string, string | null>();
 const historyBusy = new Set<string>();
 
 /**
+ * The row at the top of the view, and where it sits: the reader's place in the
+ * transcript. Null when the transcript has no rows to speak of.
+ *
+ * This is the reader's *row*, not their scroll offset: the offset says how far
+ * down the content they are, which changes every time a row above them
+ * changes height. The row says what they are reading, which does not.
+ */
+function readerRow(timeline: HTMLElement): { id: string; top: number } | null {
+  const viewTop = timeline.getBoundingClientRect().top;
+  for (const row of timeline.querySelectorAll<HTMLElement>("[data-item]")) {
+    const box = row.getBoundingClientRect();
+    if (box.bottom <= viewTop) continue;
+    return { id: row.dataset.item ?? "", top: box.top - viewTop };
+  }
+  return null;
+}
+
+/** The row with this id, in this transcript. Found by walking the rows rather
+ *  than by selector: an item id is harness-generated, but it is data, and a
+ *  selector built from it would have to be escaped — and `CSS.escape` is not
+ *  everywhere this code runs. */
+function rowById(timeline: HTMLElement, id: string): HTMLElement | null {
+  for (const row of timeline.querySelectorAll<HTMLElement>("[data-item]")) {
+    if (row.dataset.item === id) return row;
+  }
+  return null;
+}
+
+/**
  * Fetch one older page and splice it above what is already loaded, holding the
  * reader's scroll position while it happens.
  *
@@ -1052,20 +1114,23 @@ export async function loadPreviousHistory(id: string, timeline: HTMLElement) {
   const cursor = historyCursor.get(id) ?? null;
   if (!cursor || historyBusy.has(id)) return;
   historyBusy.add(id);
-  const oldHeight = timeline.scrollHeight;
-  const oldTop = timeline.scrollTop;
   // A reader at the bottom — or a transcript short enough to fit, where the top
   // *is* the bottom — is following the live end of the chat, and older history
   // arriving above must not move them. Keeping the distance from the top is only
   // right for someone who scrolled up to read it: applied to the short case it
   // threw the view up to the old messages every time a chat opened before it had
   // pinned, or a finished turn folded its work away and left the feed short.
-  const atBottom = oldHeight - oldTop - timeline.clientHeight < 80;
+  const atBottom = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 80;
   try {
     const page = await api.taskHistory(id, cursor, 100);
     // An empty page means this cursor is exhausted; asking again would spin.
     if (!page.items.length) { historyCursor.set(id, null); return; }
     historyCursor.set(id, page.cursor);
+    // Where the reader is *now*: the content has not changed yet, and this is
+    // where they ended up after any scrolling they did while the page was in
+    // flight. Taken here rather than before the request, so a reader who kept
+    // scrolling is not yanked back to where they were when they asked.
+    const place = readerRow(timeline);
     set((s) => {
       const current = s.items[id] ?? [];
       const known = new Set(current.map((item) => item.id));
@@ -1074,14 +1139,26 @@ export async function loadPreviousHistory(id: string, timeline: HTMLElement) {
     });
     requestAnimationFrame(() => {
       if (!timeline.isConnected) return;
-      // The reader may have scrolled while the page was in flight. Holding the
-      // offset from before the request would yank them back to where they were
-      // when they asked, so keep the rows they are on now, moved down by the
-      // height added above them. A reader who was following the live end and
-      // has not moved stays pinned to it.
-      const growth = Math.max(0, timeline.scrollHeight - oldHeight);
-      const moved = timeline.scrollTop !== oldTop;
-      timeline.scrollTop = atBottom && !moved ? timeline.scrollHeight : timeline.scrollTop + growth;
+      // A follower is pinned to the live end, and the page landing above them
+      // must not move them: the transcript's own pin puts them back.
+      if (atBottom) { timeline.scrollTop = timeline.scrollHeight; return; }
+      // A reader up in the transcript has just had a page of older messages
+      // added above them, so their row is now lower down. Put it back where it
+      // was: the same row, at the same place in the view.
+      //
+      // Measured, not estimated. The height the page adds is *not* the height
+      // the reader's row moves: the rows above them have never been on screen,
+      // so the browser counts an estimate for each one, and `scrollHeight` says
+      // how much it thinks was added. Correcting by that estimate threw the
+      // reader off the message they were reading, sometimes all the way back
+      // to the top — and the transcript's own anchoring then pulled them back
+      // again, and the two fought over the view. The row's real position is
+      // the truth, so it is what this uses.
+      if (!place) return;
+      const row = rowById(timeline, place.id);
+      if (!row) return;
+      const moved = row.getBoundingClientRect().top - timeline.getBoundingClientRect().top - place.top;
+      if (moved) timeline.scrollTop += moved;
     });
   } catch {
     // The next upward scroll can retry; never block the already-loaded history.
@@ -1262,9 +1339,25 @@ export function boot(): Promise<void> {
       // below is torn down on arrival instead of left installed alongside the
       // next boot's.
       const gen = ++attachGen;
-      const dispose = await attachListeners();
+      // A registration that rejects — a webview that is not ready yet, a remote
+      // page whose IPC shim is still connecting, a command this build lacks —
+      // used to reject out of here before `api.boot()` ran. Nothing set
+      // `bootError` on that path, so the window sat on "Starting…" for good with
+      // an unhandled rejection in the console and no way to retry.
+      //
+      // `attachListeners` reports the failure instead of rejecting, and hands
+      // back its teardown with it: the listeners that *did* register have to go
+      // before the retry installs the set again, or every event arrives twice.
+      const { dispose, failed } = await attachListeners();
       if (gen !== attachGen) {
         dispose();
+        return;
+      }
+      if (failed !== null) {
+        dispose();
+        listenersAttached = false;
+        bootInflight = null;
+        set({ bootError: `Couldn't attach the backend event listeners · ${String(failed)}` });
         return;
       }
       trackDetach(dispose);
@@ -1288,7 +1381,10 @@ export function boot(): Promise<void> {
       return;
     }
     set({
-      ready: true, settings: b.settings, providers: b.providers, providerPresets: b.provider_presets ?? [], models: b.models, shell: b.shell, dataDir: b.data_dir, monthSpend: b.month_spend, claudeAllowed: b.claude_allowed ?? false,
+      // A previous attempt's failure must not outlive a successful one: the App
+      // renders the boot error in place of the whole window, so a stale message
+      // would keep a working app behind it.
+      ready: true, bootError: null, settings: b.settings, providers: b.providers, providerPresets: b.provider_presets ?? [], models: b.models, shell: b.shell, dataDir: b.data_dir, monthSpend: b.month_spend, claudeAllowed: b.claude_allowed ?? false,
       // Folded in rather than assigned: the listeners above are already live, so
       // this snapshot can be older than a `task` event that landed while it was
       // in flight, and replacing the map wholesale would paint that event away —
@@ -1299,7 +1395,15 @@ export function boot(): Promise<void> {
       items: mergeNoticeSnapshot(get().items, b.user_notices ?? {}),
       home: { plan: false, ultra: false, ultra_wt: false, ultra_x: null, perm: b.settings.perm, model: b.settings.model, effort: b.settings.effort, worktree: defaultMode(b.settings) === "worktree", docker: defaultMode(b.settings) === "docker", branch: "", subagents: true, assist: b.settings.assist ?? "default", agents: withRequiredAgents(b.settings.default_agents ?? ["explore", "general"]), route: "" },
     });
-    set((st) => ({ home: { ...st.home, route: defaultRoute(st.home.model) } }));
+    // The new-task screen comes up on the model the user last worked with, not
+    // on whatever the build shipped as a default. `settings.model` *is* that
+    // last-used model (the backend writes it when a task is created, and the
+    // composer writes it when the pick changes) — but it can name a model that
+    // is no longer reachable, so `lastUsedModel` falls through to one that is.
+    set((st) => {
+      const model = lastUsedModel();
+      return { home: { ...st.home, model, route: defaultRoute(model) } };
+    });
     // A toast click that landed before this window was listening — the app was
     // closed and the click launched it. The listener is attached above, and
     // taking the click is what lets later clicks through, so this is the moment.
@@ -1352,8 +1456,11 @@ export function foldBisect(prev: BisectProgress | undefined, e: BisectEvent): Bi
   }
 }
 
-/** The whole Tauri listener set, as one detachable function. */
-async function attachListeners(): Promise<() => void> {
+/** The whole Tauri listener set, as one detachable function plus the first
+ *  registration that failed (if any). It never rejects: a caller that is left
+ *  holding a rejection has no way to tear down the listeners that did attach,
+ *  and the set it installed would double-deliver events on the next attempt. */
+async function attachListeners(): Promise<{ dispose: () => void; failed: unknown }> {
     const detachers: Array<() => void> = [];
     const pending: Promise<unknown>[] = [];
     const add = (registration: Promise<unknown>) => {
@@ -1505,8 +1612,13 @@ async function attachListeners(): Promise<() => void> {
       go("session", { task });
     }));
 
-    await Promise.all(pending);
-    return () => { for (const d of detachers) { try { d(); } catch { /* already detached */ } } };
+    // Settled, not `all`: one refused command must not hide the failure of the
+    // others or throw away their teardown, and the caller needs to know *and*
+    // to be able to undo.
+    const settled = await Promise.allSettled(pending);
+    const dispose = () => { for (const d of detachers) { try { d(); } catch { /* already detached */ } } };
+    const refusal = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    return { dispose, failed: refusal ? refusal.reason : null };
 }
 
 export const modelInfo = (id: string): ModelInfo => {
@@ -1646,6 +1758,44 @@ export const shownAccounts = (list: AccountView[]) => list.filter((a) => !subscr
 export function defaultRoute(model: string): string {
   const routes = state.settings?.routes ?? [];
   return (routes.find((r) => r.heads?.includes(model)) ?? routes.find((r) => r.all))?.id ?? "";
+}
+
+/**
+ * The model a new task should start on: the last one the user actually used.
+ *
+ * The stored default (`settings.model`) is that last-used model, but it can name
+ * something that is no longer usable — a provider whose key was removed, a model
+ * that has since been switched off, a route that was deleted. Preselecting a
+ * dead model is what made the new-task screen show "Pick a model" again and
+ * again, so a stale default falls through to the most recent model that *is*
+ * usable, and only then to the first connected one.
+ *
+ * "Usable" is the same test the composer uses to decide whether a model is
+ * ready: the model is in the catalog, is not disabled, and its provider is
+ * enabled and connected. A route is always usable — it is a chain the backend
+ * resolves, not a provider of its own.
+ */
+export function lastUsedModel(): string {
+  const stored = state.settings?.model ?? "";
+  const recent = state.settings?.recent_models ?? [];
+  // A boot snapshot can be partial — a test's fixture, or a backend that
+  // answered before the catalog loaded — so every list is read defensively.
+  // This runs on the boot path, where a throw takes the whole app down.
+  const models = state.models ?? [];
+  const providers = state.providers ?? [];
+  const usable = (id: string): boolean => {
+    if (!id) return false;
+    if (id.startsWith("route/")) return (state.settings?.routes ?? []).some((r) => "route/" + r.id === id && r.steps.length > 0);
+    const m = models.find((x) => x.id === id);
+    if (!m || m.enabled === false) return false;
+    return providers.some((p) => p.id === m.provider && p.enabled && isConnected(p));
+  };
+  if (usable(stored)) return stored;
+  for (const id of recent) if (usable(id)) return id;
+  // Nothing remembered is usable: fall back to a model the user can actually
+  // reach, so the screen offers one rather than an empty "Pick a model".
+  const first = models.find((m) => m.enabled !== false && providers.some((p) => p.id === m.provider && p.enabled && isConnected(p)));
+  return first?.id ?? stored;
 }
 
 const draftTimers: Record<string, ReturnType<typeof setTimeout>> = {};

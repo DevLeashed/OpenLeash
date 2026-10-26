@@ -7,7 +7,7 @@
 // keystroke of a number field would round-trip half-typed values through the
 // backend — and the test panel is meant to try rules *before* they go live.
 import { useMemo, useState } from "react";
-import { api, EFFORTS, type ModelInfo, type Route, type RouteAction, type RouteCondition, type RouteDecision, type RouteRule, type RouteSituation } from "../api";
+import { api, EFFORTS, EFFORT_LADDER, type ModelInfo, type Route, type RouteAction, type RouteCondition, type RouteDecision, type RouteRule, type RouteSituation } from "../api";
 import { flash, isConnected, modelInfo, saveSettings, shownProviders, useStore } from "../store";
 import { copyText } from "./clipboard";
 import { I } from "./icons";
@@ -69,7 +69,7 @@ function Field({ label, children, wide = false }: { label: string; children: Rea
 }
 
 function EffortSelect({ value, onChange, none }: { value: number | null | undefined; onChange: (v: number | null) => void; none?: string }) {
-  const opts: Opt[] = [...(none !== undefined ? [{ value: "", label: none }] : []), ...EFFORTS.map((label, i) => ({ value: String(i), label }))];
+  const opts: Opt[] = [...(none !== undefined ? [{ value: "", label: none }] : []), ...EFFORT_LADDER.map((e) => ({ value: String(e.value), label: e.label }))];
   return <Dropdown value={value == null ? "" : String(value)} options={opts} search={false} placeholder="Effort" onChange={(v) => onChange(v === "" ? null : Number(v))} style={{ width: 140, flex: "none" }} />;
 }
 

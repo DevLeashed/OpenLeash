@@ -142,6 +142,7 @@ pub async fn classify(
         effort: 1,
         max_tokens: 200,
         cache_key: format!("ol-review-{task_id}"),
+        cwd: String::new(),
     };
     let out = router::oneshot(
         h,

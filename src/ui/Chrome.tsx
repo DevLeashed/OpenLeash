@@ -839,6 +839,10 @@ function CtxMenu({ ctx, close }: { ctx: NonNullable<Ctx>; close: () => void }) {
     ...(t.titled ? [{ icon: I.edit(12), label: "Let the agent name it", run: run(() => patchTask(t.id, { untitled: true })) }] : []),
     { icon: I.copy(12), label: "Duplicate", run: run(() => api.duplicate(t.id).then((d) => set((s) => ({ tasks: { ...s.tasks, [d.id]: d } }))).catch((e) => flash(String(e)))) },
     { icon: I.download(12), label: "Export…", run: run(() => exportTasks([t.id])) },
+    // A training set is not a backup: it is the conversation and nothing else,
+    // in a shape a trainer accepts. So it gets its own row rather than another
+    // flag on the ordinary export.
+    { icon: I.download(12), label: "Export training data…", run: run(() => set({ trainingExport: t.id })) },
     // Only opens the box; drafting is a second, deliberate click inside it.
     { icon: <Sparkles size={12} strokeWidth={1.7} aria-hidden="true" />, label: "Save as skill…", run: run(() => openSaveAsSkill(t.id)) },
     { icon: <MonitorUp size={12} strokeWidth={1.7} aria-hidden="true" />, label: "Move to…", run: run(() => openMove(t.id)) },

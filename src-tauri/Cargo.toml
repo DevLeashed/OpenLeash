@@ -1,6 +1,6 @@
 [package]
 name = "openleash"
-version = "0.1.35"
+version = "0.5.0"
 # Which binary `cargo build`/`tauri build` means when the crate has more than
 # one — the headless entry point below is a second `[[bin]]`, and without this
 # the Tauri CLI refuses to guess ("failed to find main binary").

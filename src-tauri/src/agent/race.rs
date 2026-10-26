@@ -48,6 +48,8 @@ pub struct RaceCheck {
 pub struct RaceAttempt {
     pub task_id: String,
     pub model: String,
+    #[serde(default)]
+    pub prompt: String,
     pub effort: usize,
     #[serde(default)]
     pub checks: Vec<RaceCheck>,
@@ -106,6 +108,8 @@ pub struct AttemptSpec {
     pub model: String,
     #[serde(default)]
     pub effort: usize,
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// What the composer sends. Mirrors the shared fields of a normal new task;
@@ -164,6 +168,7 @@ pub struct AttemptTask {
     pub total: usize,
     pub model: String,
     pub effort: usize,
+    pub prompt: String,
     pub title: String,
 }
 
@@ -219,6 +224,7 @@ pub fn plan_attempts(spec: &NewRace) -> Vec<AttemptTask> {
             total,
             model: a.model.trim().to_string(),
             effort: a.effort.min(4),
+            prompt: a.prompt.as_deref().filter(|p| !p.trim().is_empty()).unwrap_or(&spec.prompt).trim().to_string(),
             title: attempt_title(i + 1, total, &spec.prompt),
         })
         .collect()
@@ -242,13 +248,14 @@ where
     let mut made = vec![];
     let mut error = None;
     for a in plan {
-        let (model, effort) = (a.model.clone(), a.effort);
+        let (model, effort, prompt) = (a.model.clone(), a.effort, a.prompt.clone());
         match make(a).await {
             Ok((task_id, summary)) => {
                 attempts.push(RaceAttempt {
                     task_id,
                     model,
                     effort,
+                    prompt,
                     checks: vec![],
                     checked: false,
                 });
@@ -1125,6 +1132,7 @@ async fn run_judge(
         effort: race.judge_effort.min(4),
         max_tokens: 4_000,
         cache_key: format!("ol-race-{id}"),
+        cwd: String::new(),
     };
     // Attributed to the first surviving attempt for routing (accounts, usage
     // caps, fallback chain) as a side request: it ignores that chat's pause and
@@ -1463,6 +1471,11 @@ mod tests {
         assert_eq!(s.perm, "ask");
         assert!(!s.plan);
         assert_eq!(s.judge_model, "");
+        let mut custom = spec("x", 2);
+        custom.attempts[1].prompt = Some("  Use a different strategy  ".into());
+        let planned = plan_attempts(&custom);
+        assert_eq!(planned[0].prompt, "Fix the parser\nwith details");
+        assert_eq!(planned[1].prompt, "Use a different strategy");
         assert_eq!(s.judge_effort, 2);
         // Worktrees unless a request says docker, so old callers are unchanged.
         assert!(!s.uses_docker());
@@ -1601,6 +1614,7 @@ mod tests {
                 RaceAttempt {
                     task_id: "a".into(),
                     model: "m".into(),
+                    prompt: "p".into(),
                     effort: 2,
                     checks: vec![],
                     checked: false,
@@ -1608,6 +1622,7 @@ mod tests {
                 RaceAttempt {
                     task_id: "b".into(),
                     model: "m".into(),
+                    prompt: "p".into(),
                     effort: 2,
                     checks: vec![],
                     checked: false,
@@ -1652,6 +1667,7 @@ mod tests {
                 .map(|t| RaceAttempt {
                     task_id: (*t).into(),
                     model: "m".into(),
+                    prompt: "p".into(),
                     effort: 2,
                     checks: vec![],
                     checked: false,
@@ -1878,6 +1894,7 @@ mod tests {
                 .map(|t| RaceAttempt {
                     task_id: (*t).into(),
                     model: "m".into(),
+                    prompt: "p".into(),
                     effort: 0,
                     checks: vec![],
                     checked: false,

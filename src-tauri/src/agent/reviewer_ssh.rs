@@ -147,7 +147,7 @@ fn local_ops_refuse_ssh_paths() {
         .unwrap();
     assert!(e.contains("remote (SSH) folder"), "{e}");
     let bg = shell::BgManager::default();
-    assert!(bg.spawn("t", "echo hi", cwd).is_err());
+    assert!(bg.spawn("t", "", "echo hi", cwd).is_err());
     for refusal in [
         host::refuse(cwd, "Checkpoints are"),
         git::populate_worktree(cwd, "C:/x").map(|_| ()),

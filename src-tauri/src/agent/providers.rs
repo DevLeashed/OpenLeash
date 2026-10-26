@@ -94,6 +94,30 @@ pub const PROVIDERS: &[ProviderInfo] = &[
         terms_url: "https://www.anthropic.com/legal/consumer-terms",
         accept: "I understand, and I'm doing this at my own risk",
     }), key_login: false }) },
+    // Not an HTTP provider and not an account provider: `agy` owns the login and
+    // runs the turn itself. `kind: "cli"` is what sends the request to the
+    // subprocess backend (`antigravity::run`) instead of a wire protocol. Nothing
+    // here reads or stores a Google credential — that is the whole point.
+    ProviderInfo { id: "antigravity", name: "Antigravity", icon: "antigravity", mono: "Ag", color: "#a5a6ff", base_url: "", env: "", chip: "Google Antigravity · drives your `agy` login", kind: "cli", local: true, account: None },
+    // A key-login subscription like OpenCode Go: the Kimi Code plan sells API
+    // access that third-party tools are explicitly invited to use (the docs
+    // cover Claude Code, OpenCode and Codex setup), so the "login" is a key
+    // created in the Kimi Code console and there is nothing to acknowledge.
+    // The CLI's own stored login is an OAuth session we deliberately do not
+    // replay — same stance as Antigravity — so `login_file` stays empty and
+    // the connect dialog offers the paste box only.
+    ProviderInfo { id: "kimi-code", name: "Kimi Code", icon: "moonshot", mono: "Ki", color: "#60a5fa", base_url: "https://api.kimi.ai/coding/v1", env: "KIMI_API_KEY", chip: "Kimi Code subscription · key from the Kimi console", kind: "openai", local: false, account: Some(AccountProviderInfo {
+        display_name: "Kimi Code",
+        short_name: "Kimi",
+        login_file: "",
+        login_command: "create a key at kimi.com/code/console",
+        paste_hint: "Paste a Kimi Code API key",
+        setup_command: "",
+        token_prefix: "",
+        warning: "Kimi allows third-party tools but requires each client to identify itself honestly — OpenLeash sends its own name, never the Kimi CLI's.",
+        terms_gate: None,
+        key_login: true,
+    }) },
     ProviderInfo { id: "anthropic", name: "Anthropic", icon: "anthropic", mono: "A", color: "#e8967a", base_url: "https://api.anthropic.com", env: "ANTHROPIC_API_KEY", chip: "Anthropic API key", kind: "anthropic", local: false, account: None },
     ProviderInfo { id: "openai", name: "OpenAI", icon: "openai", mono: "O", color: "#e4e4e7", base_url: "https://api.openai.com/v1", env: "OPENAI_API_KEY", chip: "OpenAI API key", kind: "openai", local: false, account: None },
     ProviderInfo { id: "google", name: "Google", icon: "gemini", mono: "G", color: "#8ab4ff", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", env: "GEMINI_API_KEY", chip: "Google AI Studio key", kind: "openai", local: false, account: None },
@@ -290,6 +314,11 @@ fn m(
         ),
         ("codex", _) => (&["low", "medium", "high"], "reasoning.effort"),
         ("zai", _) => (&["off", "on"], "thinking"),
+        // Kimi Code documents `reasoning_effort` with low/high/max and maps
+        // unknown values to a 400, so its own level list is sent verbatim
+        // rather than the generic low/medium/high ladder (medium would read
+        // as high, and max would be unreachable).
+        ("kimi-code", _) => (&["low", "high", "max"], "reasoning_effort"),
         _ => (&["low", "medium", "high"], "reasoning_effort"),
     };
     ModelInfo {
@@ -579,6 +608,97 @@ fn go_context(id: &str) -> u64 {
         // what the model accepts before compaction.
         128_000
     }
+}
+
+/// Parse Kimi Code's `/coding/v1/models` into subscription model infos.
+///
+/// The payload is Kimi's own shape, not the OpenAI list (checked against the
+/// official CLI's `toModelInfo`): each entry carries `limit.context` — the one
+/// field the CLI treats as required — an optional `limit.output`, a `reasoning`
+/// object (`type: only|both|none`, plus an optional `effort.valid` level list)
+/// and `modalities.input`. Where the payload speaks it wins; the fill-ins are
+/// the documented floors:
+///
+/// - context falls back to 256K, the window every plan accepts; the tier-gated
+///   1M windows arrive here through `limit.context` on the refresh;
+/// - output falls back to 32K — Kimi publishes no per-model output cap and the
+///   CLI does not consume `limit.output` either, so a reported one is taken
+///   but its absence is not guessed high;
+/// - a missing `reasoning` object reads as no adjustable thinking, the safe
+///   direction: claiming an effort the model does not take is a 400, while
+///   missing one only hides a slider (the server default effort applies);
+/// - `modalities.input` absent means text-only, the same default the CLI
+///   applies; video is documented but this app does not send it, and pdf is
+///   not offered on this gateway;
+/// - the plan bills the subscription, so prices stay 0 and the spend screen is
+///   fed by the account's usage windows, exactly as on Go.
+pub fn parse_kimi_models(v: &Value) -> Vec<ModelInfo> {
+    let arr = v["data"].as_array().cloned().unwrap_or_default();
+    arr.iter()
+        .filter_map(|x| {
+            let id = x["id"].as_str()?.to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let name = x["display_name"]
+                .as_str()
+                .or(x["name"].as_str())
+                .map(String::from)
+                .unwrap_or_else(|| go_model_name(&id));
+            let reasoning = &x["reasoning"];
+            // `type: "only"` (thinking-locked, K3.1 Pro) and `"both"` think;
+            // `"none"` and an absent object take no effort value.
+            let thinks = matches!(reasoning["type"].as_str(), Some("only") | Some("both"));
+            let valid: Vec<String> = reasoning["effort"]["valid"]
+                .as_array()
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|e| e.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The slider needs an ordered low→high ladder; `effort.valid` is
+            // authoritative, the documented low/high/max ladder is the fill-in
+            // for a thinking model that ships no list.
+            let levels = if !valid.is_empty() {
+                valid
+            } else if thinks {
+                vec!["low".into(), "high".into(), "max".into()]
+            } else {
+                Vec::new()
+            };
+            let mut mi = m(
+                "kimi-code",
+                &id,
+                &name,
+                x["limit"]["context"]
+                    .as_u64()
+                    .filter(|c| *c > 0)
+                    .or(x["context_length"].as_u64())
+                    .unwrap_or(262_144),
+                x["limit"]["output"]
+                    .as_u64()
+                    .filter(|o| *o > 0)
+                    .or(x["max_output_tokens"].as_u64())
+                    .unwrap_or(32_000),
+                0.0,
+                0.0,
+                !levels.is_empty(),
+            );
+            if !levels.is_empty() {
+                mi.reasoning_levels = levels;
+            }
+            let image = x["modalities"]["input"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|v| v.as_str() == Some("image")));
+            mi.input_types = if image {
+                vec!["text".into(), "image".into()]
+            } else {
+                vec!["text".into()]
+            };
+            Some(mi)
+        })
+        .collect()
 }
 
 /// Parse Anthropic `/v1/models` into subscription model infos.
@@ -1129,6 +1249,73 @@ fn build_catalog() -> Vec<ModelInfo> {
             0.0,
             true,
         ),
+        // Kimi Code (the Kimi membership's coding plan). Contexts are the
+        // floor every plan accepts — 256K; the 1M windows on k3/k3.1-pro are
+        // tier-gated and the live /models refresh raises them when the
+        // account's plan reports more. Prices are 0: the subscription bills
+        // the account, and the spend screen is fed by its usage windows.
+        m(
+            "kimi-code",
+            "k3.1-pro",
+            "K3.1 Pro (Kimi Code)",
+            262_144,
+            32_000,
+            0.0,
+            0.0,
+            true,
+        ),
+        m(
+            "kimi-code",
+            "k3.1-pro-highspeed",
+            "K3.1 Pro Highspeed (Kimi Code)",
+            262_144,
+            32_000,
+            0.0,
+            0.0,
+            true,
+        ),
+        m(
+            "kimi-code",
+            "k3",
+            "K3 (Kimi Code)",
+            262_144,
+            32_000,
+            0.0,
+            0.0,
+            true,
+        ),
+        m(
+            "kimi-code",
+            "k3-256k",
+            "K3 256K (Kimi Code)",
+            262_144,
+            32_000,
+            0.0,
+            0.0,
+            true,
+        ),
+        m(
+            "kimi-code",
+            "kimi-for-coding",
+            "Kimi For Coding (Kimi Code)",
+            262_144,
+            32_000,
+            0.0,
+            0.0,
+            true,
+        ),
+        // Fixed thinking ("Thinking:ON") with no adjustable effort, so the
+        // effort slider has nothing to drive on this one.
+        m(
+            "kimi-code",
+            "kimi-for-coding-highspeed",
+            "Kimi For Coding Highspeed (Kimi Code)",
+            262_144,
+            32_000,
+            0.0,
+            0.0,
+            false,
+        ),
         m(
             "ollama",
             "qwen3-coder:30b",
@@ -1161,8 +1348,51 @@ fn build_catalog() -> Vec<ModelInfo> {
         {
             mi.reasoning_levels = XHIGH.iter().map(|s| s.to_string()).collect();
         }
+        // Kimi Code documents image input on every model (video too, which
+        // this app does not send); pdf is not documented, so it is not claimed.
+        if mi.provider == "kimi-code" {
+            mi.input_types = vec!["text".into(), "image".into()];
+        }
     }
     v
+}
+
+/// Parse `agy models` — one `slug<TAB>Label` line per model, after a
+/// "Fetching available models…" line that has no tab and is dropped.
+///
+/// The CLI's own list rather than a hardcoded one: it is right for the installed
+/// build *and* the account's plan (a free login sees fewer slugs than an Ultra
+/// one), and Google adds models without telling us. Prices are 0 because the run
+/// is covered by the plan, and the window is guessed from the slug because the
+/// CLI reports none.
+pub fn parse_agy_models(out: &str) -> Vec<ModelInfo> {
+    out.lines()
+        .filter_map(|line| {
+            let (slug, label) = line.split_once('\t')?;
+            let slug = slug.trim();
+            if slug.is_empty() || slug.contains(' ') {
+                return None;
+            }
+            let label = label.trim();
+            let ctx = if slug.starts_with("gemini") || slug.starts_with("claude") {
+                1_000_000
+            } else {
+                128_000
+            };
+            Some(m(
+                "antigravity",
+                slug,
+                if label.is_empty() { slug } else { label },
+                ctx,
+                64_000,
+                0.0,
+                0.0,
+                // Effort is baked into the slug (`…-high` / `…-medium`), so the
+                // slider would have nothing to do but disagree with the name.
+                false,
+            ))
+        })
+        .collect()
 }
 
 /// Known model, or a sensible default for custom "provider/any-id" strings.
@@ -1349,6 +1579,11 @@ pub struct ChatRequest {
     pub max_tokens: u64,
     /// Stable per conversation: codex prompt_cache_key / session id.
     pub cache_key: String,
+    /// The workspace the turn belongs to, for a provider that runs a process
+    /// rather than speaking HTTP (Antigravity). Empty for OpenLeash's own
+    /// one-shots — a title, a summary, a commit message — which have no project
+    /// and must not be given one.
+    pub cwd: String,
 }
 
 /// One concrete thing to send a request to.
@@ -1430,6 +1665,18 @@ pub enum StreamEvent {
     ToolStart {
         id: String,
         name: String,
+    },
+    /// A step a vendor CLI took on its own (Antigravity).
+    ///
+    /// Deliberately not `ToolStart`: OpenLeash never dispatched this call, so no
+    /// result will ever be paired with it, and dressing it up as one of our tools
+    /// would both leave a card spinning forever and tell the user their approval
+    /// layer covered something it did not.
+    Step {
+        name: String,
+        input: Value,
+        output: String,
+        error: bool,
     },
     BlockEnd,
     /// A failed attempt already streamed output: drop it, a retry follows.
@@ -1771,6 +2018,9 @@ pub async fn call(
     match wire(settings, &t.prov, &t.model).as_str() {
         "anthropic" => anthropic(http, settings, t, req, on, cancel, hdrs).await,
         "codex" | "responses" => codex(http, settings, t, req, on, cancel, hdrs).await,
+        // A local CLI, not a wire protocol: no key, no URL, no HTTP client. The
+        // vendor's own binary runs the turn with its own tools.
+        "cli" => super::antigravity::run(t, req, on, cancel).await,
         _ => openai_compat(http, settings, t, req, on, cancel, hdrs).await,
     }
 }
@@ -2391,9 +2641,31 @@ async fn codex(
 /// through a gateway whose own id says nothing about it. OpenCode Zen/Go list
 /// `deepseek-v4.1-flash` among many other vendors' models, and a custom endpoint
 /// can point at api.deepseek.com under any name the user likes.
+///
+/// Kimi Code is matched on the provider alone, and deliberately not on the model
+/// name: every model on that gateway thinks (K3.1 Pro cannot even disable it),
+/// its error reference names the missing `reasoning_content` in assistant tool
+/// calls as its own hard 400, and a name-based match would reach the `kimi-*`
+/// models on Zen/Go, which answer fine without the replay.
 fn needs_reasoning_replay(prov: &str, model: &str) -> bool {
     let named = |s: &str| s.to_ascii_lowercase().contains("deepseek");
-    named(prov) || named(model)
+    named(prov) || named(model) || prov == "kimi-code"
+}
+
+/// The completion-budget field a chat/completions provider takes.
+///
+/// Kimi Code joins OpenAI on `max_completion_tokens`: on Kimi's reasoning
+/// models the legacy `max_tokens` shares its budget with the reasoning itself,
+/// and a small value there comes back as a 200 with no content at all. The
+/// official CLI normalizes to `max_completion_tokens` for exactly this reason
+/// (packages/kosong/src/providers/kimi.ts) — sending the legacy field would be
+/// a silent truncation waiting for the first long-thinking turn.
+fn completion_tokens_field(prov: &str) -> &'static str {
+    if prov == "openai" || prov == "kimi-code" {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
 }
 
 /// History → Chat Completions.
@@ -2523,6 +2795,14 @@ fn to_openai_messages(system: &str, msgs: &[Message], reasoning_model: Option<&s
 /// for the Go usage read: the gateway gates on it, so a monitor request that
 /// arrives as a generic HTTP client is answered differently from the real one.
 pub const OPENCODE_UA: &str = "opencode/1.18.31";
+
+/// The User-Agent Kimi Code requests go out with. Kimi's terms make
+/// "maintaining the tool's real identity" a condition of use — tampering with
+/// the client identifier risks the subscription — so this names this app,
+/// the opposite move from the OpenCode spoof above, which exists for a
+/// gateway that only serves its own client. Public because `accounts.rs`
+/// reuses it for the probe and the usage read.
+pub const KIMI_CODE_UA: &str = concat!("openleash/", env!("CARGO_PKG_VERSION"));
 
 /// Deterministic `ses_<12 hex><14 alnum>` session id from the task's
 /// cache_key (`ol-{task}`), stable per task so prompt caching keeps hitting.
@@ -2658,11 +2938,7 @@ async fn openai_compat(
     }
     let mi = model_info(&t.model_id);
     let out_cap = req.max_tokens.min(mi.output.max(1024));
-    if prov == "openai" {
-        body["max_completion_tokens"] = json!(out_cap);
-    } else {
-        body["max_tokens"] = json!(out_cap);
-    }
+    body[completion_tokens_field(prov)] = json!(out_cap);
     if let Some(l) = pick_level(&mi.reasoning_levels, req.effort) {
         match mi.reasoning_param.as_str() {
             "reasoning.max_tokens" => {
@@ -2697,6 +2973,9 @@ async fn openai_compat(
     }
     if prov == "openrouter" {
         rb = rb.header("X-Title", "OpenLeash");
+    }
+    if prov == "kimi-code" {
+        rb = rb.header("User-Agent", KIMI_CODE_UA);
     }
     if is_opencode(prov) {
         // Look like the official CLI: UA-gated free pool + ses_/msg_ ids the
@@ -3152,6 +3431,107 @@ mod wire_tests {
         assert_eq!(m.output, 32_000, "default output");
     }
 
+    /// Kimi's `/models` payload is Kimi's own shape, not the OpenAI list —
+    /// `limit.context`, a `reasoning` object and `modalities.input` (checked
+    /// against the official CLI's `toModelInfo`). Where it speaks it wins;
+    /// the Highspeed pair ships `type: "only"` with no `effort` block, which
+    /// is fixed thinking the effort slider must not pretend to drive.
+    #[test]
+    fn parse_kimi_models_extracts_metadata_when_present() {
+        let list = json!({"data": [
+            {
+                "id": "k3.1-pro",
+                "display_name": "Kimi K3.1 Pro",
+                "limit": {"context": 1048576},
+                "reasoning": {"type": "only", "effort": {"valid": ["low", "high", "max"], "default": "high"}}
+            },
+            {
+                "id": "kimi-for-coding-highspeed",
+                "limit": {"context": 262144},
+                "reasoning": {"type": "only"}
+            }
+        ]});
+        let models = parse_kimi_models(&list);
+        assert_eq!(models.len(), 2);
+        let pro = &models[0];
+        assert_eq!(pro.id, "kimi-code/k3.1-pro");
+        assert_eq!(pro.context, 1_048_576, "the plan's real window from limit.context");
+        assert_eq!(
+            pro.output, 32_000,
+            "no limit.output in the payload: the documented floor, not a guess high"
+        );
+        assert_eq!(
+            pro.reasoning_levels,
+            vec!["low", "high", "max"],
+            "effort.valid is authoritative"
+        );
+        assert_eq!(pro.reasoning_param, "reasoning_effort");
+        assert_eq!(
+            pro.input_types,
+            ["text"],
+            "no modalities field: text only, the CLI's own default"
+        );
+        let hs = &models[1];
+        assert!(
+            hs.reasoning_levels.is_empty(),
+            "type only with no effort block: fixed thinking, no slider"
+        );
+        assert!(!hs.effort);
+    }
+
+    /// A payload that reports everything: the reported values must survive
+    /// intact, including a partial effort ladder and an explicit output cap.
+    #[test]
+    fn parse_kimi_models_honors_a_fully_described_entry() {
+        let list = json!({"data": [{
+            "id": "k3-256k",
+            "limit": {"context": 262144, "output": 65536},
+            "modalities": {"input": ["text", "image"]},
+            "reasoning": {"type": "both", "effort": {"valid": ["low", "high"]}}
+        }]});
+        let models = parse_kimi_models(&list);
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.context, 262_144);
+        assert_eq!(m.output, 65_536, "limit.output when reported");
+        assert_eq!(
+            m.reasoning_levels,
+            vec!["low", "high"],
+            "the payload's ladder, not the documented default"
+        );
+        assert_eq!(m.input_types, ["text", "image"]);
+    }
+
+    /// A bare payload falls back to the documented floors, and a missing
+    /// `reasoning` object reads as no adjustable effort — the safe direction,
+    /// the same default the official CLI applies.
+    #[test]
+    fn parse_kimi_models_falls_back_to_documented_floors() {
+        let list = json!({"data": [{"id": "k3"}]});
+        let models = parse_kimi_models(&list);
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.context, 262_144, "the floor every plan accepts");
+        assert_eq!(m.output, 32_000);
+        assert!(!m.effort, "no reasoning object: no effort claimed");
+        assert_eq!(
+            m.input_price + m.output_price,
+            0.0,
+            "the subscription bills the account, not a meter"
+        );
+    }
+
+    /// The default gateway is the overseas host — the one the docs' own
+    /// examples use and most plans are sold on. The China host is one base-URL
+    /// override away, not a second provider.
+    #[test]
+    fn kimi_code_defaults_to_the_overseas_gateway() {
+        assert_eq!(
+            base_url(&Settings::default(), "kimi-code"),
+            "https://api.kimi.ai/coding/v1"
+        );
+    }
+
     /// `remote_model` flags models whose context/output are not in the API response.
     #[test]
     fn remote_model_flags_guessed_models() {
@@ -3373,6 +3753,7 @@ mod tests {
             effort: 2,
             max_tokens: 100,
             cache_key: "test".into(),
+            cwd: String::new(),
         };
         let client = reqwest::Client::new();
         let cancel = CancellationToken::new();
@@ -3438,6 +3819,7 @@ mod tests {
             effort: 2,
             max_tokens: 100,
             cache_key: "test".into(),
+            cwd: String::new(),
         };
         let mut on = |_| {};
         let result = anthropic(
@@ -3497,6 +3879,7 @@ mod tests {
             effort: 2,
             max_tokens: 100,
             cache_key: "test".into(),
+            cwd: String::new(),
         };
         let client = reqwest::Client::new();
         let cancel = CancellationToken::new();
@@ -3657,7 +4040,7 @@ mod tests {
     /// OpenAI-shaped": sending `reasoning_content` to a provider that does not
     /// model it is the mirror-image risk of omitting it where it is required.
     #[test]
-    fn only_deepseek_targets_enforce_the_reasoning_round_trip() {
+    fn only_deepseek_and_kimi_targets_enforce_the_reasoning_round_trip() {
         // Matched on the provider id…
         assert!(needs_reasoning_replay("deepseek", "deepseek-chat"));
         // …and on the model name, because a gateway's own id says nothing about
@@ -3673,11 +4056,35 @@ mod tests {
         assert!(needs_reasoning_replay("my-deepseek-proxy", "anything"));
         // Case does not matter: model ids are not case-normalised anywhere else.
         assert!(needs_reasoning_replay("opencode-go", "DeepSeek-V4.1-Flash"));
+        // Kimi Code is matched on the provider alone — every model on that
+        // gateway thinks (K3.1 Pro cannot even disable it) and its error
+        // reference names the missing `reasoning_content` in assistant tool
+        // calls as a hard 400. A name match would reach the `kimi-*` models
+        // on Zen/Go, which answer fine without the replay.
+        assert!(needs_reasoning_replay("kimi-code", "k3"));
+        assert!(needs_reasoning_replay(
+            "kimi-code",
+            "kimi-for-coding-highspeed"
+        ));
         // Everything else is left alone.
         assert!(!needs_reasoning_replay("anthropic", "claude-opus-5"));
         assert!(!needs_reasoning_replay("opencode-go", "kimi-k3"));
         assert!(!needs_reasoning_replay("openai", "gpt-6-luna"));
         assert!(!needs_reasoning_replay("openrouter", "z-ai/glm-5.3"));
+    }
+
+    /// The completion-budget field is a per-provider decision with a failure
+    /// mode on the wrong side: Kimi's reasoning models split the legacy
+    /// `max_tokens` between content and reasoning, so the legacy field there
+    /// is a silent empty-content 200 waiting for the first long-thinking turn.
+    #[test]
+    fn kimi_takes_the_completion_budget_in_the_modern_field() {
+        assert_eq!(completion_tokens_field("openai"), "max_completion_tokens");
+        assert_eq!(completion_tokens_field("kimi-code"), "max_completion_tokens");
+        // Everyone else keeps the field they have always sent.
+        assert_eq!(completion_tokens_field("opencode-go"), "max_tokens");
+        assert_eq!(completion_tokens_field("deepseek"), "max_tokens");
+        assert_eq!(completion_tokens_field("openrouter"), "max_tokens");
     }
 
     /// The reader side: reasoning that streams in has to end up *in the turn*,
@@ -3730,6 +4137,7 @@ mod tests {
             effort: 2,
             max_tokens: 100,
             cache_key: "test".into(),
+            cwd: String::new(),
         };
         let mut events = vec![];
         let mut on = |event| events.push(event);

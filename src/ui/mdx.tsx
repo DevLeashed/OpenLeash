@@ -1,6 +1,6 @@
 /** Smarter markdown for agent replies: clickable file paths, numeric table
  *  columns, and automatic done/open progress bars. */
-import { memo, useSyncExternalStore } from "react";
+import { Children, memo, useSyncExternalStore } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -32,6 +32,11 @@ const prop = (n: Node, k: string, v: unknown) => {
 /** Looks like a file path: has an extension or a slash, no spaces. */
 export const PATH = /^(?:[A-Za-z]:)?[\w.@~-]*[\\/]?[\w.@~\\/*-]*\.[A-Za-z0-9]{1,8}(?::\d+){0,2}$|^[\w.@~-]+(?:[\\/][\w.@~*-]+)+[\\/]?(?::\d+){0,2}$/;
 
+/** What a progress cell shows. The rounded percentage is the label the reader
+ *  sees; the exact fraction goes into the cell's sort key, so two cells that
+ *  both read "75%" still order by their real values. */
+const barLabel = (fraction: number) => fraction >= 0 ? `${Math.round(fraction * 100)}%` : "—";
+
 function table(t: Node) {
   const rows = t.children ?? [];
   if (rows.length < 2) return;
@@ -60,7 +65,10 @@ function table(t: Node) {
         if (i > 0) {
           const value = num(text(cell(r, index) ?? { type: "x" }));
           const denominator = num(text(cell(r, totalIndex) ?? { type: "x" }));
-          prop(bar, "dataBar", denominator > 0 && value >= 0 && value <= denominator ? value / denominator : -1);
+          const fraction = denominator > 0 && value >= 0 && value <= denominator ? value / denominator : -1;
+          prop(bar, "dataBar", fraction);
+          // Text in the cell, for the same reason as the Progress column below.
+          bar.children = [{ type: "text", value: barLabel(fraction) }];
         }
         r.children = [...(r.children ?? []), bar];
         if (i === 0) t.align = [...(t.align ?? []), null];
@@ -77,7 +85,15 @@ function table(t: Node) {
     if (i > 0) {
       const d = num(text(cell(r, done) ?? { type: "x" }));
       const all = open >= 0 ? d + num(text(cell(r, open) ?? { type: "x" })) : num(text(cell(r, total) ?? { type: "x" }));
-      prop(bar, "dataBar", all > 0 ? Math.max(0, Math.min(1, d / all)) : -1);
+      const fraction = all > 0 ? Math.max(0, Math.min(1, d / all)) : -1;
+      prop(bar, "dataBar", fraction);
+      // The cell carries the percentage as its own text. The bar beside it is
+      // drawn by the `td` component, so a cell element that holds nothing is
+      // all the sortable reply table can see — and it orders a column by the
+      // text it can read, so a textless cell sorts as an empty string and the
+      // Progress column silently never reorders. Keeping the label in the tree
+      // also means the number is in the transcript, not only in a style.
+      bar.children = [{ type: "text", value: barLabel(fraction) }];
     }
     r.children = [...(r.children ?? []), bar];
   });
@@ -198,10 +214,13 @@ export const mdComponents: Components = {
     const bar = (node?.properties as Record<string, unknown> | undefined)?.dataBar;
     if (bar != null) {
       const v = Number(bar);
+      // The label comes from the cell's own text, which the table plugin puts
+      // there; the fallback only covers a bar that arrived without one.
+      const label = Children.count(children) ? children : barLabel(v);
       return (
         <td className="barcell">
           {v >= 0 && <span className="cellbar"><span style={{ width: `${v * 100}%`, background: v >= 1 ? "#4ade80" : "var(--accent, #a78bfa)" }} /></span>}
-          <span className="cellpct">{v >= 0 ? `${Math.round(v * 100)}%` : "—"}</span>
+          <span className="cellpct">{label}</span>
         </td>
       );
     }

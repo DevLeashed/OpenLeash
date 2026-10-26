@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }))
 
 import type { ModelInfo, ProviderView, Race, RaceDetail, Settings, TaskSummary } from "../api";
 import { get, set } from "../store";
-import { archiveRace, getRaces, groupRaceRows, resetRaces, setRaces } from "../race";
+import { archiveRace, deleteRace, getRaces, groupRaceRows, resetRaces, setRaces } from "../race";
 import { RaceView } from "./Race";
 import { RaceSetupDialog } from "./RaceSetup";
 import { Sidebar } from "./Chrome";
@@ -290,5 +290,46 @@ describe("sidebar race group archive", () => {
     await act(async () => { fireEvent.click(within(group).getByRole("button", { name: "Archive" })); });
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("race_archive", { id: "r1", archived: true });
     expect(getRaces().races.r1?.archived).toBe(true);
+  });
+});
+
+describe("deleting an archived race for good", () => {
+  it("drops the race and its deleted chats, and names what was kept", async () => {
+    const r = race({ archived: true });
+    vi.mocked(invoke).mockImplementation(async (cmd) => (cmd === "race_delete"
+      ? { id: "r1", deleted_chats: ["a"], kept_chats: ["b"], kept_worktrees: 2 }
+      : null));
+    set({ tasks: { a: task("a"), b: task("b"), x: task("x") } });
+    setRaces({ races: { r1: r }, open: "r1" });
+    expect(await deleteRace("r1")).toBe(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("race_delete", { id: "r1", removeWorktree: false });
+    // The race is out of the store, and the comparison view closed with it.
+    expect(getRaces().races.r1).toBeUndefined();
+    expect(getRaces().open).toBeNull();
+    // The deleted chat left the chat store; the one the backend kept stayed.
+    expect(get().tasks.a).toBeUndefined();
+    expect(get().tasks.b).toBeTruthy();
+    expect(get().toast).toContain("1 chat deleted");
+    expect(get().toast).toContain("1 chat kept");
+    expect(get().toast).toContain("2 worktrees kept on disk");
+  });
+
+  it("asks the backend to remove the worktrees when the user says so", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => (cmd === "race_delete"
+      ? { id: "r1", deleted_chats: ["a", "b"], kept_chats: [], kept_worktrees: 0 }
+      : null));
+    setRaces({ races: { r1: race({ archived: true }) } });
+    expect(await deleteRace("r1", true)).toBe(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("race_delete", { id: "r1", removeWorktree: true });
+    expect(get().toast).toContain("2 chats deleted");
+    expect(get().toast).not.toContain("worktree");
+  });
+
+  it("reports a failed delete and leaves the race as it was", async () => {
+    vi.mocked(invoke).mockRejectedValue("could not remove worktree");
+    setRaces({ races: { r1: race({ archived: true }) } });
+    expect(await deleteRace("r1")).toBe(false);
+    expect(getRaces().races.r1).toBeTruthy();
+    expect(get().toast).toContain("could not remove worktree");
   });
 });

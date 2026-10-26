@@ -654,7 +654,8 @@ impl Bridge {
             ultra_wt: false,
             ultra_x: None,
         };
-        let summary = crate::create_task(self.h.clone(), req, Some(display.to_string())).await?;
+        let summary =
+            crate::create_task_external(self.h.clone(), req, Some(display.to_string())).await?;
         // The app learns about a chat it did not create from this event; the
         // composer's own create call gets the summary back instead.
         if let Ok(t) = self.h.task(&summary.id).await {

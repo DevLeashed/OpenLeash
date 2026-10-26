@@ -667,6 +667,10 @@ async fn start(
                 spend_cap: s.burner.spend_cap,
             }),
         },
+        // External: a backlog item the quota burner started on spare quota is
+        // not the user choosing a model, so it must not move the new-task
+        // default the next task starts on.
+        crate::CreateTaskOptions::External,
     )
     .await?;
     {

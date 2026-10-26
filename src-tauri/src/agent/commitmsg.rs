@@ -360,6 +360,7 @@ fn request(system: &str, user: &str, task_id: &str) -> providers::ChatRequest {
         effort: 4,
         max_tokens: 512,
         cache_key: format!("ol-commitmsg-{task_id}"),
+        cwd: String::new(),
     }
 }
 

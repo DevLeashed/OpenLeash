@@ -257,7 +257,7 @@ mod tests {
         let (h, _) = harness(Settings::default(), vec![ready("attempt"), ready("other")]);
         let command = "sleep 30";
         let id =
-            h.bg.spawn("attempt", command, dir.to_str().unwrap())
+            h.bg.spawn("attempt", "", command, dir.to_str().unwrap())
                 .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(h.bg.list("attempt").iter().any(|job| job.running));

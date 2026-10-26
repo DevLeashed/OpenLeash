@@ -1,9 +1,14 @@
 //! Usage statistics, persisted to `~/.openleash/stats.json`.
 //!
-//! Per model, per account, per day, per hour (last 14 days), per tool and per
-//! agent kind, plus per chat, plus router events (retries, fallbacks, pauses).
+//! Per model, per account, per day, per hour, per tool and per agent kind,
+//! plus per chat, plus router events (retries, fallbacks, pauses).
 //! Recording is in-memory; a background flush writes the file at most every few
 //! seconds.
+//!
+//! Nothing here is ever deleted. There is no reset, no prune and no expiry:
+//! a usage number that was true once stays true, and a chat's row outlives
+//! the chat itself. The file therefore grows with use, and that is the
+//! intended trade — it is a ledger, not a cache.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -181,9 +186,10 @@ pub struct StatsData {
     /// The UI joins ids to the chat list it already holds, so the names never
     /// reach a second file that outlives the chat.
     ///
-    /// Unlike the day/hour maps this has no date on the key to trim on — a chat
-    /// that ran once a year ago is still a real number — so it is capped by
-    /// count instead, least recently used first (`MAX_CHATS`).
+    /// Nothing ages out of this map and nothing is dropped when a chat is
+    /// deleted: a row is the only surviving record of what a chat spent, so
+    /// the one thing that must never happen is losing it. The map therefore
+    /// grows with use — it is a ledger, not a cache.
     pub chats: BTreeMap<String, ChatStat>,
     /// Time in the app, all time.
     pub presence: Presence,
@@ -199,31 +205,6 @@ pub struct StatsData {
     /// The longest single run of the app, ms.
     pub longest_session_ms: u64,
 }
-
-/// How many chats [`StatsData::chats`] keeps.
-///
-/// Every chat that ever ran a request wants an entry, and unlike the daily keys
-/// there is no date on them to age out, so an unbounded map would grow forever
-/// and be serialized in full on every flush (10s) and every poll (15s) — the
-/// same mistake the daily map already made once, per the note in `record`.
-///
-/// A chat record is ~2 KB with a few models and tools on it, so this is roughly
-/// the file size the dimension is worth: 100 chats is ~200 KB on top of a stats
-/// file that is already ~130 KB. Past that the least recently used rows fall
-/// out, and their totals are still in `models`/`daily` either way.
-pub const MAX_CHATS: usize = 100;
-
-/// How many tools one chat keeps.
-///
-/// The app has ~36 tools, so an unbounded per-chat map is bounded in practice —
-/// but "in practice" is how the chat map itself would have grown forever, and a
-/// chat that used everything is exactly the one whose record is biggest. The
-/// busiest win, because a tool with 1 call is noise next to one with 400.
-pub const MAX_CHAT_TOOLS: usize = 25;
-
-/// How many usage ids one chat keeps. A big ultrathread tree is dozens of
-/// subagents, each with its own row; past this the least expensive fall out.
-pub const MAX_CHAT_AGENTS: usize = 50;
 
 /// One finished model request.
 pub struct Sample {
@@ -306,31 +287,7 @@ impl Stats {
             .add(ms, focused, working);
         d.session_ms += ms;
         d.longest_session_ms = d.longest_session_ms.max(d.session_ms);
-        let cutoff = (now - chrono::Duration::days(14))
-            .format("%Y-%m-%dT%H")
-            .to_string();
-        d.presence_hourly.retain(|k, _| *k >= cutoff);
-        let day_cutoff = (now - chrono::Duration::days(365))
-            .format("%Y-%m-%d")
-            .to_string();
-        d.presence_daily.retain(|k, _| *k >= day_cutoff);
         self.dirty.store(true, Ordering::SeqCst);
-    }
-
-    /// Drop the stats of every chat `keep` rejects. Returns how many went.
-    ///
-    /// Only the per-chat rows go: the chat's tokens, cost and requests stay in
-    /// the model/day/account totals, which is what keeps those reconciling with
-    /// the spend ledger.
-    pub fn retain_chats(&self, keep: impl Fn(&str) -> bool) -> usize {
-        let mut d = self.data.lock().unwrap();
-        let before = d.chats.len();
-        d.chats.retain(|id, _| keep(id));
-        let removed = before - d.chats.len();
-        if removed > 0 {
-            self.dirty.store(true, Ordering::SeqCst);
-        }
-        removed
     }
 
     pub fn record(
@@ -385,55 +342,12 @@ impl Stats {
             if c.started.is_empty() {
                 c.started = chrono::Utc::now().to_rfc3339();
             }
-            // Bounded the way the tool list is: this map is serialized in full on
-            // every flush, and a big ultrathread tree is dozens of subagents each
-            // with a row, so the cheapest fall out. Sorting by `(cost, key)` rather
-            // than cost alone gives equal costs a stable order, so two zero-cost
-            // rows do not take turns evicting each other on alternate flushes.
-            if c.by_agent.len() > MAX_CHAT_AGENTS {
-                let mut by_cost: Vec<(f64, String)> = c
-                    .by_agent
-                    .iter()
-                    .map(|(k, v)| (v.cost, k.clone()))
-                    .collect();
-                by_cost.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| b.1.cmp(&a.1))
-                });
-                for (_, k) in by_cost.into_iter().skip(MAX_CHAT_AGENTS) {
-                    c.by_agent.remove(&k);
-                }
-            }
         }
-        // Keep hourly bounded: two weeks. Daily keys were never trimmed, so
-        // the maps grew by one entry per day forever and every stats poll
-        // serialized the lot. "All" and the ledger below still have the totals.
-        let cutoff = (now - chrono::Duration::days(14))
-            .format("%Y-%m-%dT%H")
-            .to_string();
-        d.hourly.retain(|k, _| *k >= cutoff);
-        d.model_hourly.retain(|k, _| *k >= cutoff);
-        let day_cutoff = (now - chrono::Duration::days(365))
-            .format("%Y-%m-%d")
-            .to_string();
-        d.daily.retain(|k, _| *k >= day_cutoff);
-        d.model_daily.retain(|k, _| *k >= day_cutoff);
-        // Chats age out by use, not by date: drop the least recently used until
-        // there is room again. `last_used` is an RFC 3339 UTC stamp, so the
-        // lexicographic order of the values is the chronological one and this
-        // needs no second sort key.
-        if d.chats.len() > MAX_CHATS {
-            let mut by_age: Vec<(String, String)> = d
-                .chats
-                .iter()
-                .map(|(k, c)| (c.total.last_used.clone(), k.clone()))
-                .collect();
-            by_age.sort();
-            for (_, k) in by_age.into_iter().take(d.chats.len() - MAX_CHATS) {
-                d.chats.remove(&k);
-            }
-        }
+        // Nothing is trimmed here. The hourly, daily and per-chat maps are the
+        // record of what was spent, and an expired entry is a number the user
+        // can never get back: the app is not a sampling window, it is a ledger.
+        // The file grows with use, and that is the honest trade — the totals
+        // are what the money was, and they stay.
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -453,7 +367,7 @@ impl Stats {
         // A tool call is only recorded against a chat that exists. Unlike the
         // request path this is not the thing that creates the row, so a chat
         // with no row here is a chat that never ran a request — giving it one
-        // would fill the capped map with empty entries.
+        // would fill the map with empty entries.
         let Some(c) = d.chats.get_mut(chat) else {
             self.dirty.store(true, Ordering::SeqCst);
             return;
@@ -462,14 +376,6 @@ impl Stats {
         t.calls += 1;
         if failed {
             t.errors += 1;
-        }
-        if c.tools.len() > MAX_CHAT_TOOLS {
-            let mut by_calls: Vec<(u64, String)> =
-                c.tools.iter().map(|(k, t)| (t.calls, k.clone())).collect();
-            by_calls.sort_by(|a, b| b.cmp(a));
-            for (_, k) in by_calls.into_iter().skip(MAX_CHAT_TOOLS) {
-                c.tools.remove(&k);
-            }
         }
         self.dirty.store(true, Ordering::SeqCst);
     }
@@ -484,21 +390,6 @@ impl Stats {
             *c.events.entry(name.into()).or_default() += 1;
         }
         self.dirty.store(true, Ordering::SeqCst);
-    }
-
-    /// Stop counting a chat's usage against it, keeping every other dimension.
-    ///
-    /// Deleting a chat calls this only when the user turned "Keep stats for
-    /// deleted chats" off: by default the numbers for a chat that is gone are
-    /// still what was spent on it, and a usage ledger that shrinks as you tidy
-    /// up stops adding up. It also covers a chat whose id is *wrong* rather
-    /// than gone (a fork reusing one), which would otherwise silently merge two
-    /// chats' history into one row forever.
-    pub fn forget_chat(&self, chat: &str) {
-        let mut d = self.data.lock().unwrap();
-        if d.chats.remove(chat).is_some() {
-            self.dirty.store(true, Ordering::SeqCst);
-        }
     }
 
     pub fn error(&self, chat: &str, model: &str, account: Option<&str>) {
@@ -519,16 +410,15 @@ impl Stats {
         // this one *creates* the row: a chat whose every attempt failed is
         // exactly the one a user opens stats on to find out why, and it would
         // otherwise show up as a chat with nothing recorded at all. `last_used`
-        // is stamped because the row exists now and the LRU trim reads it.
+        // is stamped because the row exists now and the panel reads it.
         let c = d.chats.entry(chat.into()).or_default();
         c.total.errors += 1;
         c.total.last_used = chrono::Utc::now().to_rfc3339();
         c.total.update_failure_rate();
         if !c.models.contains_key(model) {
-            // Keep the model's `last_used` in step with the chat's: the LRU trim
-            // reads the chat's stamp, but a model row with an empty one is the
-            // shape the per-model charts sort on, and "never used" would read
-            // as older than everything.
+            // Keep the model's `last_used` in step with the chat's: the model
+            // rows are what the per-model charts sort on, and "never used"
+            // would read as older than everything.
             c.models.entry(model.into()).or_default().last_used = c.total.last_used.clone();
         }
         let cm = c.models.entry(model.into()).or_default();
@@ -580,29 +470,13 @@ impl Stats {
         self.data.lock().unwrap().clone()
     }
 
-    /// One chat's record, if it is still within the cap.
+    /// One chat's record, if it has one.
     ///
     /// `None` is a real answer, not an error: a chat that never ran a request has
-    /// no row, and one that has aged out of `MAX_CHATS` has lost it.
+    /// no row, and one that has been deleted still has its row — that is the
+    /// point, since its spend is still real.
     pub fn chat(&self, id: &str) -> Option<ChatStat> {
         self.data.lock().unwrap().chats.get(id).cloned()
-    }
-
-    pub fn reset(&self) {
-        let mut d = self.data.lock().unwrap();
-        // The app is still on its current run, so the run itself is not reset.
-        let session = d.session_ms;
-        *d = StatsData {
-            version: 1,
-            since: chrono::Utc::now().to_rfc3339(),
-            launches: 1,
-            session_ms: session,
-            longest_session_ms: session,
-            ..Default::default()
-        };
-        drop(d);
-        self.dirty.store(true, Ordering::SeqCst);
-        self.flush();
     }
 
     /// Write the file if anything changed since the last write.
@@ -735,7 +609,7 @@ mod tests {
         );
         assert_eq!(t.ttft_n, 1);
         assert!((t.cost - 0.01).abs() < 1e-9);
-        assert!(!t.last_used.is_empty(), "drives the LRU trim");
+        assert!(!t.last_used.is_empty(), "the panel sorts on it");
         assert!(!c.started.is_empty(), "the span needs a first stamp");
         // The per-model split has to exist from the first request, not just the
         // token total: "which model served this chat" is the question the
@@ -820,15 +694,17 @@ mod tests {
     fn a_tool_call_does_not_create_a_chat_that_never_spent_anything() {
         let s = Stats::default();
         s.tool_in("ghost", "bash", false);
-        // `chats` is capped by count, so entries conjured by tool calls would
-        // quietly evict real chats' rows. A tool call is not evidence the chat
-        // exists — the request is.
+        // `chats` is a ledger, so entries conjured by tool calls would add
+        // empty rows to it. A tool call is not evidence the chat exists — the
+        // request is.
         assert!(s.snapshot().chats.is_empty());
         assert_eq!(s.snapshot().tools["bash"].calls, 1);
     }
 
+    /// A chat's tool breakdown is a record of what it spent calls on, so it is
+    /// never trimmed: a rare tool that ran once is still a fact about the chat.
     #[test]
-    fn a_chats_tool_list_stays_bounded_and_keeps_the_busy_ones() {
+    fn a_chats_tool_list_is_never_trimmed() {
         let s = Stats::default();
         s.record(
             "chat-1",
@@ -847,19 +723,18 @@ mod tests {
                 cost: 0.0,
             },
         );
-        for i in 0..MAX_CHAT_TOOLS {
+        // More tools than the old cap allowed, and one that ran exactly once.
+        for i in 0..60 {
             s.tool_in("chat-1", &format!("tool-{i:02}"), false);
         }
-        // The one-off tool is the one that should go when the cap bites.
-        s.tool_in("chat-1", "tool-00", false);
         s.tool_in("chat-1", "rare_tool", false);
         let c = &s.snapshot().chats["chat-1"];
-        assert_eq!(c.tools.len(), MAX_CHAT_TOOLS);
-        assert!(c.tools.contains_key("tool-00"), "a 2-call tool was evicted");
+        assert_eq!(c.tools.len(), 61, "a tool row was dropped");
         assert!(
-            !c.tools.contains_key("rare_tool"),
-            "the cap kept the noisiest row"
+            c.tools.contains_key("rare_tool"),
+            "the least-used tool was dropped"
         );
+        assert_eq!(c.tools["rare_tool"].calls, 1);
     }
 
     #[test]
@@ -947,7 +822,7 @@ mod tests {
         // with nothing recorded.
         assert!(
             !d.chats["chat-a"].total.last_used.is_empty(),
-            "an error-created row needs a stamp or the LRU trim evicts it first"
+            "an error-created row needs a stamp or the panel cannot sort on it"
         );
         assert!(!d.chats["chat-a"].started.is_empty());
         assert_eq!(
@@ -1065,8 +940,15 @@ mod tests {
         assert_eq!(d.models["codex/gpt-6-sol"].failure_rate, 0.0);
     }
 
+    /// A chat's row outlives the chat: deleting the chat does not delete its
+    /// numbers, because the spend happened either way.
+    ///
+    /// This is the regression test for "stats never delete". The old build had
+    /// `Stats::forget_chat` and `Stats::reset`, and both are gone from the type
+    /// — so this test cannot call them, and its job is to pin what replaced
+    /// them: recording more only ever adds.
     #[test]
-    fn forgetting_a_chat_leaves_every_other_dimension_alone() {
+    fn a_chats_numbers_survive_the_chat_and_are_never_taken_back() {
         let s = Stats::default();
         let smp = || Sample {
             input: 7,
@@ -1080,21 +962,30 @@ mod tests {
         };
         s.record("chat-a", "codex/gpt-6-sol", None, "main", "main", &smp());
         s.record("chat-b", "codex/gpt-6-sol", None, "main", "main", &smp());
-        s.forget_chat("chat-a");
+        let before = s.snapshot();
+        // More activity after the fact. Nothing here deletes anything, so the
+        // earlier numbers stand and the totals only grow.
+        s.record("chat-a", "codex/gpt-6-sol", None, "main", "main", &smp());
+        s.tool_in("chat-a", "bash", false);
+        s.event_in("chat-a", "retries");
         let d = s.snapshot();
-        assert!(!d.chats.contains_key("chat-a"));
+        assert!(d.chats.contains_key("chat-a"), "a chat's row was dropped");
+        assert!(d.chats.contains_key("chat-b"), "a chat's row was dropped");
         assert_eq!(d.chats["chat-b"].total.input, 7);
         assert_eq!(
-            d.models["codex/gpt-6-sol"].input, 14,
-            "the model's total is not a chat's to remove"
+            d.models["codex/gpt-6-sol"].input, 21,
+            "the model's total must count every request"
         );
-        // Idempotent: nothing left to remove, no rewrite, no panic.
-        s.forget_chat("chat-a");
-        assert_eq!(s.snapshot().chats.len(), 1);
+        assert_eq!(
+            d.chats["chat-a"].total.requests,
+            before.chats["chat-a"].total.requests + 1
+        );
     }
 
+    /// The chat map is a ledger, not a cache: every chat that ever spent
+    /// something keeps its row, however many there are.
     #[test]
-    fn the_chat_map_is_capped_and_drops_the_least_recently_used() {
+    fn the_chat_map_never_drops_a_chat() {
         let s = Stats::default();
         let smp = || Sample {
             input: 1,
@@ -1106,7 +997,9 @@ mod tests {
             ttft_ms: None,
             cost: 0.0,
         };
-        for i in 0..MAX_CHATS {
+        // Far more chats than the old cap of 100.
+        let n = 250;
+        for i in 0..n {
             s.record(
                 &format!("chat-{i:04}"),
                 "codex/gpt-6-sol",
@@ -1116,25 +1009,22 @@ mod tests {
                 &smp(),
             );
         }
-        assert_eq!(s.snapshot().chats.len(), MAX_CHATS);
-        // Touch the oldest, then overflow by one: the one that has not been used
-        // is the one that goes. `last_used` has second resolution, so the whole
-        // loop lands in the same second and the tie is broken by insertion order
-        // in the sort above — still oldest-out-first among equals.
-        let oldest = format!("chat-{:04}", 0);
-        s.record(&oldest, "codex/gpt-6-sol", None, "main", "main", &smp());
+        let d = s.snapshot();
+        assert_eq!(d.chats.len(), n, "a chat's row was dropped");
+        // Touching the oldest must not push anything else out.
+        s.record("chat-0000", "codex/gpt-6-sol", None, "main", "main", &smp());
         s.record("overflow", "codex/gpt-6-sol", None, "main", "main", &smp());
         let d = s.snapshot();
-        assert_eq!(d.chats.len(), MAX_CHATS, "the cap must bound the map");
-        assert!(d.chats.contains_key(&oldest), "a used chat was evicted");
+        assert_eq!(d.chats.len(), n + 1, "a chat's row was dropped");
+        assert!(d.chats.contains_key("chat-0000"), "a used chat was evicted");
         assert!(
-            !d.chats.contains_key("chat-0001"),
-            "the least recently used chat survived the cap"
+            d.chats.contains_key("chat-0001"),
+            "an idle chat was evicted"
         );
         assert_eq!(
             d.models["codex/gpt-6-sol"].requests,
-            MAX_CHATS as u64 + 2,
-            "evicting a row must not lose the totals it was part of"
+            n as u64 + 2,
+            "the model's total must count every request"
         );
     }
 
@@ -1260,12 +1150,12 @@ mod tests {
         assert_eq!(c.total.requests, 3);
     }
 
-    /// An ultrathread tree spawns dozens of subagents, and this map is
-    /// serialized in full on every flush, so it has to be capped. The costliest
-    /// rows win because a row with ~no spend is noise next to one that ran the
-    /// task; no request may fall out of `total` when a row is evicted.
+    /// An ultrathread tree spawns dozens of subagents, and each is a spender
+    /// worth naming: which one ran the task and what it cost is exactly what
+    /// the breakdown is for. So no row is ever evicted — not the cheapest, not
+    /// the noisiest, none.
     #[test]
-    fn the_by_agent_map_is_capped_and_keeps_the_costliest() {
+    fn the_by_agent_map_never_drops_a_row() {
         let s = Stats::default();
         let smp = |cost: f64| Sample {
             input: 1,
@@ -1277,7 +1167,8 @@ mod tests {
             ttft_ms: None,
             cost,
         };
-        let n = MAX_CHAT_AGENTS + 5;
+        // More subagents than the old cap of 50.
+        let n = 80;
         for i in 0..n {
             s.record(
                 "chat-1",
@@ -1289,62 +1180,74 @@ mod tests {
             );
         }
         let c = &s.snapshot().chats["chat-1"];
-        assert_eq!(
-            c.by_agent.len(),
-            MAX_CHAT_AGENTS,
-            "the cap must bound the map"
-        );
-        // Ascending cost, so the cheapest are the first ids and the costliest is
-        // the last one inserted.
+        assert_eq!(c.by_agent.len(), n, "a spender's row was dropped");
+        // The cheapest is the one the old cap evicted first, so it is the one
+        // that proves the row is kept.
         assert!(
-            !c.by_agent.contains_key("sub:000"),
-            "the cheapest survived the cap"
-        );
-        assert!(!c.by_agent.contains_key("sub:004"), "an evicted row stayed");
-        assert!(
-            c.by_agent.contains_key("sub:005"),
-            "the cheapest kept row is wrong"
+            c.by_agent.contains_key("sub:000"),
+            "the cheapest spender was dropped"
         );
         assert!(
             c.by_agent.contains_key(&format!("sub:{:03}", n - 1)),
             "the costliest went"
         );
-        // Evicting a breakdown row must not lose the spend from the headline.
+        // The breakdown is additive to the headline, and dropping nothing means
+        // the two still agree.
+        assert_eq!(c.total.requests, n as u64, "total lost requests");
         assert_eq!(
-            c.total.requests, n as u64,
-            "total lost requests on eviction"
+            c.by_agent.values().map(|a| a.requests).sum::<u64>(),
+            c.total.requests
         );
     }
 
+    /// The hourly and daily maps are a record of what was spent, so old keys
+    /// are not expired: a day from last year is still a day that cost money.
     #[test]
-    fn a_reset_clears_the_chats_too() {
+    fn old_hours_and_days_are_never_expired() {
         let s = Stats::default();
-        s.record(
-            "chat-a",
-            "codex/gpt-6-sol",
-            None,
-            "main",
-            "main",
-            &Sample {
-                input: 1,
-                output: 1,
-                cache_read: 0,
-                cache_write: 0,
-                reasoning: 0,
-                ms: 1,
-                ttft_ms: None,
-                cost: 0.0,
-            },
-        );
-        // `reset` writes the file, which needs the real data dir; assert on the
-        // in-memory half that the caller sees either way.
-        let mut d = s.data.lock().unwrap();
-        *d = StatsData {
-            version: 1,
-            since: "2026-01-01T00:00:00Z".into(),
-            ..Default::default()
+        let smp = || Sample {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            ms: 1,
+            ttft_ms: None,
+            cost: 0.0,
         };
-        assert!(d.chats.is_empty());
+        s.record("chat-1", "codex/gpt-6-sol", None, "main", "main", &smp());
+        // Backdate the maps well past the old 14-day and 365-day cutoffs.
+        {
+            let mut d = s.data.lock().unwrap();
+            d.hourly.insert("2020-01-01T00".into(), Counter::default());
+            d.model_hourly
+                .insert("2020-01-01T00".into(), BTreeMap::new());
+            d.daily.insert("2020-01-01".into(), Counter::default());
+            d.model_daily.insert("2020-01-01".into(), BTreeMap::new());
+            d.presence_daily
+                .insert("2020-01-01".into(), Presence::default());
+            d.presence_hourly
+                .insert("2020-01-01T00".into(), Presence::default());
+        }
+        // One more request, which used to be the moment the old keys were
+        // trimmed away.
+        s.record("chat-1", "codex/gpt-6-sol", None, "main", "main", &smp());
+        let d = s.snapshot();
+        assert!(d.hourly.contains_key("2020-01-01T00"), "an hour expired");
+        assert!(
+            d.model_hourly.contains_key("2020-01-01T00"),
+            "an hour expired"
+        );
+        assert!(d.daily.contains_key("2020-01-01"), "a day expired");
+        assert!(d.model_daily.contains_key("2020-01-01"), "a day expired");
+        assert!(
+            d.presence_daily.contains_key("2020-01-01"),
+            "a day of presence expired"
+        );
+        assert!(
+            d.presence_hourly.contains_key("2020-01-01T00"),
+            "an hour of presence expired"
+        );
     }
 
     #[test]
@@ -1386,8 +1289,10 @@ mod tests {
         );
     }
 
+    /// A chat that is gone from the list keeps its row: the spend happened, and
+    /// the row is what explains a total no live chat accounts for.
     #[test]
-    fn retain_chats_drops_only_rejected_rows_and_keeps_totals() {
+    fn a_chats_row_outlives_the_chat_list() {
         let s = Stats::default();
         let smp = || Sample {
             input: 5,
@@ -1401,10 +1306,12 @@ mod tests {
         };
         s.record("live", "m", None, "main", "main", &smp());
         s.record("gone", "m", None, "main", "main", &smp());
-        assert_eq!(s.retain_chats(|id| id == "live"), 1);
         let d = s.snapshot();
-        assert!(d.chats.contains_key("live") && !d.chats.contains_key("gone"));
+        assert!(d.chats.contains_key("live"));
+        assert!(
+            d.chats.contains_key("gone"),
+            "a deleted chat's row was dropped"
+        );
         assert_eq!(d.models["m"].input, 10);
-        assert_eq!(s.retain_chats(|id| id == "live"), 0);
     }
 }

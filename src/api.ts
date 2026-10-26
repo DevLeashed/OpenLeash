@@ -238,6 +238,11 @@ export interface ItemData {
   /** Staged temp copies of what the user attached: path, name and size. Lets an
    *  edited message be resent with its attachments without re-reading files. */
   attachments?: { path: string; name: string; size: number }[];
+  /** How many of the `attachments` are pictures rather than files. The blobs on
+   *  `images` are dropped from older messages to bound memory, so the count of
+   *  blobs still on the item is not the count of pictures the message went out
+   *  with — this is, and it is what tells a picture from a file. */
+  image_attachments?: number;
   resolved?: string; kind?: string; detail?: string; title?: string; feedback?: string;
   rec_wt?: boolean | null; suggest_wt?: boolean; reason?: string; git?: boolean; rec_why?: string;
   sub?: string; repeat?: boolean; rule?: string;
@@ -277,7 +282,10 @@ export interface ModelInfo {
 export interface AccountTermsGate { title: string; lede: string; points: string[]; terms_url: string; accept: string }
 export interface AccountProviderInfo { display_name: string; short_name: string; login_file: string; login_command: string; paste_hint: string; setup_command: string; token_prefix: string; warning: string; terms_gate: AccountTermsGate | null; key_login: boolean }
 export interface ProviderPreset { name: string; url: string; kind: "openai" | "anthropic"; icon: string }
-export interface ProviderView { id: string; name: string; icon: string; mono: string; color: string; base_url: string; env: string; chip: string; kind: "openai" | "anthropic" | "codex"; custom: boolean; insist: boolean; connected: boolean; has_key: boolean; key_hint: string; key_hints: string[]; key_pool: boolean; base_url_override: string; enabled: boolean; local: boolean; account: AccountProviderInfo | null }
+export interface ProviderView { id: string; name: string; icon: string; mono: string; color: string; base_url: string; env: string; chip: string; kind: "openai" | "anthropic" | "codex" | "cli"; custom: boolean; insist: boolean; connected: boolean; has_key: boolean; key_hint: string; key_hints: string[]; key_pool: boolean; base_url_override: string; enabled: boolean; local: boolean; account: AccountProviderInfo | null }
+/** Install state of a CLI-backed provider (Antigravity). `authed` is only true once
+ *  the CLI has answered with a model list, which needs a working sign-in. */
+export interface AntigravityStatus { found: boolean; path: string; version: string; authed: boolean; models: number; error: string; settings_path: string; docs: string }
 export interface RemoteModel { id: string; name: string; context: number | null; output: number | null; input_price: number | null; output_price: number | null; modalities: string[] | null; reasoning_levels?: string[] | null; reasoning_param?: string | null; reasoning_parameter?: string | null; supported_reasoning_levels?: (string | { effort?: string })[] | null; supported_parameters?: string[] | null; guessed?: boolean }
 export interface AllowRule { pattern: string; project: string }
 /** `transport` is absent on servers saved before the HTTP transport existed —
@@ -403,8 +411,14 @@ export interface Settings {
   cache_keepalive?: boolean;
   /** Maximum number of keepalive pings per task. */
   cache_keepalive_pings?: number;
-  /** Keep a chat's row in Stats after the chat is deleted. On unless set false. */
-  keep_chat_stats?: boolean;
+  /** Check GitHub for a newer release on a timer, without being asked.
+   *  Off by default: a check discloses this machine's IP address to GitHub on
+   *  a schedule the user never asked for, so it is opt-in. */
+  auto_check_updates?: boolean;
+  /** Download and install a newer release in the background once one is found,
+   *  restarting the app to finish — but only while nothing is running. Off by
+   *  default: installing closes the app, so it needs the user's say-so. */
+  auto_update?: boolean;
 }
 
 export type HookEvent =
@@ -646,6 +660,9 @@ export const api = {
   appUpdateStatus: () => invoke<AppUpdateStatus>("app_update_status"),
   appUpdateCheck: () => invoke<AppUpdateStatus>("app_update_check"),
   appUpdateDownload: () => invoke<AppUpdateStatus>("app_update_download"),
+  /** Find, fetch and apply a release in one call. Without arguments by design:
+   *  the webview cannot point the installer at anything of its own. */
+  appUpdateNow: () => invoke<AppUpdateStatus>("app_update_now"),
   appUpdateInstall: () => invoke<void>("app_update_install"),
   boot: () => invoke<Boot>("app_boot"),
   tasks: () => invoke<TaskSummary[]>("tasks_list"),
@@ -661,6 +678,10 @@ export const api = {
   subTranscript: (id: string, sub: string) => invoke<Item[]>("sub_transcript", { id, sub }),
   create: (req: NewTask) => invoke<TaskSummary>("task_create", { req }),
   send: (id: string, text: string, later = false, images?: string[], files?: string[], imageNames?: string[]) => invoke<void>("task_send", { id, text, later, images, files, imageNames }),
+  /** Stop: cut everything in flight and freeze the chat where it stands, so
+   *  Resume carries on with every agent's context intact. Subagents pause with
+   *  it instead of being ended. `interrupt` is the outright cancellation. */
+  stop: (id: string) => invoke<void>("task_stop", { id }),
   interrupt: (id: string) => invoke<void>("task_interrupt", { id }),
   respond: (id: string, itemId: string, response: unknown) => invoke<void>("task_respond", { id, itemId, response }),
   /** Answer a question the agent raised without waiting (`ask_nonblocking`). The
@@ -671,16 +692,13 @@ export const api = {
   dismissAgentNotice: (id: string, itemId: string) => invoke<void>("task_dismiss_notice", { id, itemId }),
   update: (id: string, patch: TaskPatch) => invoke<TaskSummary>("task_update", { id, patch }),
   stats: () => invoke<import("./ui/Stats").StatsData>("stats_get"),
-  statsReset: () => invoke<void>("stats_reset"),
-  /** Drop the per-chat stats rows of deleted and archived chats; returns how many. */
-  statsPruneChats: () => invoke<number>("stats_prune_chats"),
   /** One chat's stats, by id — the panel behind "Stats…" in a chat's context
    *  menu. Its own command because `stats_get` returns the whole ledger and
    *  opening one chat's numbers does not need the rest of it.
    *
-   *  `null` when the chat has no row: it never ran a request, or it has aged
-   *  out of the cap the backend keeps. An empty title means the chat itself is
-   *  gone — its numbers are kept after deletion on purpose. */
+   *  `null` when the chat has no row: it never ran a request. A chat that was
+   *  deleted still has its row — its numbers are kept on purpose,
+   *  because the spend is real. An empty title means the chat itself is gone. */
   statsChat: (id: string) => invoke<[string, import("./ui/Stats").ChatStat] | null>("stats_chat", { id }),
   /** Where one chat's run spent its time and money, assembled from the timings
    *  recorded with the task (`agent/spans.rs`). A chat from before those were
@@ -693,7 +711,14 @@ export const api = {
   filesAttach: (paths: string[], cwd?: string) => invoke<FileRef[]>("files_attach", { paths, cwd: cwd ?? null }),
   /** Read an attached image into a data URL so the model can see it. */
   fileDataUrl: (path: string) => invoke<string>("file_data_url", { path }),
-  remoteUpload: (id: string, filename: string, bytes: ArrayBuffer) => invoke<FileRef>("remote_stage_upload", { id, filename, bytes: Array.from(new Uint8Array(bytes)) }),
+  /** Read one of OpenLeash's own staged attachment copies back as a data URL.
+   *  The transcript drops a message's picture blobs to bound memory; the staged
+   *  copy is still on disk, so the picture can be shown again. */
+  stagedImageUrl: (path: string) => invoke<string>("staged_image_url", { path }),
+  /** Write bytes as a file in OpenLeash's attachment temp folder and get its
+   *  path back — the same staging a phone's upload goes through. A pasted file
+   *  has no path of its own, and an attachment is a path the agent opens. */
+  stageBytes: (id: string, filename: string, bytes: ArrayBuffer) => invoke<FileRef>("remote_stage_upload", { id, filename, bytes: Array.from(new Uint8Array(bytes)) }),
   /** A picture an agent's reply points at, confined to the chat's folder (`reply_image`). */
   replyImage: (cwd: string, path: string) => invoke<string>("reply_image", { cwd, path }),
   subSend: (id: string, subId: string, text: string, images?: string[], imageNames?: string[]) => invoke<void>("sub_send", { id, subId, text, images, imageNames }),
@@ -733,6 +758,9 @@ export const api = {
   accountCapClear: (ids: string[], window: string) => invoke<AccountView[]>("account_cap_clear", { ids, window }),
   accountsRefresh: () => invoke<AccountView[]>("accounts_refresh"),
   exportTask: (id: string, path: string) => invoke<void>("task_export", { id, path }),
+  /** One chat as a fine-tuning JSONL file: `openrouter` keeps the system prompt
+   *  inside `messages`, `claude` puts it in the top-level `system` field. */
+  exportTraining: (id: string, path: string, format: "openrouter" | "claude") => invoke<void>("task_training_export", { id, path, format }),
   /** The ticked chats into one file. Its own command rather than a loop of
    * `exportTask`: N round-trips is N writes of work to end up in one file, and
    * falling back to `exportAll` would quietly drag in chats nobody ticked.
@@ -817,6 +845,7 @@ export const api = {
   provider: (id: string, p: { apiKey?: string; baseUrl?: string; enabled?: boolean; keyPool?: boolean }) => invoke<ProviderView[]>("provider_set", { id, apiKey: p.apiKey, baseUrl: p.baseUrl, enabled: p.enabled, keyPool: p.keyPool }),
   providerKey: (id: string, p: { op: "add" | "remove" | "replace"; key?: string; index?: number }) => invoke<ProviderView[]>("provider_key", { id, op: p.op, key: p.key ?? null, index: p.index ?? null }),
   models: () => invoke<ModelInfo[]>("models_list"),
+  antigravityStatus: () => invoke<AntigravityStatus>("antigravity_status"),
   providerAdd: (p: { name: string; base_url: string; kind: string; api_key: string; insist?: boolean; builtin?: string }) => invoke<ProviderView[]>("provider_add", { p }),
   providerRemove: (id: string) => invoke<ProviderView[]>("provider_remove", { id }),
   modelSave: (model: ModelInfo, replace?: string) => invoke<ModelInfo[]>("model_save", { model, replace }),
@@ -897,6 +926,15 @@ export const api = {
 
 export const EFFORTS = ["Max", "Extra High", "High", "Medium", "Low"];
 
+/** The generic ladder as the pickers draw it: Low first, Max last. Each entry
+ * carries the stored effort it belongs to, so a picker can offer the names
+ * without re-deriving which number goes with which.
+ *
+ * `EFFORTS` itself stays indexed by the stored effort (0 = Max … 4 = Low) —
+ * that is the contract with Rust's `pick_level` — so this is a *second* list,
+ * in the order things are shown, not a re-indexed one. */
+export const EFFORT_LADDER: { value: number; label: string }[] = EFFORTS.map((label, value) => ({ value, label })).reverse();
+
 /** The reasoning levels a model actually accepts, lowest first. Empty when it
  *  has no reasoning control, so the effort pickers offer nothing for it. */
 export function effortLevels(m: { reasoning_levels: string[]; reasoning_param: string }): string[] {
@@ -917,6 +955,20 @@ export function effortSteps(m: { reasoning_levels: string[]; reasoning_param: st
   const out: number[] = [];
   for (let e = 0; e <= 4; e++) if (out.every((k) => at(k) !== at(e))) out.push(e);
   return out;
+}
+
+/** The effort rungs of one model, in the order the pickers draw them: Low
+ * first, Max last.
+ *
+ * `effortSteps` returns the rungs in *stored* order (max → low) because that
+ * is the order the numbers run in; a picker wants the opposite, the way a
+ * slider runs from cheap thinking to expensive thinking. So this reverses the
+ * rungs and names each one, using the model's own level where it has one. */
+export function effortLadder(m: { reasoning_levels: string[]; reasoning_param: string }): { value: number; label: string }[] {
+  return effortSteps(m)
+    .slice()
+    .reverse()
+    .map((value) => ({ value, label: effortLabel(m, value) ?? EFFORTS[value]! }));
 }
 
 /** Snap a stored effort onto a position the model really has, so a setting
@@ -1079,13 +1131,13 @@ export function withRequiredAgents(ids: string[]): string[] {
 export interface RaceAttemptSpec { model: string; effort: number }
 export interface NewRace {
   prompt: string; project: string; base_branch: string; perm: Perm; plan: boolean; assist: Assist; agents: string[]; route?: string;
-  attempts: RaceAttemptSpec[]; judge_model: string; judge_effort: number;
+  attempts: (RaceAttemptSpec & { prompt?: string })[]; judge_model: string; judge_effort: number;
   images?: string[]; image_names?: string[]; files?: string[];
   /** "worktree" (default) or "docker": a private clone with commands in the project's container. */
   workspace?: "worktree" | "docker";
 }
 export interface RaceCheck { label: string; cmd: string; ok: boolean; output: string }
-export interface RaceAttempt { task_id: string; model: string; effort: number; checks: RaceCheck[]; checked: boolean }
+export interface RaceAttempt { task_id: string; model: string; effort: number; prompt?: string; checks: RaceCheck[]; checked: boolean }
 export interface RaceRank { task_id: string; rank: number; score: number | null; reason: string }
 export interface RaceJudge { model: string; ranking: RaceRank[]; summary: string; at: string; cost: number; error: string | null }
 export type RaceState = "running" | "checking" | "judging" | "judged" | "failed";
@@ -1097,6 +1149,16 @@ export interface Race {
   archived: boolean; archived_chats: string[];
 }
 export interface RaceAttemptStats { task_id: string; files: number; add: number; del: number; error: string | null }
+/** What a permanent race delete took with it, and what it left behind. */
+export interface RaceDeleteResult {
+  id: string;
+  /** The attempt chats that were deleted. */
+  deleted_chats: string[];
+  /** The attempt chats the user had restored on their own: left alone. */
+  kept_chats: string[];
+  /** The worktrees left on disk (zero when they were removed too). */
+  kept_worktrees: number;
+}
 export interface RaceDetail { race: Race; stats: RaceAttemptStats[] }
 /** The `ol://race` payload: a race as it is now, or the id of one that was forgotten. */
 export type RaceEvent = Race | { id: string; removed: true };
@@ -1123,4 +1185,7 @@ export const raceApi = {
   openFolder: (cwd: string) => invoke<void>("open_path", { cwd, path: "." }),
   /** Drop the race record; the chats are untouched. */
   forget: (id: string) => invoke<void>("race_forget", { id }),
+  /** Delete an archived race for good, with the attempt chats that are still
+   *  archived with it. `removeWorktree` also removes their worktrees. */
+  delete: (id: string, removeWorktree: boolean) => invoke<RaceDeleteResult>("race_delete", { id, removeWorktree }),
 };

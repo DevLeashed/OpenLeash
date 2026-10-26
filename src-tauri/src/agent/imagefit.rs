@@ -178,6 +178,19 @@ fn fit_block(b: &mut Value) -> bool {
     ) else {
         return false;
     };
+    // A type no provider accepts (an SVG, say) fails the whole request every
+    // turn. It cannot be shrunk into something sendable, so it is replaced with
+    // a note. For a user message the staged attachment list still names the
+    // copy on disk, so the agent can open the file instead of seeing it.
+    if !super::tools::is_model_image(mt) {
+        let hint = if mt.eq_ignore_ascii_case("image/svg+xml") {
+            " If the message lists a staged attachment for it, read that file instead."
+        } else {
+            ""
+        };
+        *b = json!({"type": "text", "text": format!("[image removed: {mt} is not a format models accept.{hint}]")});
+        return true;
+    }
     match fit_b64("An image", mt, data) {
         None => false,
         Some(Ok((mt, data))) => {
@@ -204,11 +217,18 @@ pub fn needs_fit(msgs: &[Message]) -> bool {
                 .and_then(b64_dimensions)
                 .is_some_and(too_big)
     };
+    let unsupported = |b: &Value| {
+        b["type"] == "image"
+            && b["source"]["media_type"]
+                .as_str()
+                .is_some_and(|mt| !super::tools::is_model_image(mt))
+    };
     msgs.iter().flat_map(|m| m.content.iter()).any(|b| {
         over(b)
-            || b["content"]
-                .as_array()
-                .is_some_and(|a| b["type"] == "tool_result" && a.iter().any(over))
+            || unsupported(b)
+            || b["content"].as_array().is_some_and(|a| {
+                b["type"] == "tool_result" && a.iter().any(|c| over(c) || unsupported(c))
+            })
     })
 }
 
@@ -296,6 +316,31 @@ mod tests {
         assert!(e.contains("12000x900") && e.contains("pano.jpg"), "{e}");
         // Within the limit it passes untouched, whatever the format.
         assert!(fit_bytes("ok.jpg", "image/jpeg", jpeg_header(4000, 3000)).is_ok());
+    }
+
+    /// An SVG is a file a model reads, not a picture it can see. A history that
+    /// carries one as an image block used to make every later request fail; it
+    /// becomes a note instead, and a user message's staged attachment list still
+    /// names the copy on disk.
+    #[test]
+    fn an_unsupported_image_is_stubbed_instead_of_bricking_the_chat() {
+        let svg = b64(b"<svg xmlns='http://www.w3.org/2000/svg'/>");
+        let mut msgs = vec![Message::user(vec![json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/svg+xml", "data": svg},
+        })])];
+        assert!(needs_fit(&msgs));
+        assert!(fit_messages(&mut msgs));
+        let block = &msgs[0].content[0];
+        assert_eq!(block["type"], "text");
+        assert!(
+            block["text"].as_str().unwrap().contains("image/svg+xml"),
+            "{block}"
+        );
+        assert!(
+            !fit_messages(&mut msgs),
+            "a second pass finds nothing to do"
+        );
     }
 
     #[test]

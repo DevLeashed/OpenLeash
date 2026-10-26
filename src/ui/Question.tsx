@@ -286,7 +286,10 @@ function OptNoteBox({ i, a, onChange }: { i: number; a: Ans; onChange: (i: numbe
   );
 }
 
-function Resolved({ it }: { it: Item }) {
+function Resolved({ it, fresh = false }: { it: Item; fresh?: boolean }) {
+  // Only a card answered in this view eases its answer line in; a transcript
+  // loading old answers must not animate every one of them.
+  const rc = fresh ? "resolved fresh" : "resolved";
   const qs: Q[] = it.data?.questions ?? [];
   const [open, setOpen] = useState(false);
   const one = qs.length === 1;
@@ -295,19 +298,19 @@ function Resolved({ it }: { it: Item }) {
   if (it.data?.dismissed) {
     const why = typeof it.data.note === "string" ? it.data.note : "";
     return (
-      <div className="resolved"><span style={{ color: "var(--mut)", display: "flex" }}><X size={12} /></span>Questions dismissed{why ? ` · ${why}` : " · the agent will use its judgment"}</div>
+      <div className={rc}><span style={{ color: "var(--mut)", display: "flex" }}><X size={12} /></span>Questions dismissed{why ? ` · ${why}` : " · the agent will use its judgment"}</div>
     );
   }
   // Every question skipped is not an answer, so it doesn't read as one.
   const skips = qs.map((_, i) => wasSkipped(it, i));
   if (skips.every(Boolean)) {
     return (
-      <div className="resolved"><span style={{ color: "var(--mut)", display: "flex" }}><Minus size={12} /></span>Skipped · the agent will use its judgment</div>
+      <div className={rc}><span style={{ color: "var(--mut)", display: "flex" }}><Minus size={12} /></span>Skipped · the agent will use its judgment</div>
     );
   }
   const nSkipped = skips.filter(Boolean).length;
   if (one) return (
-    <div className="resolved">
+    <div className={rc}>
       <span style={{ color: "var(--mut2)", display: "flex" }}><Check size={12} /></span>Answered · {showAnswer(first.value)}
       {first.note && <span style={{ color: "var(--mut3)" }}> — “{first.note}”</span>}
     </div>
@@ -315,7 +318,7 @@ function Resolved({ it }: { it: Item }) {
   const noted = notes.filter(Boolean).length;
   return (
     <div>
-      <Pressable className="resolved" onClick={() => setOpen(!open)} style={{ cursor: "default" }}>
+      <Pressable className={rc} onClick={() => setOpen(!open)} style={{ cursor: "default" }}>
         <span style={{ color: "var(--mut2)", display: "flex" }}><Check size={12} /></span>Answered {qs.length} questions{noted ? ` · ${noted} with a note` : ""}{nSkipped ? ` · ${nSkipped} skipped` : ""}{it.data?.title ? ` · ${it.data.title}` : ""}
         <span style={{ color: "var(--dim)" }}>{open ? "hide" : "show"}</span>
       </Pressable>
@@ -335,6 +338,36 @@ function Resolved({ it }: { it: Item }) {
       )}
     </div>
   );
+}
+
+/** The answered card's send-off: a detached copy of the card lifts, glows and
+ *  dissolves upward over the spot while the real card has already been replaced
+ *  by its answer line. A copy rather than the card itself, so the answer is never
+ *  held back for an animation and nothing about the live card's lifecycle
+ *  changes. Clipped to the scrolling transcript so it never draws over the
+ *  header, and skipped entirely under reduced motion. */
+export function ghostOut(card: HTMLElement | null) {
+  if (!card || typeof window === "undefined") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  const r = card.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  let scroller: HTMLElement | null = card.parentElement;
+  while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) scroller = scroller.parentElement;
+  const clip = scroller?.getBoundingClientRect() ?? { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const frame = document.createElement("div");
+  frame.className = "q-ghost-frame";
+  Object.assign(frame.style, { left: `${clip.left}px`, top: `${clip.top}px`, width: `${clip.width}px`, height: `${clip.height}px` });
+  const ghost = card.cloneNode(true) as HTMLElement;
+  ghost.removeAttribute("data-pending-question");
+  ghost.removeAttribute("tabindex");
+  ghost.setAttribute("aria-hidden", "true");
+  ghost.classList.add("q-ghost");
+  Object.assign(ghost.style, { left: `${r.left - clip.left}px`, top: `${r.top - clip.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+  frame.appendChild(ghost);
+  document.body.appendChild(frame);
+  const done = () => frame.remove();
+  ghost.addEventListener("animationend", (e) => { if (e.target === ghost) done(); });
+  window.setTimeout(done, 1200);
 }
 
 export function Question({ it, task }: { it: Item; task: TaskSummary }) {
@@ -358,6 +391,8 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   const [query, setQuery] = useState("");
   const filterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const sent = useRef(false);
   // The last body handed to the backend, so we only write real changes.
   const saved = useRef<string | null>(null);
   // `ans` is built from `qs` (`qs.map(initial)`, and `restore` maps over the
@@ -426,7 +461,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   // early returns below, because it is a hook and they are not.
   useEffect(() => { setOptOpen([]); setQuery(""); }, [page]);
 
-  if (done) return <Resolved it={it} />;
+  if (done) return <Resolved it={it} fresh={sent.current} />;
   const sourceQ = qs[page];
   if (!sourceQ) return null;
   const a = ans[page];
@@ -460,7 +495,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
   const setNoteText = (text: string) => upd({ note: { on: true, text } });
   const setOptNote = (i: number, text: string) => upd({ optNotes: { ...a.optNotes, [i]: text } });
   const clearNote = () => { setErr(null); setAns((x) => x.map((v, j) => (j === page ? { ...v, note: blankNote() } : v))); };
-  const respond = (response: unknown) => api.respond(task.id, it.id, response).catch((e) => flash(String(e)));
+  const respond = (response: unknown) => { sent.current = true; ghostOut(cardRef.current); return api.respond(task.id, it.id, response).catch((e) => flash(String(e))); };
   // The skipped list is sent explicitly: an answer alone can't tell a skip from
   // an optional field the user had no opinion on, and those mean different
   // things to the agent.
@@ -498,7 +533,7 @@ export function Question({ it, task }: { it: Item; task: TaskSummary }) {
 
   return (
     <div
-      className="card-q" tabIndex={0} data-pending-question={it.id}
+      ref={cardRef} className="card-q" tabIndex={0} data-pending-question={it.id}
       onKeyDown={(e) => {
         const tag = (e.target as HTMLElement).tagName;
         if (tag === "INPUT" || tag === "TEXTAREA" || dismissing) return;

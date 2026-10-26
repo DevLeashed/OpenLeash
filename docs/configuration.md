@@ -2,6 +2,8 @@
 
 Add API keys in Settings → Models, or set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `ZAI_API_KEY` or `OPENCODE_API_KEY` (same key covers both OpenCode Zen and OpenCode Go). Keys, settings and tasks live in `~/.openleash/` (override with `OPENLEASH_HOME`).
 
+**Antigravity** needs no key: install the official CLI (`curl -fsSL https://antigravity.google/cli/install.sh | bash`, or the PowerShell installer on Windows), run `agy` once to sign in, then add **Antigravity** in Settings → Models. Its card shows whether the binary was found, which version, and the model slugs your plan can reach (from `agy models`), with **Refresh models** to re-read them. OpenLeash never reads, stores or refreshes a Google credential — the CLI owns that login. A turn on this provider is **delegated** to `agy`: it runs its own tools with full access, outside the approval layer and plan mode, which is why [the security model](security-model.md#antigravity) needs a paragraph of its own.
+
 Settings → Plugins contains computer use and the headless browser. Each card's **Details** button opens its description and configuration; the switch controls whether agents receive its tools. Screen/browser availability is separate from whether the plugin is enabled. Plugin changes apply to new chats or after `/compact` in existing chats.
 
 Computer use lists the displays it can see in the order the tools index them (the primary first, so `monitor: 0` is always the primary). Only the primary unrotated display takes clicks and keystrokes: absolute input coordinates are normalised over the primary screen, so the card marks any other one as available to look at but not to click, and the agent is refused rather than clicking the right place on the wrong screen. **Settle time** is how long it waits after an action before the screenshot it returns. While an agent is driving your screen a small always-on-top banner shows the batch and a Stop button, and `Esc` — which is caught globally on Windows, so it works while another window has focus — tells it to stop touching your screen; pressing it twice in quick succession ends the run.
@@ -92,9 +94,9 @@ Settings has eighteen pages, in this order. The keys are in `settings.json` unle
 
 | Page | Main options |
 |---|---|
-| **General** | Interface zoom `ui_zoom` (110); close to tray `close_to_tray` (on); desktop notifications `notify` (on); send key `send_with` (Enter); `phone_enter_sends` (off); show thinking `show_thinking` (off); context breakdown `ctx_breakdown` (off); where new tasks run `workspace` (local); assist mode `assist` (default); **Memory** `memory` (on); automatic resume `automatic_resume` (on); project docs `project_docs`; `inject_global_claude` (off, reads `~/.claude/CLAUDE.md`); trace export endpoint `trace_endpoint` (empty). |
+| **General** | Interface zoom `ui_zoom` (110); close to tray `close_to_tray` (on); desktop notifications `notify` (on); send key `send_with` (Enter); `phone_enter_sends` (off); show thinking `show_thinking` (off); context breakdown `ctx_breakdown` (off); where new tasks run `workspace` (local); assist mode `assist` (default); **Memory** `memory` (on); automatic resume `automatic_resume` (on); project docs `project_docs`; `inject_global_claude` (off, reads `~/.claude/CLAUDE.md`); trace export endpoint `trace_endpoint` (empty). The **About** section at the bottom of this page holds the update switches: check for updates automatically `auto_check_updates` (off), and update automatically `auto_update` (off) — which downloads, installs and restarts the app by itself, but only once no chat, subagent or command is running. |
 | **Theme** | `theme` (`raycast`), `mode` (`dark`). |
-| **Models** | Provider keys and key pools (`providers`), custom providers and models, per-model settings (`model_configs`), disabled, favourite and recent models. |
+| **Models** | Provider keys and key pools (`providers`), custom providers and models, per-model settings (`model_configs`), disabled, favourite and recent models. The model new tasks start on is `model`, and the reasoning level they start at is `effort`: both are written when a task is created, so the next new task comes up on the model and level you last used. |
 | **Accounts** | Subscription and API accounts with priority, enable switch and usage caps (`accounts`); the spend-quota **burner** (`burner`: off, reset within 30 minutes, headroom 20 points, spend cap 90%); subagent defaults (`agents`, `default_agents`: `explore`, `general`). See [Features](features.md#spend-quota-before-it-resets). |
 | **Routers** | Routes with heads, fallback steps and `on_exhausted` (`routes`). See [Features](features.md#routers). |
 | **Subagents** | Subagent definitions, their effort and instruction injection (`agents`). |
@@ -109,7 +111,7 @@ Settings has eighteen pages, in this order. The keys are in `settings.json` unle
 | **Checks & hooks** | Diagnostics `diagnostics` (on); verify nudge `verify_nudge` (on); checkpoints `checkpoints` (on); `hooks` and `trusted_hooks`. See [Security](security-model.md). |
 | **MCP servers** | Servers `mcp` (each with `enabled`, `auto_approve`, `oauth` and `defer`); `tool_search` (on); `defer_plugins` (off). |
 | **Remote** | Stored in `remote.json`, not `settings.json`: remote control, reachability, port (17420), paired devices and the ntfy settings. See [Remote](remote.md). |
-| **Stats** | Monthly budget `budget` (50, in dollars; 0 disables it); `keep_chat_stats` (on); `cache_keepalive` (off); `cache_keepalive_pings` (4). See [Features](features.md#stats). |
+| **Stats** | Monthly budget `budget` (50, in dollars; 0 disables it); `cache_keepalive` (off); `cache_keepalive_pings` (4). See [Features](features.md#stats). |
 
 Two switches sit outside Settings. The **Review** page has `git_attribution` (what a commit says about the agent) and `git_commit_verify` (off, whether hooks run on agent commits). The sidebar usage bar toggles `home_usage`.
 
@@ -128,9 +130,10 @@ Everything the app stores lives under `~/.openleash/`, or under `OPENLEASH_HOME`
 | `remote.json` | Remote control state: paired devices (hashed secrets only), SSH hosts and the ntfy settings. |
 | `mcp-oauth.json` | MCP OAuth tokens, backend-only, plaintext. |
 | `burner.json` | Spend-quota runs (the last 50 are kept). |
+| `antigravity-sessions.json` | Which `agy` conversation each chat delegates to, so the CLI keeps its memory across turns and restarts. Handles only — no credential, and deleting one costs that chat its delegate memory and nothing else. |
 | `schedules.json` | Scheduled runs. A corrupt file is moved aside with a `.bad` suffix. |
 | `races.json` | Best-of-N races. |
-| `stats.json` | Usage and spend ledger for the Stats page. |
+| `stats.json` | Usage and spend ledger for the Stats page. Never pruned: it grows with use. |
 | `memory/_global/`, `memory/<project>-<fingerprint>/` | Agent memory notes and their `MEMORY.md` indexes. |
 | `OPENLEASH.md` | Personal instructions loaded into every chat. |
 | `skills/<name>/SKILL.md` | Global skills. |

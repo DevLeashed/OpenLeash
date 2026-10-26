@@ -161,15 +161,53 @@ fn command(cmd: &str, cwd: &str) -> Command {
     c
 }
 
+/// Start `taskkill /T /F` on a child's process tree. Waiting for it is the
+/// caller's business: it is fast for a bare shell and slow (seconds) for a real
+/// tree of node/msbuild children, and the agent paths must not wait on a runtime
+/// worker while it walks that tree.
+#[cfg(windows)]
+fn start_taskkill(child: &Child) -> Option<std::process::Child> {
+    let pid = child.id()?;
+    let mut k = std::process::Command::new("taskkill");
+    k.args(["/T", "/F", "/PID", &pid.to_string()]);
+    use std::os::windows::process::CommandExt;
+    k.creation_flags(0x0800_0000);
+    k.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    k.spawn().ok()
+}
+
 /// Kill the whole process tree (bash → node → …), not just the shell.
+///
+/// This is the blocking form, for callers that cannot await (a `Drop`). The
+/// agent loop uses `kill_tree_async`, which moves the wait off the worker.
 pub fn kill_tree(child: &mut Child) {
     #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let mut k = std::process::Command::new("taskkill");
-        k.args(["/T", "/F", "/PID", &pid.to_string()]);
-        use std::os::windows::process::CommandExt;
-        k.creation_flags(0x0800_0000);
-        let _ = k.output();
+    if let Some(mut k) = start_taskkill(child) {
+        let _ = k.wait();
+    }
+    let _ = child.start_kill();
+}
+
+/// `kill_tree`, with `taskkill`'s wait moved off the async worker.
+///
+/// Every shell timeout, every Stop and every background-job kill goes through
+/// here. Waiting inline parked a tokio worker until `taskkill /T` had walked the
+/// whole tree — seconds on a big one, per call, with other tasks queued behind it.
+pub async fn kill_tree_async(child: &mut Child) {
+    #[cfg(windows)]
+    if let Some(k) = start_taskkill(child) {
+        // Bounded: the wait is off the worker, but a Stop must still return even
+        // if `taskkill` itself is stuck on a process that will not die.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let mut k = k;
+                let _ = k.wait();
+            }),
+        )
+        .await;
     }
     let _ = child.start_kill();
 }
@@ -361,13 +399,26 @@ async fn run_built(
     let r2 = pump(child.stderr.take(), buf.clone());
     let mut timed_out = false;
     let mut interrupted = false;
+    let mut killing = false;
     let status = tokio::select! {
         s = child.wait() => s.ok(),
-        _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => { timed_out = true; kill_tree(&mut child); None }
-        _ = cancel.cancelled() => { interrupted = true; kill_tree(&mut child); None }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => { timed_out = true; killing = true; None }
+        _ = cancel.cancelled() => { interrupted = true; killing = true; None }
     };
+    // Outside the handler, because it waits for `taskkill` on a blocking thread:
+    // inside one it would hold the child across an await while the other branch
+    // still borrows it.
+    if killing {
+        kill_tree_async(&mut child).await;
+    }
     if let (true, Some((denv, job))) = (timed_out || interrupted, &docker_job) {
-        Box::pin(super::docker::kill_job(denv, job)).await;
+        // Best effort, and bounded: a wedged docker daemon must not stop the
+        // timeout that fired from turning into a tool result.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::docker::kill_job(denv, job)),
+        )
+        .await;
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let _ = r1.await;
@@ -426,6 +477,13 @@ fn pump_counted<R: AsyncRead + Unpin + Send + 'static>(
 pub struct BgJob {
     pub id: String,
     pub task_id: String,
+    /// The subagent that started it ("" = the chat's own agent).
+    ///
+    /// A stop on one subagent kills the commands *that* agent started and
+    /// leaves the chat's own dev servers alone: without this the only scope
+    /// available was the whole task, and stopping one runaway worker would
+    /// have taken every server in the chat down with it.
+    pub sub_id: String,
     pub cmd: String,
     pub started: chrono::DateTime<chrono::Utc>,
     pub buf: Arc<Mutex<String>>,
@@ -482,10 +540,16 @@ pub struct BgManager {
 }
 
 impl BgManager {
-    pub fn spawn(&self, task_id: &str, cmd: &str, cwd: &str) -> Result<String, String> {
+    pub fn spawn(
+        &self,
+        task_id: &str,
+        sub_id: &str,
+        cmd: &str,
+        cwd: &str,
+    ) -> Result<String, String> {
         local_cwd(cwd)?;
         let id = format!("bg_{}", &super::new_id()[..6]);
-        self.spawn_built(task_id, cmd, command(cmd, cwd), id, None)
+        self.spawn_built(task_id, sub_id, cmd, command(cmd, cwd), id, None)
     }
 
     /// `spawn` for a remote-SSH project: started over ssh (async, since the
@@ -494,6 +558,7 @@ impl BgManager {
     pub async fn spawn_remote(
         &self,
         task_id: &str,
+        sub_id: &str,
         cmd: &str,
         cwd: &str,
     ) -> Result<String, String> {
@@ -519,6 +584,7 @@ impl BgManager {
         let bg = Arc::new(BgJob {
             id: id.clone(),
             task_id: task_id.into(),
+            sub_id: sub_id.into(),
             cmd: cmd.into(),
             started: chrono::Utc::now(),
             buf,
@@ -565,18 +631,27 @@ impl BgManager {
         &self,
         denv: &super::docker::DockerEnv,
         task_id: &str,
+        sub_id: &str,
         cmd: &str,
         cwd: &str,
     ) -> Result<String, String> {
         let cfg = super::docker::load_config(&denv.project).unwrap_or_default();
         let id = format!("bg_{}", &super::new_id()[..6]);
         let c = docker_exec(denv, &id, cmd, cwd, &cfg);
-        self.spawn_built(task_id, cmd, c, id.clone(), Some((denv.clone(), id)))
+        self.spawn_built(
+            task_id,
+            sub_id,
+            cmd,
+            c,
+            id.clone(),
+            Some((denv.clone(), id)),
+        )
     }
 
     fn spawn_built(
         &self,
         task_id: &str,
+        sub_id: &str,
         cmd: &str,
         mut c: Command,
         id: String,
@@ -593,6 +668,7 @@ impl BgManager {
         let job = Arc::new(BgJob {
             id: id.clone(),
             task_id: task_id.into(),
+            sub_id: sub_id.into(),
             cmd: cmd.into(),
             started: chrono::Utc::now(),
             buf,
@@ -607,14 +683,33 @@ impl BgManager {
         self.jobs.lock().unwrap().insert(id.clone(), job);
         self.prune_finished();
         tokio::spawn(async move {
-            let res = tokio::select! {
-                s = child.wait() => s.ok().and_then(|s| s.code()).map(|c| format!("exit {c}")).unwrap_or("exited".into()),
-                _ = stop.cancelled() => {
-                    kill_tree(&mut child);
+            let waited = tokio::select! {
+                s = child.wait() => Some(s.ok().and_then(|s| s.code()).map(|c| format!("exit {c}")).unwrap_or("exited".into())),
+                _ = stop.cancelled() => None
+            };
+            // The kill waits for `taskkill` on a blocking thread, so it cannot
+            // happen in the handler above: that would hold the child across an
+            // await while `child.wait()` still borrows it.
+            let res = match waited {
+                Some(res) => res,
+                None => {
+                    kill_tree_async(&mut child).await;
                     if let Some((denv, job)) = &docker_job {
-                        Box::pin(super::docker::kill_job(denv, job)).await;
+                        // Bounded and best effort: the job is reported killed
+                        // either way, and a wedged daemon must not leave the
+                        // dashboard's "running" flag stuck on this job.
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            Box::pin(super::docker::kill_job(denv, job)),
+                        )
+                        .await;
                     }
-                    kill_reason.lock().unwrap().clone().map(|r| format!("killed: {r}")).unwrap_or("killed".into())
+                    kill_reason
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .map(|r| format!("killed: {r}"))
+                        .unwrap_or("killed".into())
                 }
             };
             *exit.lock().unwrap() = Some(res);
@@ -683,6 +778,20 @@ impl BgManager {
         }
     }
 
+    /// Forget every job of a chat that is being deleted.
+    ///
+    /// `kill_task` cancels the jobs but leaves the entries in the map, and
+    /// `prune_finished` only trims per task when that task starts another one.
+    /// So a deleted chat kept its newest eight jobs — up to 2 MB of captured
+    /// output each — for the life of the process. Scheduled runs make that
+    /// routine rather than rare: every fire is a fresh chat.
+    pub fn forget_task(&self, task_id: &str) {
+        self.jobs
+            .lock()
+            .unwrap()
+            .retain(|_, j| j.task_id != task_id);
+    }
+
     pub fn kill_task(&self, task_id: &str) {
         for j in self.jobs.lock().unwrap().values() {
             if j.task_id == task_id {
@@ -700,9 +809,43 @@ impl BgManager {
     /// had already exited is left out, so a caller telling the agent what was
     /// cut off never claims credit for killing something that had finished.
     pub fn kill_task_with_reasons(&self, task_id: &str, reason: &str) -> Vec<BgInfo> {
-        let mut killed: Vec<BgInfo> = vec![];
+        self.kill_task_grouped(task_id, reason)
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect()
+    }
+
+    /// `kill_task_with_reasons`, keeping the agent that started each job.
+    ///
+    /// The consumer that matters is telling agents what they lost: a stop kills
+    /// the chat's own servers *and* every subagent's, and a note listing someone
+    /// else's build is noise the agent has to rule out before rerunning its own.
+    pub fn kill_task_grouped(&self, task_id: &str, reason: &str) -> Vec<(String, BgInfo)> {
+        let mut killed: Vec<(String, BgInfo)> = vec![];
         for j in self.jobs.lock().unwrap().values() {
             if j.task_id == task_id && j.exit.lock().unwrap().is_none() {
+                // Read it as it was *before* the kill: the process may record
+                // its exit the instant the token fires, and a job that was
+                // already on its way out is not one the user stopped.
+                let before = bg_info(j);
+                *j.kill_reason.lock().unwrap() = Some(reason.to_string());
+                j.stop.cancel();
+                killed.push((j.sub_id.clone(), before));
+            }
+        }
+        killed.sort_by_key(|(_, b)| b.started);
+        killed
+    }
+
+    /// Kill the running background commands *one subagent* started, recording
+    /// why (shown to the agent as its exit).
+    ///
+    /// Scoped to that agent on purpose: a stop on a subagent must not take the
+    /// chat's own dev servers down with it.
+    pub fn kill_sub_with_reasons(&self, task_id: &str, sub_id: &str, reason: &str) -> Vec<BgInfo> {
+        let mut killed: Vec<BgInfo> = vec![];
+        for j in self.jobs.lock().unwrap().values() {
+            if j.task_id == task_id && j.sub_id == sub_id && j.exit.lock().unwrap().is_none() {
                 // Read it as it was *before* the kill: the process may record
                 // its exit the instant the token fires, and a job that was
                 // already on its way out is not one the user stopped.
@@ -801,5 +944,52 @@ mod wsl_tests {
         );
         assert_eq!(wsl_arg("Ubuntu", "HEAD"), "HEAD");
         assert_eq!(wsl_arg("Ubuntu", "--quiet"), "--quiet");
+    }
+}
+
+#[cfg(test)]
+mod bg_tests {
+    use super::*;
+
+    fn job(id: &str, task: &str) -> Arc<BgJob> {
+        Arc::new(BgJob {
+            id: id.into(),
+            task_id: task.into(),
+            sub_id: String::new(),
+            cmd: "npm run dev".into(),
+            started: chrono::Utc::now(),
+            buf: Arc::new(Mutex::new(String::new())),
+            read_pos: Mutex::new(0),
+            exit: Arc::new(Mutex::new(None)),
+            stop: CancellationToken::new(),
+            kill_reason: Arc::new(Mutex::new(None)),
+            done: CancellationToken::new(),
+            remote: false,
+            dropped: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Deleting a chat cancelled its jobs but left them in this map: each one
+    /// holds up to 2 MB of captured output, and `prune_finished` only trims a
+    /// task when that task starts another job. A scheduled run makes a fresh
+    /// chat every fire, so the process filled with jobs of chats that are gone.
+    #[test]
+    fn a_deleted_chat_does_not_keep_its_background_jobs() {
+        let bg = BgManager::default();
+        {
+            let mut jobs = bg.jobs.lock().unwrap();
+            jobs.insert("bg_a1".into(), job("bg_a1", "chat-a"));
+            jobs.insert("bg_a2".into(), job("bg_a2", "chat-a"));
+            jobs.insert("bg_b1".into(), job("bg_b1", "chat-b"));
+        }
+
+        bg.forget_task("chat-a");
+
+        let jobs = bg.jobs.lock().unwrap();
+        assert!(!jobs.contains_key("bg_a1") && !jobs.contains_key("bg_a2"));
+        assert!(
+            jobs.contains_key("bg_b1"),
+            "another chat's jobs must survive"
+        );
     }
 }

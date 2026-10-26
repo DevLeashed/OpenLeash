@@ -565,15 +565,50 @@ pub fn docker_command() -> Command {
     c
 }
 
+/// How long a `docker` call that only reads state may take. The daemon can wedge
+/// — Docker Desktop after a laptop resumes from sleep is the usual way — and
+/// every caller here sits on the agent's path to a tool result, so an unbounded
+/// call is a hung turn that no timeout further up can reach
+/// (`ensure_running_with_rebuild` holds the chat's docker lock while it waits).
+/// `docker_command` sets `kill_on_drop`, so a call that runs out of time takes
+/// its client process with it rather than leaking one per attempt.
+const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// And how long one that moves a whole filesystem may take. A base-image pull or
+/// a container commit is legitimately minutes of work; killing it halfway would
+/// be worse than the hang this bounded call exists to prevent.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The deadline for one call, by subcommand.
+fn call_timeout(args: &[&str]) -> Duration {
+    match args.first().copied() {
+        Some("pull" | "commit" | "save" | "export" | "import" | "load" | "build") => SLOW_TIMEOUT,
+        _ => QUICK_TIMEOUT,
+    }
+}
+
 /// Run `docker <args>` and return stdout, or stderr as the error.
 pub async fn docker(args: &[&str]) -> Result<String, String> {
-    let out = docker_command().args(args).output().await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "Docker isn't installed (no `docker` command found).".to_string()
-        } else {
-            format!("couldn't run docker: {e}")
+    docker_within(args, call_timeout(args)).await
+}
+
+async fn docker_within(args: &[&str], limit: Duration) -> Result<String, String> {
+    let out = match tokio::time::timeout(limit, docker_command().args(args).output()).await {
+        Ok(r) => r.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "Docker isn't installed (no `docker` command found).".to_string()
+            } else {
+                format!("couldn't run docker: {e}")
+            }
+        })?,
+        Err(_) => {
+            return Err(format!(
+                "docker {} didn't answer within {}s — is the engine wedged? Start Docker Desktop (or the docker service) and try again.",
+                args.first().unwrap_or(&""),
+                limit.as_secs()
+            ))
         }
-    })?;
+    };
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -1095,6 +1130,23 @@ pub fn exec_args(
 mod tests {
     use super::*;
 
+    /// A cap meant to stop a wedged daemon hanging a turn must not also kill the
+    /// calls that legitimately take minutes. A base-image pull was cut off at the
+    /// short deadline the first time this was written.
+    #[test]
+    fn slow_docker_subcommands_get_the_long_deadline() {
+        assert_eq!(call_timeout(&["pull", "ubuntu:24.04"]), SLOW_TIMEOUT);
+        assert_eq!(call_timeout(&["commit", "abc", "tag"]), SLOW_TIMEOUT);
+        // Everything the agent waits on for a tool result stays on the short one.
+        for quick in [
+            "version", "ps", "inspect", "start", "stop", "rm", "rmi", "exec", "logs", "image",
+        ] {
+            assert_eq!(call_timeout(&[quick]), QUICK_TIMEOUT, "{quick}");
+        }
+        // An empty argv cannot hang on anything real, but it must not panic.
+        assert_eq!(call_timeout(&[]), QUICK_TIMEOUT);
+    }
+
     fn env() -> DockerEnv {
         DockerEnv {
             container: "openleash-abc".into(),
@@ -1501,7 +1553,7 @@ mod tests {
 
             // Background jobs too.
             let bg = super::super::shell::BgManager::default();
-            let id = bg.spawn_docker(&env, &task, "sleep 302", &dir).unwrap();
+            let id = bg.spawn_docker(&env, &task, "", "sleep 302", &dir).unwrap();
             tokio::time::sleep(Duration::from_millis(1500)).await;
             assert!(docker(&["exec", &env.container, "ps", "-o", "args"])
                 .await

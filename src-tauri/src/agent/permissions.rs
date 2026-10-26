@@ -1481,10 +1481,13 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
         // reach the metadata service); plan mode refuses writes; a GET/HEAD to
         // the public internet is a web read and runs everywhere, like
         // `web_fetch`; then an exact per-method-per-host allow rule; then Full
-        // Access, which covers *public* writes only. Loopback and private
-        // targets always fall through to the card: Full Access was granted for
-        // the project's work, and the router or another local service is not
-        // obviously that.
+        // Access, which covers every target class — public, loopback and
+        // private alike. Full Access is the user's "ask me nothing" mode, so a
+        // local dev server is reachable there too; only the blocked targets
+        // (cloud metadata, link-local) and plan mode's write block still apply.
+        // Below Full Access a loopback or private target always falls through
+        // to the card: Full Access was granted for *this* project's work, and
+        // the router or another local service is not obviously that.
         "http_request" => {
             use super::http_tool::{self as ht, Target};
             let req = match ht::parse_request(input) {
@@ -1513,7 +1516,7 @@ pub fn check(tool: &str, input: &Value, resolved_path: Option<&str>, ctx: &Ctx) 
                     && rule_scope_matches(&r.project, ctx.project)
                     && r.pattern.trim().eq_ignore_ascii_case(&rule)
             });
-            if allowed || (rung == Rung::Turbo && public) {
+            if allowed || rung == Rung::Turbo {
                 return Decision::Allow;
             }
             if disabled {

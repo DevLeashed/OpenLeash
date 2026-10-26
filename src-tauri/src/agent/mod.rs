@@ -14,6 +14,7 @@
 //! - `store.rs`       settings + task persistence
 
 pub mod accounts;
+pub mod antigravity;
 pub mod attachments;
 pub mod bisect;
 pub mod browser;
@@ -121,6 +122,8 @@ mod reviewer_ssh;
 mod reviewer_staleness;
 #[cfg(test)]
 mod reviewer_startup;
+#[cfg(test)]
+mod reviewer_stop_pause;
 #[cfg(test)]
 mod reviewer_streams;
 #[cfg(test)]
@@ -313,6 +316,16 @@ pub struct SubInfo {
     /// Runs detached; its report reaches the main agent as a note.
     #[serde(default)]
     pub background: bool,
+    /// The user stopped this agent by hand, so it must not be picked back up.
+    ///
+    /// A background agent that was cut off by a crash, an app close or a
+    /// chat-wide Stop is resumed on the next turn — that is the whole point of
+    /// keeping its conversation. But one the user stopped *by hand* is a
+    /// different thing: they said stop, and the next turn quietly starting it
+    /// again is the opposite of what they asked for. This flag is what tells
+    /// the two apart.
+    #[serde(default)]
+    pub user_stopped: bool,
     /// Subagent that launched this one (ultrathread nesting); empty = the main agent.
     #[serde(default)]
     pub parent: String,
@@ -645,6 +658,7 @@ pub struct Task {
     pub spans: Vec<spans::Span>,
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    #[serde(default)]
     pub touched: HashMap<String, Option<String>>,
     /// Router decisions persisted for activity history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -814,6 +828,7 @@ impl Task {
         id: &str,
         by: Option<&str>,
         note: &str,
+        images: &[Value],
     ) -> Option<Vec<Message>> {
         let sub = self.subs.iter_mut().find(|s| s.id == id)?;
         if sub.status == "running" || by.is_some_and(|me| sub.parent != me) {
@@ -821,11 +836,20 @@ impl Task {
         }
         sub.status = "running".into();
         sub.meta = "resuming".into();
+        // A resume is an explicit request to continue, so the "the user stopped
+        // this one by hand" mark is cleared: it is what stopped the next turn
+        // from picking the agent up on its own, and that is exactly what a
+        // resume overrides.
+        sub.user_stopped = false;
         let mut msgs = self.sub_msgs.get(id)?.clone();
         if msgs.is_empty() {
             return None;
         }
-        runner::push_user_blocks(&mut msgs, vec![json!({"type": "text", "text": note})]);
+        // The pictures come first, so the agent reads them before the note that
+        // introduces them — the same order a subagent is launched with.
+        let mut blocks: Vec<Value> = images.to_vec();
+        blocks.push(json!({"type": "text", "text": note}));
+        runner::push_user_blocks(&mut msgs, blocks);
         self.sub_msgs.insert(id.to_string(), msgs.clone());
         Some(msgs)
     }
@@ -876,6 +900,7 @@ impl Task {
                 call_id: s.call_id.clone(),
                 item_id: s.item_id.clone(),
                 background: s.background,
+                user_stopped: s.user_stopped,
                 parent: s.parent.clone(),
                 depth: s.depth,
             })
@@ -1102,6 +1127,11 @@ pub struct QueuedMsg {
 /// The ceiling on how many images are pinned for one agent on top of whatever
 /// the user actually sent. See `Harness::note_images`, which enforces it.
 pub const INBOX_IMAGES: usize = 8;
+
+/// The ceiling on queued harness notes for one agent. See `Harness::note`: a
+/// note is only drained by that agent's next request, so a chat that is parked,
+/// paused or finished accumulates them — and a subagent report is tens of KB.
+pub const INBOX_NOTES: usize = 40;
 
 /// A live park and the watcher generation that owns it. Deliberately runtime-only:
 /// this does not claim that a trigger survives an application restart.
@@ -1855,19 +1885,23 @@ impl Harness {
             f.cancel();
             *f = CancellationToken::new();
         }
-        let killed: Vec<String> = self
-            .bg
-            .list(task_id)
-            .into_iter()
-            .filter(|b| b.running)
-            .map(|b| format!("`{}` ({})", b.cmd, b.id))
-            .collect();
-        self.bg.kill_task_with(
+        let killed = self.bg.kill_task_grouped(
             task_id,
             "stopped by force pause before it finished — rerun it",
         );
-        if !killed.is_empty() {
-            self.note(task_id, "main", format!("<system-reminder>The user force-paused this task. These background commands were killed before they finished and need to be started again: {}</system-reminder>", killed.join(", "))).await;
+        // Per agent, for the same reason a stop is: a subagent whose own build
+        // was cut has to hear about it, and one that was not must not be told
+        // about somebody else's server.
+        let mut by_agent: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for (sub, job) in &killed {
+            by_agent
+                .entry(sub.as_str())
+                .or_default()
+                .push(format!("`{}` ({})", job.cmd, job.id));
+        }
+        for (agent, list) in by_agent {
+            let who = if agent.is_empty() { "main" } else { agent };
+            self.note(task_id, who, format!("<system-reminder>The user force-paused this task. These background commands were killed before they finished and need to be started again: {}</system-reminder>", list.join(", "))).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         self.emit(task_id, "bg", json!(self.bg.list(task_id)));
@@ -2070,14 +2104,23 @@ impl Harness {
     }
 
     /// Queue a harness note for one agent ("main" or a sub id).
+    ///
+    /// Capped per agent, newest kept — the same reason the images are capped
+    /// below. A note is drained only when that agent next builds a request, so a
+    /// chat that is parked, paused, or simply never runs again accumulates every
+    /// background-job exit, wake note, peer message and subagent report (tens of
+    /// KB each) for the life of the process.
     pub async fn note(&self, task_id: &str, agent: &str, text: String) {
-        self.runtime(task_id)
-            .inbox
-            .lock()
-            .await
-            .entry(agent.to_string())
-            .or_default()
-            .push(text);
+        let rt = self.runtime(task_id);
+        let mut q = rt.inbox.lock().await;
+        let list = q.entry(agent.to_string()).or_default();
+        list.push(text);
+        // The oldest go first: the note queued a moment ago is the one the next
+        // request needs, and a buried order would be a different bug.
+        if list.len() > INBOX_NOTES {
+            let drop_n = list.len() - INBOX_NOTES;
+            list.drain(..drop_n);
+        }
     }
 
     /// Queue pasted images for one agent. (media_type, base64) pairs.

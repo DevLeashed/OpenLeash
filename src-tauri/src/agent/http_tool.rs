@@ -17,11 +17,10 @@
 //! are. `Blocked` (cloud metadata, link-local, multicast…) is refused on every
 //! rung, whatever the rules say: there is no legitimate agent use for
 //! `169.254.169.254`, and it is the classic SSRF prize. `Loopback` and
-//! `Private` are legitimate (testing a local dev server is a core use case) but
-//! only ever through an approval or an explicit per-host rule — never silently,
-//! not even on Full Access, because "full access" was granted for *this
-//! project's* work and a request to the router admin page or another local
-//! service is not obviously that.
+//! `Private` are legitimate (testing a local dev server is a core use case)
+//! and are reached through an approval or an explicit per-host rule — except
+//! on Full Access, which is the user's "ask me nothing" mode and therefore
+//! covers every target class, local ones included.
 //!
 //! URL parsing is the WHATWG parser (`reqwest::Url`), which is also what the
 //! client connects with. That matters: `http://0251.0376.0251.0376/`,
@@ -58,9 +57,9 @@ pub fn schema(read_only: bool) -> Value {
         METHODS.to_vec()
     };
     let description = if read_only {
-        "Make a read-only HTTP request (GET or HEAD) and get back the status, the useful response headers and the body (JSON pretty-printed, binary summarised). Use it to check what an API endpoint or a local dev server returns. To read a docs page or article use web_fetch instead. Requests to localhost or a private network need the user's approval; cloud metadata and link-local addresses are always refused."
+        "Make a read-only HTTP request (GET or HEAD) and get back the status, the useful response headers and the body (JSON pretty-printed, binary summarised). Use it to check what an API endpoint or a local dev server returns. To read a docs page or article use web_fetch instead. Requests to localhost or a private network need the user's approval (Full Access runs them without asking); cloud metadata and link-local addresses are always refused."
     } else {
-        "Make an HTTP request and get back the status, the useful response headers and the body (JSON pretty-printed, binary summarised, long bodies truncated). Use it to call an API, test an endpoint on a local dev server (`http://localhost:3000/api/...`), or send a webhook. Do NOT use it to read docs, articles or web pages — use web_fetch, which strips HTML — and do NOT use it for GitHub — use the github tool. GET/HEAD to a public host runs like web_fetch; any other method (POST/PUT/PATCH/DELETE/OPTIONS), and any request to localhost or a private network, needs the user's approval (plan mode refuses writes outright). Cloud metadata and link-local addresses are always refused, and redirects into private space are not followed. Put credentials in `headers`, never in the URL; they are redacted from what the user sees, but don't invent or guess secrets. Send `json` for a JSON body (sets Content-Type) or `body` for anything else, not both."
+        "Make an HTTP request and get back the status, the useful response headers and the body (JSON pretty-printed, binary summarised, long bodies truncated). Use it to call an API, test an endpoint on a local dev server (`http://localhost:3000/api/...`), or send a webhook. Do NOT use it to read docs, articles or web pages — use web_fetch, which strips HTML — and do NOT use it for GitHub — use the github tool. GET/HEAD to a public host runs like web_fetch; any other method (POST/PUT/PATCH/DELETE/OPTIONS), and any request to localhost or a private network, needs the user's approval (Full Access runs those too; plan mode refuses writes outright). Cloud metadata and link-local addresses are always refused, and redirects into private space are not followed. Put credentials in `headers`, never in the URL; they are redacted from what the user sees, but don't invent or guess secrets. Send `json` for a JSON body (sets Content-Type) or `body` for anything else, not both."
     };
     json!({
         "name": TOOL,
@@ -358,10 +357,11 @@ pub fn deny_subject(input: &Value) -> Option<String> {
 ///
 /// A name that was written as public was auto-approved (for GET) as a web
 /// read; if it resolves into loopback/private space that is DNS rebinding or an
-/// internal DNS entry, and the approval never covered it. A target the user
-/// did approve as local may resolve locally — but nothing ever reaches a
-/// blocked address.
-pub fn check_resolved(written: Target, addrs: &[IpAddr]) -> Result<(), String> {
+/// internal DNS entry, and the approval never covered it — unless the caller
+/// is on Full Access, which approved every target class to begin with. A target
+/// the user did approve as local may resolve locally — but nothing ever
+/// reaches a blocked address.
+pub fn check_resolved(written: Target, addrs: &[IpAddr], allow_local: bool) -> Result<(), String> {
     if addrs.is_empty() {
         return Err("The host name did not resolve to any address.".into());
     }
@@ -373,7 +373,7 @@ pub fn check_resolved(written: Target, addrs: &[IpAddr]) -> Result<(), String> {
                 ))
             }
             Target::Public => {}
-            local if written == Target::Public => {
+            local if written == Target::Public && !allow_local => {
                 let what = if local == Target::Loopback {
                     "this machine"
                 } else {
@@ -418,13 +418,21 @@ fn same_origin(a: &Url, b: &Url) -> bool {
 ///
 /// * A blocked target is refused, always.
 /// * A loopback/private target is only followed inside the approved origin
-///   (`/login` → `/dashboard` on the same dev server). Anything else would let
-///   a public page — or one local service — bounce the call somewhere the
+///   (`/login` → `/dashboard` on the same dev server), unless the caller is on
+///   Full Access, which approved every target class. Anything else would let a
+///   public page — or one local service — bounce the call somewhere the
 ///   user never approved.
 /// * 307/308 resend the method and body. Cross-origin, that is a write to a
 ///   host nobody approved, so it is handed back rather than followed.
 /// * 303, and 301/302 after a POST, become a body-less GET (what browsers do).
-pub fn redirect_step(origin: &Url, cur: &Url, method: &str, status: u16, location: &str) -> Hop {
+pub fn redirect_step(
+    origin: &Url,
+    cur: &Url,
+    method: &str,
+    status: u16,
+    location: &str,
+    allow_local: bool,
+) -> Hop {
     let Ok(next) = cur.join(location.trim()) else {
         return Hop::Refuse(format!(
             "the server sent an invalid redirect location `{}`.",
@@ -463,7 +471,7 @@ pub fn redirect_step(origin: &Url, cur: &Url, method: &str, status: u16, locatio
             "it points at {shown}, a link-local / cloud-metadata / reserved address."
         ));
     }
-    if target != Target::Public && !same_origin(&next, origin) {
+    if target != Target::Public && !same_origin(&next, origin) && !allow_local {
         return Hop::Refuse(format!(
             "it points at {shown}, on this machine or a private network, outside the origin that was approved. Request it directly if you need it — that asks the user."
         ));
@@ -737,13 +745,17 @@ pub fn approval_reason(req: &Request, auto_rung: bool) -> String {
         ),
     }
 }
-
 // ───────────────────────────── execution ─────────────────────────────
 
 pub struct Options<'a> {
     /// Spill a long result to a local file (false for SSH tasks, whose file
     /// tools could not read a local spill path).
     pub keep_spill: bool,
+    /// Whether the caller's rung approved every target class (Full Access).
+    /// When true, a public-looking name may resolve to a local address and a
+    /// redirect may land on one; the blocked targets stay out of reach either
+    /// way.
+    pub allow_local: bool,
     /// The caller's deny policy for the effective method and URL of a hop.
     pub check_hop: &'a (dyn Fn(&str, &Url) -> Result<(), String> + Send + Sync),
 }
@@ -757,7 +769,7 @@ impl Options<'_> {
         status: u16,
         location: &str,
     ) -> Hop {
-        let mut hop = redirect_step(origin, cur, method, status, location);
+        let mut hop = redirect_step(origin, cur, method, status, location, self.allow_local);
         if let Hop::Follow { url, method, .. } = &hop {
             if let Err(reason) = (self.check_hop)(method, url) {
                 hop = Hop::Refuse(format!("Redirect refused by the HTTP deny rules: {reason}"));
@@ -836,7 +848,11 @@ fn build_headers(input: &Value) -> Result<reqwest::header::HeaderMap, String> {
 
 /// Resolve the URL's host and check each address. Returns the addresses to
 /// pin the connection to (empty for an IP-literal host, which needs no DNS).
-async fn resolve_checked(u: &Url, deadline: Instant) -> Result<Vec<SocketAddr>, String> {
+async fn resolve_checked(
+    u: &Url,
+    deadline: Instant,
+    allow_local: bool,
+) -> Result<Vec<SocketAddr>, String> {
     let written = classify_url(u);
     if written == Target::Blocked {
         return Err(format!(
@@ -846,7 +862,7 @@ async fn resolve_checked(u: &Url, deadline: Instant) -> Result<Vec<SocketAddr>, 
     }
     let port = u.port_or_known_default().unwrap_or(80);
     match host_kind(u) {
-        Some(HostKind::Ip(ip)) => check_resolved(written, &[ip]).map(|_| vec![]),
+        Some(HostKind::Ip(ip)) => check_resolved(written, &[ip], allow_local).map(|_| vec![]),
         Some(HostKind::Domain(d)) => {
             let left = deadline.saturating_duration_since(Instant::now());
             let addrs: Vec<SocketAddr> =
@@ -856,7 +872,7 @@ async fn resolve_checked(u: &Url, deadline: Instant) -> Result<Vec<SocketAddr>, 
                     .map_err(|e| format!("Could not resolve `{d}`: {e}"))?
                     .collect();
             let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
-            check_resolved(written, &ips)?;
+            check_resolved(written, &ips, allow_local)?;
             Ok(addrs)
         }
         None => Err("The URL has no host.".into()),
@@ -985,7 +1001,7 @@ pub async fn execute(input: &Value, opts: &Options<'_>) -> Result<String, String
     let mut hops = 0usize;
     let mut stop_note: Option<String> = None;
     let resp = loop {
-        let pinned = resolve_checked(&url, deadline).await?;
+        let pinned = resolve_checked(&url, deadline, opts.allow_local).await?;
         let mut b = reqwest::Client::builder()
             // A proxy resolves the name itself, which would make the address
             // check above meaningless.

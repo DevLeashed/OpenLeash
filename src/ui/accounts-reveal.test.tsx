@@ -36,6 +36,13 @@ const provider: ProviderView = {
   },
 } as unknown as ProviderView;
 
+/** The Kimi Code subscription: a pasted console key, no CLI login file. */
+const kimiProvider: ProviderView = {
+  ...provider,
+  id: "kimi-code", name: "Kimi Code", icon: "moonshot", mono: "Ki", color: "#60a5fa",
+  account: { ...provider.account!, display_name: "Kimi Code", short_name: "Kimi", login_file: "", key_login: true },
+} as unknown as ProviderView;
+
 const store = (accounts: AccountView[]) => set({
   providers: [provider], accounts,
   settings: { paused_all: false, paused_reason: "" } as unknown as Settings,
@@ -82,22 +89,25 @@ describe("revealing account details from the toolbar", () => {
     expect(document.body.textContent).not.toContain(EMAIL);
   });
 
-  it("shows recorded emails, partial OpenCode keys, and missing-email feedback", () => {
-    set({ providers: [provider, { ...provider, id: "opencode-go" }], accounts: [
+  it("shows recorded emails, partial key fragments, and missing-identity feedback", () => {
+    set({ providers: [provider, { ...provider, id: "opencode-go" }, kimiProvider], accounts: [
       { ...acct("a1"), email: EMAIL },
       { ...acct("a2"), email: "second@example.com" },
       { ...acct("a3") },
       { ...acct("a4"), kind: "opencode-go", key_hint: "••••abcd" },
+      { ...acct("a5"), kind: "kimi-code", key_hint: "••••kim1" },
     ] });
     const view = render(<AccountsTab />);
     expect(document.body.textContent).not.toContain("••••abcd");
+    expect(document.body.textContent).not.toContain("••••kim1");
     fireEvent.click(view.getByRole("button", { name: "Reveal" }));
     fireEvent.click(view.getByRole("button", { name: "Reveal details" }));
     const text = [...document.querySelectorAll(".acct")].map((row) => row.textContent).join(" ");
     expect(text).toContain(EMAIL);
     expect(text).toContain("second@example.com");
-    expect(text).toContain("No email recorded");
+    expect(text).toContain("Nothing recorded");
     expect(text).toContain("••••abcd");
+    expect(text).toContain("••••kim1");
   });
 });
 

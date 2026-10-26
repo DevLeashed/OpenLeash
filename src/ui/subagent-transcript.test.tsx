@@ -58,6 +58,20 @@ describe("a subagent's transcript in a chat opened after launch", () => {
     render(<SubPanel task={task} sub={doneSub} />);
     expect(await screen.findByText("No transcript saved for this subagent.")).toBeTruthy();
   });
+
+  // A brief that says "check this screenshot" and shows nothing leaves the user
+  // guessing whether the subagent was given the right picture, so the pictures
+  // that went with the brief are drawn in the panel.
+  it("shows the pictures the brief was sent with", async () => {
+    const pic = "data:image/png;base64,iVBORw0KGgo=";
+    const withPic = { ...brief, data: { brief: true, has_images: 1, images: [pic] } } as Item;
+    vi.spyOn(api, "subTranscript").mockResolvedValue([withPic]);
+    render(<SubPanel task={task} sub={doneSub} />);
+    expect(await screen.findByText("Brief from the main agent")).toBeTruthy();
+    const img = document.querySelector(".brief .ubimgs img") as HTMLImageElement | null;
+    expect(img, "the brief draws the picture it was given").toBeTruthy();
+    expect(img!.getAttribute("src")).toBe(pic);
+  });
 });
 
 describe("loadSubTranscript", () => {
